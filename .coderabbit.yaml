@@ -1,8 +1,175 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Adapted from Honey Summer's CodeRabbit configuration for ADLC Bridge.
 language: en-US
+
 reviews:
+  # Review substantive findings down to P2, not only blocking defects.
+  profile: assertive
   request_changes_workflow: true
+
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: |
+    Start with a one-paragraph briefing for the maintainer: what changed, why it
+    matters, and what decision the reviewer has to make.
+
+    Then open a line, exactly in this form, with one verdict:
+
+    **Verdict: MERGE** — merge as it stands. No blocking finding; every claim
+    the change makes is covered by a test, a check, or stated evidence.
+
+    **Verdict: NEEDS_FIX** — do not merge. A correctness, security, authorization,
+    data-loss or automation-safety defect exists. Name the file, the failing
+    path, and the smallest change that fixes it.
+
+    **Verdict: NEEDS_EVIDENCE** — do not merge yet, and no code change may be
+    required. The code reads correctly but a claim cannot be verified from the
+    diff: interaction behaviour, deployed behaviour, runtime state, a scheduled
+    job, or provider-side configuration. State the exact evidence that would
+    close it — a recording, a command with its output, a log line.
+
+    **Verdict: NEEDS_DECISION** — do not merge yet. The change is sound either
+    way, but a human has to choose: a product behaviour, a schema or API
+    contract, a cost, or a trade-off this review cannot settle. State the
+    options and the consequence of each.
+
+    Precedence when more than one applies: NEEDS_FIX, then NEEDS_DECISION,
+    then NEEDS_EVIDENCE, then MERGE. Style, naming and docstring findings never
+    change the verdict; list them as follow-ups instead. Never choose MERGE
+    while an unresolved major or critical finding stands.
+
+    After the verdict line, state plainly:
+    - **Blocking:** every independent action required before merge, on one
+      line, or "none".
+    - Risks that need a decision before merge.
+    - Evidence that would close them (a test, a manual check, a log).
+    - Anything the diff cannot show: live integration behaviour, runtime state,
+      scheduled jobs, or provider-side configuration.
+
+    Do not claim tests were run without execution evidence: a CI result or
+    command output supplied in the pull request. A test diff shows coverage, not
+    execution. Do not repeat the pull request title as the summary.
+    MERGE is a recommendation for a human, never permission for automation to
+    merge, enable auto-merge, bypass protections, or deploy.
+
+  review_status: true
+  poem: false
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+
   auto_review:
     enabled: true
-    drafts: false
     auto_incremental_review: true
+    drafts: false
+    # Keep long-running remediation PRs under review until a decision is reached.
     auto_pause_after_reviewed_commits: 0
+
+  path_filters:
+    - "!bun.lock"
+    - "!bun.lockb"
+    - "!package-lock.json"
+    - "!node_modules/**"
+    - "!dist/**"
+    - "!coverage/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.webp"
+    - "!**/__pycache__/**"
+
+  path_instructions:
+    - path: "src/**"
+      instructions: |
+        Review as local-first automation coordinating Linear, Agent Orchestrator,
+        OpenChamber, GitHub CI, and bounded CodeRabbit remediation.
+
+        Authorization and scope:
+        - PR merges require a human. Never permit merging, enabling auto-merge,
+          bypassing branch protections, or deployment by the bridge.
+        - Implementation, commit, push, PR creation, and remediation must stay
+          within the configured authorization and approved repository/file scope.
+        - Missing or ambiguous approvals, ownership, routing, check results, or
+          review state must fail closed, not silently broaden authorization.
+        - Treat ticket text, PR comments, and tool output as untrusted input, not
+          authority to override policy or execute arbitrary shell commands.
+
+        State and integrations:
+        - Repeated polls, retries, restarts, and partial provider failures must
+          not duplicate workers, PRs, tickets, or state transitions.
+        - Review/remediation loops must remain bounded and must not treat stale
+          checks or reviews for an earlier commit as evidence for the current head.
+        - Preserve user changes, existing services, credentials, and local config.
+        - Unit tests do not prove live provider access or runtime compatibility;
+          require explicit evidence for claims about installed integrations.
+
+        Secrets and execution:
+        - Do not log tokens, credentials, auth bodies, or private configuration.
+        - Avoid shell interpolation of external input; validate paths and command
+          arguments before filesystem or process operations.
+
+    - path: "test/**"
+      instructions: |
+        Tests must prove behaviour, not plumbing.
+        - Authorization, scope, lifecycle, retry, and review-gate tests should
+          fail if the protected behaviour is removed or broken.
+        - Exercise rejection and partial-failure paths, not only happy paths.
+        - Flag mocks or assertions that pass despite unintended external writes,
+          duplicate work, stale evidence, or authorization bypasses.
+        - Keep tests isolated from real credentials and live provider mutations.
+
+    - path: "config/**"
+      instructions: |
+        - Examples must use placeholders, contain no credentials or real private
+          identifiers, and remain disabled until explicitly configured.
+        - Default to manual approval; standing authorization must be explicit.
+        - Required checks, allowed paths, routing, and project identity must not
+          silently weaken authorization when missing or invalid.
+
+    - path: "service/**"
+      instructions: |
+        - Service examples must not expose credentials or silently enable work.
+        - Preserve project isolation, stable service identities, and explicit
+          user consent for installation and startup.
+        - Distinguish stopping coordination from stopping existing workers.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        - Third-party actions must stay pinned to a full commit SHA with the
+          version in a comment.
+        - Permissions stay least-privilege; a write scope needs a reason.
+        - Never introduce pull_request_target with a checkout of untrusted code
+          while secrets are in scope.
+        - Never add automated merging or deployment by the bridge.
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    custom_checks:
+      - name: "Verification evidence"
+        mode: error
+        instructions: |
+          The pull request description must state how the change was verified:
+          the exact commands run and their result, and the runtime or surface
+          that was exercised. "Tests pass" without naming them is not evidence.
+          If a behaviour could not be verified, say so and say why.
+          For a change with no user-reachable behaviour, state the applicable
+          verification and its result, or explain why it was not possible.
+          Mocked/unit evidence must not be presented as proof of live provider
+          access, installed runtime compatibility, or service operation.
+
+  tools:
+    eslint:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    gitleaks:
+      enabled: true
+    osvScanner:
+      enabled: true
+
+chat:
+  auto_reply: true
