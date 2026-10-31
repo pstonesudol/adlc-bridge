@@ -1,0 +1,21 @@
+# Machine-specific project configuration and historical snapshots
+config/*.json
+!config/*.example.json
+# Local credentials, runtime state and generated artifacts
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+node_modules/
+.DS_Store
+# Installed LaunchAgent snapshots (placeholders only in service/*.example.plist)
+service/*.plist
+# Machine-local working notes and ticket plans
+AUTOMATIC-WORKFLOW.md
+COORDINATION-MILESTONE.md
+DEV-8-*.md
+IMPLEMENTATION-STATUS.md
+PR-REVIEW-COORDINATOR.md

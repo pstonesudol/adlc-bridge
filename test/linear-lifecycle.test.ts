@@ -1,0 +1,16 @@
+import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';
+const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
+function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false;
+ const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}});
+ const api=async(q:string,v:any)=>{if(q.includes('workflowState'))return {workflowState:{id:v.id,type:v.id==='done'?'completed':'started',team:{id:'t'}}};if(q.includes('issueUpdate')){updates++;state=v.state;if(lost){lost=false;throw Error('Lost status reply');}return {issueUpdate:{success:true,issue:issue()}};}return {issue:issue()};};
+ const sync=new LinearLifecycle(s,api,async()=>({state:merged?'closed':'open',merged}));
+ return {s,id,sync,get state(){return state;},get updates(){return updates;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
+}
+test('owned ticket moves In Progress → In Review → Done only after observed merge',async()=>{
+ const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
+ await f.sync.sync(c);expect(f.state).toBe('review');expect(f.s.get(f.id).state).not.toBe('done');f.merge();await f.sync.sync(c);expect(f.state).toBe('done');expect(f.s.get(f.id).state).toBe('done');expect(f.updates).toBe(3);
+ }finally{f.s.close();}
+});
+test('lost status reply reconciles without replay; subsequent manual change is preserved',async()=>{
+ const f=fixture();try{f.lost();await f.sync.sync(c);expect(f.updates).toBe(1);await f.sync.sync(c);expect(f.updates).toBe(1);f.manual('todo');const result=await f.sync.sync(c);expect(result[0].state).toBe('needs_reconciliation');expect(f.state).toBe('todo');expect(f.updates).toBe(1);}finally{f.s.close();}
+});

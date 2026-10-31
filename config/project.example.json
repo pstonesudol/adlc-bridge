@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "name": "Your project",
+  "repo": "/absolute/path/to/your/repository",
+  "githubRepo": "OWNER/REPOSITORY",
+  "automation": {
+    "planningEnabled": false,
+    "orchestratorProject": "YOUR_REGISTERED_PROJECT_ID",
+    "maxPlanning": 1
+  },
+  "linear": {
+    "projectId": "REPLACE_WITH_PROJECT_UUID",
+    "teamId": "REPLACE_WITH_TEAM_UUID",
+    "readyStateId": "REPLACE_WITH_TODO_STATE_UUID",
+    "readyLabelId": "REPLACE_WITH_AGENT_READY_LABEL_UUID"
+  },
+  "requiredChecks": [
+    "REPLACE_WITH_EXACT_REQUIRED_CHECK_NAME"
+  ],
+  "reviewAllowedPaths": [
+    "src/**"
+  ],
+  "approval": {
+    "mode": "manual"
+  },
+  "routing": {
+    "enabled": false,
+    "dataDir": "/absolute/path/to/.config/openchamber",
+    "runtimeDir": "/absolute/path/to/openchamber/packages/web/server/lib/routing",
+    "harness": "opencode-v2"
+  },
+  "statusSync": {
+    "enabled": false,
+    "inProgress": "REPLACE_WITH_STATE_UUID",
+    "inReview": "REPLACE_WITH_STATE_UUID",
+    "done": "REPLACE_WITH_STATE_UUID"
+  },
+  "featurePlanning": {
+    "enabled": false,
+    "backlogStateId": "REPLACE_WITH_BACKLOG_STATE_UUID",
+    "maxAgents": 3,
+    "maxTickets": 25
+  },
+  "planApproval": {
+    "enabled": false,
+    "approverIds": [],
+    "scope": [
+      "src/**"
+    ]
+  },
+  "branchUpdate": {
+    "enabled": false,
+    "authorizedBy": "",
+    "maxUpdates": 3
+  }
+}

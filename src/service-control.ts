@@ -1,0 +1,41 @@
+import {existsSync} from 'node:fs';
+import {homedir} from 'node:os';
+import {join} from 'node:path';
+import {Store} from './core';
+import {ProjectServices,registryPath,assertDefinition,readDefinition} from './project-services';
+async function launch(args:string[]){
+ const p=Bun.spawn(['/bin/launchctl',...args],{stdout:'pipe',stderr:'pipe'});
+ const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ return {stdout,stderr,code};
+}
+export async function registeredProjects(){
+ const s=new Store(registryPath());try{const registry=new ProjectServices(s);registry.discoverLegacy();return registry.list().map(p=>({...p,definitionInstalled:existsSync(join(homedir(),'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
+}
+export async function serviceControl(action:string,project?:string){
+ if(process.platform!=='darwin'||!process.getuid)throw Error('Service controls require macOS');
+ const s=new Store(registryPath());
+ try{
+  const registry=new ProjectServices(s);registry.discoverLegacy();
+  if(action==='service-status'&&!project&&registry.list().length>1){
+   const results=[];for(const p of registry.list())results.push(await serviceControl(action,p.project));return results;
+  }
+  const entry=registry.select(project);registry.verify(entry);
+  const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(homedir(),'Library/LaunchAgents',`${label}.plist`);
+  if(existsSync(plist))assertDefinition(readDefinition(plist),label,entry.config);
+  const status=async()=>{
+   const r=await launch(['print',target]);
+   if(r.code!==0&&!/Could not find service/.test(r.stderr+r.stdout))throw Error('Unable to inspect background service');
+   return {loaded:r.code===0,running:r.code===0&&/state = running/.test(r.stdout)};
+  };
+  if(action==='service-status')return {project:entry.project,service:label,...await status(),definitionInstalled:existsSync(plist),intervalSeconds:60};
+  if(!['start','stop'].includes(action))throw Error('Unknown service action');
+  let current=await status();
+  if(action==='start'&&!current.loaded){
+   if(!existsSync(plist))throw Error('Background service definition is missing; complete project service installation');
+   const r=await launch(['bootstrap',domain,plist]);if(r.code!==0)throw Error('Could not start background service');
+  }
+  if(action==='stop'&&current.loaded){const r=await launch(['bootout',target]);if(r.code!==0)throw Error('Could not stop background service');}
+  current=await status();if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
+  return {project:entry.project,service:label,...current,workerSessionsStopped:false,note:action==='stop'?'Background coordination stopped. Existing Orchestrator workers continue independently.':'Background coordination enabled; polls approximately every 60 seconds.'};
+ }finally{s.close();}
+}
