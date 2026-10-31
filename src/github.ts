@@ -1,3 +1,5 @@
+import {latestWorkflowChecks} from './check-runs';
+import {templateCIFindings,templateSignature} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 
@@ -25,12 +27,14 @@ export function metadataFindings(review:any,head:string,comments:any[]){
  if(!match)return [];
  return [{kind:'pr_description',path:null,sha:head,body:match[1].replace(/<[^>]*>/g,'').trim().slice(0,10000)}];
 }
-export async function readiness(repo:string, number:number, required:string[]) {
+export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[]) {
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1)throw Error('Valid owner/repository and PR number required');
+  required=[...new Set([...required,...metadataChecks])];
   const base=`repos/${repo}`;
   const first=await gh(['api',`${base}/pulls/${number}`]);
   if(first.state!=='open')throw Error('PR is not open');
-  const [checks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
+  const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
+  const checks=await latestWorkflowChecks(repo,first.head.sha,rawChecks,path=>gh(['api',path]));
   const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();let unresolved=0;
   const findings:any[]=[];
   do {
@@ -77,9 +81,15 @@ export async function readiness(repo:string, number:number, required:string[]) {
   const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
+  const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),async path=>{
+   const p=Bun.spawn(['gh','api',path,'--allow-escape-sequences'],{stdout:'pipe',stderr:'pipe',timeout:30000});
+   const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+   if(code!==0)throw Error('Template-check logs unavailable');return out;
+  });
+  findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
-    branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
+    botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
 }
 
 // Observation only. This function cannot merge or modify a PR.

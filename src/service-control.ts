@@ -30,12 +30,14 @@ export async function serviceControl(action:string,project?:string){
   if(action==='service-status')return {project:entry.project,service:label,...await status(),definitionInstalled:existsSync(plist),intervalSeconds:60};
   if(!['start','stop'].includes(action))throw Error('Unknown service action');
   let current=await status();
+  if(action==='start'){const enabled=await launch(['enable',target]);if(enabled.code!==0)throw Error('Could not enable background service');}
   if(action==='start'&&!current.loaded){
    if(!existsSync(plist))throw Error('Background service definition is missing; complete project service installation');
    const r=await launch(['bootstrap',domain,plist]);if(r.code!==0)throw Error('Could not start background service');
   }
   if(action==='stop'&&current.loaded){const r=await launch(['bootout',target]);if(r.code!==0)throw Error('Could not stop background service');}
-  current=await status();if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
+  for(let attempt=0;attempt<100;attempt++){current=await status();if(current.loaded===(action==='start'))break;await Bun.sleep(100);}
+  if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
   return {project:entry.project,service:label,...current,workerSessionsStopped:false,note:action==='stop'?'Background coordination stopped. Existing Orchestrator workers continue independently.':'Background coordination enabled; polls approximately every 60 seconds.'};
  }finally{s.close();}
 }

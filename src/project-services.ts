@@ -1,3 +1,4 @@
+import {installedCLI} from './install-state';
 import {Store,digest} from './core';
 import {existsSync,readFileSync,realpathSync} from 'node:fs';
 import {join,resolve} from 'node:path';
@@ -16,7 +17,7 @@ export function readDefinition(path:string){
 }
 export function assertDefinition(def:any,label:string,config:string){
  const a=def.ProgramArguments;
- if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||realpathSync(a[1])!==realpathSync(join(import.meta.dir,'cli.ts')))throw Error('Service definition does not match this project; existing service preserved');
+ if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||![join(import.meta.dir,'cli.ts'),installedCLI()].filter(Boolean).some(x=>realpathSync(a[1])===realpathSync(x!)))throw Error('Service definition does not match this project; existing service preserved');
 }
 export class ProjectServices{
  constructor(public s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);`);}

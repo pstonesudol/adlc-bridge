@@ -1,0 +1,15 @@
+import {test,expect} from 'bun:test';
+import {controlStack,activityBlockers,turnBlockers,type StackOps} from '../src/stack-control';
+function fixture(){
+ const calls:string[]=[];let on=true;let blocks:{session:string;reason:string}[]=[];
+ const ops:StackOps={projects:async()=>[{project:'one'},{project:'two'}],project:async(a,id)=>{calls.push(`${a}:${id}`);return {project:id,loaded:a!=='stop'};},backend:async()=>({ready:on,loaded:on,managed:true}),backendStart:async()=>{calls.push('backend:start');on=true;},backendStop:async()=>{calls.push('backend:stop');on=false;},blockers:async()=>{calls.push('workers:check');return blocks;}};
+ return {calls,ops,block:(value:typeof blocks)=>blocks=value};
+}
+test('stack stop pauses all intake before scanning workers and stopping backend',async()=>{const f=fixture();const r=await controlStack('stop',f.ops);expect(f.calls).toEqual(['stop:one','stop:two','workers:check','backend:stop']);expect(r.backend.ready).toBe(false);});
+test('busy and queued workers preserve backend and leave intake paused',async()=>{const f=fixture();f.block([{session:'worker',reason:'queued turn'}]);await expect(controlStack('stop',f.ops)).rejects.toThrow('worker (queued turn)');expect(f.calls).toEqual(['stop:one','stop:two','workers:check']);});
+test('failed worker inspection cannot stop backend',async()=>{const f=fixture();f.ops.blockers=async()=>{throw Error('unavailable');};await expect(controlStack('stop',f.ops)).rejects.toThrow('unavailable');expect(f.calls).not.toContain('backend:stop');});
+test('shared backend is preserved when not bridge managed',async()=>{const f=fixture();f.ops.backend=async()=>({ready:true,loaded:true,managed:false});await expect(controlStack('stop',f.ops)).rejects.toThrow('not managed');expect(f.calls).toEqual(['stop:one','stop:two']);});
+test('backend must be ready before enabling any intake',async()=>{const f=fixture();f.ops.backendStart=async()=>{throw Error('startup failed');};await expect(controlStack('start',f.ops)).rejects.toThrow('startup failed');expect(f.calls).toEqual([]);});
+test('stack start and repeated stop are ordered and safe',async()=>{const f=fixture();await controlStack('stop',f.ops);f.calls.length=0;await controlStack('stop',f.ops);expect(f.calls).toEqual(['stop:one','stop:two','backend:stop']);f.calls.length=0;await controlStack('start',f.ops);expect(f.calls).toEqual(['backend:start','start:one','start:two']);});
+test('status does not mutate services',async()=>{const f=fixture();await controlStack('status',f.ops);expect(f.calls).toEqual(['service-status:one','service-status:two']);});
+test('unknown worker activity and queued turns block; idle and terminal work do not',()=>{expect(activityBlockers([{id:'idle',activity:{state:'idle'}},{id:'busy',activity:{state:'working'}},{id:'unknown'},{id:'gone',isTerminated:true}])).toEqual([{session:'busy',reason:'working'},{session:'unknown',reason:'unknown activity'}]);expect(turnBlockers('one',{turns:[{state:'completed'},{state:'queued'},{state:'running'}]})).toEqual([{session:'one',reason:'queued turn'},{session:'one',reason:'running turn'}]);expect(()=>turnBlockers('one',{})).toThrow('Cannot verify');});

@@ -51,6 +51,7 @@
   "branchUpdate": {
     "enabled": false,
     "authorizedBy": "",
-    "maxUpdates": 3
-  }
+    "maxUpdates": null
+  },
+  "prMetadataChecks": []
 }

@@ -1,0 +1,245 @@
+--- a/backend/internal/adapters/scm/github/provider.go
++++ b/backend/internal/adapters/scm/github/provider.go
+@@ -151,6 +151,9 @@
+ 		return out, scmObserveError(err)
+ 	}
+ 
++	if err := p.normalizeCheckReruns(ctx, owner, repo, rest.Head.SHA, gq); err != nil {
++		return out, scmObserveError(err)
++	}
+ 	out.CI = ciSummaryFromGraphQL(gq)
+ 	out.Review = reviewDecisionFromGraphQL(gq)
+ 	out.Mergeability = mergeabilityFromGraphQL(gq, rest, out.CI, out.Review)
+--- a/backend/internal/adapters/scm/github/observer_provider.go
++++ b/backend/internal/adapters/scm/github/observer_provider.go
+@@ -258,6 +258,9 @@
+ 			if err := p.fetchRemainingCheckContexts(ctx, ref, pr); err != nil {
+ 				return nil, err
+ 			}
++		}
++		if err := p.normalizeCheckReruns(ctx, ref.Repo.Owner, ref.Repo.Name, firstNonEmpty(str(pr["headRefOid"]), latestCommitOID(pr)), pr); err != nil {
++			return nil, err
+ 		}
+ 		out[i] = scmObservationFromGraphQL(ref, pr)
+ 	}
+--- /dev/null
++++ b/backend/internal/adapters/scm/github/check_reruns.go
+@@ -0,0 +1,151 @@
++package github
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++)
++
++type checkRunAttempt struct {
++	workflow        string
++	number, attempt int64
++}
++
++// normalizeCheckReruns only supersedes contexts from the same verified Actions
++// workflow and event. Same-name checks from other workflows remain independent.
++func (p *Provider) normalizeCheckReruns(ctx context.Context, owner, repo, head string, pr map[string]any) error {
++	return supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		u, err := url.Parse(str(n["detailsUrl"]))
++		if err != nil || u.Host != "github.com" {
++			return checkRunAttempt{}, false, nil
++		}
++		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
++		if len(parts) != 7 || parts[0] != owner || parts[1] != repo || parts[2] != "actions" || parts[3] != "runs" || parts[5] != "job" {
++			return checkRunAttempt{}, false, nil
++		}
++		runID, e1 := strconv.ParseInt(parts[4], 10, 64)
++		jobID, e2 := strconv.ParseInt(parts[6], 10, 64)
++		checkID := int64(num(n["databaseId"]))
++		if e1 != nil || e2 != nil || runID <= 0 || jobID <= 0 || checkID <= 0 {
++			return checkRunAttempt{}, false, fmt.Errorf("invalid Actions check identity")
++		}
++		read := func(path string, out any) error {
++			r, e := p.client.doREST(ctx, http.MethodGet, path, nil, nil)
++			if e != nil {
++				return e
++			}
++			return json.Unmarshal(r.Body, out)
++		}
++		var job struct {
++			ID       int64  `json:"id"`
++			RunID    int64  `json:"run_id"`
++			Head     string `json:"head_sha"`
++			Attempt  int64  `json:"run_attempt"`
++			CheckURL string `json:"check_run_url"`
++		}
++		if err := read(repoPath(owner, repo, "actions", "jobs", parts[6]), &job); err != nil {
++			return checkRunAttempt{}, false, err
++		}
++		var run struct {
++			ID         int64  `json:"id"`
++			Head       string `json:"head_sha"`
++			Workflow   int64  `json:"workflow_id"`
++			Number     int64  `json:"run_number"`
++			Event      string `json:"event"`
++			Repository struct {
++				FullName string `json:"full_name"`
++			} `json:"repository"`
++		}
++		if err := read(repoPath(owner, repo, "actions", "runs", parts[4]), &run); err != nil {
++			return checkRunAttempt{}, false, err
++		}
++		if job.ID != jobID || job.RunID != runID || job.Head != head || job.Attempt <= 0 || job.CheckURL != fmt.Sprintf("https://api.github.com/repos/%s/%s/check-runs/%d", owner, repo, checkID) || run.ID != runID || run.Head != head || run.Workflow <= 0 || run.Number <= 0 || run.Event == "" || run.Repository.FullName != owner+"/"+repo {
++			return checkRunAttempt{}, false, fmt.Errorf("Actions check provenance mismatch")
++		}
++		return checkRunAttempt{workflow: fmt.Sprintf("%d:%s", run.Workflow, run.Event), number: run.Number, attempt: job.Attempt}, true, nil
++	})
++}
++
++func supersedeCheckReruns(pr map[string]any, resolve func(map[string]any) (checkRunAttempt, bool, error)) error {
++	roll := statusRollup(pr)
++	if roll == nil {
++		return nil
++	}
++	contexts, _ := roll["contexts"].(map[string]any)
++	// A partial connection cannot establish that all failures are represented.
++	if pageInfoHasMore(contexts) {
++		return nil
++	}
++	raw := nodes(contexts["nodes"])
++	groups := map[string][]int{}
++	for i, n := range raw {
++		if str(n["__typename"]) == "CheckRun" {
++			groups[str(n["name"])] = append(groups[str(n["name"])], i)
++		}
++	}
++	dropped := map[int]bool{}
++	for _, group := range groups {
++		if len(group) < 2 {
++			continue
++		}
++		attempts := map[int]checkRunAttempt{}
++		complete := true
++		for _, i := range group {
++			a, ok, err := resolve(raw[i])
++			if err != nil {
++				return err
++			}
++			if !ok {
++				complete = false
++				break
++			}
++			attempts[i] = a
++		}
++		if !complete {
++			continue
++		}
++		latest := map[string]checkRunAttempt{}
++		for _, a := range attempts {
++			old := latest[a.workflow]
++			if a.number > old.number || a.number == old.number && a.attempt > old.attempt {
++				latest[a.workflow] = a
++			}
++		}
++		for i, a := range attempts {
++			last := latest[a.workflow]
++			if a.number < last.number || a.number == last.number && a.attempt < last.attempt {
++				dropped[i] = true
++			}
++		}
++	}
++	if len(dropped) == 0 {
++		return nil
++	}
++	kept := []any{}
++	for i, n := range raw {
++		if !dropped[i] {
++			kept = append(kept, n)
++		}
++	}
++	contexts["nodes"] = kept
++	// The original aggregate also includes superseded failures. Recompute only
++	// after removing a proven older run, preserving all other visible failures.
++	state := ciSummaryFromGraphQL(pr)
++	switch state {
++	case domain.CIPassing:
++		roll["state"] = "SUCCESS"
++	case domain.CIFailing:
++		roll["state"] = "FAILURE"
++	case domain.CIPending:
++		roll["state"] = "PENDING"
++	default:
++		roll["state"] = "EXPECTED"
++	}
++	return nil
++}
+--- /dev/null
++++ b/backend/internal/adapters/scm/github/check_reruns_test.go
+@@ -0,0 +1,64 @@
++package github
++
++import (
++	"fmt"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"testing"
++)
++
++func rerunPR(checks ...map[string]any) map[string]any {
++	raw := []any{}
++	for _, c := range checks {
++		raw = append(raw, c)
++	}
++	return map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "FAILURE", "contexts": map[string]any{"nodes": raw, "pageInfo": map[string]any{"hasNextPage": false}}}}}}}}
++}
++func rerunCheck(id int, status, conclusion string) map[string]any {
++	return map[string]any{"__typename": "CheckRun", "name": "PR body structure", "databaseId": float64(id), "status": status, "conclusion": conclusion}
++}
++func TestSupersededActionsFailureDoesNotKeepBoardRed(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++	err := supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{"workflow:pull_request", int64(num(n["databaseId"])), 1}, true, nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ciSummaryFromGraphQL(pr); got != domain.CIPassing {
++		t.Fatalf("legacy CI=%s", got)
++	}
++	if got := ciSummaryFromRollupState(pr); got != domain.CIPassing {
++		t.Fatalf("observer CI=%s", got)
++	}
++	if len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 1 {
++		t.Fatal("older run retained")
++	}
++}
++func TestSeparateWorkflowsDoNotHideFailure(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++	_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{fmt.Sprint(n["databaseId"]), 1, 1}, true, nil
++	})
++	if ciSummaryFromGraphQL(pr) != domain.CIFailing {
++		t.Fatal("distinct failure hidden")
++	}
++}
++func TestPendingRerunDoesNotInheritOldFailureOrPass(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "IN_PROGRESS", ""))
++	_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{"workflow", int64(num(n["databaseId"])), 1}, true, nil
++	})
++	if ciSummaryFromRollupState(pr) != domain.CIPending {
++		t.Fatal("pending rerun not pending")
++	}
++}
++func TestUnverifiedAndPartialChecksKeepFailure(t *testing.T) {
++	for _, partial := range []bool{false, true} {
++		pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++		statusRollup(pr)["contexts"].(map[string]any)["pageInfo"] = map[string]any{"hasNextPage": partial}
++		_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) { return checkRunAttempt{}, false, nil })
++		if ciSummaryFromGraphQL(pr) != domain.CIFailing {
++			t.Fatal("unverified failure hidden")
++		}
++	}
++}

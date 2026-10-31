@@ -56,6 +56,7 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   if(existsSync(path))throw Error(`Configuration already exists: ${path}. Preserved; use another --config path.`);
   if(!linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
   const c:any={version:1,name,repo,githubRepo:await ask('GitHub owner/repository'),automation:{planningEnabled:true,orchestratorProject:await ask('Existing Orchestrator project ID'),maxPlanning:1},linear:{projectId:await ask('Linear project UUID'),teamId:await ask('Linear team UUID'),readyStateId:await ask('Todo state UUID'),readyLabelId:await ask('agent-ready label UUID')},requiredChecks:(await ask('Required GitHub Actions check names (comma separated)')).split(',').map(x=>x.trim()).filter(Boolean),reviewAllowedPaths:(await ask('Allowed review path patterns (comma separated)','src/**')).split(',').map(x=>x.trim()),approval:{mode:'manual'}};
+  c.prMetadataChecks=(await ask('PR-description-only CI check names (comma separated; blank for none)')).split(',').map(x=>x.trim()).filter(Boolean);
   if(await yes('Enable shared OpenChamber task routing')){
    c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};
    await loadOpenChamber(c.routing);
@@ -69,7 +70,7 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   }
   if(await yes('Authorize automatic base-branch updates to owned feature PRs (never merges a PR)')){
    const actor=await ask('Your name for branch update authorization');if(!actor)throw Error('Authorizing person required');
-   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:3};
+   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:null};
   }
   if(await yes('Enable plan approval replies in Linear from your account')){
    const b=await linearAPI('query{viewer{id name app}}');

@@ -9,10 +9,10 @@ import {disableNativeFeedback} from './ao-policy';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
- if(e.failedChecks.length)return {state:'blocked',send:false,reason:'Required CI failed; inspect failure and ticket scope before remediation'};
+ if(e.failedChecks.length&&!e.failedChecks.every((c:any)=>e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.check===c.name)))return {state:'blocked',send:false,reason:'Required CI failed; inspect failure and ticket scope before remediation'};
  if(e.findings.length){
   if(e.findings.some((f:any)=>f.kind!=='pr_description'&&!scopeAllows(f.path,allowedPaths)))return {state:'blocked',send:false,reason:'Review findings exceed approved file scope'};
-  return {state:'remediation_pending',send:true,reason:'Actionable latest-SHA CodeRabbit findings'};
+  return {state:'remediation_pending',send:true,reason:e.failedChecks.length?'Actionable PR-template CI failure':'Actionable latest-SHA CodeRabbit findings'};
  }
  if(waitingMs>=30*60*1000)return {state:'blocked',send:false,reason:e.reasons.join('; ')};
  if(e.pendingChecks?.length||e.missingChecks?.length)return {state:'waiting_for_ci',send:false,reason:`Waiting for CI: ${[...(e.pendingChecks??[]),...(e.missingChecks??[])].join(', ')}`};
@@ -27,14 +27,22 @@ export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
 export class ReviewLoop{
- constructor(public s:Store,public postReview=postFullReview){s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
+ constructor(public s:Store,public postReview=postFullReview,public io={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback}){s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
   head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,
   head_since INTEGER NOT NULL,last_signature TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS remediation_context(job TEXT NOT NULL,attempt INTEGER NOT NULL,kind TEXT NOT NULL,baseline_body_hash TEXT,PRIMARY KEY(job,attempt));
   CREATE TABLE IF NOT EXISTS review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,head,body_hash));
+  CREATE TABLE IF NOT EXISTS metadata_check_policy(project TEXT PRIMARY KEY,checks TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS metadata_baselines(job TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(job,attempt));
+  CREATE TABLE IF NOT EXISTS metadata_waits(job TEXT NOT NULL,head TEXT NOT NULL,body TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(job,head,body));
   CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));`);}
+ configureMetadataChecks(project:string,names:string[]){
+  if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
+  this.s.db.query('INSERT INTO metadata_check_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET checks=excluded.checks').run(project,JSON.stringify([...new Set(names)]));
+ }
+ metadataChecks(job:string):string[]{const row=this.s.db.query('SELECT checks FROM metadata_check_policy WHERE project=?').get(this.s.get(job).project) as any;return row?JSON.parse(row.checks):[];}
  register(job:string,repo:string,pr:number,required:string[],paths:string[],remediate=false){
   const l=new Lifecycle(this.s);l.current(job);if(!l.run(job))throw Error('Existing approved run required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1||!required.length||!paths.length||paths.some(p=>p.startsWith('/')||p.split('/').includes('..')))throw Error('Invalid review target');
@@ -69,11 +77,12 @@ export class ReviewLoop{
  async tick(job:string,branchPolicy?:BranchPolicy){
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
-  const session=await sessionEvidence(run.session_id);
+  const session=await this.io.sessionEvidence(run.session_id);
   if(session.session.isTerminated||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
   const branch=await new BranchUpdates(this.s).ensure(job,t.repo,t.pr,session,branchPolicy);
   if(branch)return this.record(job,branch);
-  const e=await readiness(t.repo,t.pr,JSON.parse(t.required_checks));
+  const metadataChecks=this.metadataChecks(job),required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
+  const e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);
   if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');
   const since=t.head===e.head?t.head_since:Date.now();
   // Request one fresh pass when old review evidence cannot clear an otherwise
@@ -84,6 +93,15 @@ export class ReviewLoop{
     this.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(e.head,job);
     return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
    }
+  }
+  const waiting=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? AND body=?').get(job,e.head,e.descriptionHash) as any;
+  if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>e.findings.some((f:any)=>f.source==='github-ci'&&f.check===c.name))&&waiting.signature===e.templateSignature){
+   return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
+  }
+  if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.clear){
+   if(!e.coderabbitPending)await this.requestReview(job,e.head,e.descriptionHash);
+   const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,e.descriptionHash) as any;
+   if(request&&(e.coderabbitPending||!e.botReviewSubmittedAt||e.botReviewSubmittedAt<request.requested))return this.record(job,{state:Date.now()-request.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
   const d=decision(e,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
@@ -102,6 +120,9 @@ export class ReviewLoop{
     if(pending.head===e.head){
      const context=this.s.db.query('SELECT * FROM remediation_context WHERE job=? AND attempt=?').get(job,pending.attempt) as any;
      if(context?.kind==='pr_description'&&context.baseline_body_hash!==e.descriptionHash){
+      const baseline=this.s.db.query('SELECT signature FROM metadata_baselines WHERE job=? AND attempt=?').get(job,pending.attempt) as any;
+      this.s.db.query('INSERT OR IGNORE INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,baseline?.signature??e.templateSignature,Date.now());
+      if(e.failedChecks.length||e.pendingChecks.length||e.missingChecks.length)return this.record(job,{state:'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; waiting for CI reevaluation'});
       if(!e.coderabbitPending&&!e.pendingChecks.length&&!e.missingChecks.length)await this.requestReview(job,e.head,e.descriptionHash);
       return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'PR evidence updated; awaiting CodeRabbit reevaluation'});
      }
@@ -113,8 +134,8 @@ export class ReviewLoop{
    const metadataOnly=e.findings.every((f:any)=>f.kind==='pr_description');
    const operations=metadataOnly?['open-pr']:['commit','push-feature'];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
-   await disableNativeFeedback(run.session_id);
-   const result=await sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,JSON.parse(t.required_checks));
+   await this.io.disableNativeFeedback(run.session_id);
+   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,required,metadataChecks);
    return {...d,head:e.head,delivery:result};
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};

@@ -1,3 +1,5 @@
+import {installedCLI} from './install-state';
+import {trustedDaemon} from './daemon-runtime';
 import {configureSessionRoute,preflightRoute} from './routing-session';
 import {AO} from './orchestrator';
 import {sessionEvidence} from './session-evidence';
@@ -14,7 +16,7 @@ async function jsonCommand(args:string[]){
 }
 export async function localAO(path:string,method='GET',body?:unknown){
  const state=await jsonCommand([AO,'status','--json']);
- if(state.state!=='ready'||state.executablePath!==AO||!Number.isSafeInteger(state.port))throw Error('Verified Orchestrator daemon is not ready');
+ if(state.state!=='ready'||!trustedDaemon(state.executablePath)||!Number.isSafeInteger(state.port))throw Error('Verified Orchestrator daemon is not ready');
  // This module constructs paths internally. Never proxy arbitrary worker input.
  const r=await fetch(`http://127.0.0.1:${state.port}/api/v1/${path}`,{method,headers:{'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(120000)});
  const b:any=await r.json();if(!r.ok)throw Error(`Orchestrator HTTP ${r.status}`);return b;
@@ -57,10 +59,10 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  mkdirSync(backupDir,{recursive:true,mode:0o700});
  const backup=resolve(backupDir,`${project}-${Date.now()}.json`);
  writeFileSync(backup,JSON.stringify(b.project.config,null,2),{mode:0o600,flag:'wx'});
- const hook=`/opt/homebrew/bin/bun ${shellQuote(resolve(import.meta.dir,'planning-gate.ts'))}`;
+ const hook=`${shellQuote(process.execPath)} ${shellQuote(resolve(installedCLI()?resolve(installedCLI()!,'..'):import.meta.dir,'planning-gate.ts'))}`;
  const scripts=config.postCreate??[];
  if(!Array.isArray(scripts)||scripts.some((x:any)=>typeof x!=='string'))throw Error('Unexpected setup scripts');
- const prior=scripts.filter((x:string)=>!x.includes('/adlc-bridge/src/planning-gate.ts')&&!x.includes('ADLC execution disabled pending host approval gate'));
+ const prior=scripts.filter((x:string)=>!x.includes('/src/planning-gate.ts')&&!x.includes('ADLC execution disabled pending host approval gate'));
  config.postCreate=[hook,...prior];
  config.env={...(config.env??{}),ADLC_WORKFLOW_CONFIG:path};
  delete config.env.ADLC_PLANNING_JOB;delete config.env.ADLC_PLANNING_PROJECT;
