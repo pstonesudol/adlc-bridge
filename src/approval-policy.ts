@@ -1,5 +1,6 @@
 import {Store,digest} from './core';
 import {validScopes} from './file-scope';
+import {readinessFor} from './readiness';
 export const featureGit=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
 export type ApprovalPolicy={mode:'manual'|'ready-queue';id?:string;authorizedBy?:string;scope?:string[];gitScope?:'feature-pr'};
 export class ApprovalPolicyStore{
@@ -19,6 +20,8 @@ export class ApprovalPolicyStore{
   const j=this.s.get(job),e=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;
   if(j.project!==project||!e||e.project!==project||!e.ready||e.spec_hash!==digest(j.spec)||e.observed>now+5000||now-e.observed>120000)return {allowed:false,reason:'Fresh complete Todo + agent-ready snapshot required'};
   if(!['awaiting_approval','approved'].includes(j.state)||!j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))return {allowed:false,reason:'Current captured plan required'};
+  const readiness=readinessFor(this.s,job);
+  if(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))return {allowed:false,reason:'Actionable plan required; resolve outstanding questions or dependencies before standing authorization'};
   return {allowed:true,reason:'Authorized by user standing ready-queue policy',policyHash:this.hash(p),actor:`standing-policy:${p.id}`,paths:[...p.scope]};
  }
  record(job:string,project:string,p:ApprovalPolicy){

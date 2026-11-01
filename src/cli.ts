@@ -28,6 +28,8 @@ import {FeaturePublish} from './feature-publish';
 import {LinearLifecycle} from './linear-lifecycle';
 import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
+import {LinearBlockers} from './linear-blockers';
+import {readinessFor,recordReadiness,recordResolution,activeResolution} from './readiness';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
@@ -38,8 +40,8 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
-export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
- const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,io={poll,linearToken,out}}=context;
+export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+ const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,io={poll,linearToken,out}}=context;
  return async()=>runPollTick(async()=>{
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
@@ -55,6 +57,7 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
    }
   }
   const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
+  const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
    if(target.state==='completed')continue;
@@ -110,6 +113,10 @@ async function main(){
   ingest PROJECT ISSUE SPEC_FILE        local ingestion
   plan JOB PLAN_FILE                    submit plan
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
+  reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+  resolve-plan JOB --source SOURCE --human NAME --answer TEXT
+                                       record a human answer or satisfied dependency; no resume
+  resume-job JOB CONFIG                 resume the existing needs-input worker after verified resolution
   adopt-pilot JOB SESSION               reconcile existing supervised worker only
   observe-pilot JOB OWNER/REPO PR CONFIG persist latest-SHA review evidence
   recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
@@ -163,8 +170,8 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
-  if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve'].includes(command))throw Error('Unknown command');
-  const c=['poll','serve'].includes(command)?JSON.parse(readFileSync(req(a[0],'Config'),'utf8')):null;if(c)validate(c);
+  if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+  const c=['poll','serve','reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[['poll','serve','reconcile-preview'].includes(command)?0:1],'Config'),'utf8')):null;if(c)validate(c);
    if(command==='recover-handoff'){
     const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
@@ -172,7 +179,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,a.length===2);
     try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
    }
-   const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
+   const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
@@ -185,7 +192,19 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='approve-job'){
       const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
       if(option('--git')!=='feature-pr')throw Error('Only feature-pr Git scope is supported; merge/deploy are forbidden');
-      return out(workflow.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'),option('--paths').split(','),option('--runtime'),['inspect','fetch','worktree','branch','commit','push-feature','open-pr']));
+      return out(workflow.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'),option('--paths').split(','),option('--runtime'),['inspect','fetch','worktree','branch','commit','push-feature','open-pr'],undefined,{readiness:a.includes('--acknowledge-readiness')}));
+    }
+    if(command==='reconcile-preview')return out(await workflow.previewReconcile(c!));
+    if(command==='resolve-plan'){
+      const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
+      const job=req(a[0],'Job');recordResolution(s,job,option('--source'),option('--human'),option('--answer'));
+      return out({job,state:'resolution_recorded',resumeAuthorized:false,readiness:readinessFor(s,job)});
+    }
+    if(command==='resume-job'){
+      const job=req(a[0],'Job');await poll(c!,s,linearToken());
+      const stage=await workflow.resume(job,c!);
+      const retracted=await blockers.retract(job,c!);
+      return out({...stage,blockerLabel:retracted.state});
     }
     if(command==='register-review'){
       const job=req(a[0],'Job'),config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));
@@ -215,9 +234,19 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='capture-plan')return out(capturePlan(s,req(a[0],'Job'),await sessionEvidence(req(a[1],'Session')),Number(a[2])));
     if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
     if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
-    if(command==='approve-plan'){s.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'));return out({approved:true,executionEnabled:false});}
+    if(command==='approve-plan'){
+      const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
+      if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
+      let r=readinessFor(s,job);
+      if(!r&&j.plan){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));r=readinessFor(s,job);}
+      const resolved=activeResolution(s,job);
+      if(r?.valid&&r.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
+      if((!r||!r.valid)&&!resolved&&!a.includes('--acknowledge-readiness'))throw Error('Structured plan readiness is missing or malformed; explicit --acknowledge-readiness required');
+      if((!r||!r.valid)&&!resolved)recordResolution(s,job,'human-acknowledgement',req(a[2],'Human'),'Human explicitly acknowledged legacy or malformed plan readiness');
+      s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
+    }
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features});
+    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();
