@@ -155,11 +155,13 @@ export class Workflow{
   if(j.plan_hash!==d.plan_hash||r?.session_id!==d.session_id)throw Error('Execution approval is stale');
   if(new ApprovalPolicyStore(this.s).get(job)){if(!c)throw Error('Project policy required for automatic execution');new ApprovalPolicyStore(this.s).verify(job,c.linear.projectId,c.approval);}
   let e;
-  try{e=await this.t.evidence(d.session_id);}catch(err){
-   if(d.state==='pr_handoff')this.s.db.query("UPDATE implementation_dispatch SET state='needs_reconciliation',reason='Execution evidence refresh failed; handoff not confirmed' WHERE job=?").run(job);
+  try{
+   e=await this.t.evidence(d.session_id);
+   if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Execution session mismatch');
+  }catch(err){
+   this.s.db.query("UPDATE implementation_dispatch SET state='needs_reconciliation',reason='Execution evidence refresh failed; handoff not confirmed' WHERE job=? AND state='pr_handoff'").run(job);
    throw err;
   }
-  if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Execution session mismatch');
   if(d.runtime!=='supervised-host')throw Error('Existing unsupported runtime requires reconciliation; no automatic conversion');
    if(d.state!=='approved_pending')return this.executionStatus(job,e,c);
   if(e.transcript?.controller!=='ready')return {state:'waiting_for_worker'};

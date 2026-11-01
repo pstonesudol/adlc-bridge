@@ -122,6 +122,24 @@ test('evidence refresh failure invalidates a recorded handoff',async()=>{
  expect(w.implementation(id).state).toBe('needs_reconciliation');
  s.close();
 });
+test('terminated session invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ f.sessions.get('session-1').session.isTerminated=true;
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('Execution session mismatch');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
+test('evidence failure preserves a newer dispatch blocker',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ s.db.query("UPDATE implementation_dispatch SET state='blocked',reason='Later blocker' WHERE job=?").run(id);
+ f.evidence=async()=>{throw Error('evidence unavailable');};
+ await w.tick(config);
+ expect(s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(id)).toEqual({state:'blocked',reason:'Later blocker'});
+ s.close();
+});
 test('actual branch drift blocks even when native session has no PR metadata',async()=>{
  const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
  await w.tick(config);f.finishImplementation();f.sessions.get('session-1').session.prs=[];
