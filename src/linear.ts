@@ -9,6 +9,8 @@ export type ProjectConfig = {
   statusSync?:{enabled:boolean;inProgress:string;inReview:string;done:string};
   branchUpdate?:{enabled:boolean;authorizedBy:string;maxUpdates:number};
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
+  blockerSync?:{enabled:boolean;labelId?:string};
+  workflow?:{prGraceMs?:number};
   featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number};
   remediation?:RemediationConfig;
 };
@@ -16,6 +18,8 @@ export function validate(c: any): asserts c is ProjectConfig {
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
+  if(c.blockerSync?.enabled&&!/^[0-9a-f-]{36}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
+  if(c.workflow?.prGraceMs!==undefined&&(!Number.isSafeInteger(c.workflow.prGraceMs)||c.workflow.prGraceMs<0||c.workflow.prGraceMs>86400000))throw Error('prGraceMs must be an integer from 0 to 86400000');
   if(c.statusSync?.enabled)for(const key of ['inProgress','inReview','done'])if(!/^[0-9a-f-]{36}$/i.test(c.statusSync[key]??''))throw Error('Verified status-sync UUIDs required');
   remediationPolicy(c.remediation);
   for (const key of ['projectId', 'teamId', 'readyStateId', 'readyLabelId']) {

@@ -7,6 +7,7 @@ import {DeliveryRecovery,type DeliveryFacts} from '../src/delivery-recovery';
 import {deliveryBranch,assertDeliveryTarget} from '../src/delivery-identity';
 import {BranchUpdates} from '../src/branch-updates';
 import {ReviewLoop} from '../src/review-loop';
+import {recordReadiness} from '../src/readiness';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -14,6 +15,7 @@ import {join} from 'node:path';
 function fixture(path=':memory:'){
  const s=new Store(path),w=new Workflow(s,{} as any),id=s.enqueue('project','issue','spec'),p=new Planning(s),r=p.reserve(id,'ao');
  p.gate(id,'ao','worker',r.branch,'/worktree');const hash=s.propose(id,'plan');
+ recordReadiness(s,id,'plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->',hash,digest('spec'));
  s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);
  s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(id,r.spec_hash,'awaiting_approval','worker',null,'plan-message');
  w.approve(id,hash,'human',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
