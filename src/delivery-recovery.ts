@@ -45,16 +45,23 @@ export class DeliveryRecovery{
   const first=await this.preview(job,c);if(first.hash!==hash)throw Error('Proposal changed; preview again');
   this.install();
   const p=first.proposal;
-  const claim=this.s.db.transaction(()=>{
+  // Reserve the job before re-reading evidence, but keep the unattempted state
+  // distinct from an uncertain claim. A failed pre-claim preview clears it so a
+  // later confirmation can retry; claim_uncertain is durable only from the
+  // moment the claim invocation begins.
+  const reservation=this.s.db.transaction(()=>{
    this.authorization(job,c);
    const old=this.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(job) as any;
-   if(old){if(old.proposal!==hash)throw Error('Existing adoption requires reconciliation; never overwrite');return false;}
-   this.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(job,hash,'claim_uncertain',p.session,p.auth.worktree,p.reserved,p.branch,p.candidate.repo,p.candidate.pr,p.head,p.anchor,p.auth.plan,p.auth.spec,JSON.stringify(p));
-   this.s.event(job,'delivery_adoption_reserved',JSON.stringify({hash,session:p.session,pr:p.candidate.url,reserved:p.reserved,branch:p.branch}));return true;
+   if(old){if(old.proposal!==hash)throw Error('Existing adoption requires reconciliation; never overwrite');return old.state==='reserved'?'retry':false;}
+   this.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(job,hash,'reserved',p.session,p.auth.worktree,p.reserved,p.branch,p.candidate.repo,p.candidate.pr,p.head,p.anchor,p.auth.plan,p.auth.spec,JSON.stringify(p));
+   this.s.event(job,'delivery_adoption_reserved',JSON.stringify({hash,session:p.session,pr:p.candidate.url,reserved:p.reserved,branch:p.branch}));return 'reserve';
   }).immediate();
-  if(claim){
-   if((await this.preview(job,c)).hash!==hash)throw Error('Proposal changed before claim; explicit reconciliation required');
-   try{await this.t.claim(p.session,p.candidate.url);}catch{/* Reconcile authoritative attachment, never blindly repeat. */}
+  if(reservation==='reserve'||reservation==='retry'){
+   let pre;
+   try{pre=await this.preview(job,c);}catch(e){this.s.db.query("DELETE FROM delivery_adoptions WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);throw e;}
+   if(pre.hash!==hash){this.s.db.query("DELETE FROM delivery_adoptions WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);throw Error('Proposal changed before claim; explicit reconciliation required');}
+   const moved=this.s.db.query("UPDATE delivery_adoptions SET state='claim_uncertain' WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);
+   if(moved.changes)try{await this.t.claim(p.session,p.candidate.url);}catch{/* Reconcile authoritative attachment, never blindly repeat. */}
   }
   if(!await this.t.attached(p.session,p.candidate.url))throw Error('Claim receipt uncertain; no repeat claim, inspect ownership');
   if((await this.preview(job,c)).hash!==hash)throw Error('Proposal changed after claim; delivery remains blocked');

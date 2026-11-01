@@ -125,10 +125,12 @@ test('claim always passes --no-takeover',async()=>{
 });
 test('attached requires one open PR on a non-terminated session',async()=>{
  const f=fixture();try{
-  const url='https://github.com/owner/repo/pull/7',t=()=>recoveryTransport(f.s,f.run,async()=>f.state.evidence),prs=f.state.evidence.session.prs;
+  const url='https://github.com/owner/repo/pull/7',seen:string[]=[];
+  const t=()=>recoveryTransport(f.s,f.run,async(session:string)=>{seen.push(session);return f.state.evidence;}),prs=f.state.evidence.session.prs;
   expect(await t().attached('worker',url)).toBe(true);
   prs.push({state:'open',number:7,url});expect(await t().attached('worker',url)).toBe(false);
   prs.pop();prs[0].state='closed';expect(await t().attached('worker',url)).toBe(false);
   prs[0].state='open';f.state.evidence.session.isTerminated=true;expect(await t().attached('worker',url)).toBe(false);
+  expect(seen).toEqual(['worker','worker','worker','worker']);
  }finally{f.cleanup();}
 });

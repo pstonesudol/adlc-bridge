@@ -68,8 +68,16 @@ test('adoption survives process restart without another claim',async()=>{
   const s=new Store(path);try{await new DeliveryRecovery(s,f.t).confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);expect(deliveryBranch(s,f.id,{id:'worker',branch:f.r.branch})).toBe(f.facts.branch);}finally{s.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
-test('evidence changes during final pre-claim read invalidate proposal',async()=>{
- const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);let reads=0;f.t.inspect=async()=>{if(++reads===2)f.facts.head=f.facts.candidates[0].head='c'.repeat(40);return structuredClone(f.facts);};await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}
+test('failed pre-claim preview clears the reservation and allows a later confirmation',async()=>{
+ const f=fixture();try{
+  const p=await f.recovery.preview(f.id,f.c);let reads=0;
+  f.t.inspect=async()=>{if(++reads===2)f.facts.head=f.facts.candidates[0].head='c'.repeat(40);return structuredClone(f.facts);};
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');
+  expect(f.calls()).toBe(0);expect(f.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(f.id)).toBeNull();
+  f.t.inspect=async()=>structuredClone(f.facts);
+  const fresh=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,fresh.hash);
+  expect(f.calls()).toBe(1);expect(f.s.db.query('SELECT state FROM delivery_adoptions WHERE job=?').get(f.id).state).toBe('adopted');
+ }finally{f.s.close();}
 });
 test('confirmation binds approved path scope and reconciliation preserves adopted session',async()=>{
  const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.s.db.query('UPDATE implementation_dispatch SET paths=? WHERE job=?').run('["other/**"]',f.id);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);

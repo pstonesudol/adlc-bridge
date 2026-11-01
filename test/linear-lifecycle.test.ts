@@ -173,9 +173,9 @@ test('branch mismatch sync posts one notice and confirms uncertain delivery by c
 test('uncertain drift notice stays fail-closed without an exact comment',async()=>{
  const f=fixture();try{
   const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
-  let comments:any[]=[];const original=f.sync.api;
+  let comments:any[]=[],creates=0,body='';const original=f.sync.api;
   f.sync.api=async(q,v)=>{
-   if(q.includes('commentCreate')){comments=[{id:v.input.id,body:v.input.body}];throw Error('Lost receipt');}
+   if(q.includes('commentCreate')){creates++;body=v.input.body;comments=[{id:v.input.id,body:v.input.body}];throw Error('Lost receipt');}
    if(q.includes('comments('))return {issue:{comments:{nodes:comments,pageInfo:{hasNextPage:false,endCursor:null}}}};
    return original(q,v);
   };
@@ -185,6 +185,9 @@ test('uncertain drift notice stays fail-closed without an exact comment',async()
   expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
   comments=[{id:commentId,body:'different body'}];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
   expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  comments=[{id:'00000000-0000-4000-8000-000000000000',body}];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  expect(creates).toBe(1);
  }finally{f.s.close();}
 });
 test('drift notice confirms a matching comment on a later page',async()=>{
