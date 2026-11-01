@@ -50,7 +50,7 @@ async function main(){
       if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
       docker=runtime.tools.docker;
     }
-    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker});out(result);if(!result.passed)process.exitCode=1;return;
+    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker,projectRepo:c.repo});out(result);if(!result.passed)process.exitCode=1;return;
   }
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());

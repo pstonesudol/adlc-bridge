@@ -2,7 +2,7 @@ import {existsSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from './core';
-import {ProjectServices,registryPath,assertDefinition,readDefinition} from './project-services';
+import {ProjectServices,registryPath,readDefinition} from './project-services';
 async function launch(args:string[]){
  const p=Bun.spawn(['/bin/launchctl',...args],{stdout:'pipe',stderr:'pipe'});
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
@@ -21,7 +21,7 @@ export async function serviceControl(action:string,project?:string){
   }
   const entry=registry.select(project);registry.verify(entry);
   const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(homedir(),'Library/LaunchAgents',`${label}.plist`);
-  if(existsSync(plist))assertDefinition(readDefinition(plist),label,entry.config);
+  if(existsSync(plist))registry.assertInstalled(readDefinition(plist),label,entry.config);
   const status=async()=>{
    const r=await launch(['print',target]);
    if(r.code!==0&&!/Could not find service/.test(r.stderr+r.stdout))throw Error('Unable to inspect background service');
