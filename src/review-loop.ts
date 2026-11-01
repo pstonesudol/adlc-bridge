@@ -161,7 +161,7 @@ export class ReviewLoop{
    // Once metadata remediation creates a gate, another same-head body edit
    // cannot escape it. Carry its baseline forward and restart review freshness
    // for each newly observed body, including a return to an earlier body.
-   const needsBodyEvidence=metadataChecks.length>0&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks);
+    const needsBodyEvidence=metadataChecks.length>0&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks);
     const checkWait=metadataChecks.length===0?null:this.s.db.transaction(()=>{
     const prior=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? ORDER BY started DESC,rowid DESC LIMIT 1').get(job,e.head) as any;
     if(!prior){
@@ -191,7 +191,7 @@ export class ReviewLoop{
    if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){
    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
   }
-   if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
+   if(waiting&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
     if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted))await this.requestReview(job,e.head,e.descriptionHash);
     const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);

@@ -644,7 +644,7 @@ branch. New projects can opt in during `adlc init`, or configure:
 "branchUpdate": {
   "enabled": true,
   "authorizedBy": "Your name",
-  "maxUpdates": null
+  "maxUpdates": 3
 }
 ```
 

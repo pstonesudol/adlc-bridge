@@ -81,6 +81,24 @@ test('readiness collection continues without open-pr permission when automatic u
   expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
+test('missing body evidence does not prevent scoped code remediation with a configured metadata policy',async()=>{
+ for(const deliveredDescription of [false,true]){const f=templateFixture();try{
+  if(deliveredDescription){await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='delivered-description';}
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','commit','push-feature'],'human');
+  f.e.clear=false;f.e.failedChecks=[];f.e.findings=[{path:'src/fix.ts',body:'Fix the scoped defect',sha:f.head}];delete f.e.metadataCheckEvidence;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});expect(f.sends()).toBe(deliveredDescription?2:1);expect(f.reviews()).toBe(0);
+  if(deliveredDescription){expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toHaveLength(1);expect(f.s.db.query('SELECT * FROM description_delivery_gates').all()).toHaveLength(1);}
+  // Remediation is allowed, not readiness: after the finding clears, missing
+  // attestation must still block even an otherwise-clear old approval.
+  f.session.transcript.turns.at(-1).state='completed';f.e.findings=[];f.e.clear=true;f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');
+ }finally{f.s.close();}}
+});
+test('body-evidence remediation bypass still rejects findings outside the approved scope',async()=>{
+ const f=templateFixture();try{
+  f.e.failedChecks=[];f.e.findings=[{path:'outside/file.ts',body:'Out-of-scope change',sha:f.head}];delete f.e.metadataCheckEvidence;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
 test('an empty metadata policy skips wait creation and ignores historical metadata waits',async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];delete f.e.metadataCheckEvidence;

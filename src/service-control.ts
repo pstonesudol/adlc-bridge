@@ -18,8 +18,8 @@ export async function stopLoadedIntake(status:{loaded:boolean;pid?:number;runnin
  if(!status.loaded)return;
  verify(status,config,cli);await bootout();
 }
-async function launch(args:string[]){
- const p=Bun.spawn(['/bin/launchctl',...args],{stdout:'pipe',stderr:'pipe'});
+export async function launch(args:string[],spawn=Bun.spawn){
+ const p=spawn(['/bin/launchctl',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  return {stdout,stderr,code};
 }

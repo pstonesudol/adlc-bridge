@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {disableNativeFeedback} from '../src/ao-policy';import {sessionEvidence} from '../src/session-evidence';import {turnBarrier} from '../src/turn-submission';
+import {command as stackCommand,daemonStatus} from '../src/stack-control';import {launch as serviceLaunch} from '../src/service-control';
 
 for(const [name,read,message] of [['native feedback status',disableNativeFeedback,'status probe failed'],['session evidence',sessionEvidence,'session inspection failed']] as const){
  test(`${name} timeout terminates the subprocess and releases the submission fence`,async()=>{
@@ -19,3 +20,14 @@ test('session evidence preserves valid output and rejects failed or mismatched r
  const spawn=((_args:any,opts:any)=>{options=opts;return {stdout:new Response(JSON.stringify(output)).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
  expect(await sessionEvidence('worker',spawn)).toEqual(output);expect(options.timeout).toBe(30000);await expect(sessionEvidence('other',spawn)).rejects.toThrow('Invalid session evidence');
 });
+for(const [name,run] of [['stack command',stackCommand],['service launch',serviceLaunch]] as const){
+ test(`${name} timeout preserves failed output and releases its control fence`,async()=>{
+  const state=mkdtempSync(join(tmpdir(),'adlc-control-timeout-'));let child:ReturnType<typeof Bun.spawn>|undefined;
+  try{
+   let options:any,args:string[]=[],launched!:()=>void;const started=new Promise<void>(resolve=>launched=resolve);
+   const spawn=((input:any,opts:any)=>{options=opts;args=input;child=Bun.spawn(['/bin/sh','-c','printf "partial output"; printf "partial error" >&2; exec /bin/sleep 60'],{...opts,timeout:1000,env:{PATH:'/usr/bin:/bin',HOME:state}});launched();return child;}) as typeof Bun.spawn;
+   const pending=turnBarrier(state).run(()=>run(['status'],spawn));await started;expect(options.timeout).toBe(30000);expect(args).toEqual(name==='service launch'?['/bin/launchctl','status']:['status']);await expect(turnBarrier(state).submit(async()=>{})).rejects.toThrow('in progress');
+   const result=await pending;expect(result.code).not.toBe(0);expect(result.stdout).toBe('partial output');expect(result.stderr).toBe('partial error');expect(child!.signalCode).toBe('SIGTERM');expect(()=>daemonStatus(result)).toThrow();await turnBarrier(state).run(async()=>{});
+  }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}rmSync(state,{recursive:true,force:true});}
+ });
+}

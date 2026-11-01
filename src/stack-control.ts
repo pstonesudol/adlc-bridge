@@ -48,8 +48,8 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
  return {scope:'all',backend:stopped,projects:results,note:'Background stack stopped and disabled at login. Start --all re-enables it. The desktop window may remain open.'};
  });
 }
-async function command(args:string[]){
- const p=Bun.spawn(args,{stdout:'pipe',stderr:'pipe'});
+export async function command(args:string[],spawn=Bun.spawn){
+ const p=spawn(args,{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {stdout,stderr,code};
 }
 const stateDir=()=>join(homedir(),'Library/Application Support/ADLC Bridge');
