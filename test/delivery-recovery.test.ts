@@ -68,15 +68,23 @@ test('adoption survives process restart without another claim',async()=>{
   const s=new Store(path);try{await new DeliveryRecovery(s,f.t).confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);expect(deliveryBranch(s,f.id,{id:'worker',branch:f.r.branch})).toBe(f.facts.branch);}finally{s.close();}
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
-test('failed pre-claim preview clears the reservation and allows a later confirmation',async()=>{
+test('rejected pre-claim inspection leaves no reservation and allows a later confirmation',async()=>{
  const f=fixture();try{
   const p=await f.recovery.preview(f.id,f.c);let reads=0;
-  f.t.inspect=async()=>{if(++reads===2)f.facts.head=f.facts.candidates[0].head='c'.repeat(40);return structuredClone(f.facts);};
-  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');
+  f.t.inspect=async()=>{if(++reads===2)throw Error('collector unavailable');return structuredClone(f.facts);};
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('collector unavailable');
   expect(f.calls()).toBe(0);expect(f.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(f.id)).toBeNull();
   f.t.inspect=async()=>structuredClone(f.facts);
   const fresh=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,fresh.hash);
   expect(f.calls()).toBe(1);expect(f.s.db.query('SELECT state FROM delivery_adoptions WHERE job=?').get(f.id).state).toBe('adopted');
+ }finally{f.s.close();}
+});
+test('handoff is not reported without an adopted row',async()=>{
+ const f=fixture();try{
+  const p=await f.recovery.preview(f.id,f.c);
+  f.t.attached=async()=>{f.s.db.query('DELETE FROM delivery_adoptions WHERE job=?').run(f.id);return true;};
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('Adoption not confirmed');
+  expect(f.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(f.id).state).not.toBe('pr_handoff');
  }finally{f.s.close();}
 });
 test('confirmation binds approved path scope and reconciliation preserves adopted session',async()=>{

@@ -45,10 +45,11 @@ export class DeliveryRecovery{
   const first=await this.preview(job,c);if(first.hash!==hash)throw Error('Proposal changed; preview again');
   this.install();
   const p=first.proposal;
-  // Reserve the job before re-reading evidence, but keep the unattempted state
-  // distinct from an uncertain claim. A failed pre-claim preview clears it so a
-  // later confirmation can retry; claim_uncertain is durable only from the
-  // moment the claim invocation begins.
+  // Re-read evidence before reserving anything so a transient collector failure
+  // leaves no adoption state behind. The reservation still records a distinct
+  // unattempted state, so a crash before the claim remains retryable.
+  const pre=await this.preview(job,c);
+  if(pre.hash!==hash)throw Error('Proposal changed before claim; explicit reconciliation required');
   const reservation=this.s.db.transaction(()=>{
    this.authorization(job,c);
    const old=this.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(job) as any;
@@ -57,9 +58,6 @@ export class DeliveryRecovery{
    this.s.event(job,'delivery_adoption_reserved',JSON.stringify({hash,session:p.session,pr:p.candidate.url,reserved:p.reserved,branch:p.branch}));return 'reserve';
   }).immediate();
   if(reservation==='reserve'||reservation==='retry'){
-   let pre;
-   try{pre=await this.preview(job,c);}catch(e){this.s.db.query("DELETE FROM delivery_adoptions WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);throw e;}
-   if(pre.hash!==hash){this.s.db.query("DELETE FROM delivery_adoptions WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);throw Error('Proposal changed before claim; explicit reconciliation required');}
    const moved=this.s.db.query("UPDATE delivery_adoptions SET state='claim_uncertain' WHERE job=? AND proposal=? AND state='reserved'").run(job,hash);
    if(moved.changes)try{await this.t.claim(p.session,p.candidate.url);}catch{/* Reconcile authoritative attachment, never blindly repeat. */}
   }
@@ -69,6 +67,10 @@ export class DeliveryRecovery{
    this.authorization(job,c);
    const changed=this.s.db.query("UPDATE delivery_adoptions SET state='adopted' WHERE job=? AND proposal=? AND state='claim_uncertain'").run(job,hash);
    if(changed.changes)this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
+   else{
+    const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
+    if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
+   }
    this.s.db.query("UPDATE implementation_dispatch SET state='pr_handoff',reason=NULL WHERE job=?").run(job);
    return {job,state:'pr_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash};
   }).immediate();
