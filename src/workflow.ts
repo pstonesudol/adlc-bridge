@@ -305,9 +305,10 @@ export class Workflow{
    const current=this.s.get(job);
    if(current.plan){const legacy=assessPlan(current.plan);readiness={plan_hash:current.plan_hash,spec_hash:digest(current.spec),...legacy};}
   }
-  const readinessResolution=readiness&&readiness.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job):null;
-  const acknowledgedOnly=readiness?.source==='plan-text'&&readiness.questions.length>0&&readinessResolution?.source==='human-acknowledgement';
-  const readinessResolved=!!readinessResolution&&!acknowledgedOnly;
+  const legacyConcrete=readiness?.source==='plan-text'&&readiness.questions.length>0;
+  const readinessResolution=readiness&&readiness.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer','dependency-satisfied']):null;
+  const legacyResolution=legacyConcrete&&readiness?.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer']):null;
+  const readinessResolved=legacyConcrete?!!legacyResolution:!!readinessResolution;
   if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved){
    if(readiness.valid&&readiness.state==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:'Plan requires input that the completed worker did not resolve',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
    if(readiness.valid&&readiness.state==='blocked-by-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:'Plan is blocked by a referenced dependency',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
@@ -384,6 +385,7 @@ export class Workflow{
    claim=this.s.db.transaction(()=>{
     const current=this.s.get(job);
     if(current.plan_hash!==j.plan_hash||current.spec!==j.spec)throw Error('Plan changed during resume reservation');
+    if(current.state!=='approved'||current.approved_hash!==j.plan_hash)throw Error('Plan approval revoked during resume reservation');
     if(this.unresolvedContinuation(job,j.plan_hash))throw Error('A continuation is already reserved or in flight; never duplicate a resume delivery');
     return this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,j.plan_hash,digest(j.spec),binding,clientId,d.session_id);
    }).immediate();

@@ -327,6 +327,30 @@ test('acknowledgement alone does not hide concrete legacy questions',async()=>{
  expect(result.state).toBe('needs_input');expect(result.questions[0].question).toContain('product/listing identifier');
  s.close();
 });
+test('legacy questions require a human answer, not acknowledgement or dependency evidence',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const c={...config,workflow:{prGraceMs:0}};
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(c);f.legacyPlan();await w.tick(c);
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops,undefined,{readiness:true});
+ await w.tick(c);f.workerReceipt('Completed without a status receipt.');f.sessions.get('session-1').session.prs=[];
+ expect((await w.tick(c))[0].state).toBe('needs_input');
+ recordResolution(s,id,'dependency-satisfied','Alice','DEV-9 is complete');
+ expect((await w.tick(c))[0].state).toBe('needs_input');
+ recordResolution(s,id,'human-answer','Alice','Identifier SKU-42 confirmed');
+ expect((await w.tick(c))[0].questions).toEqual([]);
+ s.close();
+});
+test('resume rechecks approval inside the reservation transaction',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
+ w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(workerBlock('needs-input','Which listing ID?'));await w.tick(config);
+ recordResolution(s,id,'human-answer','Alice','SKU-42');
+ const original=f.evidence.bind(f);let revoked=false;
+ f.evidence=async(session:string)=>{if(!revoked){revoked=true;s.db.query("UPDATE jobs SET state='blocked',approved_hash=NULL WHERE id=?").run(id);}return original(session);};
+ await expect(w.resume(id,config)).rejects.toThrow('approval revoked');
+ expect(f.sends.length).toBe(1);s.close();
+});
 test('the reservation transaction refuses an in-flight continuation even if the pre-check was stale',async()=>{
  const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);

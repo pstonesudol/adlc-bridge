@@ -185,11 +185,12 @@ export function recordResolution(s:Store,job:string,source:string,actor:string,d
     return {job,planHash:j.plan_hash,binding,readinessBinding:readinessBindingValue,source,actor:actor.trim()};
   }).immediate();
 }
-export function activeReadinessResolution(s:Store,job:string):any{
+export function activeReadinessResolution(s:Store,job:string,sources?:string[]):any{
   ensureReadinessStore(s);const j=s.get(job),binding=readinessBinding(s,job);
   if(!binding)return null;
-  return s.db.query("SELECT * FROM plan_resolutions WHERE job=? AND plan_hash=? AND spec_hash=? AND readiness_binding=? AND state='active'")
-    .get(job,j.plan_hash,digest(j.spec),binding);
+  const sourceFilter=sources?.length?` AND source IN (${sources.map(()=>'?').join(',')})`:'';
+  return s.db.query(`SELECT * FROM plan_resolutions WHERE job=? AND plan_hash=? AND spec_hash=? AND readiness_binding=? AND state='active'${sourceFilter} ORDER BY at DESC, rowid DESC LIMIT 1`)
+    .get(job,j.plan_hash,digest(j.spec),binding,...(sources??[]));
 }
 
 export const PLAN_STATUS_INSTRUCTION=[
