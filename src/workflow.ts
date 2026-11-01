@@ -264,6 +264,9 @@ export class Workflow{
  continuation(job:string):any{
   return this.s.db.query('SELECT * FROM continuations WHERE job=? ORDER BY id DESC LIMIT 1').get(job);
  }
+ unresolvedContinuation(job:string,planHash:string):any{
+  return this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state IN ('reserved','delivery_uncertain','delivery_accepted') ORDER BY id DESC LIMIT 1").get(job,planHash);
+ }
  outcomes(job:string):any{return this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job);}
  private saveOutcome(job:string,d:any,result:any,graceMs:number,now:number,previous?:any){
   const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&previous.outcome==='awaiting_pr';
@@ -302,7 +305,9 @@ export class Workflow{
    const current=this.s.get(job);
    if(current.plan){const legacy=assessPlan(current.plan);readiness={plan_hash:current.plan_hash,spec_hash:digest(current.spec),...legacy};}
   }
-  const readinessResolved=readiness&&readiness.plan_hash===d.plan_hash&&!!activeReadinessResolution(this.s,job);
+  const readinessResolution=readiness&&readiness.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job):null;
+  const acknowledgedOnly=readiness?.source==='plan-text'&&readiness.questions.length>0&&readinessResolution?.source==='human-acknowledgement';
+  const readinessResolved=!!readinessResolution&&!acknowledgedOnly;
   if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved){
    if(readiness.valid&&readiness.state==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:'Plan requires input that the completed worker did not resolve',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
    if(readiness.valid&&readiness.state==='blocked-by-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:'Plan is blocked by a referenced dependency',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
@@ -356,7 +361,7 @@ export class Workflow{
   if(e.session?.id!==d.session_id||r.session_id!==d.session_id||run.session_id!==d.session_id||e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Existing execution session identity changed');
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   if(prs.length)throw Error(prs.length===1?'A PR already exists; use its handoff instead of resuming':'Multiple PRs require reconciliation');
-  const unresolved=this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state IN ('reserved','delivery_uncertain','delivery_accepted') ORDER BY id DESC LIMIT 1").get(job,j.plan_hash) as any;
+  const unresolved=this.unresolvedContinuation(job,j.plan_hash);
   if(unresolved){
    if(unresolved.state==='delivery_uncertain'||unresolved.state==='reserved')throw Error('Continuation delivery is uncertain; never resend. Reconcile the existing session first');
    throw Error('A continuation is already in flight for this plan; wait for its outcome before recording another resolution');
@@ -379,6 +384,7 @@ export class Workflow{
    claim=this.s.db.transaction(()=>{
     const current=this.s.get(job);
     if(current.plan_hash!==j.plan_hash||current.spec!==j.spec)throw Error('Plan changed during resume reservation');
+    if(this.unresolvedContinuation(job,j.plan_hash))throw Error('A continuation is already reserved or in flight; never duplicate a resume delivery');
     return this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,j.plan_hash,digest(j.spec),binding,clientId,d.session_id);
    }).immediate();
   }catch(error){

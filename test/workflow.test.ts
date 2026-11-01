@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {Store} from '../src/core';
+import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -316,6 +316,28 @@ test('a resolved legacy plan blocker does not resurface after PR grace',async()=
  const result=(await w.tick(c))[0];
  expect(result.state).toBe('needs_reconciliation');expect(result.questions).toEqual([]);
  s.close();
+});
+test('acknowledgement alone does not hide concrete legacy questions',async()=>{
+ const c={...config,workflow:{prGraceMs:0}};
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(c);f.legacyPlan();await w.tick(c);
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops,undefined,{readiness:true});
+ await w.tick(c);f.workerReceipt('Completed without a status receipt.');f.sessions.get('session-1').session.prs=[];
+ const result=(await w.tick(c))[0];
+ expect(result.state).toBe('needs_input');expect(result.questions[0].question).toContain('product/listing identifier');
+ s.close();
+});
+test('the reservation transaction refuses an in-flight continuation even if the pre-check was stale',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
+ w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(workerBlock('needs-input','Which listing ID?'));await w.tick(config);
+ recordResolution(s,id,'human-answer','Alice','SKU-42');
+ s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'delivery_uncertain')")
+  .run(id,s.get(id).plan_hash,digest(s.get(id).spec),'manual-binding','manual-client','session-1');
+ const original=(w as any).unresolvedContinuation.bind(w);let calls=0;
+ (w as any).unresolvedContinuation=(job:string,plan:string)=>{calls++;return calls===1?null:original(job,plan);};
+ await expect(w.resume(id,config)).rejects.toThrow('never duplicate a resume delivery');
+ expect(f.sends.length).toBe(1);s.close();
 });
 
 test('preview reconciliation exposes the three reported blockers without applying repairs',async()=>{
