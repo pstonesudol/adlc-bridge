@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "platform": "launchd",
+  "projectConfig": "/REPLACE/config/project.json",
+  "controller": "/REPLACE/stable-install/src/cli.ts",
+  "workingDirectory": "/REPLACE/stable-install",
+  "tools": {
+    "bun": {"path": "/REPLACE/bin/bun", "version": "1.4.2"},
+    "ao": {"path": "/REPLACE/bin/ao", "version": "0.0.0"},
+    "git": {"path": "/REPLACE/bin/git", "version": "0.0.0"},
+    "gh": {"path": "/REPLACE/bin/gh", "version": "0.0.0"}
+  },
+  "service": {
+    "label": "local.adlc.REPLACE_PROJECT",
+    "path": "/REPLACE/staging/project.plist",
+    "interval": 60,
+    "runAtLoad": false,
+    "stdout": "/REPLACE/state/project.log",
+    "stderr": "/REPLACE/state/project-error.log"
+  }
+}

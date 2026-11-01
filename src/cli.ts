@@ -11,6 +11,8 @@ import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
 import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
+import {setupPreview,writeSetupService,sanitizedSetup} from './setup';
+import {verificationInstructions,runVerification} from './verification';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -41,7 +43,7 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
-export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  return async()=>runPollTick(async()=>{
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
@@ -56,13 +58,14 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
     const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
     if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
     const delivery=workflow.implementation(stage.job);
-    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
+    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true,c.verification);
    }
   }
   const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
   const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+   reviewLoop.setVerification(target.job,c.verification);
    if(target.state==='completed')continue;
    try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
   }
@@ -78,6 +81,18 @@ async function main(){
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
   if(['start','stop','status'].includes(command)&&a.includes('--all')){if(a.length!==1)throw Error('Use --all without a project ID or other options');return out(await stackControl(command as 'start'|'stop'|'status'));}
+  if(command==='setup'){
+    const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
+    if(a.includes('--export'))return out(sanitizedSetup(c,r));
+    if(a.includes('--write-service'))return out(writeSetupService(c,r));
+    const preview=setupPreview(c,r);out(preview);if(!preview.passed)process.exitCode=1;return;
+  }
+  if(command==='verification'){
+    const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(c);
+    if(!a.includes('--run'))return console.log(verificationInstructions(c.verification));
+    if(!c.verification)throw Error('Project verification is not configured');
+    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification);out(result);if(!result.passed)process.exitCode=1;return;
+  }
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
@@ -90,6 +105,10 @@ async function main(){
   start --all | stop --all | status --all
                                        full background stack; stop requires idle workers
   projects                             list registered project services
+  setup PROJECT_JSON RUNTIME_JSON       read-only prerequisite/service preview
+    [--write-service]                   create staged definition only; no activation
+    [--export]                          print sanitized, disabled setup template
+  verification CONFIG [WORKTREE]        instructions; --run requires worktree
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
@@ -228,7 +247,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const run=lifecycle.run(job);if(!run)throw Error('Existing approved run required');
       await disableNativeFeedback(run.session_id);
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
-      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true));
+      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification));
     }
     if(command==='tick-review'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
@@ -236,6 +255,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
       new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
+      reviewLoop.setVerification(job,config.verification);
       return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
     }
     if(command==='extend-budget'){

@@ -3,10 +3,12 @@ import {validScopes} from './file-scope';
 import { Store } from './core';
 import {remediationPolicy,type RemediationConfig} from './remediation';
 import {validateClarifications} from './linear-clarifications';
+import {validateVerification,type Verification} from './verification';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
   requiredChecks:string[];
+  verification?:Verification;
   linear: { projectId: string; teamId: string; readyStateId: string; readyLabelId: string };
   statusSync?:{enabled:boolean;inProgress:string;inReview:string;done:string};
   prMetadataChecks?:string[];
@@ -28,6 +30,7 @@ export function metadataCheckNames(value:unknown):string[]{
   return value;
 }
 export function validate(c: any): asserts c is ProjectConfig {
+  if(c?.verification!==undefined)validateVerification(c.verification);
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   requiredCheckNames(c.requiredChecks);
   validateClarifications(c);
