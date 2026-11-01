@@ -299,15 +299,9 @@ does not establish that CodeRabbit has cleared the current commit. The bridge
 never merges. It also does not automatically delete sessions or worktrees.
 
 For a missed handoff after an eligible ticket's original authorization was
-revoked, use the guarded recovery command after investigation:
-
-```sh
-adlc recover-handoff JOB_ID config/local.json
-```
-
-It requires an unchanged original standing authorization, fresh eligibility,
-the original completed delivery, and exactly one matching existing PR. It
-reconnects the review target; it never resends implementation or creates a PR.
+revoked, see [Existing worker PR recovery](#existing-worker-pr-recovery).
+Recovery previews read-only by default and applies only the reviewed proposal
+with `--confirm HASH`; normal polling registers the review target afterwards.
 
 ## Feature requirements to ticket batches
 
