@@ -13,6 +13,16 @@ import {serviceControl} from './service-control';
 import {Store} from './core';
 import {ProjectServices,registryPath,legacyLabel,assertDefinition,readDefinition} from './project-services';
 
+export async function collectMetadataChecks(ask:(label:string)=>Promise<string>){
+ const names:string[]=[];
+ for(;;){const name=(await ask('PR-description-only CI check name (production blocked until body attestation exists; one exact name; blank to finish)')).trim();if(!name)return names;if(!names.includes(name))names.push(name);if(names.length>10)throw Error('At most 10 PR metadata checks supported');}
+}
+export function branchUpdateLimit(answer:string){
+ const value=answer.trim().toLowerCase();if(value==='unlimited')return null;
+ const limit=Number(value);
+ if(!/^\d+$/.test(value)||!Number.isSafeInteger(limit)||limit<1||limit>10)throw Error('branchUpdate.maxUpdates must be an integer from 1 through 10 or "unlimited"');
+ return limit;
+}
 export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO){
  validate(c);
  if(!/^[\w.-]+\/[\w.-]+$/.test(c.githubRepo)||!c.requiredChecks?.length||c.requiredChecks.some((x:any)=>typeof x!=='string'||!x.trim())||!validScopes(c.reviewAllowedPaths))throw Error('Repository, required checks and safe review scope required');
@@ -42,55 +52,61 @@ export function serviceDefinition(config:string,bun=process.execPath,source=reso
 <key>StandardErrorPath</key><string>${xml(join(state,`${logName}-error.log`))}</string>
 </dict></plist>\n`;
 }
-export async function initWizard(repoArg?:string,args:string[]=[]){
- if(!stdin.isTTY||!stdout.isTTY)throw Error('Interactive terminal required. Run adlc init in Terminal, or use init REPO --preview.');
- const rl=createInterface({input:stdin,output:stdout});
+const wizardIO={interactive:()=>!!stdin.isTTY&&!!stdout.isTTY,prompts:():Pick<ReturnType<typeof createInterface>,'question'|'close'>=>createInterface({input:stdin,output:stdout}),linearToken,verifyInitConfig,registryPath,home:homedir,log:console.log};
+export async function initWizard(repoArg?:string,args:string[]=[],overrides:Partial<typeof wizardIO>={}){
+  const io={...wizardIO,...overrides};
+  if(!io.interactive())throw Error('Interactive terminal required. Run adlc init in Terminal, or use init REPO --preview.');
+  const rl=io.prompts(),home=io.home();
  const ask=async(label:string,fallback='')=>{const answer=(await rl.question(`${label}${fallback?` [${fallback}]`:''}: `)).trim();return answer||fallback;};
  const yes=async(label:string)=>(await ask(`${label} (yes/no)`,'no')).toLowerCase()==='yes';
  try{
-  console.log('ADLC local setup. No Git operations, merges, deployments, or credential copies. Existing files are never replaced.');
+   io.log('ADLC local setup. No Git operations, merges, deployments, or credential copies. Existing files are never replaced.');
   const repo=realpathSync(resolve(repoArg??await ask('Repository path')));
   const name=await ask('Project name',basename(repo));
   const ci=args.indexOf('--config');const path=resolve(ci>=0?args[ci+1]??'':join(import.meta.dir,'..','config',`${basename(repo)}.json`));
   if(ci>=0&&!args[ci+1])throw Error('--config needs a path');
   if(existsSync(path))throw Error(`Configuration already exists: ${path}. Preserved; use another --config path.`);
-  if(!linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
+   if(!io.linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
   const c:any={version:1,name,repo,githubRepo:await ask('GitHub owner/repository'),automation:{planningEnabled:true,orchestratorProject:await ask('Existing Orchestrator project ID'),maxPlanning:1},linear:{projectId:await ask('Linear project UUID'),teamId:await ask('Linear team UUID'),readyStateId:await ask('Todo state UUID'),readyLabelId:await ask('agent-ready label UUID')},requiredChecks:(await ask('Required GitHub Actions check names (comma separated)')).split(',').map(x=>x.trim()).filter(Boolean),reviewAllowedPaths:(await ask('Allowed review path patterns (comma separated)','src/**')).split(',').map(x=>x.trim()),approval:{mode:'manual'}};
+   c.prMetadataChecks=await collectMetadataChecks(ask);
   if(await yes('Enable shared OpenChamber task routing')){
    c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};
    await loadOpenChamber(c.routing);
   }
   if(await yes('Enable Linear status updates'))c.statusSync={enabled:true,inProgress:await ask('In Progress state UUID'),inReview:await ask('In Review state UUID'),done:await ask('Done state UUID')};
   if(c.routing&&await yes('Enable multi-agent feature planning'))c.featurePlanning={enabled:true,backlogStateId:await ask('Backlog state UUID'),maxAgents:3,maxTickets:25};
-  console.log('Manual plan approval is the default. Standing authorization allows every Todo + agent-ready ticket to implement, commit/push its feature branch and open a PR. It never authorizes merge or deploy.');
+   io.log('Manual plan approval is the default. Standing authorization allows every Todo + agent-ready ticket to implement, commit/push its feature branch and open a PR. It never authorizes merge or deploy.');
   if(await yes('Authorize that automatic execution policy')){
    const actor=await ask('Your name');if(!actor)throw Error('Authorizing person required');
    c.approval={mode:'ready-queue',id:`${basename(repo)}-ready-queue-v1`,authorizedBy:actor,scope:c.reviewAllowedPaths,gitScope:'feature-pr'};
   }
   if(await yes('Authorize automatic base-branch updates to owned feature PRs (never merges a PR)')){
    const actor=await ask('Your name for branch update authorization');if(!actor)throw Error('Authorizing person required');
-   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:3};
+    const limit=await ask('Maximum automatic branch updates per PR (1-10, or "unlimited")','3');
+    let maxUpdates=branchUpdateLimit(limit);
+    if(maxUpdates===null&&!await yes('Explicitly authorize unlimited branch updates, each potentially triggering another CI and CodeRabbit cycle')){maxUpdates=3;io.log('Unlimited updates not authorized; using the finite limit of 3.');}
+    c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates};
   }
   if(await yes('Enable plan approval replies in Linear from your account')){
    const b=await linearAPI('query{viewer{id name app}}');
    if(!b.viewer?.id||b.viewer.app)throw Error('A human Linear account is required for approval replies');
-   console.log(`Approvals will be accepted from ${b.viewer.name} (${b.viewer.id}).`);
+    io.log(`Approvals will be accepted from ${b.viewer.name} (${b.viewer.id}).`);
    c.planApproval={enabled:true,approverIds:[b.viewer.id],scope:c.approval.scope??c.reviewAllowedPaths};
   }
-  await verifyInitConfig(c);
-  console.log(JSON.stringify({configuration:path,...c},null,2));
+   await io.verifyInitConfig(c);
+   io.log(JSON.stringify({configuration:path,...c},null,2));
   if(!await yes('Save this exact configuration'))return {cancelled:true,written:false};
-  saveInitConfig(path,c);console.log(`Saved ${path}. Provider login and real model requests still require verification in Orchestrator.`);
-  {const state=new Store(registryPath());try{const registry=new ProjectServices(state);registry.discoverLegacy();registry.register(path,undefined,false);}finally{state.close();}}
+   saveInitConfig(path,c);io.log(`Saved ${path}. Provider login and real model requests still require verification in Orchestrator.`);
+   {const state=new Store(io.registryPath());try{const registry=new ProjectServices(state);registry.discoverLegacy(home);registry.register(path,undefined,false);}finally{state.close();}}
   if(!await yes('Install the reserved-worktree gate in this Orchestrator project (changes project settings)'))return {configuration:path,gateInstalled:false,serviceEnabled:false};
   await installWorkflowHook(path);
-  const registryStore=new Store(registryPath());let entry;
-  try{const registry=new ProjectServices(registryStore);registry.discoverLegacy();entry=registry.register(path);}finally{registryStore.close();}
-  const plist=join(homedir(),'Library/LaunchAgents',`${entry.label}.plist`);
+   const registryStore=new Store(io.registryPath());let entry;
+   try{const registry=new ProjectServices(registryStore);registry.discoverLegacy(home);entry=registry.register(path);}finally{registryStore.close();}
+   const plist=join(home,'Library/LaunchAgents',`${entry.label}.plist`);
   if(existsSync(plist)){assertDefinition(readDefinition(plist),entry.label,path);return {configuration:path,project:entry.project,gateInstalled:true,existingServicePreserved:true,note:'Existing matching project service preserved. No start/stop was performed.'};}
   if(!await yes('Install this project’s 60-second background service (loads at next login)'))return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false};
-  mkdirSync(dirname(plist),{recursive:true});mkdirSync(join(homedir(),'Library/Application Support/ADLC Bridge'),{recursive:true,mode:0o700});
-  writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),homedir(),entry.label),{flag:'wx',mode:0o600});
+   mkdirSync(dirname(plist),{recursive:true});mkdirSync(join(home,'Library/Application Support/ADLC Bridge'),{recursive:true,mode:0o700});
+   writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),home,entry.label),{flag:'wx',mode:0o600});
   if(await yes('Start this project now (can pick up eligible tickets and perform authorized work)'))return {configuration:path,project:entry.project,gateInstalled:true,service:await serviceControl('start',entry.project)};
   return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false,note:'Service installed but not loaded; it can load at next login.'};
  }finally{rl.close();}

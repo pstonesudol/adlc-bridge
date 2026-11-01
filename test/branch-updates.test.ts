@@ -15,4 +15,20 @@ test('comparison resolves current base ref instead of trusting stale PR base SHA
  const snapshot=await readBranchSnapshot('owner/repo',1,read);expect(snapshot.base).toBe(current);expect(snapshot.behind).toBe(7);expect(compared).toContain(`${current}...${head}`);
 });
 
+test('uncapped policy permits continuing successful updates beyond the old lifetime cap',async()=>{
+ const f=fixture();try{for(let i=0;i<12;i++){f.b.head=i.toString(16).padStart(40,'0');f.b.base=(i+20).toString(16).padStart(40,'0');expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:null}))?.state).toBe('updating_branch');}expect(f.calls()).toBe(12);}finally{f.s.close();}
+});
+test('uncapped policy still stops at first uncertain result even if head and base change',async()=>{
+ const f=fixture();try{f.lose();expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:null}))?.state).toBe('blocked');f.b.head='c'.repeat(40);f.b.base='d'.repeat(40);expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:null}))?.reason).toContain('uncertain');expect(f.calls()).toBe(1);}finally{f.s.close();}
+});
+test('unlimited branch authorization must be explicit; malformed limits are rejected',async()=>{
+ const f=fixture();try{for(const value of [undefined,0,-1,11,'unlimited'])await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:value as any})).rejects.toThrow('authorization');expect(f.calls()).toBe(0);}finally{f.s.close();}
+});
 test('disabled automatic updates do not bypass delivery branch validation',async()=>{const f=fixture();try{f.b.branch='unexpected';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('Blocked — branch mismatch');expect(f.calls()).toBe(0);}finally{f.s.close();}});
+test('disabled updates allow observation under either existing scoped grant while enabled updates still require fetch and push',async()=>{
+ for(const grant of [['fetch','push-feature'],['open-pr']]){const f=fixture();try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,grant as any,'human');expect(await f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).toBeNull();expect(f.calls()).toBe(0);
+  if(grant[0]==='open-pr')await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('approved feature branch execution');
+  f.s.db.exec('DELETE FROM git_grants');await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('approved feature branch execution');expect(f.calls()).toBe(0);
+ }finally{f.s.close();}}
+});

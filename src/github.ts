@@ -1,3 +1,6 @@
+import {latestWorkflowChecks} from './check-runs';
+import {templateLogReader} from './gh-logs';
+import {templateCIFindings,templateSignature,metadataCheckEvidence,metadataBodyCovered} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 
@@ -25,12 +28,14 @@ export function metadataFindings(review:any,head:string,comments:any[]){
  if(!match)return [];
  return [{kind:'pr_description',path:null,sha:head,body:match[1].replace(/<[^>]*>/g,'').trim().slice(0,10000)}];
 }
-export async function readiness(repo:string, number:number, required:string[]) {
+export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[]) {
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1)throw Error('Valid owner/repository and PR number required');
+  required=[...new Set([...required,...metadataChecks])];
   const base=`repos/${repo}`;
   const first=await gh(['api',`${base}/pulls/${number}`]);
   if(first.state!=='open')throw Error('PR is not open');
-  const [checks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
+  const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
+   const checks=latestWorkflowChecks(rawChecks);
   const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();let unresolved=0;
   const findings:any[]=[];
   do {
@@ -74,12 +79,20 @@ export async function readiness(repo:string, number:number, required:string[]) {
   if(final.base.ref!==first.base.ref||await baseTip(repo,final.base.ref)!==currentBase){gate.clear=false;gate.reasons.push('Base branch changed during review collection');}
   if(final.state!=='open' || final.draft || final.mergeable!==true){gate.clear=false;gate.reasons.push('PR closed, draft, conflicted or mergeability unknown');}
   const requiredChecks=checks.filter((c:any)=>required.includes(c.name)&&c.head_sha===first.head.sha&&c.app?.slug==='github-actions');
-  const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({name:c.name,conclusion:c.conclusion,url:c.details_url}));
+  const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
+    const bodyEvidence=metadataCheckEvidence(checks,first.head.sha,metadataChecks);
+    const descriptionHash=digest(final.body??'');
+    if(metadataChecks.length&&!metadataBodyCovered({head:first.head.sha,descriptionHash,metadataCheckEvidence:bodyEvidence},metadataChecks)){
+     gate.clear=false;gate.reasons.push('Missing body-bound success evidence for every configured metadata check');
+    }
+    const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,descriptionHash,path=>gh(['api',path]),templateLogReader(),bodyEvidence);
+  findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
-    branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
+    metadataCheckEvidence:bodyEvidence,
+     botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }
 
 // Observation only. This function cannot merge or modify a PR.

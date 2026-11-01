@@ -3,7 +3,7 @@ import {remediationDecision} from '../src/core';
 import {validate} from '../src/linear';
 import {DEFAULT_REMEDIATION_POLICY,formatRemediationBudget,remediationPolicy,remediationSummary} from '../src/remediation';
 
-const config=(extra:any={})=>({version:1,name:'Test',repo:'/repo',linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'},...extra});
+const config=(extra:any={})=>({version:1,name:'Test',repo:'/repo',requiredChecks:['CI'],linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'},...extra});
 
 test('omitted remediation settings preserve the five-attempt default',()=>{
  expect(DEFAULT_REMEDIATION_POLICY).toEqual({maxAttempts:5,maxNoProgress:5,window:'job'});

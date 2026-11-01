@@ -48,7 +48,7 @@ test('Linear pagination is scoped and idempotent, errors do not authorize execut
   const fetchOriginal=globalThis.fetch;const s=new Store(':memory:');
   const projectId='25a25ffb-6a31-4851-8ec5-2732cd9174d3',teamId='1e9f847c-2009-4fec-85a8-8b71d9820579',readyStateId='00000000-0000-0000-0000-000000000000';
   const readyLabelId='762695df-df09-4eba-aff4-35bee6415650';
-  const c={version:1 as const,name:'test',repo:'/repo',linear:{projectId,teamId,readyStateId,readyLabelId}};
+  const c={version:1 as const,name:'test',repo:'/repo',requiredChecks:['CI'],linear:{projectId,teamId,readyStateId,readyLabelId}};
   globalThis.fetch=(async(_url:any,options:any)=>{
     const vars=JSON.parse(options.body).variables;const after=vars.after;
     expect(vars.label).toBe(readyLabelId);
@@ -67,7 +67,7 @@ test('Linear pagination is scoped and idempotent, errors do not authorize execut
 test('unlabelled Todo issues cannot enter the agent queue',async()=>{
   const original=globalThis.fetch;const s=new Store(':memory:');
   const projectId='25a25ffb-6a31-4851-8ec5-2732cd9174d3',teamId='1e9f847c-2009-4fec-85a8-8b71d9820579',readyStateId='b4eb906f-23b3-41b5-8aa5-2bee8753a556',readyLabelId='762695df-df09-4eba-aff4-35bee6415650';
-  const c={version:1 as const,name:'test',repo:'/repo',linear:{projectId,teamId,readyStateId,readyLabelId}};
+  const c={version:1 as const,name:'test',repo:'/repo',requiredChecks:['CI'],linear:{projectId,teamId,readyStateId,readyLabelId}};
   globalThis.fetch=(async()=>Response.json({data:{issues:{nodes:[{id:'unlabelled',identifier:'DEV-1',title:'Test',project:{id:projectId},team:{id:teamId},state:{id:readyStateId},labels:{nodes:[],pageInfo:{hasNextPage:false}}}],pageInfo:{hasNextPage:false}}}})) as typeof fetch;
   try{await expect(poll(c,s,'test-only')).rejects.toThrow('label missing');expect(s.list()).toEqual([]);}
   finally{globalThis.fetch=original;s.close();}

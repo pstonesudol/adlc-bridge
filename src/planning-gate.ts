@@ -38,6 +38,6 @@ async function gate(){
   if(cwd===root)throw Error('Primary checkout may not be used for agent planning');
   if(tree!==root||realpath(process.env.AO_WORKTREE_PATH??'')!==cwd)throw Error('Unverified source/worktree context');
   const s=new Store(join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite'));
-  try{new Planning(s).gate(job,project,null,branch.trim(),cwd);console.log('ADLC: authorized DEV-8 planning stage in a separate worktree; implementation remains gated');}finally{s.close();}
+  try{new Planning(s).gate(job,project,null,branch.trim(),cwd);console.log('ADLC: authorized planning stage in a separate worktree; implementation remains gated');}finally{s.close();}
 }
 gate().catch(e=>{console.error(e instanceof Error?e.message:'Planning gate failed');process.exitCode=78;});

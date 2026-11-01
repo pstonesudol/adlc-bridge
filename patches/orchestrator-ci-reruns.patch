@@ -1,0 +1,385 @@
+--- a/backend/internal/adapters/scm/github/provider.go
++++ b/backend/internal/adapters/scm/github/provider.go
+@@ -151,6 +151,9 @@
+ 		return out, scmObserveError(err)
+ 	}
+ 
++	if err := p.normalizeCheckReruns(ctx, owner, repo, rest.Head.SHA, gq); err != nil {
++		return out, scmObserveError(err)
++	}
+ 	out.CI = ciSummaryFromGraphQL(gq)
+ 	out.Review = reviewDecisionFromGraphQL(gq)
+ 	out.Mergeability = mergeabilityFromGraphQL(gq, rest, out.CI, out.Review)
+--- a/backend/internal/adapters/scm/github/observer_provider.go
++++ b/backend/internal/adapters/scm/github/observer_provider.go
+@@ -258,6 +258,9 @@
+ 			if err := p.fetchRemainingCheckContexts(ctx, ref, pr); err != nil {
+ 				return nil, err
+ 			}
++		}
++		if err := p.normalizeCheckReruns(ctx, ref.Repo.Owner, ref.Repo.Name, firstNonEmpty(str(pr["headRefOid"]), latestCommitOID(pr)), pr); err != nil {
++			return nil, err
+ 		}
+ 		out[i] = scmObservationFromGraphQL(ref, pr)
+ 	}
+--- /dev/null
++++ b/backend/internal/adapters/scm/github/check_reruns.go
+@@ -0,0 +1,165 @@
++package github
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++)
++
++type checkRunAttempt struct {
++	workflow        string
++	job             string
++	number, attempt int64
++}
++type checkWorkflowRun struct {
++	ID         int64  `json:"id"`
++	Head       string `json:"head_sha"`
++	Workflow   int64  `json:"workflow_id"`
++	Number     int64  `json:"run_number"`
++	Event      string `json:"event"`
++	Repository struct {
++		FullName string `json:"full_name"`
++	} `json:"repository"`
++}
++
++// normalizeCheckReruns requires matching workflow, event and job provenance.
++// Attempt-specific REST IDs do not prove cross-attempt logical job identity.
++func (p *Provider) normalizeCheckReruns(ctx context.Context, owner, repo, head string, pr map[string]any) error {
++	type runResult struct { run checkWorkflowRun; err error }
++	runs := map[int64]runResult{}
++	return supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		u, err := url.Parse(str(n["detailsUrl"]))
++		if err != nil || u.Host != "github.com" {
++			return checkRunAttempt{}, false, nil
++		}
++		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
++		if len(parts) != 7 || parts[0] != owner || parts[1] != repo || parts[2] != "actions" || parts[3] != "runs" || parts[5] != "job" {
++			return checkRunAttempt{}, false, nil
++		}
++		runID, e1 := strconv.ParseInt(parts[4], 10, 64)
++		jobID, e2 := strconv.ParseInt(parts[6], 10, 64)
++		checkID := int64(num(n["databaseId"]))
++		if e1 != nil || e2 != nil || runID <= 0 || jobID <= 0 || checkID <= 0 {
++			return checkRunAttempt{}, false, nil
++		}
++		read := func(path string, out any) error {
++			r, e := p.client.doREST(ctx, http.MethodGet, path, nil, nil)
++			if e != nil {
++				return e
++			}
++			return json.Unmarshal(r.Body, out)
++		}
++		var job struct {
++			ID       int64  `json:"id"`
++			RunID    int64  `json:"run_id"`
++			Head     string `json:"head_sha"`
++			Attempt  int64  `json:"run_attempt"`
++			CheckURL string `json:"check_run_url"`
++		}
++		if err := read(repoPath(owner, repo, "actions", "jobs", parts[6]), &job); err != nil {
++			return checkRunAttempt{}, false, nil
++		}
++		cached, ok := runs[runID]
++		if !ok {
++			cached.err = read(repoPath(owner, repo, "actions", "runs", parts[4]), &cached.run)
++			runs[runID] = cached
++		}
++		if cached.err != nil {
++			return checkRunAttempt{}, false, nil
++		}
++		run := cached.run
++		if job.ID != jobID || job.RunID != runID || job.Head != head || job.Attempt <= 0 || job.CheckURL != fmt.Sprintf("https://api.github.com/repos/%s/%s/check-runs/%d", owner, repo, checkID) || run.ID != runID || run.Head != head || run.Workflow <= 0 || run.Number <= 0 || run.Event == "" || run.Repository.FullName != owner+"/"+repo {
++			return checkRunAttempt{}, false, nil
++		}
++		// REST job IDs are attempt-specific. Without a stable logical-job ID,
++		// retain distinct IDs rather than infer identity from a display name.
++		return checkRunAttempt{workflow: fmt.Sprintf("%d:%s", run.Workflow, run.Event), job: strconv.FormatInt(job.ID, 10), number: run.Number, attempt: job.Attempt}, true, nil
++	})
++}
++
++func supersedeCheckReruns(pr map[string]any, resolve func(map[string]any) (checkRunAttempt, bool, error)) error {
++	roll := statusRollup(pr)
++	if roll == nil {
++		return nil
++	}
++	contexts, _ := roll["contexts"].(map[string]any)
++	// A partial connection cannot establish that all failures are represented.
++	if pageInfoHasMore(contexts) {
++		return nil
++	}
++	raw := nodes(contexts["nodes"])
++	groups := map[string][]int{}
++	for i, n := range raw {
++		if str(n["__typename"]) == "CheckRun" {
++			groups[str(n["name"])] = append(groups[str(n["name"])], i)
++		}
++	}
++	dropped := map[int]bool{}
++	for _, group := range groups {
++		if len(group) < 2 {
++			continue
++		}
++		attempts := map[int]checkRunAttempt{}
++		complete := true
++		for _, i := range group {
++			a, ok, err := resolve(raw[i])
++			if err != nil {
++				return err
++			}
++			if !ok {
++				complete = false
++				break
++			}
++			attempts[i] = a
++		}
++		if !complete {
++			continue
++		}
++		latest := map[string]checkRunAttempt{}
++		for _, a := range attempts {
++			if a.job == "" { continue }
++			key := a.workflow + ":job:" + a.job
++			old := latest[key]
++			if a.number > old.number || a.number == old.number && a.attempt > old.attempt {
++				latest[key] = a
++			}
++		}
++		for i, a := range attempts {
++			if a.job == "" { continue }
++			last := latest[a.workflow + ":job:" + a.job]
++			if a.number < last.number || a.number == last.number && a.attempt < last.attempt {
++				dropped[i] = true
++			}
++		}
++	}
++	if len(dropped) == 0 {
++		return nil
++	}
++	kept := []any{}
++	for i, n := range raw {
++		if !dropped[i] {
++			kept = append(kept, n)
++		}
++	}
++	contexts["nodes"] = kept
++	// The original aggregate also includes superseded failures. Recompute only
++	// after removing a proven older run, preserving all other visible failures.
++	state := ciSummaryFromGraphQL(pr)
++	switch state {
++	case domain.CIPassing:
++		roll["state"] = "SUCCESS"
++	case domain.CIFailing:
++		roll["state"] = "FAILURE"
++	case domain.CIPending:
++		roll["state"] = "PENDING"
++	default:
++		roll["state"] = "EXPECTED"
++	}
++	return nil
++}
+--- /dev/null
++++ b/backend/internal/adapters/scm/github/check_reruns_test.go
+@@ -0,0 +1,190 @@
++package github
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"testing"
++)
++
++func rerunPR(checks ...map[string]any) map[string]any {
++	raw := []any{}
++	for _, c := range checks {
++		raw = append(raw, c)
++	}
++	return map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "FAILURE", "contexts": map[string]any{"nodes": raw, "pageInfo": map[string]any{"hasNextPage": false}}}}}}}}
++}
++func rerunCheck(id int, status, conclusion string) map[string]any {
++	return map[string]any{"__typename": "CheckRun", "name": "PR body structure", "databaseId": float64(id), "status": status, "conclusion": conclusion}
++}
++func TestSupersededActionsFailureDoesNotKeepBoardRed(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++	err := supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{"workflow:pull_request", "logical-job", int64(num(n["databaseId"])), 1}, true, nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := ciSummaryFromGraphQL(pr); got != domain.CIPassing {
++		t.Fatalf("legacy CI=%s", got)
++	}
++	if got := ciSummaryFromRollupState(pr); got != domain.CIPassing {
++		t.Fatalf("observer CI=%s", got)
++	}
++	if len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 1 {
++		t.Fatal("older run retained")
++	}
++}
++func TestSeparateWorkflowsDoNotHideFailure(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++	_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{fmt.Sprint(n["databaseId"]), "logical-job", 1, 1}, true, nil
++	})
++	if ciSummaryFromGraphQL(pr) != domain.CIFailing {
++		t.Fatal("distinct failure hidden")
++	}
++}
++func TestPendingRerunDoesNotInheritOldFailureOrPass(t *testing.T) {
++	pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "IN_PROGRESS", ""))
++	_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++		return checkRunAttempt{"workflow", "logical-job", int64(num(n["databaseId"])), 1}, true, nil
++	})
++	if ciSummaryFromRollupState(pr) != domain.CIPending {
++		t.Fatal("pending rerun not pending")
++	}
++}
++func TestUnverifiedAndPartialChecksKeepFailure(t *testing.T) {
++	for _, partial := range []bool{false, true} {
++		pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"))
++		statusRollup(pr)["contexts"].(map[string]any)["pageInfo"] = map[string]any{"hasNextPage": partial}
++		_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) { return checkRunAttempt{}, false, nil })
++		if ciSummaryFromGraphQL(pr) != domain.CIFailing {
++			t.Fatal("unverified failure hidden")
++		}
++	}
++}
++
++// Exercise the real REST provenance resolver, not only the grouping helper.
++func TestNormalizeCheckRerunsProvenanceAndAttempts(t *testing.T) {
++	for _, conclusion := range []string{"SUCCESS", "FAILURE"} {
++		for _, reverse := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/reverse=%v", conclusion, reverse), func(t *testing.T) {
++				f := newFakeGH(t)
++				for id := 1; id <= 2; id++ {
++					id := id
++					f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++						_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)})
++					})
++				}
++				f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++					_ = json.NewEncoder(w).Encode(map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}})
++				})
++				old := "FAILURE"
++				if conclusion == "FAILURE" { old = "SUCCESS" }
++				a, b := rerunCheck(1, "COMPLETED", old), rerunCheck(2, "COMPLETED", conclusion)
++				a["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/1"
++				b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
++				if reverse { a, b = b, a }
++				pr := rerunPR(a, b)
++				if err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr); err != nil { t.Fatal(err) }
++				kept := nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])
++				if len(kept) != 2 { t.Fatalf("distinct job IDs were superseded: %#v", kept) }
++				if ciSummaryFromGraphQL(pr) != domain.CIFailing || ciSummaryFromRollupState(pr) != domain.CIFailing { t.Fatal("unproven logical job identity hid a failure") }
++				if got := f.callsTo(http.MethodGet, "/repos/owner/repo/actions/runs/10"); got != 1 { t.Fatalf("run lookup calls=%d, want 1", got) }
++			})
++		}
++	}
++	for _, field := range []string{"job.head_sha", "job.check_run_url", "job.run_id", "run.head_sha", "run.repository", "url.host", "url.path"} {
++		t.Run(field, func(t *testing.T) {
++			f := newFakeGH(t)
++			for id := 1; id <= 2; id++ {
++				id := id
++				f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++					job := map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)}
++					if id == 2 {
++						switch field {
++						case "job.head_sha": job["head_sha"] = "forged"
++						case "job.check_run_url": job["check_run_url"] = "https://api.github.com/repos/foreign/repo/check-runs/2"
++						case "job.run_id": job["run_id"] = 99
++						}
++					}
++					_ = json.NewEncoder(w).Encode(job)
++				})
++			}
++			f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++				run := map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}}
++				if field == "run.head_sha" { run["head_sha"] = "forged" }
++				if field == "run.repository" { run["repository"] = map[string]any{"full_name": "foreign/repo"} }
++				_ = json.NewEncoder(w).Encode(run)
++			})
++			a, b := rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS")
++			a["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/1"
++			b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
++			if field == "url.host" { b["detailsUrl"] = "https://evil.test/owner/repo/actions/runs/10/job/2" }
++			if field == "url.path" { b["detailsUrl"] = "https://github.com/foreign/repo/actions/runs/10/job/2" }
++			pr := rerunPR(a, b)
++			err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr)
++			if err != nil { t.Fatalf("unverified provenance should retain the original observation: %v", err) }
++			if ciSummaryFromGraphQL(pr) != domain.CIFailing || len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 2 { t.Fatal("unverified failure suppressed") }
++		})
++	}
++}
++func TestRerunReadErrorsKeepOriginalFailure(t *testing.T) {
++	for _, failure := range []string{"job-error", "job-json", "run-error", "run-json"} {
++		t.Run(failure, func(t *testing.T) {
++			f := newFakeGH(t)
++			for id := 1; id <= 2; id++ {
++				id := id
++				f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++					if failure == "job-error" { http.Error(w, "unavailable", http.StatusNotFound); return }
++					if failure == "job-json" { _, _ = w.Write([]byte("not JSON")); return }
++					_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)})
++				})
++			}
++			f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++				if failure == "run-error" { http.Error(w, "unavailable", http.StatusNotFound); return }
++				_, _ = w.Write([]byte("not JSON"))
++			})
++			a, b := rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS")
++			a["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/1"
++			b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
++			pr := rerunPR(a, b)
++			if err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr); err != nil { t.Fatal(err) }
++			if ciSummaryFromGraphQL(pr) != domain.CIFailing || ciSummaryFromRollupState(pr) != domain.CIFailing || len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 2 { t.Fatal("read failure suppressed original checks") }
++		})
++	}
++}
++
++func TestDistinctOrUnknownLogicalJobsNeverSupersede(t *testing.T) {
++	for _, missing := range []bool{false, true} {
++		pr := rerunPR(rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"), rerunCheck(3, "COMPLETED", "SUCCESS"))
++		_ = supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++			id := int64(num(n["databaseId"]))
++			job, attempt := "job-b", int64(1)
++			if id == 1 { job = "job-a" }; if id == 3 { attempt = 2 }; if missing { job = "" }
++			return checkRunAttempt{"workflow", job, 1, attempt}, true, nil
++		})
++		want := 2; if missing { want = 3 }
++		if len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != want || ciSummaryFromGraphQL(pr) != domain.CIFailing || ciSummaryFromRollupState(pr) != domain.CIFailing { t.Fatal("different or unproven logical job hid failure") }
++	}
++}
++
++func TestSelectiveRerunKeepsOtherSameNameJobFailure(t *testing.T) {
++	f := newFakeGH(t)
++	for id := 1; id <= 3; id++ {
++		id := id
++		f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++			attempt := 1; if id == 3 { attempt = 2 }
++			_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": attempt, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)})
++		})
++	}
++	f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++		_ = json.NewEncoder(w).Encode(map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}})
++	})
++	a, b, c := rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS"), rerunCheck(3, "COMPLETED", "SUCCESS")
++	for i, check := range []map[string]any{a, b, c} { check["detailsUrl"] = fmt.Sprintf("https://github.com/owner/repo/actions/runs/10/job/%d", i+1) }
++	pr := rerunPR(a, b, c)
++	if err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr); err != nil { t.Fatal(err) }
++	if len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 3 || ciSummaryFromGraphQL(pr) != domain.CIFailing || ciSummaryFromRollupState(pr) != domain.CIFailing { t.Fatal("selective rerun suppressed another job's failure") }
++}

@@ -12,6 +12,53 @@ Your repository's own workflows may independently deploy when a human merges.
 ## Daily use on the configured Mac
 
 ```sh
+adlc start --all     # start managed Orchestrator, then all project intake services
+adlc stop --all      # pause intake, check workers, stop the managed backend
+adlc status --all    # show backend and all registered intake services
+```
+
+Full-stack controls require a registered, hash-pinned Orchestrator background
+service on this Mac. They use the owner-only
+`~/Library/Application Support/ADLC Bridge/orchestrator-runtime.json` registration
+(`executable`, `sha256`, `serviceLabel`, `launcher`) and the matching installed
+LaunchAgent. They preserve unrelated Orchestrator installations and services.
+
+`stop --all` disables the managed services across subsequent logins;
+`start --all` re-enables them. Stop pauses **all registered project intake** first,
+then checks every live session's activity and conversation turns. Active, queued,
+unknown, or unreadable worker state refuses backend shutdown and leaves intake
+paused. Finish or stop those workers in Orchestrator, then retry. Do not submit
+new worker requests during shutdown. There is no force-stop flag.
+
+Every bridge-owned session creation and turn delivery shares an inter-process
+barrier with shutdown. Planning, implementation and feature-agent reservations
+stay inside that same barrier through submission; rejected acquisition leaves
+requests pending rather than falsely recording an uncertain delivery.
+Stop holds it from intake unload and the final inventory scan through
+backend shutdown and leaves submissions paused until a successful `start --all`.
+A delivery already holding it refuses shutdown before unloading any intake
+service, instead of interrupting the send. Retry once that delivery settles.
+Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
+they cannot unload a poll process while it owns an in-flight submission.
+Acquiring the lock is not proof that a legacy process participates. Loaded
+intake services must also have an owner-only process acknowledgement matching
+their CLI bytes and, while running, PID and process start time. An idle service
+must have a clean completion receipt. Services without that proof are preserved:
+before upgrading a pre-barrier installation, an operator must establish
+quiescence and stop/unload its intake services manually. Never interrupt a
+submission or delete uncertain delivery records to force migration.
+Contention or an abandoned `turn-submission.lock` fails closed; inspect the stack
+and delivery receipts before removing an abandoned lock. This barrier cannot fence
+manual requests from the Orchestrator UI or other native clients; keep those idle
+during shutdown as well.
+
+These commands control background services. The desktop window may remain open;
+run `start --all` before reopening it when the stack is off. Worktrees, durable
+queue, session history, and credentials are preserved. `status --all` is read-only.
+A backend startup failure does not start intake. The existing commands below
+retain their project and queue meanings:
+
+```sh
 adlc projects
 adlc service-status
 adlc start PROJECT
@@ -386,8 +433,98 @@ is editing affected files. Back up SQLite through its backup API or with all
 writers stopped; copying only the database while WAL writers run can lose state.
 
 This README is the current setup and operation guide. Milestone and ticket
-documents are machine-local notes and are not part of the published source. Docker controller packaging, a portable
-installer, and automatic worktree cleanup are not implemented.
+notes are machine-local and not published. Docker controller packaging is not
+implemented; the supported controller runs locally on macOS.
+
+### Stable installation and self-hosting
+
+From a reviewed checkout with Bun installed. When projects are already registered,
+the Orchestrator backend must be running: apply uses it to back up project settings.
+
+```sh
+bun src/cli.ts install
+bun src/cli.ts install --apply
+```
+
+The first command previews. Apply creates a content-addressed runtime under
+`~/Library/Application Support/ADLC Bridge/versions`, migrates registered intake
+services and project gates, and updates the `adlc` launcher. It pauses intake
+while changing service definitions and restores its previous on/off state.
+Workers are not stopped. Existing configuration, authentication, database and
+project settings are preserved, with backups for activation rollback.
+If a managed Orchestrator runtime is registered, its trusted pin and service
+definition are migrated to the new snapshot's Python launcher as well. The
+running backend is not restarted; the launcher update activates at the next
+guarded `adlc stop --all` / `adlc start --all`. Binary upgrades still require
+`install-runtime` with the backend stopped and service unloaded.
+Use `--bin /absolute/path/to/adlc` to choose the launcher location.
+
+Coding workers edit source worktrees; they do not modify the installed runtime.
+After a human reviews and merges a framework change, run `adlc install --apply`
+from the source checkout to activate it. The installed CLI remembers that source
+path. A source edit or PR merge alone does not activate new controller code.
+This separation is necessary when the bridge manages its own repository.
+
+### Reproduce the pinned Orchestrator daemon
+
+The signed Orchestrator app is preserved. `patches/orchestrator-ci-reruns.patch`
+currently verifies provenance only; it does **not** change production check
+results or fix superseded GitHub Actions failures. REST job IDs are attempt-specific,
+so the patch cannot safely collapse rerun attempts without a stable logical-job
+identity. Distinct checks remain visible, and CI can remain blocked for inspection.
+Do not install this build expecting rerun failures to be cleared. The optional build
+recipe verifies the SHA-256 of the official source archive at a pinned revision,
+applies the patch without Git, runs adapter race tests and builds the daemon.
+Upstream code is Apache-2.0; its license is in `patches/ORCHESTRATOR-LICENSE`.
+Install Go 1.27.1 and Xcode Command Line Tools (required for the runtime service's
+`/usr/bin/python3`), then run:
+
+```sh
+bun scripts/build-orchestrator.ts /absolute/new/build-directory
+# ADLC_GO=/absolute/path/to/go can select the Go binary.
+adlc install-runtime --binary /absolute/new/build-directory/ao
+# Existing managed stack only: adlc stop --all
+# First install: quit the vendor app/daemon instead; no managed stack exists yet.
+adlc install-runtime --binary /absolute/new/build-directory/ao --apply
+adlc status --all
+adlc start --all
+```
+
+On a first installation, quit the vendor app/daemon before runtime registration;
+there is no managed stack to stop yet. Runtime registration requires a stopped
+backend and unloaded service. It copies and hash-pins the binary, installs a
+portable Python launcher and macOS service, and preserves prior definitions in
+backups. It does not start the service. The launcher derives the existing browser
+runtime token in memory and sends it only through private stdin, never arguments,
+environment or logs. No provider logins are copied. The app attaches to the
+persistent daemon; use the full-stack commands for shutdown. Validate vendor
+upgrades before retiring or rebuilding this version-pinned hotfix.
+
+### Guarded recovery and optional cleanup
+
+```sh
+adlc recover JOB
+adlc recover JOB --apply --confirm HASH_FROM_PREVIEW
+adlc cleanup JOB
+# Cleanup is inspection-only until native guarded termination is available.
+```
+
+Recovery refreshes eligibility and reevaluates the existing owned PR. An uncertain
+branch update is reconciled only when GitHub proves both the recorded old head
+and requested base are ancestors of the current PR head. It never resets retry
+budgets, rewrites approval, or blindly resends uncertain dispatch/review requests.
+Changed requirements, ambiguous dispatch and exhausted remediation still need
+operator investigation; use `recover-handoff` for an initial missed PR handoff.
+
+Cleanup inspection is opt-in per job. It requires observed
+completion, a matching actually merged PR, idle worker with no queued work, and
+a clean isolated worktree at that PR head, with no ignored files. **Cleanup apply
+is disabled**: the pinned Orchestrator kill endpoint does not atomically check
+idleness while preventing new turns. A second activity read or bridge-local lock
+cannot close that race. Inspection reports `applySupported: false`; even a valid
+confirmation cannot send a kill request. Session history, worktrees, artifacts and
+GitHub branches are preserved. Native conditional termination and replay semantics
+must be established before enabling apply. No cleanup scheduler runs.
 
 ### Review coordination status
 
@@ -515,8 +652,15 @@ The host waits for an idle worker, checks the exact owned same-repository featur
 branch and current approval, and pins the expected PR head for the API request.
 Conflicts, forks, default-branch heads, exhausted limits, and uncertain outcomes
 block automatic updates. Requests are reserved durably before delivery, and the
-same head/base pair is never blindly retried. Base changes can consume further
-updates up to the configured per-job limit (maximum 10).
+same head/base pair is never blindly retried. With `maxUpdates: null`, successful updates have no lifetime cap: further base
+changes can trigger another update. Any failed or uncertain request still stops
+automation for inspection, even if the head later changes. A numeric value from
+1 to 10 retains the optional per-job cap. The bundled project example is disabled
+with a finite limit of 3; setting `null` explicitly opts into unlimited updates.
+After explicit authorization, the wizard defaults to the finite limit of 3.
+Typing `unlimited` (case-insensitive) additionally requires a separate default-no
+confirmation warning that each update can trigger another CI and CodeRabbit cycle.
+Declining that confirmation keeps the finite limit of 3.
 
 A new commit must pass CI and CodeRabbit again. Even with automatic branch updates
 disabled, the readiness gate refuses to report a branch behind its base as ready.
@@ -524,6 +668,67 @@ A base can move after any observation, so final merge eligibility must still be
 checked by the human and GitHub at merge time. No protection, review, or check is
 bypassed. Workers must fetch and fast-forward their local feature branch before
 further code remediation and stop if it is dirty or divergent.
+
+## Automatic PR-template CI remediation
+
+Configure exact GitHub Actions job names in `prMetadataChecks` for checks whose
+failures may be fixed by editing only a PR description, for example:
+
+```json
+"prMetadataChecks": ["PR body structure"]
+```
+
+The wizard can collect these names. They are added to the readiness gate as
+required checks, even for existing registered PRs.
+
+**Current production limitation:** GitHub check/job responses do not attest which
+PR description they evaluated, so production evidence has `descriptionHash: null`.
+Configured metadata checks therefore cannot authorize automatic findings or
+PR-description remediation, even when the check succeeds. Otherwise-clear checks
+wait up to five minutes for body-bound evidence and then block for inspection;
+unattested failures block for inspection without sending remediation. This remains
+fail-closed until a trustworthy body-bound attestation source is implemented.
+An empty `prMetadataChecks` policy skips this additional body-evidence gate; it
+does not bypass other required checks or CodeRabbit approval. Clearing the policy
+does not clear an outstanding remediation send: its delivery must be reconciled,
+and any observed description change still requires a fresh CodeRabbit evaluation.
+
+The remediation flow below requires that future attestation support. In addition
+to body evidence, the bridge verifies the failed job’s repository, check-run ID,
+and PR head before reading its failure logs. Only a body-bound failure can send
+the relevant errors to the existing worker under its current approval and
+`open-pr` grant. The worker must use the current repository template, preserve
+truthful verification evidence, and make description changes only. It may not
+change application code, validators, workflows, or protections to pass the check.
+
+Description edits must produce a check result bound to the current description;
+check timestamps or a matching commit/check ID alone are not proof. A repeated old failure
+waits up to five minutes rather than immediately consuming another remediation
+attempt; a new failed check can be addressed within the configured per-project
+remediation budget (five attempts by default). After CI clears, CodeRabbit is reevaluated on the current commit and
+description. Delivery uncertainty never causes a blind duplicate send.
+
+Only configured `requiredChecks` and `prMetadataChecks` block CI readiness;
+unconfigured failed checks do not block this gate. Failures in configured
+application checks, unavailable metadata-check logs, identity mismatches,
+out-of-scope work, or exhausted attempts still block for inspection.
+No automatic approval, check bypass, merge, or deployment is added.
+Log retrieval checks the installed GitHub CLI version and passes `gh api
+--allow-escape-sequences` only on version 2.97.0 or newer; older versions omit
+that flag. Escape sequences are stripped before selected failure lines reach
+the worker.
+
+When GitHub returns old and rerun check results for one commit, the bridge passes
+the raw check results through unchanged, without extra provenance REST reads.
+The native patch verifies workflow/job provenance but cannot supersede production
+attempts: GitHub REST job IDs are attempt-specific
+and do not establish a stable logical-job identity across attempts. Distinct job
+IDs are therefore retained even for successful reruns of same-name checks. This
+can leave readiness blocked or ambiguous for inspection; it cannot hide another
+job’s failure during a selective rerun. Identically named checks from different
+workflows/events also remain separate. Orchestrator’s
+own card may aggregate or cache check results differently; `adlc review-status`
+reports the bridge gate used for automation.
 
 ## Remediation budget
 

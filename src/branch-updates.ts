@@ -1,7 +1,7 @@
 import {Store} from './core';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
-export type BranchPolicy={enabled:boolean;authorizedBy:string;maxUpdates:number};
+export type BranchPolicy={enabled:boolean;authorizedBy:string;maxUpdates:number|null};
 export type BranchSnapshot={head:string;base:string;branch:string;baseBranch:string;defaultBranch:string;headRepo:string;baseRepo:string;state:string;draft:boolean;mergeable:boolean|null;behind:number};
 export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>};
 async function gh(args:string[]){const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub branch operation failed; inspect before retry');return JSON.parse(out);}
@@ -26,14 +26,17 @@ export const branchTransport:BranchTransport={
 export class BranchUpdates{
  constructor(public s:Store,public transport:BranchTransport=branchTransport){s.db.exec(`CREATE TABLE IF NOT EXISTS branch_updates(job TEXT NOT NULL REFERENCES jobs(id),head TEXT NOT NULL,base TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,reason TEXT,PRIMARY KEY(job,head,base));`);}
  async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
-   if(policy?.enabled&&(!policy.authorizedBy?.trim()||!Number.isSafeInteger(policy.maxUpdates)||policy.maxUpdates<1||policy.maxUpdates>10))throw Error('Explicit branch update authorization and limit required');
+  if(policy?.enabled&&(!policy.authorizedBy?.trim()||policy.maxUpdates!==null&&(!Number.isSafeInteger(policy.maxUpdates)||policy.maxUpdates<1||policy.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1)throw Error('Valid PR required');
   const l=new Lifecycle(this.s),j=l.current(job),run=l.run(job),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
-  if(!run||run.owner!=='orchestrator'||run.session_id!==session.session?.id||run.plan_hash!==j.plan_hash||!grant||grant.plan_hash!==j.plan_hash||!['fetch','push-feature'].every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Existing approved feature branch execution required');
+   const operations=policy?.enabled?['fetch','push-feature']:[];
+  if(!run||run.owner!=='orchestrator'||run.session_id!==session.session?.id||run.plan_hash!==j.plan_hash||!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Existing approved feature branch execution required');
   const b=await this.transport.read(repo,pr);
-   assertDeliveryTarget(this.s,job,session.session,repo,pr,b);
-   if(!policy?.enabled)return null;
-  this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head!=? AND state IN ('accepted','delivery_uncertain')").run(job,b.head);
+  assertDeliveryTarget(this.s,job,session.session,repo,pr,b);
+  if(!policy?.enabled)return null;
+  this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head!=? AND state='accepted'").run(job,b.head);
+  const uncertain=this.s.db.query("SELECT 1 FROM branch_updates WHERE job=? AND state='delivery_uncertain' LIMIT 1").get(job);
+  if(uncertain)return {state:'blocked',send:false,head:b.head,reason:'Earlier branch update outcome uncertain; inspect before recovery'};
   if(b.behind===0)return null;
   if(b.mergeable===false)return {state:'blocked',send:false,head:b.head,reason:'Feature branch has conflicts with base; human reconciliation required'};
   if(b.mergeable!==true)return {state:'updating_branch',send:false,head:b.head,reason:'Waiting for GitHub to determine branch mergeability'};
@@ -46,7 +49,7 @@ export class BranchUpdates{
   l.current(job);
   const claim=this.s.db.transaction(()=>{
    const count=(this.s.db.query('SELECT count(*) AS n FROM branch_updates WHERE job=?').get(job) as any).n;
-   if(count>=policy.maxUpdates)return 'limit';
+   if(policy.maxUpdates!==null&&count>=policy.maxUpdates)return 'limit';
    return this.s.db.query('INSERT OR IGNORE INTO branch_updates VALUES (?,?,?,?,?,?)').run(job,b.head,b.base,'delivery_uncertain',Date.now(),null).changes?'claimed':'existing';
   }).immediate();
   if(claim==='limit')return {state:'blocked',send:false,head:b.head,reason:'Automatic branch update limit reached; human inspection required'};

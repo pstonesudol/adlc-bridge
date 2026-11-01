@@ -7,8 +7,11 @@ export const digest = (text: string) => createHash('sha256').update(text).digest
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
 export class Store {
   db: Database;
+  static readonly(path:string){
+    return new Store(path,true);
+  }
   constructor(path: string, readonly=false) {
-    if(readonly){this.db=new Database(path,{readonly:true});return;}
+    if(readonly){this.db=new Database(path,{readonly:true,create:false});return;}
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });
     if (path !== ':memory:') chmodSync(path, 0o600);
