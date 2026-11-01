@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {verifyInitConfig,saveInitConfig,serviceDefinition,branchUpdateLimit} from '../src/init';
+import {verifyInitConfig,saveInitConfig,serviceDefinition,branchUpdateLimit,initWizard} from '../src/init';
 import {validate,metadataCheckNames} from '../src/linear';
 const uuid=(n:number)=>`00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
 function fixture(repo:string){
@@ -58,4 +58,15 @@ test('wizard branch-update limits accept case-insensitive unlimited or safe inte
 });
 test('bundled branch-update policy stays disabled with a finite limit until explicitly configured',()=>{
  const example=JSON.parse(readFileSync(join(import.meta.dir,'../config/project.example.json'),'utf8'));expect(example.branchUpdate).toEqual({enabled:false,authorizedBy:'',maxUpdates:3});
+});
+test('wizard saves the authorized finite or unlimited branch-update policy from injected answers',async()=>{
+ for(const [answer,maxUpdates] of [['4',4],['UnLiMiTeD',null]] as const){
+  const home=mkdtempSync(join(tmpdir(),'adlc-wizard-policy-'));let closed=false;
+  try{
+   const f=fixture(home),path=join(home,'project.json'),answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','no','no','no','yes','Test operator',answer,'no','yes','no'],questions:string[]=[];
+   const result=await initWizard(home,['--config',path],{interactive:()=>true,home:()=>home,registryPath:()=>join(home,'registry.sqlite'),log:()=>{},linearToken:()=> 'test-only-placeholder',verifyInitConfig:c=>verifyInitConfig(c,f.api,f.ao),prompts:()=>({question:async(label:string)=>{questions.push(label);if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})});
+   expect(result).toMatchObject({configuration:path,gateInstalled:false,serviceEnabled:false});expect(answers).toEqual([]);expect(closed).toBe(true);
+   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [unlimited]: ');
+  }finally{rmSync(home,{recursive:true,force:true});}
+ }
 });
