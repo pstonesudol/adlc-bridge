@@ -24,7 +24,7 @@
  	}
 --- /dev/null
 +++ b/backend/internal/adapters/scm/github/check_reruns.go
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,169 @@
 +package github
 +
 +import (
@@ -58,9 +58,13 @@
 +// normalizeCheckReruns requires matching workflow, event and job provenance.
 +// Attempt-specific REST IDs do not prove cross-attempt logical job identity.
 +func (p *Provider) normalizeCheckReruns(ctx context.Context, owner, repo, head string, pr map[string]any) error {
++	return supersedeCheckReruns(pr, p.checkAttemptResolver(ctx, owner, repo, head))
++}
++
++func (p *Provider) checkAttemptResolver(ctx context.Context, owner, repo, head string) func(map[string]any) (checkRunAttempt, bool, error) {
 +	type runResult struct { run checkWorkflowRun; err error }
 +	runs := map[int64]runResult{}
-+	return supersedeCheckReruns(pr, func(n map[string]any) (checkRunAttempt, bool, error) {
++	return func(n map[string]any) (checkRunAttempt, bool, error) {
 +		u, err := url.Parse(str(n["detailsUrl"]))
 +		if err != nil || u.Host != "github.com" {
 +			return checkRunAttempt{}, false, nil
@@ -107,7 +111,7 @@
 +		// REST job IDs are attempt-specific. Without a stable logical-job ID,
 +		// retain distinct IDs rather than infer identity from a display name.
 +		return checkRunAttempt{workflow: fmt.Sprintf("%d:%s", run.Workflow, run.Event), job: strconv.FormatInt(job.ID, 10), number: run.Number, attempt: job.Attempt}, true, nil
-+	})
++	}
 +}
 +
 +func supersedeCheckReruns(pr map[string]any, resolve func(map[string]any) (checkRunAttempt, bool, error)) error {
@@ -192,7 +196,7 @@
 +}
 --- /dev/null
 +++ b/backend/internal/adapters/scm/github/check_reruns_test.go
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,205 @@
 +package github
 +
 +import (
@@ -290,7 +294,7 @@
 +			})
 +		}
 +	}
-+	for _, field := range []string{"job.head_sha", "job.check_run_url", "job.run_id", "run.head_sha", "run.repository", "url.host", "url.path"} {
++	for _, field := range []string{"valid", "job.id", "job.head_sha", "job.check_run_url", "job.run_id", "job.run_attempt", "run.id", "run.head_sha", "run.repository", "run.workflow_id", "run.run_number", "run.event", "url.host", "url.path", "url.run", "url.job", "check.id"} {
 +		t.Run(field, func(t *testing.T) {
 +			f := newFakeGH(t)
 +			for id := 1; id <= 2; id++ {
@@ -299,9 +303,11 @@
 +					job := map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)}
 +					if id == 2 {
 +						switch field {
++						case "job.id": job["id"] = 99
 +						case "job.head_sha": job["head_sha"] = "forged"
 +						case "job.check_run_url": job["check_run_url"] = "https://api.github.com/repos/foreign/repo/check-runs/2"
 +						case "job.run_id": job["run_id"] = 99
++						case "job.run_attempt": job["run_attempt"] = 0
 +						}
 +					}
 +					_ = json.NewEncoder(w).Encode(job)
@@ -309,6 +315,10 @@
 +			}
 +			f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
 +				run := map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}}
++				if field == "run.id" { run["id"] = 99 }
++				if field == "run.workflow_id" { run["workflow_id"] = 0 }
++				if field == "run.run_number" { run["run_number"] = 0 }
++				if field == "run.event" { run["event"] = "" }
 +				if field == "run.head_sha" { run["head_sha"] = "forged" }
 +				if field == "run.repository" { run["repository"] = map[string]any{"full_name": "foreign/repo"} }
 +				_ = json.NewEncoder(w).Encode(run)
@@ -318,6 +328,15 @@
 +			b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
 +			if field == "url.host" { b["detailsUrl"] = "https://evil.test/owner/repo/actions/runs/10/job/2" }
 +			if field == "url.path" { b["detailsUrl"] = "https://github.com/foreign/repo/actions/runs/10/job/2" }
++			if field == "url.run" { b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/invalid/job/2" }
++			if field == "url.job" { b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/0" }
++			if field == "check.id" { b["databaseId"] = 0 }
++			attempt, ok, resolveErr := newProviderForTest(t, f).checkAttemptResolver(ctx(), "owner", "repo", "head")(b)
++			if resolveErr != nil { t.Fatal(resolveErr) }
++			if field == "valid" {
++				want := checkRunAttempt{workflow: "5:pull_request", job: "2", number: 7, attempt: 2}
++				if !ok || attempt != want { t.Fatalf("valid provenance: got %#v, %v; want %#v", attempt, ok, want) }
++			} else if ok || attempt != (checkRunAttempt{}) { t.Fatalf("forged %s resolved: %#v, %v", field, attempt, ok) }
 +			pr := rerunPR(a, b)
 +			err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr)
 +			if err != nil { t.Fatalf("unverified provenance should retain the original observation: %v", err) }

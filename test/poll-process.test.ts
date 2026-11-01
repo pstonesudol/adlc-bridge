@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,writeFileSync,readFileSync,readdirSync,chmodSync,rmSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {acknowledgePoll,assertPollQuiescent,assertPollStarted} from '../src/poll-process';import {stopLoadedIntake,waitForPollStartup} from '../src/service-control';import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';
-import {TurnSubmissionBlocked} from '../src/turn-submission';
+import {TurnSubmissionBlocked} from '../src/turn-submission';import {PollProcessNotRunning} from '../src/poll-process';
 function fixture(){
  const root=mkdtempSync(join(tmpdir(),'adlc-poll-proof-')),state=join(root,'state'),config=join(root,'project.json'),cli=join(root,'cli.ts');writeFileSync(config,'{}');writeFileSync(cli,'barrier-aware CLI');const turns=turnBarrier(state);
  const started=()=> 'known start',verify=(status:any,c=config,program=cli)=>assertPollQuiescent(status,c,program,state,started);
@@ -34,6 +34,24 @@ console.log(JSON.stringify({attempts}));`;
 test('unblocked startup never emits the waiting notice',async()=>{
  const f=fixture();try{let notices=0;const finish=await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit,{timeoutMs:Infinity,pause:async()=>{},onBlocked:()=>{notices++;}});expect(notices).toBe(0);finish();}finally{f.close();}
 });
+test('startup preserves another live poll receipt and replaces only idle, dead or reused-PID receipts',async()=>{
+ for(const mode of ['live','idle','dead','reused','unknown']){const f=fixture();try{
+  await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit);const path=f.receipt(),prior={...JSON.parse(readFileSync(path,'utf8')),pid:process.pid+1,started:'prior start',idle:mode==='idle'};writeFileSync(path,JSON.stringify(prior),{mode:0o600});const before=readFileSync(path);let submissions=0;
+  const started=(pid:number)=>{if(pid===process.pid)return 'current start';if(mode==='dead')throw new PollProcessNotRunning('gone');if(mode==='unknown')throw Error('inspection failed');return mode==='reused'?'different start':'prior start';};
+  const startup=acknowledgePoll(f.config,f.cli,f.state,started,async operation=>{submissions++;return operation();});
+  if(mode==='live'||mode==='unknown'){await expect(startup).rejects.toThrow(mode==='live'?'Another live poll':'inspection failed');expect(readFileSync(path)).toEqual(before);expect(submissions).toBe(0);}
+  else{const finish=await startup;expect(JSON.parse(readFileSync(path,'utf8'))).toMatchObject({pid:process.pid,started:'current start',idle:false});expect(submissions).toBe(1);finish();}
+ }finally{f.close();}}
+});
+test('a real live poll keeps its receipt when a second startup is rejected, and a dead owner can be replaced',async()=>{
+ const f=fixture();let child:ReturnType<typeof Bun.spawn>|undefined;try{
+  const script=`import {acknowledgePoll} from ${JSON.stringify(join(import.meta.dir,'../src/poll-process.ts'))};import {turnBarrier} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};await acknowledgePoll(${JSON.stringify(f.config)},${JSON.stringify(f.cli)},${JSON.stringify(f.state)},undefined,turnBarrier(${JSON.stringify(f.state)}).submit);console.log('ready');await Bun.sleep(60000);`;
+  child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},timeout:10000});
+  const reader=(child.stdout as ReadableStream<Uint8Array>).getReader(),ready=await reader.read();expect(new TextDecoder().decode(ready.value)).toBe('ready\n');reader.releaseLock();
+  const path=f.receipt(),before=readFileSync(path);await expect(acknowledgePoll(f.config,f.cli,f.state,undefined,f.turns.submit)).rejects.toThrow('Another live poll');expect(readFileSync(path)).toEqual(before);assertPollStarted({running:true,pid:child.pid},f.config,f.cli,f.state);
+  child.kill();await child.exited;const finish=await acknowledgePoll(f.config,f.cli,f.state,undefined,f.turns.submit);expect(JSON.parse(readFileSync(path,'utf8')).pid).toBe(process.pid);finish();assertPollQuiescent({running:false},f.config,f.cli,f.state);
+ }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}f.close();}
+},15000);
 test('loaded legacy intake is preserved even when the new barrier is available and launchd reports idle',async()=>{
  const f=fixture();try{let bootouts=0;for(const status of [{loaded:true,running:true,pid:process.pid},{loaded:true,running:false}])await f.turns.run(async()=>{await expect(stopLoadedIntake(status,f.config,f.cli,async()=>{bootouts++;},f.verify)).rejects.toThrow('barrier support is unverified');});expect(bootouts).toBe(0);
   await stopLoadedIntake({loaded:false},f.config,f.cli,async()=>{bootouts++;},()=>{throw Error('Unloaded legacy service needs no receipt');});expect(bootouts).toBe(0);
