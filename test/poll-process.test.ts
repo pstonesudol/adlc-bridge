@@ -13,6 +13,24 @@ test('foreground startup reports blocking once while retrying and silent startup
   expect(attempts).toBe(4);expect(pauses).toBe(3);expect(notices).toBe(interactive?1:0);assertPollStarted({running:true,pid:process.pid},f.config,f.cli,f.state,f.started);finish();f.verify({running:false});
  }finally{f.close();}}
 });
+test('default startup notification writes once only when stdin and stderr are interactive',async()=>{
+ for(const inputTTY of [false,true])for(const errorTTY of [false,true]){const f=fixture();try{
+  // Scope stream-property overrides to a child; exercise the production default
+  // wait options and console.error rather than supplying a notification hook.
+  const script=`
+import {acknowledgePoll,assertPollQuiescent} from ${JSON.stringify(join(import.meta.dir,'../src/poll-process.ts'))};
+import {TurnSubmissionBlocked} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};
+Object.defineProperty(process.stdin,'isTTY',{value:${inputTTY}});
+Object.defineProperty(process.stderr,'isTTY',{value:${errorTTY}});
+let attempts=0;
+const finish=await acknowledgePoll(${JSON.stringify(f.config)},${JSON.stringify(f.cli)},${JSON.stringify(f.state)},()=> 'child start',async operation=>{if(++attempts<=3)throw new TurnSubmissionBlocked('paused');return operation();});
+finish();assertPollQuiescent({running:false},${JSON.stringify(f.config)},${JSON.stringify(f.cli)},${JSON.stringify(f.state)});
+console.log(JSON.stringify({attempts}));`;
+  const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},timeout:10000});
+  const [out,err,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  expect(code).toBe(0);expect(JSON.parse(out)).toEqual({attempts:4});expect(err).toBe(inputTTY&&errorTTY?'Intake startup is waiting for the submission pause or control operation to clear; polling has not started.\n':'');
+ }finally{f.close();}}
+},15000);
 test('unblocked startup never emits the waiting notice',async()=>{
  const f=fixture();try{let notices=0;const finish=await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit,{timeoutMs:Infinity,pause:async()=>{},onBlocked:()=>{notices++;}});expect(notices).toBe(0);finish();}finally{f.close();}
 });
