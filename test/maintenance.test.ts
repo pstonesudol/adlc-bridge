@@ -1,18 +1,19 @@
 import {test,expect} from 'bun:test';import {assertIdle,assertCleanup} from '../src/maintenance';
-import {maintenance} from '../src/maintenance';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {ReviewLoop} from '../src/review-loop';import {BranchUpdates} from '../src/branch-updates';
+import {maintenance,maintenanceGitHub} from '../src/maintenance';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {ReviewLoop} from '../src/review-loop';import {BranchUpdates} from '../src/branch-updates';
 import {mkdtempSync,mkdirSync,realpathSync,writeFileSync,rmSync,readFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 const e=()=>({session:{id:'worker',branch:'adlc/feature',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[{state:'completed'}]}});
+const uuid=(n:number)=>`00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
 test('maintenance refuses queued or unknown turns and missing controller evidence',()=>{expect(()=>assertIdle(e())).not.toThrow();expect(()=>assertIdle({...e(),transcript:{controller:'ready',turns:[{state:'queued'}]}})).toThrow('active');expect(()=>assertIdle({})).toThrow('uncertain');});
 test('cleanup requires observed completion, exact session, owned PR and actual merge',()=>{const j={state:'done'},r={state:'completed',owner:'orchestrator',session_id:'worker'},t={state:'completed',repo:'owner/repo',pr:1},pr={merged:true,head:{ref:'adlc/feature',repo:{full_name:'owner/repo'}}};expect(()=>assertCleanup(j,r,t,e(),pr)).not.toThrow();expect(()=>assertCleanup(j,r,t,e(),{...pr,merged:false})).toThrow('Merged');expect(()=>assertCleanup(j,{...r,session_id:'other'},t,e(),pr)).toThrow('match');expect(()=>assertCleanup({state:'approved'},r,t,e(),pr)).toThrow('completed');});
 function fixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-maintenance-'))),repo=join(root,'repo'),tree=join(root,'tree');mkdirSync(repo);mkdirSync(tree);
  const git=(...args:string[])=>{const r=Bun.spawnSync(['/usr/bin/git','-C',tree,...args]);if(r.exitCode)throw Error(r.stderr.toString());return r.stdout.toString().trim();};
  git('init','-q');writeFileSync(join(tree,'.gitignore'),'ignored\n');git('add','.gitignore');git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture');const head=git('rev-parse','HEAD');
- const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('linear','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','worker',r.branch,tree);const hash=s.propose(id,'plan');s.approve(id,hash,'human');new Lifecycle(s).adoptSupervised(id,{id:'worker',correlation:r.correlation,worktree:tree,controller:'running'});new ReviewLoop(s).register(id,'owner/repo',1,['CI'],['src/**']);new BranchUpdates(s);
- const config=join(root,'config.json'),c={linear:{projectId:'linear'},automation:{orchestratorProject:'ao'},repo,githubRepo:'owner/repo'};writeFileSync(config,JSON.stringify(c));
+ const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue(uuid(1),'issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','worker',r.branch,tree);const hash=s.propose(id,'plan');s.approve(id,hash,'human');new Lifecycle(s).adoptSupervised(id,{id:'worker',correlation:r.correlation,worktree:tree,controller:'running'});new ReviewLoop(s).register(id,'owner/repo',1,['CI'],['src/**']);new BranchUpdates(s);
+ const config=join(root,'config.json'),c={version:1,name:'Test',requiredChecks:['CI'],linear:{projectId:uuid(1),teamId:uuid(2),readyStateId:uuid(3),readyLabelId:uuid(4)},automation:{orchestratorProject:'ao'},repo,githubRepo:'owner/repo'};writeFileSync(config,JSON.stringify(c));
  const evidence={...e(),session:{...e().session,projectId:'ao',branch:r.branch,worktree:tree}};const pr:any={state:'open',merged:false,head:{sha:head,ref:r.branch,repo:{full_name:'owner/repo'}},base:{sha:'base'}};
  const writes:string[]=[],comparisons:Record<string,string>={[`repos/owner/repo/compare/base...${head}`]:'ahead',[`repos/owner/repo/compare/old...${head}`]:'ahead'};
- const io:any={registrations:()=>[{project:'ao',linear_project:'linear',repo,config}],sessionEvidence:async()=>evidence,gh:async(path:string)=>{if(path in comparisons)return {status:comparisons[path]};if(path==='repos/owner/repo/pulls/1')return pr;throw Error('Unexpected GitHub read: '+path);},
+ const io:any={registrations:()=>[{project:'ao',linear_project:uuid(1),repo,config}],sessionEvidence:async()=>evidence,gh:async(path:string)=>{if(path in comparisons)return {status:comparisons[path]};if(path==='repos/owner/repo/pulls/1')return pr;throw Error('Unexpected GitHub read: '+path);},
   localAO:async()=>{writes.push('kill');return {};},poll:async()=>{writes.push('poll');},linearToken:()=>'',review:()=>({configureMetadataChecks:()=>writes.push('policy'),tick:async()=>{writes.push('tick');return {};}})};
  return {s,id,tree,root,config,c,pr,evidence,io,writes,unproven:(side:string)=>comparisons[`repos/owner/repo/compare/${side}...${head}`]='diverged',done:()=>{s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';UPDATE review_targets SET state='completed';");pr.merged=true;pr.state='closed';},close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
 }
@@ -58,7 +59,7 @@ test('recovery forwards the registered project remediation budget to review reev
  const f=fixture();try{
   const remediation={maxAttempts:12,maxNoProgress:8,window:'job'};writeFileSync(f.config,JSON.stringify({...f.c,remediation}));const calls:any[]=[];
   f.io.review=()=>({configureMetadataChecks:()=>{},tick:async(...args:any[])=>{calls.push(args);return {};}});
-  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation,{project:'linear',checks:[]}]]);
+  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation,{project:uuid(1),checks:[]}]]);
  }finally{f.close();}
 });
 test('recovery rechecks PR openness and exact ancestry target after collecting fresh session evidence',async()=>{
@@ -81,10 +82,10 @@ test('recovery validates remediation policy before any reconciliation and binds 
  }finally{f.close();}
 });
 test('recovery confirmation binds effective Linear eligibility and status-sync settings',async()=>{
- const statusSync={enabled:true,inProgress:'started',inReview:'review',done:'done'};
- const changes=[(c:any)=>c.linear.teamId='other-team',(c:any)=>c.linear.readyStateId='other-todo',(c:any)=>c.linear.readyLabelId='other-label',(c:any)=>c.statusSync.enabled=false,(c:any)=>c.statusSync.inProgress='other-started',(c:any)=>c.statusSync.inReview='other-review',(c:any)=>c.statusSync.done='other-done'];
+ const statusSync={enabled:true,inProgress:uuid(5),inReview:uuid(6),done:uuid(7)};
+ const changes=[(c:any)=>c.linear.teamId=uuid(8),(c:any)=>c.linear.readyStateId=uuid(8),(c:any)=>c.linear.readyLabelId=uuid(8),(c:any)=>c.statusSync.enabled=false,(c:any)=>c.statusSync.inProgress=uuid(8),(c:any)=>c.statusSync.inReview=uuid(8),(c:any)=>c.statusSync.done=uuid(8)];
  for(const change of changes){const f=fixture();try{
-  const c={...f.c,linear:{...f.c.linear,teamId:'team',readyStateId:'todo',readyLabelId:'label'},statusSync:{...statusSync}};writeFileSync(f.config,JSON.stringify(c));f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');
+   const c={...f.c,linear:{...f.c.linear},statusSync:{...statusSync}};writeFileSync(f.config,JSON.stringify(c));f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');
   const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);change(c);writeFileSync(f.config,JSON.stringify(c));await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}}
 });
@@ -94,4 +95,19 @@ test('configuration fingerprint invalidates a recovery preview when only reviewA
   const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);writeFileSync(f.config,JSON.stringify({...config,reviewAllowedPaths:['src/**','docs/**']}));
   await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}
+});
+test('maintenance rejects invalid registered configuration before provider reads or reconciliation',async()=>{
+ for(const change of [{requiredChecks:[]},{linear:{projectId:uuid(1),teamId:'invalid'}},{statusSync:{enabled:true,inProgress:'invalid'}},{branchUpdate:{enabled:true,authorizedBy:'',maxUpdates:1}},{version:2}]){
+  const f=fixture();try{
+   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);writeFileSync(f.config,JSON.stringify({...f.c,...change}));let reads=0;f.io.sessionEvidence=async()=>{reads++;return f.evidence;};f.io.gh=async()=>{reads++;return f.pr;};
+   for(const apply of [false,true])await expect(maintenance(f.s,'recover',f.id,apply,preview.confirmation,f.io)).rejects.toThrow();
+   expect(reads).toBe(0);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+  }finally{f.close();}
+ }
+});
+test('maintenance GitHub commands have a bounded timeout and reject failed receipts',async()=>{
+ for(const code of [0,1]){const calls:any[]=[],spawn=((args:any,options:any)=>{calls.push({args,options});return {stdout:new Response('{"state":"open"}').body,stderr:new Response('').body,exited:Promise.resolve(code)};}) as any;
+  const result=maintenanceGitHub('repos/owner/repo/pulls/1',spawn);if(code===0)expect(await result).toEqual({state:'open'});else await expect(result).rejects.toThrow('GitHub inspection failed');
+  expect(calls).toEqual([{args:['gh','api','repos/owner/repo/pulls/1'],options:{stdout:'pipe',stderr:'pipe',timeout:30000}}]);
+ }
 });

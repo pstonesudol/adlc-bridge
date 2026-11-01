@@ -45,7 +45,7 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
  configureRoute:configureSessionRoute,
   async sendImplementation(session,prompt,clientId){
    return submit(async()=>{
-   const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe'});
+   const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
   const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
    if(code!==0)throw Error('Implementation delivery uncertain');
    });
@@ -69,7 +69,7 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  const hook=`${shellQuote(process.execPath)} ${shellQuote(resolve(installedCLI()?resolve(installedCLI()!,'..'):import.meta.dir,'planning-gate.ts'))}`;
  const scripts=config.postCreate??[];
  if(!Array.isArray(scripts)||scripts.some((x:any)=>typeof x!=='string'))throw Error('Unexpected setup scripts');
- const prior=scripts.filter((x:string)=>!x.includes('/src/planning-gate.ts')&&!x.includes('ADLC execution disabled pending host approval gate'));
+  const prior=scripts.filter((x:string)=>!bridgePlanningHook(x)&&!x.includes('ADLC execution disabled pending host approval gate'));
  config.postCreate=[hook,...prior];
  config.env={...(config.env??{}),ADLC_WORKFLOW_CONFIG:path};
  delete config.env.ADLC_PLANNING_JOB;delete config.env.ADLC_PLANNING_PROJECT;
@@ -81,3 +81,11 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  return {project,backup,hookInstalled:true,planningEnabled:!!c.automation.planningEnabled};
 }
 function shellQuote(s:string){return "'"+s.replaceAll("'","'\\''")+"'";}
+export function bridgePlanningHook(script:string,checkout=resolve(import.meta.dir,'planning-gate.ts'),versions=resolve(homedir(),'Library/Application Support/ADLC Bridge/versions')){
+ const command=script.match(/^(?:'[^']*'|"[^"]*"|[^\s]+)\s+(?:'([^']*)'|"([^"]*)"|([^\s]+))\s*$/);
+ if(!command)return false;
+ const path=command[1]??command[2]??command[3];
+ if(path===checkout)return true;
+ const prefix=versions+'/';if(!path.startsWith(prefix))return false;
+ return /^[^/]+\/src\/planning-gate\.ts$/.test(path.slice(prefix.length));
+}

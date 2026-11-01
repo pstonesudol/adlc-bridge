@@ -1,9 +1,9 @@
 import {existsSync,realpathSync} from 'node:fs';
 import {Lifecycle} from './lifecycle';
 import {remediationPolicy} from './remediation';
-import {metadataCheckNames} from './linear';
+import {metadataCheckNames,validate} from './linear';
 import {Store,digest} from './core';import {sessionEvidence} from './session-evidence';import {ProjectServices,registryPath} from './project-services';import {readFileSync} from 'node:fs';import {localAO} from './workflow-transport';import {ReviewLoop} from './review-loop';import {poll} from './linear';import {linearToken} from './credential';
-async function gh(path:string){const p=Bun.spawn(['gh','api',path],{stdout:'pipe',stderr:'pipe'});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub inspection failed');return JSON.parse(out);}
+export async function maintenanceGitHub(path:string,spawn=Bun.spawn){const p=spawn(['gh','api',path],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub inspection failed');return JSON.parse(out);}
 export function assertIdle(e:any){if(!['ready','stopped'].includes(e?.transcript?.controller)||!Array.isArray(e.transcript?.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','interrupted','cancelled','recovered'].includes(t?.state)))throw Error('Worker is active or activity is uncertain');}
 export function assertCleanup(j:any,run:any,target:any,e:any,pr:any){
  if(j.state!=='done'||run.state!=='completed'||target.state!=='completed'||run.owner!=='orchestrator')throw Error('Only completed agent-owned jobs can be cleaned');
@@ -14,10 +14,11 @@ function registrations(){const r=new Store(registryPath());try{return new Projec
 export function configFor(s:Store,job:string,projects=registrations()){
  const p=projects.find(x=>x.linear_project===s.get(job).project);if(!p)throw Error('Registered project required');
  const c=JSON.parse(readFileSync(p.config,'utf8'));
- if(c.linear?.projectId!==p.linear_project||c.automation?.orchestratorProject!==p.project||typeof c.repo!=='string'||realpathSync(c.repo)!==p.repo)throw Error('Registered project configuration identity changed; reconcile before recovery');
+  if(c.linear?.projectId!==p.linear_project||c.automation?.orchestratorProject!==p.project||typeof c.repo!=='string'||realpathSync(c.repo)!==p.repo)throw Error('Registered project configuration identity changed; reconcile before recovery');
+  validate(c);
  return c;
 }
-const maintenanceIO={registrations,sessionEvidence,gh,localAO,poll,linearToken,review:(s:Store)=>new ReviewLoop(s)};
+const maintenanceIO={registrations,sessionEvidence,gh:maintenanceGitHub,localAO,poll,linearToken,review:(s:Store)=>new ReviewLoop(s)};
 export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,apply=false,confirmation?:string,io=maintenanceIO){
  const j=s.get(job),run=s.db.query('SELECT * FROM runs WHERE job=?').get(job) as any,target=s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
  if(!run||!target)throw Error('Existing run and PR target required; use recover-handoff for a missed initial handoff');
