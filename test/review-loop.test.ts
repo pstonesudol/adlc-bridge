@@ -5,6 +5,7 @@ import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {sendPilotRemediation} from '../src/pilot';
 import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {turnBarrier} from '../src/turn-submission';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -149,9 +150,13 @@ test('an attempted pilot send preserves uncertainty and its consumed budget when
  const f=templateFixture();try{f.io.spawn=()=>{throw Error('spawn receipt lost');};await expect(f.loop.tick(f.id)).rejects.toThrow('receipt lost');expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});}finally{f.s.close();}
 });
 test('remediation send uses a bounded timeout and keeps a failed receipt uncertain without resending',async()=>{
- const f=templateFixture();try{
-  let options:any,sends=0;f.io.spawn=(_args:any,opts:any)=>{sends++;options=opts;return {stdout:new Response('').body,stderr:new Response('').body,exited:Promise.resolve(143)};};
-  await f.loop.tick(f.id);expect(options).toEqual({stdout:'pipe',stderr:'pipe',timeout:30000});expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+ const f=templateFixture(),state=mkdtempSync(join(tmpdir(),'adlc-remediation-timeout-')),turns=turnBarrier(state);let child:ReturnType<typeof Bun.spawn>|undefined;
+ try{
+  let options:any,sends=0,started!:()=>void;const spawned=new Promise<void>(resolve=>started=resolve);f.io.submit=turns.submit;
+  f.io.spawn=(_args:any,opts:any)=>{sends++;options=opts;child=Bun.spawn([process.execPath,'-e','await Bun.sleep(60000)'],{...opts,timeout:200,env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:state}});started();return child;};
+  const delivery=f.loop.tick(f.id);await spawned;expect(child!.exitCode).toBeNull();await expect(turnBarrier(state).run(async()=>{})).rejects.toThrow('in progress');
+  await delivery;expect(child!.exitCode).not.toBe(0);expect(child!.signalCode).toBe('SIGTERM');await turnBarrier(state).run(async()=>{});
+  expect(options).toEqual({stdout:'pipe',stderr:'pipe',timeout:30000});expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(sends).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
- }finally{f.s.close();}
+ }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}f.s.close();rmSync(state,{recursive:true,force:true});}
 });
