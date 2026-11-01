@@ -673,14 +673,28 @@ failures may be fixed by editing only a PR description, for example:
 ```
 
 The wizard can collect these names. They are added to the readiness gate as
-required checks, even for existing registered PRs. The bridge verifies the failed
-job’s repository, check-run ID, and PR head before reading its failure logs. It
-sends the relevant errors to the existing worker under its current approval and
+required checks, even for existing registered PRs.
+
+**Current production limitation:** GitHub check/job responses do not attest which
+PR description they evaluated, so production evidence has `descriptionHash: null`.
+Configured metadata checks therefore cannot authorize automatic findings or
+PR-description remediation, even when the check succeeds. Otherwise-clear checks
+wait up to five minutes for body-bound evidence and then block for inspection;
+unattested failures block for inspection without sending remediation. This remains
+fail-closed until a trustworthy body-bound attestation source is implemented.
+An empty `prMetadataChecks` policy skips this additional body-evidence gate; it
+does not bypass other required checks or CodeRabbit approval.
+
+The remediation flow below requires that future attestation support. In addition
+to body evidence, the bridge verifies the failed job’s repository, check-run ID,
+and PR head before reading its failure logs. Only a body-bound failure can send
+the relevant errors to the existing worker under its current approval and
 `open-pr` grant. The worker must use the current repository template, preserve
 truthful verification evidence, and make description changes only. It may not
 change application code, validators, workflows, or protections to pass the check.
 
-Description edits must produce a fresh check result. A repeated old failure
+Description edits must produce a check result bound to the current description;
+check timestamps or a matching commit/check ID alone are not proof. A repeated old failure
 waits up to five minutes rather than immediately consuming another remediation
 attempt; a new failed check can be addressed within the configured per-project
 remediation budget (five attempts by default). After CI clears, CodeRabbit is reevaluated on the current commit and
