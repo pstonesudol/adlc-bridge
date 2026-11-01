@@ -62,5 +62,5 @@ export function recoveryTransport(s:Store,run:ProcessRunner=command,evidence:typ
   return {session:e.session.id,project:e.session.projectId,reserved:r.branch,worktree:w.tree,branch:w.branch,head:w.head,anchor,clean,isolated:w.tree!==source&&registered&&common===sourceCommon,lineage,idle,completed:turn?.state==='completed',owners,candidates} satisfies DeliveryFacts;
  },
  async claim(session,url){await run([AO,'session','claim-pr',session,url,'--no-takeover','--json']);},
- async attached(session,url){const e=await evidence(session);return !e.session.isTerminated&&e.session.prs?.filter((p:any)=>p.url===url&&p.state==='open').length===1;}
+ async attached(session,url){const e=await evidence(session);return e.session.isTerminated===false&&e.session.prs?.filter((p:any)=>p.url===url&&p.state==='open').length===1;}
 };}

@@ -131,6 +131,8 @@ test('attached requires one open PR on a non-terminated session',async()=>{
   prs.push({state:'open',number:7,url});expect(await t().attached('worker',url)).toBe(false);
   prs.pop();prs[0].state='closed';expect(await t().attached('worker',url)).toBe(false);
   prs[0].state='open';f.state.evidence.session.isTerminated=true;expect(await t().attached('worker',url)).toBe(false);
-  expect(seen).toEqual(['worker','worker','worker','worker']);
+  f.state.evidence.session.isTerminated=false;expect(await t().attached('worker',url)).toBe(true);
+  delete f.state.evidence.session.isTerminated;expect(await t().attached('worker',url)).toBe(false);
+  expect(seen).toEqual(['worker','worker','worker','worker','worker','worker']);
  }finally{f.cleanup();}
 });

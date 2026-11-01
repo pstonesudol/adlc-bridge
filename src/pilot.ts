@@ -12,7 +12,7 @@ import {worktreeIdentity} from './delivery-evidence';
 
 export async function adoptPilot(s:Store,job:string,session:string){
  const evidence=await sessionEvidence(session),r=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
- if(!r||evidence.session.projectId!==r.project||evidence.session.branch!==r.branch||evidence.session.isTerminated||evidence.transcript.controller!=='ready')throw Error('Expected idle existing planning worker');
+ if(!r||evidence.session.projectId!==r.project||evidence.session.branch!==r.branch||evidence.session.isTerminated!==false||evidence.transcript.controller!=='ready')throw Error('Expected idle existing planning worker');
  return new Lifecycle(s).adoptSupervised(job,{id:session,correlation:r.correlation,worktree:r.worktree,controller:'running'});
 }
 // A host-driven tick observes only. No quiet/absent review becomes approval.

@@ -75,7 +75,7 @@ export class ReviewLoop{
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   l.recordRemediationPolicy(job,remediationPolicy);
   const session=await sessionEvidence(run.session_id);
-   if(session.session.isTerminated||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
+   if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
    try{
     const snapshot=await readBranchSnapshot(t.repo,t.pr),local=await worktreeIdentity(this.s,job);
     assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);

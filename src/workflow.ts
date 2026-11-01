@@ -157,7 +157,7 @@ export class Workflow{
   let e;
   try{
    e=await this.t.evidence(d.session_id);
-   if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Execution session mismatch');
+   if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated!==false)throw Error('Execution session mismatch');
   }catch(err){
    this.s.db.query("UPDATE implementation_dispatch SET state='needs_reconciliation',reason='Execution evidence refresh failed; handoff not confirmed' WHERE job=? AND state='pr_handoff'").run(job);
    throw err;

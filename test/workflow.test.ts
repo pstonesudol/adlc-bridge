@@ -131,6 +131,15 @@ test('terminated session invalidates a recorded handoff',async()=>{
  expect(w.implementation(id).state).toBe('needs_reconciliation');
  s.close();
 });
+test('missing termination evidence invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ delete f.sessions.get('session-1').session.isTerminated;
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('Execution session mismatch');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
 test('evidence failure preserves a newer dispatch blocker',async()=>{
  const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
  await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
