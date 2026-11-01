@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {validateVerification,verificationInstructions,runVerification as runConfiguredVerification,type Verification} from '../src/verification';
+import {validateVerification,verificationInstructions,assertVerificationRepository,runVerification as runConfiguredVerification,type Verification} from '../src/verification';
 import {validateRuntime,runtimeServiceDefinition,setupPreview,sanitizedSetup,type RuntimeConfig} from '../src/setup';
 import {validate} from '../src/linear';
 import {codeRemediationInstructions} from '../src/pilot';
@@ -100,5 +100,20 @@ test('verification rejects a different repository and accepts a linked worktree 
   const config=join(root,'project.json');writeFileSync(config,JSON.stringify(project(a,host)));
   const cli=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'verification',config,b,'--run'],{stdout:'pipe',stderr:'pipe'});
   expect(cli.exitCode).not.toBe(0);expect(cli.stderr.toString()).toContain('different project repository');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('repository identity supports pre-2.31 relative common-dir output and absolute linked-worktree output (mocked Git)',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-legacy-git-test-'));
+ try{
+  const repo=join(root,'repo'),linked=join(root,'linked'),other=join(root,'other');
+  mkdirSync(join(repo,'.git'),{recursive:true});mkdirSync(linked);mkdirSync(join(other,'.git'),{recursive:true});
+  const commands:string[][]=[];
+  const inspect=((args:string[])=>{commands.push(args);return {exitCode:0,stdout:Buffer.from(args.includes('--path-format=absolute')?'--path-format=absolute\n.git\n':args[2]===linked?join(repo,'.git')+'\n':'.git\n')};}) as any;
+  expect(()=>assertVerificationRepository(repo,repo,inspect)).not.toThrow();
+  expect(()=>assertVerificationRepository(linked,repo,inspect)).not.toThrow();
+  expect(()=>assertVerificationRepository(other,repo,inspect)).toThrow('different project repository');
+  expect(commands.every(args=>args.length===5&&args[3]==='rev-parse'&&args[4]==='--git-common-dir')).toBe(true);
+  const failed=(()=>({exitCode:1,stdout:Buffer.from('')})) as any;
+  expect(()=>assertVerificationRepository(repo,repo,failed)).toThrow('Valid project repository/worktree required');
  }finally{rmSync(root,{recursive:true,force:true});}
 });

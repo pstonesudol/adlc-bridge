@@ -49,8 +49,8 @@ export const planningGateMarker='ADLC_RESERVED_WORKTREE_GATE_V1';
 export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir,'planning-gate.ts')){
  if(!Array.isArray(scripts)||scripts.some(x=>typeof x!=='string'))throw Error('Unexpected setup scripts');
  const hook=`${shellQuote(process.execPath)} ${shellQuote(gate)} # ${planningGateMarker}`;
- // Recognize pre-marker hooks by their gate filename, not installation directory.
- const legacyGate=/^(?:'[^']*bun'|"[^"]*bun"|\S*bun)\s+(?:'[^']*\/planning-gate\.ts'|"[^"]*\/planning-gate\.ts"|\S*\/planning-gate\.ts)\s*$/;
+ // Recognize pre-marker Bridge src gates, not unrelated user scripts or installation directory names.
+ const legacyGate=/^(?:'[^']*bun'|"[^"]*bun"|\S*bun)\s+(?:'[^']*\/src\/planning-gate\.ts'|"[^"]*\/src\/planning-gate\.ts"|\S*\/src\/planning-gate\.ts)\s*$/;
  const prior=scripts.filter((x:string)=>!x.includes(planningGateMarker)&&!legacyGate.test(x)&&!x.includes('ADLC execution disabled pending host approval gate'));
  return [hook,...prior];
 }
