@@ -40,7 +40,7 @@ function runtimeMigration(state:string,home:string,io:typeof installIO){
 }
 export async function installBridge(apply=false,root=resolve(import.meta.dir,'..'),bin?:string,io=installIO){
   if(root.includes('/ADLC Bridge/versions/'))root=verifiedInstallationSource(io.state())??root;
- const projects=await io.registeredProjects();
+ const projects=await io.registeredProjects(!apply);
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}
  const definitions=projects.map(p=>{const path=join(io.home(),'Library/LaunchAgents',p.label+'.plist');if(!existsSync(path))return {p,path,def:null,original:null};const def=io.readDefinition(path);io.assertDefinition(def,p.label,p.config);return {p,path,def,original:readFileSync(path)};});

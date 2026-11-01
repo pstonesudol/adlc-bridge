@@ -40,3 +40,10 @@ test('snapshot reinstalls use only a verified installation source and preserve t
   const other=join(root,'other-record');writeFileSync(other,JSON.stringify(valid),{mode:0o600});rmSync(record);symlinkSync(other,record);await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('owner-only');expect(reads).toBe(0);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('install uses read-only project discovery for preview and writable discovery for apply',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-install-discovery-'));try{
+  const source=join(root,'source'),state=join(root,'state'),modes:boolean[]=[];mkdirSync(join(source,'src'),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'test cli');
+  const io:any={state:()=>state,home:()=>root,registeredProjects:async(readOnly:boolean)=>{modes.push(readOnly);return [];}};
+  await installBridge(false,source,join(root,'adlc'),io);expect(existsSync(join(state,'installation.json'))).toBe(false);await installBridge(true,source,join(root,'adlc'),io);expect(modes).toEqual([true,false]);expect(existsSync(join(state,'installation.json'))).toBe(true);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});

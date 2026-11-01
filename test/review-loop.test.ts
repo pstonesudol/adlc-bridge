@@ -174,3 +174,9 @@ test('failed or ambiguous active-session evidence replaces a previously ready re
   }finally{f.s.close();}
  }
 });
+test('readiness collection failure replaces stale ready state with a durable send-disabled blocker',async()=>{
+ const f=templateFixture();try{
+  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.io.readiness=async()=>{throw Error('GitHub readiness unavailable');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'GitHub readiness unavailable'});expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason:'GitHub readiness unavailable'});expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});

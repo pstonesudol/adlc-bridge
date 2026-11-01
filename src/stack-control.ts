@@ -98,10 +98,10 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
   }
   return blocked;
  };
- const snapshot=await read(s.port,'sessions');if(!Array.isArray(snapshot?.sessions))throw Error('Cannot verify worker inventory; backend preserved');
+ const snapshot=await read(s.port,'sessions');if(!Array.isArray(snapshot?.sessions)||snapshot.nextCursor)throw Error('Cannot verify worker inventory; backend preserved');
  const blocked=await scan(snapshot.sessions);
  // Re-read turns as well as activity: idle activity can lag a newly queued turn.
- const latest=await read(s.port,'sessions');if(!Array.isArray(latest?.sessions))throw Error('Cannot recheck workers; backend preserved');
+ const latest=await read(s.port,'sessions');if(!Array.isArray(latest?.sessions)||latest.nextCursor)throw Error('Cannot recheck workers; backend preserved');
  blocked.push(...await scan(latest.sessions));
  const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
  return blocked;

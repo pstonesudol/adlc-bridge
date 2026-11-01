@@ -1,10 +1,10 @@
 import {test,expect} from 'bun:test';import {assertIdle,assertCleanup} from '../src/maintenance';
-import {maintenance,maintenanceGitHub} from '../src/maintenance';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {ReviewLoop} from '../src/review-loop';import {BranchUpdates} from '../src/branch-updates';
+import {maintenance,maintenanceGitHub} from '../src/maintenance';import {Store,digest} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {ReviewLoop} from '../src/review-loop';import {BranchUpdates} from '../src/branch-updates';import {DeliveryRecovery} from '../src/delivery-recovery';
 import {mkdtempSync,mkdirSync,realpathSync,writeFileSync,rmSync,readFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
-const e=()=>({session:{id:'worker',branch:'adlc/feature',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[{state:'completed'}]}});
+const e=()=>({session:{id:'worker',branch:'adlc/feature',isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[{state:'completed'}]}});
 const uuid=(n:number)=>`00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
 test('maintenance refuses queued or unknown turns and missing controller evidence',()=>{expect(()=>assertIdle(e())).not.toThrow();expect(()=>assertIdle({...e(),transcript:{controller:'ready',turns:[{state:'queued'}]}})).toThrow('active');expect(()=>assertIdle({})).toThrow('uncertain');});
-test('cleanup requires observed completion, exact session, owned PR and actual merge',()=>{const j={state:'done'},r={state:'completed',owner:'orchestrator',session_id:'worker'},t={state:'completed',repo:'owner/repo',pr:1},pr={merged:true,head:{ref:'adlc/feature',repo:{full_name:'owner/repo'}}};expect(()=>assertCleanup(j,r,t,e(),pr)).not.toThrow();expect(()=>assertCleanup(j,r,t,e(),{...pr,merged:false})).toThrow('Merged');expect(()=>assertCleanup(j,{...r,session_id:'other'},t,e(),pr)).toThrow('match');expect(()=>assertCleanup({state:'approved'},r,t,e(),pr)).toThrow('completed');});
+test('cleanup requires observed completion, exact session, owned PR and actual merge',()=>{const j={state:'done'},r={state:'completed',owner:'orchestrator',session_id:'worker'},t={state:'completed',repo:'owner/repo',pr:1},pr={merged:true,head:{ref:'adlc/feature',repo:{full_name:'owner/repo'}}};expect(()=>assertCleanup(j,r,t,e(),pr,'adlc/feature')).not.toThrow();expect(()=>assertCleanup(j,r,t,e(),{...pr,merged:false},'adlc/feature')).toThrow('Merged');expect(()=>assertCleanup(j,{...r,session_id:'other'},t,e(),pr,'adlc/feature')).toThrow('match');expect(()=>assertCleanup({state:'approved'},r,t,e(),pr,'adlc/feature')).toThrow('completed');});
 function fixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-maintenance-'))),repo=join(root,'repo'),tree=join(root,'tree');mkdirSync(repo);mkdirSync(tree);
  const git=(...args:string[])=>{const r=Bun.spawnSync(['/usr/bin/git','-C',tree,...args]);if(r.exitCode)throw Error(r.stderr.toString());return r.stdout.toString().trim();};
@@ -112,4 +112,20 @@ test('maintenance GitHub commands have a bounded timeout and reject failed recei
   const result=maintenanceGitHub('repos/owner/repo/pulls/1',spawn);if(code===0)expect(await result).toEqual({state:'open'});else await expect(result).rejects.toThrow('GitHub inspection failed');
   expect(calls).toEqual([{args:['gh','api','repos/owner/repo/pulls/1'],options:{stdout:'pipe',stderr:'pipe',timeout:30000}}]);
  }
+});
+test('cleanup inspection accepts a verified adopted branch but rejects missing or stale adoption evidence',async()=>{
+ const f=fixture();try{
+  f.done();f.pr.head.ref='adlc/adopted-delivery';await expect(maintenance(f.s,'cleanup',f.id,false,undefined,f.io)).rejects.toThrow('Merged PR and owned session must match');
+  new DeliveryRecovery(f.s,{} as any).install();const job=f.s.get(f.id);
+  f.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,'proposal','adopted','worker',f.tree,f.evidence.session.branch,f.pr.head.ref,'owner/repo',1,f.pr.head.sha,'anchor',job.plan_hash,digest(job.spec),'{}');
+  expect(await maintenance(f.s,'cleanup',f.id,false,undefined,f.io)).toMatchObject({preview:true,applySupported:false});expect(f.writes).toEqual([]);
+  f.s.db.exec("UPDATE delivery_adoptions SET spec_hash='stale'");await expect(maintenance(f.s,'cleanup',f.id,false,undefined,f.io)).rejects.toThrow('stale or mismatched');
+ }finally{f.close();}
+});
+test('recovery requires explicitly nonterminated evidence on the initial and final session reads',async()=>{
+ for(const bad of [undefined,null,true])for(const stage of ['initial','final']){const f=fixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);let reads=0;
+  f.io.sessionEvidence=async()=>{const evidence:any=structuredClone(f.evidence);if(++reads===(stage==='initial'?1:2)){if(bad===undefined)delete evidence.session.isTerminated;else evidence.session.isTerminated=bad;}return evidence;};
+  await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('matching active agent-owned PR session');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}}
 });

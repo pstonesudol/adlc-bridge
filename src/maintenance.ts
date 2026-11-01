@@ -1,13 +1,14 @@
 import {existsSync,realpathSync} from 'node:fs';
 import {Lifecycle} from './lifecycle';
+import {deliveryBranch} from './delivery-identity';
 import {remediationPolicy} from './remediation';
 import {metadataCheckNames,validate} from './linear';
 import {Store,digest} from './core';import {sessionEvidence} from './session-evidence';import {ProjectServices,registryPath} from './project-services';import {readFileSync} from 'node:fs';import {localAO} from './workflow-transport';import {ReviewLoop} from './review-loop';import {poll} from './linear';import {linearToken} from './credential';
 export async function maintenanceGitHub(path:string,spawn=Bun.spawn){const p=spawn(['gh','api',path],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub inspection failed');return JSON.parse(out);}
 export function assertIdle(e:any){if(!['ready','stopped'].includes(e?.transcript?.controller)||!Array.isArray(e.transcript?.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','interrupted','cancelled','recovered'].includes(t?.state)))throw Error('Worker is active or activity is uncertain');}
-export function assertCleanup(j:any,run:any,target:any,e:any,pr:any){
+export function assertCleanup(j:any,run:any,target:any,e:any,pr:any,branch:string){
  if(j.state!=='done'||run.state!=='completed'||target.state!=='completed'||run.owner!=='orchestrator')throw Error('Only completed agent-owned jobs can be cleaned');
- if(e.session.id!==run.session_id||e.session.branch!==pr.head?.ref||!e.session.prs?.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`)||!pr.merged||pr.head?.repo?.full_name!==target.repo)throw Error('Merged PR and owned session must match');
+ if(e.session.id!==run.session_id||branch!==pr.head?.ref||!e.session.prs?.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`)||!pr.merged||pr.head?.repo?.full_name!==target.repo)throw Error('Merged PR and owned session must match');
  assertIdle(e);
 }
 function registrations(){const r=new Store(registryPath());try{return new ProjectServices(r).list();}finally{r.close();}}
@@ -29,7 +30,7 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
   linear:{projectId:c.linear.projectId,teamId:c.linear.teamId??null,readyStateId:c.linear.readyStateId??null,readyLabelId:c.linear.readyLabelId??null},
   statusSync:c.statusSync?.enabled?{enabled:true,inProgress:c.statusSync.inProgress,inReview:c.statusSync.inReview,done:c.statusSync.done}:{enabled:false}}};
  if(action==='cleanup'){
-  assertCleanup(j,run,target,e,pr);
+  assertCleanup(j,run,target,e,pr,deliveryBranch(s,job,e.session,target.repo,target.pr));
   const tree=e.session.worktree??run.worktree;if(!tree||!existsSync(tree)||realpathSync(tree)===realpathSync(c.repo)||realpathSync(tree)!==realpathSync(run.worktree))throw Error('Verified isolated worktree required');
   const git=(args:string[])=>{const r=Bun.spawnSync(['/usr/bin/git','-C',tree,...args]);if(r.exitCode!==0)throw Error('Cannot verify worktree');return r.stdout.toString().trim();};
   if(git(['status','--porcelain','--untracked-files=all','--ignored']).length||git(['rev-parse','HEAD'])!==pr.head.sha)throw Error('Worktree has changes, ignored files or differs from merged PR head; preserved');
@@ -45,7 +46,7 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  const assertRecovery=(e:any)=>{
   assertIdle(e);
   const l=new Lifecycle(s),current=l.current(job),active=l.run(job);
-  if(current.plan_hash!==j.plan_hash||!active||active.owner!=='orchestrator'||active.state!=='running'||active.plan_hash!==current.plan_hash||active.session_id!==run.session_id||e.session?.id!==active.session_id||e.session.isTerminated||e.session.projectId!==c.automation.orchestratorProject||e.session.branch!==pr.head.ref||!Array.isArray(e.session.prs)||!e.session.prs.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`))throw Error('Recovery requires current approval and the matching active agent-owned PR session');
+  if(current.plan_hash!==j.plan_hash||!active||active.owner!=='orchestrator'||active.state!=='running'||active.plan_hash!==current.plan_hash||active.session_id!==run.session_id||e.session?.id!==active.session_id||e.session.isTerminated!==false||e.session.projectId!==c.automation.orchestratorProject||e.session.branch!==pr.head.ref||!Array.isArray(e.session.prs)||!e.session.prs.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`))throw Error('Recovery requires current approval and the matching active agent-owned PR session');
  };
  assertRecovery(e);
  const rows=s.db.query("SELECT * FROM branch_updates WHERE job=? AND state='delivery_uncertain'").all(job) as any[];

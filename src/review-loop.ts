@@ -104,7 +104,9 @@ export class ReviewLoop{
   const branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);
   if(branch)return this.record(job,branch);
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
-  const e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);
+  let e;
+  try{e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);}
+  catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
   if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');
   const since=t.head===e.head?t.head_since:Date.now();
   // A same-SHA approval can predate a description edit. Reconcile metadata

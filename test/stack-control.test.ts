@@ -36,3 +36,9 @@ test('daemon status handles both stopped states and fails closed on errors or ma
  expect(()=>daemonStatus({stdout:'{"state":"stopped"}',code:1})).toThrow('readiness is unknown');
  expect(daemonStatus({stdout:'{"state":"ready","port":3001}',code:0})).toMatchObject({ready:true,port:3001});
 });
+test('paginated initial or rechecked inventories preserve the backend during stop',async()=>{
+ for(const cursorAt of [1,2]){const f=fixture();let lists=0;
+  f.ops.blockers=()=>workerBlockers('/ao',inspect,async(_port,path)=>path==='sessions'?{sessions:[idle],nextCursor:++lists===cursorAt?'more':null}:{turns:[]});
+  await expect(controlStack('stop',f.ops)).rejects.toThrow(cursorAt===1?'Cannot verify worker inventory':'Cannot recheck workers');expect(f.calls).toEqual(['stop:one','stop:two']);expect(f.calls).not.toContain('backend:stop');
+ }
+});
