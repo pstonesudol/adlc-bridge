@@ -96,6 +96,32 @@ test('real template remediation persists baselines, sends once, waits for CI and
  e.clear=true;e.botReviewSubmittedAt=Date.now()+1000;expect((await loop.tick(id)).state).toBe('ready_for_human');expect(f.sends()).toBe(1);
  }finally{s.close();}
 });
+test('same-head B-to-C edits retain the metadata gate and require C evidence plus a fresh review',async()=>{
+ const f=templateFixture();try{
+  const started=Date.now()-1000;f.e.descriptionHash='body-B';
+  f.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(f.id,f.head,'body-B',f.e.templateSignature,started);
+  f.e.failedChecks=[];f.e.findings=[];f.e.clear=true;f.e.botReviewSubmittedAt=started+1;f.e.metadataCheckEvidence=bodyEvidence(f.e);
+  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+  f.e.descriptionHash='body-C';expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
+  const current=f.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? AND body=?').get(f.id,f.head,'body-C') as any;
+  expect(current.started).toBeGreaterThan(started);expect(current.signature).toBe(f.e.templateSignature);
+  f.e.clear=false;f.e.reasons=['CodeRabbit approval missing'];await f.loop.tick(f.id);expect(f.reviews()).toBe(0);
+  f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');await f.loop.tick(f.id);expect(f.reviews()).toBe(1);
+  f.e.clear=true;expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.sends()).toBe(0);
+  // Reverting to an earlier body must not revive its old wait/review clock.
+  f.e.descriptionHash='body-B';f.e.metadataCheckEvidence=bodyEvidence(f.e);f.e.botReviewSubmittedAt=current.started;
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  const reverted=f.s.db.query('SELECT started FROM metadata_waits WHERE job=? AND head=? AND body=?').get(f.id,f.head,'body-B') as any;expect(reverted.started).toBeGreaterThan(current.started);
+ }finally{f.s.close();}
+});
+test('same-head description edits preserve stale failure suppression but allow fresh metadata failure remediation',async()=>{
+ const f=templateFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='body-B';await f.loop.tick(f.id);
+  f.e.descriptionHash='body-C';expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');expect(f.sends()).toBe(1);expect(f.reviews()).toBe(0);
+  f.e.templateSignature='fresh-C-failure';f.e.findings[0].descriptionHash='body-C';f.e.findings[0].checkId=2;f.e.failedChecks[0].id=2;
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(2);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
 test('real pilot remediation rejects stale description, check identity and SHA before reserving or sending',async()=>{
  for(const changed of [{descriptionHash:'changed'},{checkId:2},{sha:'changed'}]){const f=templateFixture();try{const findings=JSON.stringify([{...f.e.findings[0],...changed}]);await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,['PR body structure'],f.io)).rejects.toThrow('Template failure changed');expect(f.sends()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);}finally{f.s.close();}}
 });

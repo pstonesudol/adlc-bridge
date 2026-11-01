@@ -137,7 +137,16 @@ export class ReviewLoop{
     this.s.db.query('INSERT OR IGNORE INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,baseline?.signature??e.templateSignature,Date.now());
    }).immediate();
   }
-   const waiting=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? AND body=?').get(job,e.head,e.descriptionHash) as any;
+   // Once metadata remediation creates a gate, another same-head body edit
+   // cannot escape it. Carry its baseline forward and restart review freshness
+   // for each newly observed body, including a return to an earlier body.
+   const waiting=this.s.db.transaction(()=>{
+    const prior=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? ORDER BY started DESC,rowid DESC LIMIT 1').get(job,e.head) as any;
+    if(!prior||prior.body===e.descriptionHash)return prior;
+    const started=Math.max(Date.now(),prior.started+1);
+    this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?) ON CONFLICT(job,head,body) DO UPDATE SET signature=excluded.signature,started=excluded.started').run(job,e.head,e.descriptionHash,prior.signature,started);
+    return {...prior,body:e.descriptionHash,started};
+   }).immediate();
    if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks)){
     return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; missing body-bound success evidence for every configured metadata check'});
    }
