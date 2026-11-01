@@ -2,7 +2,6 @@ import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
-import {adoptedDelivery} from './delivery-identity';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 const driftBody=(reason:string)=>reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.';
@@ -137,12 +136,8 @@ export class LinearLifecycle{
    }
    let branchMismatch=false;
    const delivery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()
-    ?this.s.db.query('SELECT reason FROM implementation_dispatch WHERE job=?').get(row.id) as any:null;
+    ?this.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(row.id) as any:null;
    const review=this.s.db.query('SELECT repo,pr,state,reason FROM review_targets WHERE job=?').get(row.id) as any;
-   if(review?.reason?.startsWith('Blocked — branch mismatch')&&adoptedDelivery(this.s,row.id)){
-    this.s.db.query('UPDATE review_targets SET reason=NULL WHERE job=? AND reason=?').run(row.id,review.reason);
-    review.reason=null;
-   }
    const reason=[delivery?.reason,review?.reason].find((r:any)=>r?.startsWith('Blocked — branch mismatch'));
    if(reason){
     branchMismatch=true;
@@ -157,7 +152,7 @@ export class LinearLifecycle{
     else if(facts.state!=='open'){results.push({job:row.id,state:'blocked',reason:'PR closed without merge; not marking Done'});continue;}
     else{if(row.state==='blocked')continue;phase='in-review';desired=c.statusSync.inReview;}
    }
-   if((row.state==='blocked'||branchMismatch||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
+   if((row.state==='blocked'||branchMismatch||delivery?.state==='blocked'||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
    const result=await this.move(row.id,phase,desired,c,row.spec_hash);results.push({job:row.id,phase,...result});
    if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
     this.assertSpecification(row.id,row.spec_hash);

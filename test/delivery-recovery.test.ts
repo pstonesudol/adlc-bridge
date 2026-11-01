@@ -6,6 +6,7 @@ import {Lifecycle} from '../src/lifecycle';
 import {DeliveryRecovery,type DeliveryFacts} from '../src/delivery-recovery';
 import {deliveryBranch,assertDeliveryTarget} from '../src/delivery-identity';
 import {BranchUpdates} from '../src/branch-updates';
+import {ReviewLoop} from '../src/review-loop';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -62,6 +63,15 @@ test('repeated confirmation preserves a later blocker and does not report handof
   f.s.db.query("UPDATE implementation_dispatch SET state='blocked',reason='Later review blocker' WHERE job=?").run(f.id);
   await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('reconciliation required');
   expect(f.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(f.id)).toEqual({state:'blocked',reason:'Later review blocker'});
+ }finally{f.s.close();}
+});
+test('adoption clears a stale review branch-mismatch reason',async()=>{
+ const f=fixture();try{
+  new ReviewLoop(f.s);
+  const reason='Blocked — branch mismatch: reserved old; actual new';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBeNull();
  }finally{f.s.close();}
 });
 test('confirmation rejects a revoked feature PR grant before claiming',async()=>{

@@ -48,7 +48,7 @@ test('another blocked review identity failure stays out of in-review',async()=>{
   expect(f.state).toBe('todo');expect(f.updates).toBe(0);
  }finally{f.s.close();}
 });
-test('adopted delivery clears a stale review branch-mismatch blocker',async()=>{
+test('post-adoption review branch mismatch remains a blocker',async()=>{
  const f=fixture();try{
   const p=f.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(f.id) as any;
   new DeliveryRecovery(f.s,{} as any).install();
@@ -56,9 +56,17 @@ test('adopted delivery clears a stale review branch-mismatch blocker',async()=>{
   const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; preview recover-handoff';
   f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
   const result=await f.sync.sync(c);
-  expect(result[0]).toEqual({job:f.id,phase:'in-review',state:'confirmed'});
-  expect(f.state).toBe('review');expect(f.updates).toBe(1);expect(f.posted.length).toBe(0);
-  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBeNull();
+  expect(result[0]).toEqual({job:f.id,state:'blocked',reason});
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);expect(f.posted.length).toBe(1);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBe(reason);
+ }finally{f.s.close();}
+});
+test('blocked dispatch identity failure stays out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','blocked','["src/**"]','supervised-host','human','Worktree and remote PR HEAD differ; reconcile before handoff');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
  }finally{f.s.close();}
 });
 function budgetBlocked(){
