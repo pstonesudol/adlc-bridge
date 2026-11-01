@@ -11,7 +11,7 @@ import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
 import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
-import {setupPreview,writeSetupService,sanitizedSetup} from './setup';
+import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime} from './setup';
 import {verificationInstructions,runVerification} from './verification';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
@@ -91,7 +91,14 @@ async function main(){
     const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(c);
     if(!a.includes('--run'))return console.log(verificationInstructions(c.verification));
     if(!c.verification)throw Error('Project verification is not configured');
-    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification);out(result);if(!result.passed)process.exitCode=1;return;
+    let docker;
+    if(c.verification.mode==='container'){
+      const i=a.indexOf('--runtime');if(i<0)throw Error('Container verification requires --runtime RUNTIME_JSON');
+      const runtime=JSON.parse(readFileSync(req(a[i+1],'Runtime config'),'utf8'));validateRuntime(runtime);
+      if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
+      docker=runtime.tools.docker;
+    }
+    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker});out(result);if(!result.passed)process.exitCode=1;return;
   }
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
@@ -109,6 +116,7 @@ async function main(){
     [--write-service]                   create staged definition only; no activation
     [--export]                          print sanitized, disabled setup template
   verification CONFIG [WORKTREE]        instructions; --run requires worktree
+    --runtime RUNTIME_JSON              required for container execution; pins Docker
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
