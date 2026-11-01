@@ -27,12 +27,12 @@ const probeDocker=(pin:DockerPin)=>{
  const p=Bun.spawnSync([pin.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
  return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===pin.version||x===`v${pin.version}`);
 };
-export function assertVerificationRepository(worktree:string,projectRepo?:string){
+export function assertVerificationRepository(worktree:string,projectRepo?:string,inspect:typeof Bun.spawnSync=Bun.spawnSync){
  if(typeof projectRepo!=='string'||!isAbsolute(projectRepo))throw Error('Configured project repository required');
  const common=(repo:string)=>{
-  const p=Bun.spawnSync(['git','-C',repo,'rev-parse','--path-format=absolute','--git-common-dir'],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
+  const p=inspect(['git','-C',repo,'rev-parse','--git-common-dir'],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
   if(p.exitCode!==0)throw Error('Valid project repository/worktree required');
-  return realpathSync(p.stdout.toString().trim());
+  return realpathSync(resolve(repo,p.stdout.toString().trim()));
  };
  if(common(worktree)!==common(projectRepo))throw Error('Verification worktree belongs to a different project repository');
 }
