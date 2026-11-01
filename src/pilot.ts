@@ -7,19 +7,25 @@ import {AO} from './orchestrator';
 import {readiness} from './github';
 import {DEFAULT_REMEDIATION_POLICY,formatRemediationBudget,type RemediationPolicy} from './remediation';
 import {withTurnSubmission} from './turn-submission';
+import {assertDeliveryTarget} from './delivery-identity';
+import {readBranchSnapshot} from './branch-updates';
+import {worktreeIdentity} from './delivery-evidence';
 
 export async function adoptPilot(s:Store,job:string,session:string){
  const evidence=await sessionEvidence(session),r=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
- if(!r||evidence.session.projectId!==r.project||evidence.session.branch!==r.branch||evidence.session.isTerminated||evidence.transcript.controller!=='ready')throw Error('Expected idle existing planning worker');
+ if(!r||evidence.session.projectId!==r.project||evidence.session.branch!==r.branch||evidence.session.isTerminated!==false||evidence.transcript.controller!=='ready')throw Error('Expected idle existing planning worker');
  return new Lifecycle(s).adoptSupervised(job,{id:session,correlation:r.correlation,worktree:r.worktree,controller:'running'});
 }
 // A host-driven tick observes only. No quiet/absent review becomes approval.
-const pilotIO={sessionEvidence,readiness,spawn:Bun.spawn,submit:withTurnSubmission};
+const pilotIO={sessionEvidence,readiness,spawn:Bun.spawn,submit:withTurnSubmission,readBranchSnapshot,worktreeIdentity};
 export async function observePilot(s:Store,job:string,repo:string,pr:number,required:string[],metadataChecks:string[]=[],io=pilotIO){
  new Lifecycle(s).current(job);
  const r=new Lifecycle(s).run(job);if(!r)throw Error('Adopt existing pilot first');
  const e=await io.sessionEvidence(r.session_id);
  if(!e.session.prs?.some((p:any)=>p.number===pr&&p.url===`https://github.com/${repo}/pull/${pr}`))throw Error('PR must be attached to this Orchestrator session');
+ const snapshot=await io.readBranchSnapshot(repo,pr),local=await io.worktreeIdentity(s,job);
+ assertDeliveryTarget(s,job,e.session,repo,pr,snapshot);
+ if(local.branch!==snapshot.branch)throw Error('Blocked — branch mismatch: worktree differs from verified delivery branch');
  const result=await io.readiness(repo,pr,required,metadataChecks);
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
@@ -31,7 +37,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
  const grant=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
  const j=l.current(job),operations=metadataOnly?['open-pr']:['commit','push-feature'];
  if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
- const e=await io.sessionEvidence(r.session_id);if(e.transcript.controller!=='ready')throw Error('Worker must be idle');
+ const e=await io.sessionEvidence(r.session_id);if(e.transcript.controller!=='ready'||!Array.isArray(e.transcript.turns)||e.transcript.turns.some((t:any)=>['running','queued'].includes(t.state)))throw Error('Worker must be idle with no queued work');
  const review=await observePilot(s,job,repo,pr,required,metadataChecks,io);
  if(review.head!==head||review.clear)throw Error('Current uncleared PR head required');
  if(parsed.some((f:any)=>f.source==='github-ci'&&(f.descriptionHash!==review.descriptionHash||!review.findings.some((x:any)=>x.source==='github-ci'&&x.checkId===f.checkId&&x.sha===f.sha))))throw Error('Template failure changed; recheck before delivery');

@@ -52,13 +52,13 @@ test('one project service cannot select another project’s PR targets',()=>{
 function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
- const session:any={session:{id:'session',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
- const io:any={readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
+ const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
   return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
  }};
- const loop=new ReviewLoop(s,async()=>{reviews++;},{readiness:io.readiness,sessionEvidence:io.sessionEvidence,disableNativeFeedback:async()=>({}),sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)} as any);
+ const loop=new ReviewLoop(s,async()=>{reviews++;},{readBranchSnapshot:io.readBranchSnapshot,worktreeIdentity:io.worktreeIdentity,readiness:io.readiness,sessionEvidence:io.sessionEvidence,disableNativeFeedback:async()=>({}),sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)} as any);
  loop.configureMetadataChecks('project',['PR body structure']);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
@@ -159,4 +159,18 @@ test('remediation send uses a bounded timeout and keeps a failed receipt uncerta
   expect(options).toEqual({stdout:'pipe',stderr:'pipe',timeout:30000});expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(sends).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
  }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}f.s.close();rmSync(state,{recursive:true,force:true});}
+});
+test('metadata review cannot bypass delivery worktree identity when branch updates are disabled',async()=>{
+ const f=templateFixture();try{
+  f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.loop.io.worktreeIdentity=async()=>({tree:'/worktree',branch:'unexpected',head:f.head});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});expect(f.loop.get(f.id).reason).toContain('branch mismatch');expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
+test('failed or ambiguous active-session evidence replaces a previously ready review with blocked state',async()=>{
+ for(const evidence of [async()=>{throw Error('evidence refresh failed');},async()=>({session:{isTerminated:undefined}})]){
+  const f=templateFixture();try{
+   f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.io.sessionEvidence=evidence as any;
+   expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.loop.get(f.id).state).toBe('blocked');expect(f.sends()).toBe(0);
+  }finally{f.s.close();}
+ }
 });

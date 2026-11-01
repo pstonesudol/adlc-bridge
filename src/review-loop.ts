@@ -1,4 +1,4 @@
-import {BranchUpdates,type BranchPolicy} from './branch-updates';
+import {BranchUpdates,branchTransport,type BranchPolicy} from './branch-updates';
 import {scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {Lifecycle} from './lifecycle';
@@ -12,6 +12,9 @@ function metadataFailureCovered(e:any,check:any){
  return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.checkId===check.id&&f.sha===e.head);
 }
 import {DEFAULT_REMEDIATION_POLICY,type RemediationPolicy} from './remediation';
+import {assertDeliveryTarget} from './delivery-identity';
+import {readBranchSnapshot} from './branch-updates';
+import {worktreeIdentity} from './delivery-evidence';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -32,8 +35,10 @@ async function postFullReview(repo:string,pr:number){
 export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
+const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity};
 export class ReviewLoop{
- constructor(public s:Store,public postReview=postFullReview,public io={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback}){s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
+ io:typeof reviewIO;
+ constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
   head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,
@@ -88,9 +93,15 @@ export class ReviewLoop{
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   l.recordRemediationPolicy(job,remediationPolicy);
-  const session=await this.io.sessionEvidence(run.session_id);
-  if(session.session.isTerminated||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
-  const branch=await new BranchUpdates(this.s).ensure(job,t.repo,t.pr,session,branchPolicy);
+  let session;
+  try{
+   session=await this.io.sessionEvidence(run.session_id);
+   if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
+   const snapshot=await this.io.readBranchSnapshot(t.repo,t.pr),local=await this.io.worktreeIdentity(this.s,job);
+   assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
+   if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
+  }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
+  const branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);
   if(branch)return this.record(job,branch);
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   const e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);

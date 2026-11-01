@@ -24,3 +24,4 @@ test('uncapped policy still stops at first uncertain result even if head and bas
 test('unlimited branch authorization must be explicit; malformed limits are rejected',async()=>{
  const f=fixture();try{for(const value of [undefined,0,-1,11,'unlimited'])await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:value as any})).rejects.toThrow('authorization');expect(f.calls()).toBe(0);}finally{f.s.close();}
 });
+test('disabled automatic updates do not bypass delivery branch validation',async()=>{const f=fixture();try{f.b.branch='unexpected';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('Blocked — branch mismatch');expect(f.calls()).toBe(0);}finally{f.s.close();}});

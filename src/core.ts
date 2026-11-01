@@ -8,10 +8,10 @@ export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocke
 export class Store {
   db: Database;
   static readonly(path:string){
-    const store=Object.create(Store.prototype) as Store;
-    store.db=new Database(path,{readonly:true,create:false});return store;
+    return new Store(path,true);
   }
-  constructor(path: string) {
+  constructor(path: string, readonly=false) {
+    if(readonly){this.db=new Database(path,{readonly:true,create:false});return;}
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });
     if (path !== ':memory:') chmodSync(path, 0o600);

@@ -8,11 +8,13 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
 
-const config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
+const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
 class Fake implements WorkflowTransport{
  starts:any[]=[];sends:any[]=[];sessions=new Map<string,any>();loseSpawn=false;loseSend=false;
  constructor(public s:Store){}
+ async worktree(){return {branch:this.starts[0].branch,head:'a'.repeat(40)};}
+ async branchSnapshot(){return {branch:this.starts[0].branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'};}
  async startPlan(r:any){
   this.starts.push(r);const id=`session-${this.starts.length}`;
   const row=this.s.db.query('SELECT job FROM planning_runs WHERE branch=?').get(r.branch) as any;
@@ -108,7 +110,7 @@ test('late PR metadata remains recoverable without sending implementation twice'
  f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');expect(f.sends.length).toBe(1);s.close();
 });
 
-test('recovery restores only unchanged eligible standing authorization for an existing PR',async()=>{
+test('recovery never restores revoked approval or resends implementation',async()=>{
  const {ApprovalPolicyStore}=await import('../src/approval-policy');
  const {s,f,w,id,hash}=await planned();
  const c={...config,githubRepo:'owner/repo',approval:{mode:'ready-queue' as const,id:'test',authorizedBy:'human',scope:['src/a.ts'],gitScope:'feature-pr' as const}};
@@ -116,9 +118,49 @@ test('recovery restores only unchanged eligible standing authorization for an ex
  w.approve(id,hash,'standing-policy:test',['src/a.ts'],'supervised-host',ops,{project:'p',policy:c.approval});
  await w.tick(c);f.finishImplementation();
  s.db.query("UPDATE jobs SET state='awaiting_approval',approved_hash=NULL,actor=NULL WHERE id=?").run(id);
- const e=f.sessions.get('session-1');e.session.branch='wrong';
- await expect(w.recoverHandoff(id,c)).rejects.toThrow('identity');e.session.branch=f.starts[0].branch;
- policy.snapshot('p',new Set());await expect(w.recoverHandoff(id,c)).rejects.toThrow('snapshot');
- policy.snapshot('p',new Set(['issue']));expect((await w.recoverHandoff(id,c)).pr.number).toBe(1);
- expect(s.get(id).state).toBe('approved');expect(f.sends.length).toBe(1);s.close();
+ await expect(w.recoverHandoff(id,c)).rejects.toThrow('approval');
+ expect(s.get(id).state).toBe('awaiting_approval');expect(f.sends.length).toBe(1);s.close();
+});
+
+test('evidence refresh failure invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ f.evidence=async()=>{throw Error('evidence unavailable');};
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('evidence unavailable');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
+test('terminated session invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ f.sessions.get('session-1').session.isTerminated=true;
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('Execution session mismatch');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
+test('missing termination evidence invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ delete f.sessions.get('session-1').session.isTerminated;
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('Execution session mismatch');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
+test('evidence failure preserves a newer dispatch blocker',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ s.db.query("UPDATE implementation_dispatch SET state='blocked',reason='Later blocker' WHERE job=?").run(id);
+ f.evidence=async()=>{throw Error('evidence unavailable');};
+ await w.tick(config);
+ expect(s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(id)).toEqual({state:'blocked',reason:'Later blocker'});
+ s.close();
+});
+test('actual branch drift blocks even when native session has no PR metadata',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();f.sessions.get('session-1').session.prs=[];
+ f.worktree=async()=>({branch:'unexpected',head:'a'.repeat(40)});
+ const result=(await w.tick(config))[0];expect(result.displayStatus).toBe('Blocked — branch mismatch');expect(result.reason).toContain('unexpected');expect(f.sends.length).toBe(1);s.close();
 });
