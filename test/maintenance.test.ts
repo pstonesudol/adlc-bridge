@@ -58,7 +58,7 @@ test('recovery forwards the registered project remediation budget to review reev
  const f=fixture();try{
   const remediation={maxAttempts:12,maxNoProgress:8,window:'job'};writeFileSync(f.config,JSON.stringify({...f.c,remediation}));const calls:any[]=[];
   f.io.review=()=>({configureMetadataChecks:()=>{},tick:async(...args:any[])=>{calls.push(args);return {};}});
-  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation,[]]]);
+  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation,{project:'linear',checks:[]}]]);
  }finally{f.close();}
 });
 test('recovery rechecks PR openness and exact ancestry target after collecting fresh session evidence',async()=>{
@@ -68,4 +68,13 @@ test('recovery rechecks PR openness and exact ancestry target after collecting f
   f.io.gh=async(path:string)=>{const value=structuredClone(await read(path));if(path==='repos/owner/repo/pulls/1'&&++reads===2)change(value);return value;};
   await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('PR changed');expect(reads).toBe(2);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}}
+});
+test('recovery validates remediation policy before any reconciliation and binds previews to policy changes',async()=>{
+ for(const remediation of [{maxAttempts:0},{maxNoProgress:0},{maxAttempts:'ten'},{unknown:1}]){const f=fixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');writeFileSync(f.config,JSON.stringify({...f.c,remediation}));
+  await expect(maintenance(f.s,'recover',f.id,true,'any',f.io)).rejects.toThrow();expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}}
+ const f=fixture();try{f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);
+  writeFileSync(f.config,JSON.stringify({...f.c,remediation:{maxAttempts:12}}));await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}
 });

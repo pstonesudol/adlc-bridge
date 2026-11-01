@@ -37,14 +37,19 @@ const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);ret
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
 async function main(){
   if(['recover','cleanup'].includes(command)){const s=new Store(db);try{return out(await maintenance(s,command as 'recover'|'cleanup',req(a[0],'Job'),a.includes('--apply'),a.includes('--confirm')?req(a[a.indexOf('--confirm')+1],'Confirmation hash'):undefined));}finally{s.close();}}
-  if(command==='install')return out(await installBridge(a.includes('--apply'),undefined,a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined));
+  if(command==='install'){
+    const bin=a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined;
+    if(bin?.startsWith('-'))throw Error('--bin requires a launcher path, not an option');
+    return out(await installBridge(a.includes('--apply'),undefined,bin));
+  }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
   if(['start','stop','status'].includes(command)&&a.includes('--all')){if(a.length!==1)throw Error('Use --all without a project ID or other options');return out(await stackControl(command as 'start'|'stop'|'status'));}
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
-  recover JOB | cleanup JOB           inspect guarded recovery or completed cleanup
+  recover JOB                         inspect guarded recovery
     [--apply --confirm HASH]           apply only the exact inspected state
+  cleanup JOB                         inspect completed cleanup (preview-only)
   install [--apply] [--bin PATH]        preview or install stable bridge snapshot
   install-runtime --binary PATH [--apply]
                                        register reproducibly built Orchestrator daemon
@@ -161,7 +166,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='tick-review'&&a[1]){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation),config.prMetadataChecks??[]));
+      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
     }
     if(command==='tick-review'){const job=req(a[0],'Job');return out(await reviewLoop.tick(job,undefined,lifecycle.budgetPolicy(job)));}
     if(command==='extend-budget'){
@@ -197,7 +202,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const featureUpdates=await features.tickProject(c);if(featureUpdates.length)out({features:featureUpdates});
       for(const target of reviewLoop.list(c.linear.projectId) as any[]){
         if(target.state==='completed')continue;
-        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,c!.prMetadataChecks??[])});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
+        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,{project:c!.linear.projectId,checks:c!.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
       }
     };if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);
