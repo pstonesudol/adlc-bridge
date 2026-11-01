@@ -53,6 +53,8 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  const hash=digest(JSON.stringify({...report,proven}));if(!apply)return {...report,confirmation:hash,preview:true,provenBranchUpdates:proven,note:'Apply reconciles only proven completed branch updates, refreshes eligibility and reevaluates the existing review. It never resets attempts or resends uncertain dispatches.'};
  if(confirmation!==hash)throw Error('Use the current preview confirmation hash; state may have changed');
  const fresh=await io.sessionEvidence(run.session_id);
+ const latestPR=await io.gh(`repos/${target.repo}/pulls/${target.pr}`);
+ if(latestPR?.state!=='open'||latestPR.head?.sha!==pr.head.sha||latestPR.head?.ref!==pr.head.ref||latestPR.head?.repo?.full_name!==target.repo||latestPR.base?.sha!==pr.base?.sha)throw Error('PR changed during recovery; uncertain ledger preserved');
  s.db.transaction(()=>{
   assertRecovery(fresh);
   for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);

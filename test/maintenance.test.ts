@@ -61,3 +61,11 @@ test('recovery forwards the registered project remediation budget to review reev
   const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation]]);
  }finally{f.close();}
 });
+test('recovery rechecks PR openness and exact ancestry target after collecting fresh session evidence',async()=>{
+ const changes=[(pr:any)=>pr.state='closed',(pr:any)=>pr.head.sha='changed',(pr:any)=>pr.head.ref='other',(pr:any)=>pr.head.repo.full_name='foreign/repo',(pr:any)=>pr.base.sha='changed'];
+ for(const change of changes){const f=fixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);let reads=0;const read=f.io.gh;
+  f.io.gh=async(path:string)=>{const value=structuredClone(await read(path));if(path==='repos/owner/repo/pulls/1'&&++reads===2)change(value);return value;};
+  await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('PR changed');expect(reads).toBe(2);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}}
+});

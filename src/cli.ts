@@ -10,7 +10,7 @@ import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
 import {initWizard} from './init';
-import {poll,validate} from './linear';
+import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -110,7 +110,7 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(command==='doctor')return out({bun:Bun.version,aoInstalled:existsSync('/Applications/Agent Orchestrator.app'),codex:!!Bun.which('codex'),opencode:!!Bun.which('opencode'),gh:!!Bun.which('gh'),linearTokenConfigured:!!process.env.ADLC_LINEAR_TOKEN||existsSync(tokenPath),executionEnabled:false});
   if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository'));return out({repo,mode:'preview_only',existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
   if(command==='handoff')return out(handoffChecklist(req(a[0],'Worktree')));
-  if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8'));if(!Array.isArray(c.requiredChecks)||c.requiredChecks.some((x:any)=>typeof x!=='string'))throw Error('requiredChecks required');return out(await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...c.requiredChecks,...(c.prMetadataChecks??[])])],c.prMetadataChecks??[]));}
+  if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out(await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata));}
   if(command.startsWith('feature-')){
     const s=new Store(db),features=new FeaturePlanning(s,featureAgents);try{
       if(command==='feature-start'){

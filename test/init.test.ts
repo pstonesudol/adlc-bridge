@@ -3,6 +3,7 @@ import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {verifyInitConfig,saveInitConfig,serviceDefinition} from '../src/init';
+import {validate,metadataCheckNames} from '../src/linear';
 const uuid=(n:number)=>`00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
 function fixture(repo:string){
  const c:any={version:1,name:'Test',repo,githubRepo:'owner/repo',automation:{orchestratorProject:'test'},linear:{projectId:uuid(1),teamId:uuid(2),readyStateId:uuid(3),readyLabelId:uuid(4)},requiredChecks:['CI'],reviewAllowedPaths:['src/**']};
@@ -33,7 +34,19 @@ test('observe-pilot CLI validates metadata-check configuration before accessing 
  const root=mkdtempSync(join(tmpdir(),'adlc-observe-config-'));try{
   const path=join(root,'config.json'),f=fixture(root);
   for(const prMetadataChecks of ['CI string',null,{},[42],['']]){
-   writeFileSync(path,JSON.stringify({...f.c,prMetadataChecks}));const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'observe-pilot','unknown-job','owner/repo','1',path],{env:{...process.env,ADLC_DB:join(root,'test.sqlite')}});
+   writeFileSync(path,JSON.stringify({...f.c,prMetadataChecks}));const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'observe-pilot','unknown-job','owner/repo','1',path],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root,ADLC_DB:join(root,'test.sqlite')}});
+   expect(result.exitCode).not.toBe(0);expect(result.stderr.toString()).toContain('Explicit PR metadata check names required');
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('shared project validation requires a nonempty array of nonblank required checks',()=>{
+ const f=fixture('/repo');for(const requiredChecks of [undefined,null,'CI',[],[''],['  '],[42],['CI',null]])expect(()=>validate({...f.c,requiredChecks})).toThrow('requiredChecks');
+ expect(()=>validate(f.c)).not.toThrow();expect(metadataCheckNames(undefined)).toEqual([]);expect(metadataCheckNames([])).toEqual([]);expect(metadataCheckNames(['CI, metadata'])).toEqual(['CI, metadata']);
+});
+test('readiness CLI rejects malformed metadata checks before constructing provider inputs',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-readiness-config-'));try{
+  const path=join(root,'config.json');for(const prMetadataChecks of ['CI string',null,{},[42],[''],['  '],Array.from({length:11},(_,i)=>`Check ${i}`)]){
+   writeFileSync(path,JSON.stringify({requiredChecks:['CI'],prMetadataChecks}));const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',path],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root,ADLC_DB:join(root,'test.sqlite')}});
    expect(result.exitCode).not.toBe(0);expect(result.stderr.toString()).toContain('Explicit PR metadata check names required');
   }
  }finally{rmSync(root,{recursive:true,force:true});}
