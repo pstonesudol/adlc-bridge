@@ -47,3 +47,10 @@ test('recovery rejects revoked approval, human ownership, stale plan, and foreig
 test('recovery revalidates approval after async ancestry collection before changing the ledger',async()=>{
  const f=fixture();try{f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io),read=f.io.gh;f.io.gh=async(path:string)=>{const result=await read(path);if(path.includes('/compare/'))f.s.db.exec("UPDATE runs SET owner='human'");return result;};await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('agent-owned');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});}finally{f.close();}
 });
+test('recovery refreshes session evidence after ancestry reads and preserves uncertain rows on changed or ambiguous activity',async()=>{
+ const changes=[(e:any)=>{e.transcript.turns=[{state:'queued'}];return e;},(e:any)=>{e.transcript.controller='running';return e;},(e:any)=>{e.session.id='other';return e;},(e:any)=>{e.session.prs=[];return e;},(e:any)=>{e.session.branch='other';return e;},()=>null,()=>({})];
+ for(const change of changes){const f=fixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);let reads=0;f.io.sessionEvidence=async()=>++reads===1?structuredClone(f.evidence):change(structuredClone(f.evidence));
+  await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow();expect(reads).toBe(2);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}}
+});

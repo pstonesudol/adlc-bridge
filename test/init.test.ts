@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {verifyInitConfig,saveInitConfig,serviceDefinition} from '../src/init';
@@ -26,5 +26,15 @@ test('generated launchd definition escapes user paths and uses explicit poll arg
 });
 import {collectMetadataChecks} from '../src/init';
 test('metadata check prompts preserve exact names with commas and allow none',async()=>{
- const names=['CI, PR body','Second check','CI, PR body',''];expect(await collectMetadataChecks(async()=>names.shift()!)).toEqual(['CI, PR body','Second check']);expect(await collectMetadataChecks(async()=>'')).toEqual([]);
+  const names=['CI, PR body','Second check','CI, PR body',''];expect(await collectMetadataChecks(async()=>names.shift()!)).toEqual(['CI, PR body','Second check']);expect(await collectMetadataChecks(async()=>'')).toEqual([]);
+ const eleven=Array.from({length:11},(_,i)=>`Check ${i}`);await expect(collectMetadataChecks(async()=>eleven.shift()!)).rejects.toThrow('At most 10 PR metadata checks supported');
+});
+test('observe-pilot CLI validates metadata-check configuration before accessing a job or providers',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-observe-config-'));try{
+  const path=join(root,'config.json'),f=fixture(root);
+  for(const prMetadataChecks of ['CI string',null,{},[42],['']]){
+   writeFileSync(path,JSON.stringify({...f.c,prMetadataChecks}));const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'observe-pilot','unknown-job','owner/repo','1',path],{env:{...process.env,ADLC_DB:join(root,'test.sqlite')}});
+   expect(result.exitCode).not.toBe(0);expect(result.stderr.toString()).toContain('Explicit PR metadata check names required');
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
 });

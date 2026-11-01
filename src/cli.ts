@@ -157,7 +157,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     }
     if(command==='tick-review')return out(await reviewLoop.tick(req(a[0],'Job')));
     if(command==='adopt-pilot')return out(await adoptPilot(s,req(a[0],'Job'),req(a[1],'Session')));
-    if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.prMetadataChecks??[]));}
+    if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));validate(config);return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.prMetadataChecks??[]));}
     if(command==='capture-plan')return out(capturePlan(s,req(a[0],'Job'),await sessionEvidence(req(a[1],'Session')),Number(a[2])));
     if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
     if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});

@@ -2,7 +2,7 @@ import {existsSync,realpathSync} from 'node:fs';
 import {Lifecycle} from './lifecycle';
 import {Store,digest} from './core';import {sessionEvidence} from './session-evidence';import {ProjectServices,registryPath} from './project-services';import {readFileSync} from 'node:fs';import {localAO} from './workflow-transport';import {ReviewLoop} from './review-loop';import {poll} from './linear';import {linearToken} from './credential';
 async function gh(path:string){const p=Bun.spawn(['gh','api',path],{stdout:'pipe',stderr:'pipe'});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub inspection failed');return JSON.parse(out);}
-export function assertIdle(e:any){if(!['ready','stopped'].includes(e.transcript?.controller)||!Array.isArray(e.transcript?.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','interrupted','cancelled','recovered'].includes(t.state)))throw Error('Worker is active or activity is uncertain');}
+export function assertIdle(e:any){if(!['ready','stopped'].includes(e?.transcript?.controller)||!Array.isArray(e.transcript?.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','interrupted','cancelled','recovered'].includes(t?.state)))throw Error('Worker is active or activity is uncertain');}
 export function assertCleanup(j:any,run:any,target:any,e:any,pr:any){
  if(j.state!=='done'||run.state!=='completed'||target.state!=='completed'||run.owner!=='orchestrator')throw Error('Only completed agent-owned jobs can be cleaned');
  if(e.session.id!==run.session_id||e.session.branch!==pr.head?.ref||!e.session.prs?.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`)||!pr.merged||pr.head?.repo?.full_name!==target.repo)throw Error('Merged PR and owned session must match');
@@ -36,11 +36,12 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  }
  assertIdle(e);
  if(pr.state!=='open'||pr.head?.repo?.full_name!==target.repo||pr.head.ref!==e.session.branch)throw Error('Recovery requires the existing owned open PR');
- const assertRecovery=()=>{
+ const assertRecovery=(e:any)=>{
+  assertIdle(e);
   const l=new Lifecycle(s),current=l.current(job),active=l.run(job);
-  if(current.plan_hash!==j.plan_hash||!active||active.owner!=='orchestrator'||active.state!=='running'||active.plan_hash!==current.plan_hash||active.session_id!==run.session_id||e.session.id!==active.session_id||e.session.isTerminated||e.session.projectId!==c.automation.orchestratorProject||!e.session.prs?.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`))throw Error('Recovery requires current approval and the matching active agent-owned PR session');
+  if(current.plan_hash!==j.plan_hash||!active||active.owner!=='orchestrator'||active.state!=='running'||active.plan_hash!==current.plan_hash||active.session_id!==run.session_id||e.session?.id!==active.session_id||e.session.isTerminated||e.session.projectId!==c.automation.orchestratorProject||e.session.branch!==pr.head.ref||!Array.isArray(e.session.prs)||!e.session.prs.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`))throw Error('Recovery requires current approval and the matching active agent-owned PR session');
  };
- assertRecovery();
+ assertRecovery(e);
  const rows=s.db.query("SELECT * FROM branch_updates WHERE job=? AND state='delivery_uncertain'").all(job) as any[];
  const proven=[];
  for(const row of rows){
@@ -50,8 +51,9 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  }
  const hash=digest(JSON.stringify({...report,proven}));if(!apply)return {...report,confirmation:hash,preview:true,provenBranchUpdates:proven,note:'Apply reconciles only proven completed branch updates, refreshes eligibility and reevaluates the existing review. It never resets attempts or resends uncertain dispatches.'};
  if(confirmation!==hash)throw Error('Use the current preview confirmation hash; state may have changed');
+ const fresh=await io.sessionEvidence(run.session_id);
  s.db.transaction(()=>{
-  assertRecovery();
+  assertRecovery(fresh);
   for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
   s.event(job,'review_recovery_requested',JSON.stringify({...report,proven}));
  }).immediate();
