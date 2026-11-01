@@ -15,6 +15,10 @@ export function readDefinition(path:string){
  const r=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',path],{stdout:'pipe',stderr:'pipe'});
  if(r.exitCode!==0)throw Error('Unable to read installed service definition');return JSON.parse(r.stdout.toString());
 }
+export function definitionXML(def:unknown){
+ const r=Bun.spawnSync(['/usr/bin/plutil','-convert','xml1','-o','-','-'],{stdin:Buffer.from(JSON.stringify(def)),stdout:'pipe',stderr:'pipe'});
+ if(r.exitCode!==0)throw Error('Unable to encode service definition');return r.stdout.toString();
+}
 export function assertDefinition(def:any,label:string,config:string){
  const a=def.ProgramArguments;
  if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||![join(import.meta.dir,'cli.ts'),installedCLI()].filter(Boolean).some(x=>realpathSync(a[1])===realpathSync(x!)))throw Error('Service definition does not match this project; existing service preserved');

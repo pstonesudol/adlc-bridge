@@ -437,6 +437,11 @@ services and project gates, and updates the `adlc` launcher. It pauses intake
 while changing service definitions and restores its previous on/off state.
 Workers are not stopped. Existing configuration, authentication, database and
 project settings are preserved, with backups for activation rollback.
+If a managed Orchestrator runtime is registered, its trusted pin and service
+definition are migrated to the new snapshot's Python launcher as well. The
+running backend is not restarted; the launcher update activates at the next
+guarded `adlc stop --all` / `adlc start --all`. Binary upgrades still require
+`install-runtime` with the backend stopped and service unloaded.
 Use `--bin /absolute/path/to/adlc` to choose the launcher location.
 
 Coding workers edit source worktrees; they do not modify the installed runtime.

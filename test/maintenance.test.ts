@@ -88,3 +88,10 @@ test('recovery confirmation binds effective Linear eligibility and status-sync s
   const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);change(c);writeFileSync(f.config,JSON.stringify(c));await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}}
 });
+test('configuration fingerprint invalidates a recovery preview when only reviewAllowedPaths changes',async()=>{
+ const f=fixture();try{
+  const config={...f.c,reviewAllowedPaths:['src/**']};writeFileSync(f.config,JSON.stringify(config));f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');
+  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);writeFileSync(f.config,JSON.stringify({...config,reviewAllowedPaths:['src/**','docs/**']}));
+  await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}
+});
