@@ -209,6 +209,29 @@ test('needs-input and blocked-dependency worker receipts surface questions inste
  s.close();blocked.close();
 });
 
+test('a captured plan replacement cannot reuse an earlier readiness receipt',async()=>{
+ const {s,f,w,id}=await planned();
+ const replacement='Replacement plan.\n\n### Questions\n- Which approved copy should be used?\n\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"needs-input","questions":[{"id":"q1","question":"Which approved copy should be used?","kind":"requirement"}],"dependencies":[],"risks":[]} -->\n';
+ const next=s.propose(id,replacement);
+ expect(()=>w.approve(id,next,'human',['src/a.ts'],'supervised-host',ops)).toThrow('unresolved');
+ expect(()=>w.approve(id,next,'human',['src/a.ts'],'supervised-host',ops,undefined,{readiness:true})).toThrow('unresolved');
+ expect(w.planning(id).state).toBe('awaiting_approval');expect(f.sends.length).toBe(0);s.close();
+});
+
+test('a resolved plan blocker does not resurface during PR grace, but changed readiness does',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const c={...config,workflow:{prGraceMs:0}};
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(c);f.completePlan('session-1',blockedPlan('Which stable product/listing identifier?'));
+ await w.tick(c);recordResolution(s,id,'human-answer','Alice','Use SKU-42');
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(c);f.finishImplementation();f.sessions.get('session-1').session.prs=[];
+ expect((await w.tick({...config,workflow:{prGraceMs:60000}}))[0].state).toBe('awaiting_pr');
+ s.db.query('UPDATE plan_readiness SET questions=? WHERE job=?').run(JSON.stringify([{id:'q1',question:'A new security decision',kind:'security-scope'}]),id);
+ expect((await w.tick(c))[0].state).toBe('needs_input');
+ s.close();
+});
+
 test('worker-reported failure becomes an explicit blocker without resending',async()=>{
  const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
  f.workerReceipt(workerBlock('failed'));

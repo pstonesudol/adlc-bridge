@@ -186,7 +186,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
       let r=readinessFor(s,job);
-      if(!r&&j.plan){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));r=readinessFor(s,job);}
+      if(j.plan&&(!r||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));r=readinessFor(s,job);}
       const resolved=activeResolution(s,job);
       if(r?.valid&&r.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
       if((!r||!r.valid)&&!resolved&&!a.includes('--acknowledge-readiness'))throw Error('Structured plan readiness is missing or malformed; explicit --acknowledge-readiness required');

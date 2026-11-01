@@ -9,7 +9,7 @@ import {deliveryBranch,assertDeliveryTarget} from './delivery-identity';
 import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
-import {ensureReadinessStore,activeResolution,readinessBinding,resolutionBinding,readinessFor,recordReadiness,recordResolution,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
+import {ensureReadinessStore,activeResolution,activeReadinessResolution,readinessBinding,resolutionBinding,readinessFor,recordReadiness,recordResolution,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number}};
 export interface WorkflowTransport{
@@ -153,7 +153,7 @@ export class Workflow{
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
    if(this.implementation(job)||new Lifecycle(this.s).run(job))throw Error('Existing execution requires reconciliation');
    let readiness=readinessFor(this.s,job);
-   if(!readiness&&j.plan){recordReadiness(this.s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(this.s,job);}
+   if(j.plan&&(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))){recordReadiness(this.s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(this.s,job);}
    const resolved=activeResolution(this.s,job);
    if(standing&&(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash))throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
    if(!standing&&readiness?.valid&&readiness.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
@@ -302,7 +302,8 @@ export class Workflow{
    const current=this.s.get(job);
    if(current.plan){const legacy=assessPlan(current.plan);readiness={plan_hash:current.plan_hash,spec_hash:digest(current.spec),...legacy};}
   }
-  if(readiness&&readiness.plan_hash===d.plan_hash){
+  const readinessResolved=readiness&&readiness.plan_hash===d.plan_hash&&!!activeReadinessResolution(this.s,job);
+  if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved){
    if(readiness.valid&&readiness.state==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:'Plan requires input that the completed worker did not resolve',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
    if(readiness.valid&&readiness.state==='blocked-by-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:'Plan is blocked by a referenced dependency',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
   }
