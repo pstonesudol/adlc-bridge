@@ -3,7 +3,7 @@ import {installBridge} from './install';
 import {maintenance} from './maintenance';
 import {installRuntime} from './runtime-install';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
-import {join} from 'node:path';
+import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {Store} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
@@ -43,6 +43,7 @@ async function main(){
   if(command==='install'){
     const bin=a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined;
     if(bin?.startsWith('-'))throw Error('--bin requires a launcher path, not an option');
+    if(bin!==undefined&&!isAbsolute(bin))throw Error('--bin requires an absolute launcher path');
     return out(await installBridge(a.includes('--apply'),undefined,bin));
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
