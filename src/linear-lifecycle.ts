@@ -18,12 +18,15 @@ export class LinearLifecycle{
    after=page.pageInfo.endCursor;if(!after||seen.has(after))throw Error('Invalid remediation notice cursor');seen.add(after);
   }while(true);
  }
- async notifyBudgetBlocker(job:string){
+ async notifyBudgetBlocker(job:string,c:SyncConfig){
   const b=this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
   if(!b?.stop_reason)return null;
   const j=this.s.get(job),binding=digest(JSON.stringify([j.plan_hash,b.stop_reason,b.consumed,b.extensions,b.last_head]));
   let n=this.s.db.query('SELECT * FROM remediation_notices WHERE job=? AND binding=?').get(job,binding) as any;
   if(n?.state==='posted')return {state:'posted',comment:n.comment_id};
+  const issue=await readLinearIssue(j.issue,this.api);
+  if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear lifecycle identity or label scope mismatch');
+  if(j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Requirements changed; refusing remediation notice');
   if(!n){
    const cap=b.configured_max_attempts===null?'uncapped':`${b.consumed}/${b.configured_max_attempts+b.extensions}`;
    const remaining=b.configured_max_attempts===null?'remaining unlimited':`remaining ${Math.max(0,b.configured_max_attempts+b.extensions-b.consumed)}`;
@@ -76,8 +79,8 @@ export class LinearLifecycle{
   const results=[];
   for(const row of rows)try{
    if(row.state==='blocked'){
-    const notice=await this.notifyBudgetBlocker(row.id);
-    if(notice){results.push({job:row.id,phase:'remediation-blocker',...notice});continue;}
+    const notice=await this.notifyBudgetBlocker(row.id,c);
+    if(notice)results.push({job:row.id,phase:'remediation-blocker',...notice});
    }
    const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;

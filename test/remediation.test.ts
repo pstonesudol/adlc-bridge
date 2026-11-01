@@ -24,6 +24,8 @@ test('custom limits above five and explicit uncapped mode are honored without cl
 });
 
 test('invalid remediation settings fail closed instead of being clamped',()=>{
+ expect(()=>remediationPolicy({maxAttemps:12} as any)).toThrow('Unknown remediation setting');
+ expect(()=>validate(config({remediation:{maxNoProgres:12}}))).toThrow('Unknown remediation setting');
  for(const value of [{maxAttempts:0},{maxAttempts:-1},{maxAttempts:1.5},{maxAttempts:'5'},{maxNoProgress:0},{maxNoProgress:2.5},{window:'release'}]){
   expect(()=>remediationPolicy(value as any)).toThrow();
  }

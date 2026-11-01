@@ -588,5 +588,6 @@ Review the returned `confirmHash`, then apply the same request with
 delivery, a changed approval/scope/head, or a job that is not stopped for
 remediation. The extension is appended to durable audit history, restores only
 the remediation stop, and never deletes attempts, replays a send, creates another
-session or PR, or forges approval. Uncapped projects do not need extension.
+session or PR, or forges approval. Uncapped projects may require an extension
+after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.

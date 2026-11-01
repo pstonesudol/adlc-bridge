@@ -24,6 +24,7 @@ export const DEFAULT_REMEDIATION_POLICY:RemediationPolicy=Object.freeze({
 
 export function remediationPolicy(value?:RemediationConfig|null):RemediationPolicy{
  if(value!==undefined&&value!==null&&(typeof value!=='object'||Array.isArray(value)))throw Error('Invalid remediation budget configuration');
+ for(const key of Object.keys(value??{}))if(!['maxAttempts','maxNoProgress','window'].includes(key))throw Error(`Unknown remediation setting: ${key}`);
  const maxAttempts=value?.maxAttempts===undefined?DEFAULT_REMEDIATION_POLICY.maxAttempts:value.maxAttempts;
  if(maxAttempts!==null&&(!Number.isSafeInteger(maxAttempts)||maxAttempts<1))throw Error('Remediation maxAttempts must be a positive integer or null for uncapped mode');
  const maxNoProgress=value?.maxNoProgress===undefined?DEFAULT_REMEDIATION_POLICY.maxNoProgress:value.maxNoProgress;

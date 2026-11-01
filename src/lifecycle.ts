@@ -209,7 +209,6 @@ export class Lifecycle {
     if(!actor)throw Error('Human operator identity required');
     if(!Number.isSafeInteger(additional)||additional<1)throw Error('Positive additional remediation budget required');
     if(!/^[a-f0-9]{40,64}$/.test(head))throw Error('Current PR head required');
-    if(policy.maxAttempts===null)throw Error('Uncapped remediation budgets do not require extension');
     return this.s.db.transaction(()=>{
       const j=this.s.get(job);
       if(!j.plan||!j.actor||j.plan_hash!==j.approved_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!['approved','blocked'].includes(j.state))throw Error('Current plan approval required');
@@ -217,6 +216,7 @@ export class Lifecycle {
       const run=this.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==j.plan_hash)throw Error('Existing owned job required');
       const budget=this.ensureBudget(job);
       if(!budget.stop_reason)throw Error('Remediation budget is not exhausted; extension refused');
+      if(policy.maxAttempts===null&&budget.stop_reason!=='no_progress_exhausted')throw Error('Uncapped remediation budgets only support recovery from no-progress stops');
       if(this.s.db.query("SELECT 1 FROM remediation WHERE job=? AND state='delivery_uncertain'").get(job))throw Error('Prior delivery uncertainty must be reconciled before extension');
       const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()
         ?this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any:null;

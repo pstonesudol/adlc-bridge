@@ -165,6 +165,51 @@ test('exhausted budget requires a previewed, audited extension and does not repl
  expect(s.get(id).attempts).toBe(6);expect(l.budgetSummary(id,policy).consumed).toBe(6);s.close();
 });
 
+async function exhaustedBudget(policy={maxAttempts:1 as number|null,maxNoProgress:1,window:'job' as const}){
+ const f=setup();await f.l.dispatch(f.id,{start:async r=>receipt(r.correlation)},runtime);
+ f.l.grantGit(f.id,f.hash,['commit','push-feature','open-pr'],'human');
+ new ReviewLoop(f.s).register(f.id,'owner/repo',1,['CI'],['src/**'],true);
+ const head='7'.repeat(40);f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(head,f.id);
+ f.l.reserveRemediation(f.id,head,'one',policy);
+ expect(f.l.reserveRemediation(f.id,head,'two',policy).blocked).toBe(true);
+ return {...f,options:{actor:'Human',additional:2,head,policy}};
+}
+
+test('uncapped no-progress recovery is previewed, audited and does not replay prior findings',async()=>{
+ const f=await exhaustedBudget({maxAttempts:null,maxNoProgress:1,window:'job'});
+ try{
+  const preview=f.l.extendRemediationBudget(f.id,f.options);
+  expect(preview.preview).toBe(true);expect(f.l.budgetSummary(f.id).noProgress).toBeGreaterThan(0);
+  const applied=f.l.extendRemediationBudget(f.id,{...f.options,confirm:preview.confirmHash});
+  expect(applied.budget).toMatchObject({uncapped:true,consumed:1,noProgress:0,stopReason:null});
+  expect(f.l.reserveRemediation(f.id,f.options.head,'one',f.options.policy).attempt).toBe(1);
+  expect(f.l.reserveRemediation(f.id,f.options.head,'two',f.options.policy).attempt).toBe(2);
+  expect((f.s.db.query('SELECT count(*) AS n FROM remediation_budget_extensions').get() as any).n).toBe(1);
+ }finally{f.s.close();}
+});
+
+test('extension guards reject stale authorization, uncertain receipts and invalid operator inputs without writes',async()=>{
+ const cases:[string,(f:Awaited<ReturnType<typeof exhaustedBudget>>)=>void,string][]=[
+  ['head',f=>{f.options.head='8'.repeat(40)},'Current review target'],
+  ['missing grant',f=>{f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.id)},'Current scoped GitHub'],
+  ['stale grant',f=>{f.s.db.query("UPDATE git_grants SET plan_hash='stale' WHERE job=?").run(f.id)},'Current scoped GitHub'],
+  ['uncertainty',f=>{f.s.db.query("UPDATE remediation SET state='delivery_uncertain' WHERE job=?").run(f.id)},'Prior delivery uncertainty'],
+  ['approval',f=>{f.s.db.query("UPDATE jobs SET approved_hash='stale' WHERE id=?").run(f.id)},'Current plan approval'],
+  ['state',f=>{f.s.db.query("UPDATE jobs SET state='awaiting_approval' WHERE id=?").run(f.id)},'Current plan approval'],
+  ['additional',f=>{f.options.additional=0},'Positive additional'],
+  ['fraction',f=>{f.options.additional=1.5},'Positive additional'],
+  ['actor',f=>{f.options.actor=' '},'Human operator'],
+  ['uncapped budget stop',f=>{f.options.policy.maxAttempts=null},'only support recovery'],
+ ];
+ for(const [name,mutate,message] of cases){
+  const f=await exhaustedBudget();try{
+   mutate(f);expect(()=>f.l.extendRemediationBudget(f.id,f.options),name).toThrow(message);
+   expect(f.l.budgetSummary(f.id).extensions).toBe(0);
+   expect((f.s.db.query('SELECT count(*) AS n FROM remediation_budget_extensions').get() as any).n).toBe(0);
+  }finally{f.s.close();}
+ }
+});
+
 test('OpenChamber handoff requires stopped processes and revokes approval',async()=>{
   const {s,l,id}=setup();const run=await l.dispatch(id,{start:async r=>receipt(r.correlation)},runtime);
   expect(()=>l.takeHumanControl(id,receipt(run.correlation),false)).toThrow();
