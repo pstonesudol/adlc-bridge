@@ -122,9 +122,11 @@ export function ensureReadinessStore(s:Store){
     observed TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS plan_resolutions (
     job TEXT NOT NULL REFERENCES jobs(id),plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,
-    binding TEXT NOT NULL,source TEXT NOT NULL,actor TEXT NOT NULL,detail TEXT NOT NULL,
+    binding TEXT NOT NULL,readiness_binding TEXT,source TEXT NOT NULL,actor TEXT NOT NULL,detail TEXT NOT NULL,
     state TEXT NOT NULL,at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY(job,plan_hash,binding));`);
+  const columns=s.db.query('PRAGMA table_info(plan_resolutions)').all() as any[];
+  if(!columns.some(column=>column.name==='readiness_binding'))s.db.exec('ALTER TABLE plan_resolutions ADD COLUMN readiness_binding TEXT');
 }
 export function recordReadiness(s:Store,job:string,plan:string,planHash:string,specHash:string){
   ensureReadinessStore(s);const assessment=assessPlan(plan);
@@ -169,17 +171,25 @@ export function recordResolution(s:Store,job:string,source:string,actor:string,d
   if(!['human-answer','dependency-satisfied','human-acknowledgement'].includes(source))throw Error('Human answer or dependency evidence required');
   if(!actor.trim()||!detail.trim()||actor.length>200||detail.length>4000)throw Error('Named human and explicit bounded resolution detail required');
   const j=s.get(job);if(!j.plan)throw Error('Captured plan required');
+  const readinessBindingValue=readinessBinding(s,job);if(!readinessBindingValue)throw Error('Current plan readiness evidence required');
   const binding=resolutionBinding(s,job);if(!binding)throw Error('Current plan readiness evidence required');
   return s.db.transaction(()=>{
     const current=s.get(job);
     if(current.plan_hash!==j.plan_hash||current.spec!==j.spec)throw Error('Plan or requirements changed during resolution');
-    s.db.query(`INSERT INTO plan_resolutions(job,plan_hash,spec_hash,binding,source,actor,detail,state)
-      VALUES (?,?,?,?,?,?,?,'active') ON CONFLICT(job,plan_hash,binding) DO UPDATE SET
-      source=excluded.source,actor=excluded.actor,detail=excluded.detail,state='active',at=CURRENT_TIMESTAMP`)
-      .run(job,j.plan_hash,digest(j.spec),binding,source,actor.trim(),detail.trim());
-    s.event(job,'plan_readiness_resolved',JSON.stringify({planHash:j.plan_hash,binding,source,actor:actor.trim()}));
-    return {job,planHash:j.plan_hash,binding,source,actor:actor.trim()};
+    s.db.query(`INSERT INTO plan_resolutions(job,plan_hash,spec_hash,binding,readiness_binding,source,actor,detail,state)
+      VALUES (?,?,?,?,?,?,?,?,'active') ON CONFLICT(job,plan_hash,binding) DO UPDATE SET
+      readiness_binding=excluded.readiness_binding,source=excluded.source,actor=excluded.actor,
+      detail=excluded.detail,state='active',at=CURRENT_TIMESTAMP`)
+      .run(job,j.plan_hash,digest(j.spec),binding,readinessBindingValue,source,actor.trim(),detail.trim());
+    s.event(job,'plan_readiness_resolved',JSON.stringify({planHash:j.plan_hash,binding,readinessBinding:readinessBindingValue,source,actor:actor.trim()}));
+    return {job,planHash:j.plan_hash,binding,readinessBinding:readinessBindingValue,source,actor:actor.trim()};
   }).immediate();
+}
+export function activeReadinessResolution(s:Store,job:string):any{
+  ensureReadinessStore(s);const j=s.get(job),binding=readinessBinding(s,job);
+  if(!binding)return null;
+  return s.db.query("SELECT * FROM plan_resolutions WHERE job=? AND plan_hash=? AND spec_hash=? AND readiness_binding=? AND state='active'")
+    .get(job,j.plan_hash,digest(j.spec),binding);
 }
 
 export const PLAN_STATUS_INSTRUCTION=[

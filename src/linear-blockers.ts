@@ -67,13 +67,14 @@ export class LinearBlockers{
   }
   let labelState='present';
   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
-   const labelIds=[...new Set([...issue.labels.nodes.map((x:any)=>x.id),labelId])];
-   const b=await this.api('mutation($id:String!,$labels:[String!]!){issueUpdate(id:$id,input:{labelIds:$labels}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,labels:labelIds});
-   const labels=b.issueUpdate?.issue?.labels;
-   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||labels?.pageInfo?.hasNextPage!==false||!labels.nodes.some((x:any)=>x.id===labelId)||issue.labels.nodes.some((x:any)=>!labels.nodes.some((y:any)=>y.id===x.id)))throw Error('Blocker label update requires reconciliation; labels were not verified');
-   labelState='applied';
+   // Record ownership before the mutation so a lost reply or verification failure
+   // still lets retract reconcile the bridge-applied label.
    this.s.db.query("UPDATE blocker_notices SET label_applied=1 WHERE job=? AND binding=?").run(job,binding);
-   this.s.event(job,'linear_blocker_label',JSON.stringify({label:labelId,preserved:issue.labels.nodes.map((x:any)=>x.id)}));
+   const b=await this.api('mutation($id:String!,$added:[String!]!){issueUpdate(id:$id,input:{addedLabelIds:$added}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,added:[labelId]});
+   const labels=b.issueUpdate?.issue?.labels;
+   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||labels?.pageInfo?.hasNextPage!==false||!labels.nodes.some((x:any)=>x.id===labelId))throw Error('Blocker label update requires reconciliation; labels were not verified');
+   labelState='applied';
+   this.s.event(job,'linear_blocker_label',JSON.stringify({label:labelId,additive:true}));
   }
   return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:labelState};
  }
@@ -84,8 +85,7 @@ export class LinearBlockers{
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity mismatch');
   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){this.s.db.query("UPDATE blocker_notices SET label_applied=0 WHERE job=?").run(job);return {state:'absent'};}
-  const labelIds=issue.labels.nodes.map((x:any)=>x.id).filter((id:string)=>id!==labelId);
-  const b=await this.api('mutation($id:String!,$labels:[String!]!){issueUpdate(id:$id,input:{labelIds:$labels}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,labels:labelIds});
+  const b=await this.api('mutation($id:String!,$removed:[String!]!){issueUpdate(id:$id,input:{removedLabelIds:$removed}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,removed:[labelId]});
   const labels=b.issueUpdate?.issue?.labels;
   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||labels?.pageInfo?.hasNextPage!==false||labels.nodes.some((x:any)=>x.id===labelId))throw Error('Blocker label removal requires reconciliation');
   this.s.db.query("UPDATE blocker_notices SET label_applied=0 WHERE job=?").run(job);
