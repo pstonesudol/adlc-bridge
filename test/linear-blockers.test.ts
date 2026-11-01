@@ -27,9 +27,10 @@ function fixture(){
   if(q.includes('issueUpdate')){
    updates++;
    if(injectHumanLabelBeforeUpdate){injectHumanLabelBeforeUpdate=false;if(!labels.includes('human-concurrent'))labels.push('human-concurrent');}
-   if(v.labelIds)labels=[...v.labelIds];
-   if(v.added)labels=[...new Set([...labels,...v.added])];
-   if(v.removed)labels=labels.filter((id:string)=>!v.removed.includes(id));
+   if(q.includes('labelIds:$added'))labels=[...v.added];
+   if(q.includes('addedLabelIds:$added'))labels=[...new Set([...labels,...v.added])];
+   if(q.includes('labelIds:$removed'))labels=[...v.removed];
+   if(q.includes('removedLabelIds:$removed'))labels=labels.filter((id:string)=>!v.removed.includes(id));
    if(failLabelVerification){
     failLabelVerification=false;
     const response=issue();
