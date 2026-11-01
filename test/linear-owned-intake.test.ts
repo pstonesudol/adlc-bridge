@@ -7,10 +7,22 @@ test('full paginated intake queues overflow even when all planning slots are unc
  const w=new Workflow(s,{startPlan:async()=>{starts++;throw Error('unknown');},findPlans:async()=>[]} as any);
  const config={...c,statusSync:undefined,routing:undefined,automation:{planningEnabled:true,orchestratorProject:'test',maxPlanning:1}};
  try{
-  globalThis.fetch=(async(_url:any,init:any)=>{const after=JSON.parse(init.body).variables.after;return new Response(JSON.stringify({data:{issues:{nodes:Array.from({length:3},(_,i)=>issue(`${after?'b':'a'}${i}`,c.linear.readyStateId)),pageInfo:{hasNextPage:!after,endCursor:after?null:'next'}}}}));}) as any;
+  let requests=0;const unexpected:unknown[]=[];
+  globalThis.fetch=(async(url:any,init:any)=>{
+   try{
+   expect(url).toBe('https://api.linear.app/graphql');expect(init.method).toBe('POST');
+   const body=JSON.parse(init.body),after=body.variables.after;
+   expect(body.query.trim()).toStartWith('query(');
+   expect(body.query).not.toMatch(/\bmutation\b/);
+   expect(body.query).toContain('issues(first: 50, after: $after, filter:');
+   expect(body.variables).toEqual({project:c.linear.projectId,team:c.linear.teamId,state:c.linear.readyStateId,label:c.linear.readyLabelId,after:requests%2===0?null:'next'});
+   requests++;
+   return new Response(JSON.stringify({data:{issues:{nodes:Array.from({length:3},(_,i)=>issue(`${after?'b':'a'}${i}`,c.linear.readyStateId)),pageInfo:{hasNextPage:!after,endCursor:after?null:'next'}}}}));
+   }catch(e){unexpected.push(e);throw e;}
+  }) as any;
   await poll(config,s,'test');expect(s.list().length).toBe(6);await w.tick(config);expect(starts).toBe(1);
   await poll(config,s,'test');await w.tick(config);expect(s.list().length).toBe(6);expect(starts).toBe(1);
-  expect(s.db.query('SELECT count(*) AS n FROM planning_dispatch').get()).toEqual({n:1});
+  expect(s.db.query('SELECT count(*) AS n FROM planning_dispatch').get()).toEqual({n:1});expect(requests).toBe(4);expect(unexpected).toEqual([]);
  }finally{globalThis.fetch=old;s.close();}
 });
 test('owned In Progress tickets remain eligible, while unrelated in-progress tickets are never adopted',async()=>{

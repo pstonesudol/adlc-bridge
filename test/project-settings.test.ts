@@ -12,7 +12,13 @@ test('defaults and supported boundaries are explicit, never clamped',()=>{
 test('serve uses configured interval and omitted default without overlapping ticks',async()=>{
  for(const seconds of [undefined,5,120]){
   let sleeps=0,ticks=0,stop=false;
-  await serveLoop(async()=>{ticks++;if(ticks===2)stop=true;},{pollingIntervalSeconds:seconds},()=>stop,async ms=>{expect(ms).toBe(1000);sleeps++;});
+  let release!:()=>void;
+  const pending=new Promise<void>(resolve=>release=resolve);
+  const loop=serveLoop(async()=>{ticks++;if(ticks===1)await pending;if(ticks===2)stop=true;},{pollingIntervalSeconds:seconds},()=>stop,async ms=>{expect(ms).toBe(1000);sleeps++;});
+  try{
+   // Give an incorrectly un-awaited loop bounded time to advance.
+   await Bun.sleep(10);expect(ticks).toBe(1);expect(sleeps).toBe(0);
+  }finally{release();await loop;}
   expect(ticks).toBe(2);expect(sleeps).toBe(seconds??60);
  }
 });

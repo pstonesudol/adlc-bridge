@@ -83,8 +83,14 @@ export class ProjectServices{
   if(entries.length!==1)throw Error(entries.length?'Multiple projects registered; specify a project ID from adlc projects':'No projects registered; use adlc init');
   return entries[0];
  }
- verify(entry:ProjectService){
-  const c=JSON.parse(readFileSync(entry.config,'utf8'));validate(c);
+ verify(entry:ProjectService,validateRuntime=true){
+  const c=JSON.parse(readFileSync(entry.config,'utf8'));
+  // Recovery bypasses only the newly introduced runtime settings, not identity
+  // or the pre-existing configuration checks. Never normalize the stored file.
+  const {pollingIntervalSeconds,...base}=c;
+  const {maxPlanning,...automation}=c.automation??{};
+  validate(validateRuntime?c:{...base,automation});
   if(c.automation?.orchestratorProject!==entry.project||c.linear.projectId!==entry.linear_project||realpathSync(c.repo)!==entry.repo)throw Error('Registered project configuration identity changed; reconcile before service control');
+  return c;
  }
 }
