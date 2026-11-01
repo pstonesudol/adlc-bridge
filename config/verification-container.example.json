@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "mode": "container",
+  "steps": [
+    {"cwd": "frontend", "argv": ["/workspace/node_modules/.bin/eslint", "."]},
+    {"cwd": "frontend", "argv": ["/workspace/node_modules/.bin/tsc", "--noEmit", "--incremental", "false"]},
+    {"cwd": "frontend", "argv": ["node", "--experimental-strip-types", "--test", "tests"]}
+  ],
+  "container": {
+    "image": "sha256:REPLACE_WITH_EXISTING_IMAGE_DIGEST",
+    "inputs": ["frontend", "backend/templates"]
+  }
+}

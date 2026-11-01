@@ -1,5 +1,129 @@
 # ADLC Bridge
 
+## Configuration-driven verification and setup (v1)
+
+Project JSON keeps repository/Linear mappings, approval and routing policies, and
+an optional `verification` object. Machine JSON is separate: copy
+`config/runtime.example.json` to an ignored local file and replace every path
+and tool version. Supported service platform is macOS launchd only. Examples
+are templates, not installable configurations. No package installation is needed.
+
+```sh
+bun src/cli.ts verification config/local.json
+bun src/cli.ts setup config/local.json config/runtime.local.json
+bun src/cli.ts setup config/local.json config/runtime.local.json --export
+# Only after preview passes: create a new staged plist, never replace a file.
+bun src/cli.ts setup config/local.json config/runtime.local.json --write-service
+```
+
+`setup` is a read-only preview by default (also accepts `--preview`). It checks
+configured paths, exact executable versions via `--version`, project-file
+agreement and existing service-file conflicts. It does not read credentials,
+contact providers, open the registry, install a workflow hook, or run launchctl.
+Only supply trusted executable paths: version checks execute those programs.
+Existing definitions must match byte-for-byte or are preserved as conflicts.
+`service.path` must be a staging path for writes, not a LaunchAgents/Daemons
+directory. Parent directories must already exist. XML escaping is automatic.
+The staged file retains the configured label, timing, log paths and RunAtLoad
+setting; staging does not load it. A human must separately approve installation
+and activation, including replacement of installed controller code. Point
+`controller` at a stable installed copy, never at a mutable development worktree.
+Source edits and these commands do not activate that installed copy.
+After human installation, service discovery records the existing user-installed
+controller's canonical path for the registered config/label, rather than tying it
+to whichever development CLI is running. Later controller-identity changes are
+rejected and require explicit reconciliation; discovery never replaces a plist
+or starts a service. Existing registry rows remain compatible.
+
+Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
+container verification is selected. Versions are exact three-component versions
+(the actual `git`, `gh` and `docker` executable names must be on the generated PATH).
+Generated services set `ADLC_AO_PATH` to the configured AO executable; legacy
+services retain the bundled-app default. Workflow hooks use the running Bun and
+a stable gate marker; repeating setup replaces prior gates even in versioned
+installation directories while retaining unrelated setup scripts.
+Unmarked legacy gates are automatically replaced only for the current Bridge
+installation's exact gate path. Literal shell quoting, including apostrophes and
+spaces, is decoded without execution. Unknown unmarked `src/planning-gate.ts`
+invocations block setup before any backup or configuration write: an operator
+must reconcile ownership in the existing `postCreate` list instead of allowing
+the installer to delete a user hook or silently add a duplicate Bridge gate.
+(optional prerelease/build suffix). Configure routing paths in the existing project
+JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
+native gh authentication and Orchestrator provider login. Never put tokens,
+passwords, environment assignments or private keys in argv, config or examples.
+Host verification inherits the caller environment; do not use it for untrusted
+code with credentials in scope. Neither mode contains the coding agent.
+
+### Verification and two-project migration
+
+Keep project `version: 1`; verification has its own `version: 1`. Missing
+verification remains compatible, but prompts explicitly report the gap instead
+of assuming a container. Implementation and CodeRabbit code-remediation prompts
+use the same renderer. Review registration persists verification separately;
+project polling refreshes it, including removal, for existing review targets.
+
+1. Back up each existing project JSON and installed plist locally. Do not copy
+   credentials, state databases, global policies or another person's grants.
+2. Preserve all existing project keys and values. For ADLC Bridge, add
+   `"verification": {"version":1,"mode":"host","steps":[{"cwd":".","argv":["bun","test"]}]}`.
+3. For Honey Summer, transcribe its approved workflow as explicit argv steps and
+   relative working directories. `config/verification-container.example.json`
+   illustrates frontend lint/type/test commands and template inputs; embed this
+   object as `verification`, replace its digest, and confirm the exact commands
+   against that repository. Alternatively choose host mode for its approved host
+   workflow. No repository name is special-cased in the framework.
+4. Populate one runtime file per project from the existing installation, retaining
+   its service label (including `local.adlc.linear-intake` where used), executable
+   pins, working directory, interval, RunAtLoad and log destinations. Keep original
+   installed definitions untouched; render to a different staging path. Compare
+   the rendered plist with the installed one before human-approved installation.
+5. Preview each project/runtime pair with the commands above. Existing AO project
+   registration, hook setup, provider access and service operation require their
+   separate existing validation; setup preview does not prove them.
+
+Verification uses argv vectors, not shell strings: globs are not expanded.
+Directories resolve relative to the explicitly supplied isolated worktree, with
+realpath containment checks. The worktree must share the configured repository's
+Git common directory; another repository is rejected before execution, while
+linked worktrees of the configured repository are accepted. Execute only after
+the plan authorizes verification:
+
+```sh
+bun src/cli.ts verification config/local.json /absolute/isolated/worktree --run
+# Container mode also requires the matching runtime configuration:
+bun src/cli.ts verification config/local.json /absolute/isolated/worktree --run --runtime config/runtime.local.json
+```
+
+Container mode requires an existing image ID/digest; it never builds or pulls.
+The runner rechecks the configured Docker version and executes that absolute
+`tools.docker.path`, never a `docker` selected from the caller's PATH. The runtime
+file must reference the same project config. Missing pins and version mismatches
+fail before copying inputs or starting any container.
+Explicit input paths are copied to a disposable snapshot, filtering common secret
+files, `.env*`, Git metadata, dependencies and symlinks. Selected input symlinks
+and symlinked parent components are rejected before resolving/copying. Never include private
+files in selected inputs: filtering is defense-in-depth, not secret discovery.
+Inputs mount read-only under `/workspace`; bake matching dependencies/tools into
+the pinned image (e.g. `/workspace/node_modules`). Each step starts a fresh
+non-root container without network, host environment, home or Docker socket,
+with a read-only root and writable `/tmp`. Commands must use `/tmp` for generated
+output. Dependency/image compatibility is the operator's responsibility; changed
+lockfiles require an explicitly rebuilt/re-pinned image. The older specialized
+`container-check` remains available only when explicitly selected.
+
+`--export` emits an allowlisted **disabled sanitized template**, not a backup:
+it replaces identities, paths and command arguments because those can contain
+private data. It retains tool versions and service interval, not local state or
+authorization. Complete a new installation with private local mappings and
+approved workflow from the original config; exports cannot transfer approval.
+Do not publish original configs or unsanitized previews (which contain paths).
+
+Tests demonstrate both project-shaped setup flows with injected executable probes
+and mocked container execution; these do not prove live Honey Summer, Docker,
+provider or launchd compatibility. Report live commands separately. Plan approval,
+scoped Git grants, human-only PR merging and no automatic deployment are unchanged.
+
 Local-first coordination between Linear, Agent Orchestrator, OpenChamber routing,
 GitHub CI, and CodeRabbit. Coding runs locally in isolated Orchestrator worktrees.
 Docker is used for supported verification, not for coding or the controller.

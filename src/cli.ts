@@ -6,6 +6,8 @@ import {Store} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {initWizard} from './init';
+import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime} from './setup';
+import {verificationInstructions,runVerification} from './verification';
 import {poll,validate} from './linear';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
@@ -31,10 +33,34 @@ const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
 async function main(){
+  if(command==='setup'){
+    const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
+    if(a.includes('--export'))return out(sanitizedSetup(c,r));
+    if(a.includes('--write-service'))return out(writeSetupService(c,r));
+    const preview=setupPreview(c,r);out(preview);if(!preview.passed)process.exitCode=1;return;
+  }
+  if(command==='verification'){
+    const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(c);
+    if(!a.includes('--run'))return console.log(verificationInstructions(c.verification));
+    if(!c.verification)throw Error('Project verification is not configured');
+    let docker;
+    if(c.verification.mode==='container'){
+      const i=a.indexOf('--runtime');if(i<0)throw Error('Container verification requires --runtime RUNTIME_JSON');
+      const runtime=JSON.parse(readFileSync(req(a[i+1],'Runtime config'),'utf8'));validateRuntime(runtime);
+      if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
+      docker=runtime.tools.docker;
+    }
+    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker,projectRepo:c.repo});out(result);if(!result.passed)process.exitCode=1;return;
+  }
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.5 — Agent Orchestrator + OpenChamber
   projects                             list registered project services
+  setup PROJECT_JSON RUNTIME_JSON       read-only prerequisite/service preview
+    [--write-service]                   create staged definition only; no activation
+    [--export]                          print sanitized, disabled setup template
+  verification CONFIG [WORKTREE]        instructions; --run requires worktree
+    --runtime RUNTIME_JSON              required for container execution; pins Docker
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
@@ -124,7 +150,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       await poll(config,s,linearToken());
       const stage=await workflow.recoverHandoff(req(a[0],'Job'),config);
       await disableNativeFeedback(stage.session);
-      reviewLoop.register(stage.job,config.githubRepo,stage.pr.number,config.requiredChecks,JSON.parse(workflow.implementation(stage.job).paths),true);
+      reviewLoop.register(stage.job,config.githubRepo,stage.pr.number,config.requiredChecks,JSON.parse(workflow.implementation(stage.job).paths),true,config.verification);
       return out(stage);
     }
     if(command==='show-plan'){const j=s.get(req(a[0],'Job'));return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),routing:new TaskRouting(s).list(j.id)});}
@@ -138,7 +164,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const run=lifecycle.run(job);if(!run)throw Error('Existing approved run required');
       await disableNativeFeedback(run.session_id);
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
-      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true));
+      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification));
     }
     if(command==='tick-review')return out(await reviewLoop.tick(req(a[0],'Job')));
     if(command==='adopt-pilot')return out(await adoptPilot(s,req(a[0],'Job'),req(a[1],'Session')));
@@ -157,12 +183,13 @@ Registered approved review targets can request bounded in-scope fixes from their
           const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
           if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
           const delivery=workflow.implementation(stage.job);
-          reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
+          reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true,c.verification);
         }
       }
       const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)out({linearStatuses:linearUpdates});
       const featureUpdates=await features.tickProject(c);if(featureUpdates.length)out({features:featureUpdates});
       for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+        reviewLoop.setVerification(target.job,c.verification);
         if(target.state==='completed')continue;
         try{out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
       }

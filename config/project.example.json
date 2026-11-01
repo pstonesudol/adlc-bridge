@@ -3,6 +3,11 @@
   "name": "Your project",
   "repo": "/absolute/path/to/your/repository",
   "githubRepo": "OWNER/REPOSITORY",
+  "verification": {
+    "version": 1,
+    "mode": "host",
+    "steps": [{"cwd": ".", "argv": ["bun", "test"]}]
+  },
   "automation": {
     "planningEnabled": false,
     "orchestratorProject": "YOUR_REGISTERED_PROJECT_ID",
