@@ -80,11 +80,29 @@ test('direct project stops are fenced and nested stack stops reuse only the cont
   const calls:string[]=[],operate=async(action:string)=>{calls.push(action);return {};};
   await f.turns.submit(async()=>{
    await expect(serviceControl('stop','project',f.turns,operate)).rejects.toThrow('in progress');expect(calls).toEqual([]);
-   await serviceControl('service-status','project',f.turns,operate);await serviceControl('start','project',f.turns,operate);expect(calls).toEqual(['service-status','start']);
+   await serviceControl('service-status','project',f.turns,operate);await expect(serviceControl('start','project',f.turns,operate)).rejects.toThrow('in progress');expect(calls).toEqual(['service-status']);
   });
   calls.length=0;await f.turns.run(async()=>{
    await serviceControl('stop','project',turnBarrier(f.state),async action=>{calls.push(action);await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');return {};});
   });expect(calls).toEqual(['stop']);
+ }finally{f.close();}
+});
+test('direct starts reject the durable pause while stack starts can confirm services before resuming',async()=>{
+ const f=fixture();try{
+  f.turns.pause();const starts:string[]=[];
+  const operate=async(action:string,id?:string)=>{starts.push(`${action}:${id}`);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);return {loaded:true,running:true,startupAcknowledged:true};};
+  await expect(serviceControl('start','one',turnBarrier(f.state),operate)).rejects.toThrow('use start --all');expect(starts).toEqual([]);expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+  f.ops.projects=async()=>[{project:'one'},{project:'two'}];f.ops.project=(action,id)=>serviceControl(action,id,turnBarrier(f.state),operate);
+  await controlStack('start',f.ops);expect(starts).toEqual(['start:one','start:two']);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(false);await f.turns.submit(async()=>{});
+  // An independent direct start still works when the stack is unpaused.
+  let direct=0;await serviceControl('start','one',f.turns,async()=>{direct++;await expect(turnBarrier(f.state).submit(async()=>{})).rejects.toThrow('in progress');return {};});expect(direct).toBe(1);
+ }finally{f.close();}
+});
+test('partial stack startup failure cannot be bypassed by a subsequent direct project start',async()=>{
+ const f=fixture();try{
+  let starts=0;f.ops.projects=async()=>[{project:'one'},{project:'two'}];f.ops.project=(action,id)=>serviceControl(action,id,turnBarrier(f.state),async()=>{starts++;if(id==='two')throw Error('second acknowledgement failed');return {loaded:true,running:true};});
+  await expect(controlStack('start',f.ops)).rejects.toThrow('second acknowledgement failed');expect(starts).toBe(2);
+  await expect(serviceControl('start','one',f.turns,async()=>{starts++;return {};})).rejects.toThrow('use start --all');expect(starts).toBe(2);await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');
  }finally{f.close();}
 });
 test('production project-stop wiring refuses an active submission before touching launchd',()=>{

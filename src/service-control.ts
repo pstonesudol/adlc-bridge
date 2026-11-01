@@ -28,7 +28,7 @@ export async function registeredProjects(readOnly=false,home=homedir(),path=regi
  try{const registry=new ProjectServices(s,!readOnly),legacy=registry.discoverLegacy(home,read,!readOnly),entries=registry.list();if(legacy&&!entries.some(p=>p.project===legacy.project))entries.push(legacy);return entries.map(p=>({...p,definitionInstalled:existsSync(join(home,'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
 }
 export async function serviceControl(action:string,project?:string,turns:TurnBarrier=turnBarrier(),operate=controlProject){
- return action==='stop'?turns.run(()=>operate(action,project)):operate(action,project);
+  return action==='stop'||action==='start'?turns.run(()=>operate(action,project),action==='start'?'start':'control'):operate(action,project);
 }
 async function controlProject(action:string,project?:string){
  if(process.platform!=='darwin'||!process.getuid)throw Error('Service controls require macOS');

@@ -6,7 +6,7 @@ const submitting=new AsyncLocalStorage<{lock:string;active:boolean}>();
 const controlling=new AsyncLocalStorage<{lock:string;active:boolean}>();
 export class TurnSubmissionBlocked extends Error{}
 export type TurnBarrier={
- run<T>(operation:()=>Promise<T>):Promise<T>;
+  run<T>(operation:()=>Promise<T>,mode?:'control'|'start'):Promise<T>;
  submit<T>(operation:()=>Promise<T>):Promise<T>;
  pause():void;
  resume():void;
@@ -21,9 +21,14 @@ export function turnBarrier(state=appState()):TurnBarrier{
   try{mkdirSync(lock,{mode:0o700});}catch(e:any){if(e?.code==='EEXIST')throw new TurnSubmissionBlocked('Turn submission or shutdown is in progress; inspect turn-submission.lock if interrupted');throw e;}
   try{return await operation();}finally{try{rmdirSync(lock);}catch{console.error('Turn submission lock cleanup needs inspection:',lock);}}
  };
- const run=async<T>(operation:()=>Promise<T>):Promise<T>=>{
-  const inherited=controlling.getStore();if(inherited?.active&&inherited.lock===lock)return operation();
-  return exclusive(async()=>{const scope={lock,active:true};return controlling.run(scope,async()=>{try{return await operation();}finally{scope.active=false;}});});
+  const run=async<T>(operation:()=>Promise<T>,mode:'control'|'start'='control'):Promise<T>=>{
+   const inherited=controlling.getStore();if(inherited?.active&&inherited.lock===lock)return operation();
+   return exclusive(async()=>{
+    // Check under the lock, before creating a control scope. Only an already
+    // active stack-control scope may start intake behind its own pause.
+    if(mode==='start'&&isPaused())throw new TurnSubmissionBlocked('Intake submissions remain paused; use start --all after inspecting the stack');
+    const scope={lock,active:true};return controlling.run(scope,async()=>{try{return await operation();}finally{scope.active=false;}});
+   });
  };
  const submit=async<T>(operation:()=>Promise<T>):Promise<T>=>{
   const inherited=submitting.getStore();if(inherited?.active&&inherited.lock===lock)return operation();
