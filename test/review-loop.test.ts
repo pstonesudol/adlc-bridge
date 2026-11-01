@@ -83,6 +83,27 @@ test('an empty metadata policy skips wait creation and ignores historical metada
   expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual(rows);expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
+test('removing metadata policy cannot bypass an uncertain description send or its fresh-review obligation',async()=>{
+ const f=templateFixture();try{
+  await f.loop.tick(f.id);f.loop.configureMetadataChecks('project',[]);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  f.session.transcript.turns[0].state='completed';expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  f.e.descriptionHash='edited-after-policy-removal';f.e.botReviewSubmittedAt=Date.now()-1000;
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'completed'});expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM description_delivery_gates').all()).toHaveLength(1);await f.loop.tick(f.id);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+  f.loop.configureMetadataChecks('project',['Alternative']);f.e.metadataCheckEvidence=bodyEvidence(f.e,['Alternative']);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');f.loop.configureMetadataChecks('project',[]);
+  f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+  f.e.descriptionHash='another-body';f.e.botReviewSubmittedAt=Date.now()-1000;expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(2);
+ }finally{f.s.close();}
+});
+test('clearing metadata policy after delivery reconciliation still requires review of the delivered description',async()=>{
+ const f=templateFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='delivered-body';f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()-1000;
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');f.loop.configureMetadataChecks('project',[]);
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.sends()).toBe(1);expect(f.reviews()).toBe(1);
+  f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+ }finally{f.s.close();}
+});
 test('pilot rejects matching check identities and findings when failure body attestation is missing or stale',async()=>{
  for(const invalid of ['missing','null','old-body','identity','success']){const f=templateFixture();try{
   const finding=f.e.findings[0];
@@ -166,7 +187,7 @@ test('fresh failing check allows bounded remediation instead of a stale CI wait'
  }finally{f.s.close();}
 });
 test('CodeRabbit reevaluation blocks after thirty minutes without duplicate review requests',async()=>{
-  const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');const elapsed=Date.now()-30*60*1000-1;f.s.db.query('UPDATE full_review_requests SET requested=?').run(elapsed);f.s.db.query('UPDATE metadata_waits SET started=?').run(elapsed);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
+   const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');const elapsed=Date.now()-30*60*1000-1;f.s.db.query('UPDATE full_review_requests SET requested=?').run(elapsed);f.s.db.query('UPDATE metadata_waits SET started=?').run(elapsed);f.s.db.query('UPDATE description_delivery_gates SET started=?').run(elapsed);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
 });
 test('metadata remediation preserves the configured budget after base-branch integration',async()=>{
  const f=templateFixture(),policy={maxAttempts:2,maxNoProgress:5,window:'job' as const};try{

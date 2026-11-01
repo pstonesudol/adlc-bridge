@@ -465,10 +465,14 @@ from the source checkout to activate it. The installed CLI remembers that source
 path. A source edit or PR merge alone does not activate new controller code.
 This separation is necessary when the bridge manages its own repository.
 
-### Reproduce the Orchestrator CI hotfix
+### Reproduce the pinned Orchestrator daemon
 
 The signed Orchestrator app is preserved. `patches/orchestrator-ci-reruns.patch`
-fixes superseded GitHub Actions results in both native SCM adapters. The build
+currently verifies provenance only; it does **not** change production check
+results or fix superseded GitHub Actions failures. REST job IDs are attempt-specific,
+so the patch cannot safely collapse rerun attempts without a stable logical-job
+identity. Distinct checks remain visible, and CI can remain blocked for inspection.
+Do not install this build expecting rerun failures to be cleared. The optional build
 recipe verifies the SHA-256 of the official source archive at a pinned revision,
 applies the patch without Git, runs adapter race tests and builds the daemon.
 Upstream code is Apache-2.0; its license is in `patches/ORCHESTRATOR-LICENSE`.
@@ -683,7 +687,9 @@ wait up to five minutes for body-bound evidence and then block for inspection;
 unattested failures block for inspection without sending remediation. This remains
 fail-closed until a trustworthy body-bound attestation source is implemented.
 An empty `prMetadataChecks` policy skips this additional body-evidence gate; it
-does not bypass other required checks or CodeRabbit approval.
+does not bypass other required checks or CodeRabbit approval. Clearing the policy
+does not clear an outstanding remediation send: its delivery must be reconciled,
+and any observed description change still requires a fresh CodeRabbit evaluation.
 
 The remediation flow below requires that future attestation support. In addition
 to body evidence, the bridge verifies the failed job’s repository, check-run ID,
@@ -710,9 +716,10 @@ Log retrieval checks the installed GitHub CLI version and passes `gh api
 that flag. Escape sequences are stripped before selected failure lines reach
 the worker.
 
-When GitHub returns old and rerun check results for one commit, the bridge verifies
-the workflow run, job, repository, commit, workflow identity, and event. Supersession
-also requires the same job provenance: GitHub REST job IDs are attempt-specific
+When GitHub returns old and rerun check results for one commit, the bridge passes
+the raw check results through unchanged, without extra provenance REST reads.
+The native patch verifies workflow/job provenance but cannot supersede production
+attempts: GitHub REST job IDs are attempt-specific
 and do not establish a stable logical-job identity across attempts. Distinct job
 IDs are therefore retained even for successful reruns of same-name checks. This
 can leave readiness blocked or ambiguous for inspection; it cannot hide another

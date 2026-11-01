@@ -35,7 +35,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   const first=await gh(['api',`${base}/pulls/${number}`]);
   if(first.state!=='open')throw Error('PR is not open');
   const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
-  const checks=await latestWorkflowChecks(repo,first.head.sha,rawChecks,path=>gh(['api',path]));
+   const checks=latestWorkflowChecks(rawChecks);
   const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();let unresolved=0;
   const findings:any[]=[];
   do {

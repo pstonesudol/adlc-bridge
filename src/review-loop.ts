@@ -48,7 +48,8 @@ export class ReviewLoop{
   CREATE TABLE IF NOT EXISTS review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,head,body_hash));
   CREATE TABLE IF NOT EXISTS metadata_check_policy(project TEXT PRIMARY KEY,checks TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS metadata_baselines(job TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(job,attempt));
-  CREATE TABLE IF NOT EXISTS metadata_waits(job TEXT NOT NULL,head TEXT NOT NULL,body TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(job,head,body));
+   CREATE TABLE IF NOT EXISTS metadata_waits(job TEXT NOT NULL,head TEXT NOT NULL,body TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(job,head,body));
+   CREATE TABLE IF NOT EXISTS description_delivery_gates(job TEXT PRIMARY KEY,head TEXT NOT NULL,body TEXT NOT NULL,started INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));`);}
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
@@ -128,20 +129,32 @@ export class ReviewLoop{
   // A same-SHA approval can predate a description edit. Reconcile metadata
   // receipts before considering e.clear, so that edit always creates its gate.
   const metadataPending=this.s.db.query("SELECT r.*,c.baseline_body_hash FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.state='delivery_uncertain' AND c.kind='pr_description' ORDER BY r.attempt DESC LIMIT 1").get(job) as any;
-   if(metadataChecks.length>0&&metadataPending?.head===e.head&&metadataPending.baseline_body_hash!==e.descriptionHash){
-   const handle=`adlc-fix-${job.slice(0,12)}-${metadataPending.attempt}`,entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
-   if(turn?.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous metadata remediation is uncertain or incomplete; never infer completion'});
-   const baseline=this.s.db.query('SELECT signature FROM metadata_baselines WHERE job=? AND attempt=?').get(job,metadataPending.attempt) as any;
-   this.s.db.transaction(()=>{
-    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,metadataPending.attempt);
-    this.s.db.query('INSERT OR IGNORE INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,baseline?.signature??e.templateSignature,Date.now());
+   if(metadataPending){
+    const handle=`adlc-fix-${job.slice(0,12)}-${metadataPending.attempt}`,entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
+    if(turn?.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous metadata remediation is uncertain or incomplete; never infer completion'});
+    if(metadataPending.baseline_body_hash===e.descriptionHash)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'Metadata worker completed without an observed description change; inspect before clearing delivery'});
+    const baseline=this.s.db.query('SELECT signature FROM metadata_baselines WHERE job=? AND attempt=?').get(job,metadataPending.attempt) as any;
+    this.s.db.transaction(()=>{
+     this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,metadataPending.attempt);
+     if(metadataChecks.length)this.s.db.query('INSERT OR IGNORE INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,baseline?.signature??e.templateSignature,Date.now());
+     this.s.db.query('INSERT INTO description_delivery_gates VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET head=excluded.head,body=excluded.body,started=excluded.started').run(job,e.head,e.descriptionHash,Date.now());
+    }).immediate();
+   }
+   // A delivered description edit creates a review obligation independently of
+   // mutable metadata-check policy. Clearing that policy cannot clear delivery
+   // uncertainty or make an approval for the previous body current.
+   const deliveryWait=this.s.db.transaction(()=>{
+    const prior=this.s.db.query('SELECT * FROM description_delivery_gates WHERE job=?').get(job) as any;
+    if(!prior||prior.head===e.head&&prior.body===e.descriptionHash)return prior;
+    const started=Math.max(Date.now(),prior.started+1);
+    this.s.db.query('UPDATE description_delivery_gates SET head=?,body=?,started=? WHERE job=?').run(e.head,e.descriptionHash,started,job);
+    return {...prior,head:e.head,body:e.descriptionHash,started};
    }).immediate();
-  }
    // Once metadata remediation creates a gate, another same-head body edit
    // cannot escape it. Carry its baseline forward and restart review freshness
    // for each newly observed body, including a return to an earlier body.
    const needsBodyEvidence=metadataChecks.length>0&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks);
-   const waiting=metadataChecks.length===0?null:this.s.db.transaction(()=>{
+    const checkWait=metadataChecks.length===0?null:this.s.db.transaction(()=>{
     const prior=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? ORDER BY started DESC,rowid DESC LIMIT 1').get(job,e.head) as any;
     if(!prior){
      if(!needsBodyEvidence)return null;
@@ -153,7 +166,8 @@ export class ReviewLoop{
     this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?) ON CONFLICT(job,head,body) DO UPDATE SET signature=excluded.signature,started=excluded.started').run(job,e.head,e.descriptionHash,prior.signature,started);
     return {...prior,body:e.descriptionHash,started};
    }).immediate();
-   if(needsBodyEvidence){
+    const waiting=checkWait??deliveryWait;
+    if(needsBodyEvidence){
     return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; missing body-bound success evidence for every configured metadata check'});
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
@@ -168,10 +182,11 @@ export class ReviewLoop{
    if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){
    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
   }
-  if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
-   if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=waiting.started))await this.requestReview(job,e.head,e.descriptionHash);
+   if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
+    const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
+    if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted))await this.requestReview(job,e.head,e.descriptionHash);
    const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,e.descriptionHash) as any;
-   const sinceReview=Math.max(waiting.started,request?.requested??waiting.started);
+    const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
    if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
   const d=decision(e,JSON.parse(t.allowed_paths),Date.now()-since);
