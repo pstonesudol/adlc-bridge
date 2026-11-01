@@ -3,7 +3,7 @@ import {atomicFile as atomic} from './atomic-file';
 import {trustedDaemon} from './daemon-runtime';
 import {definitionXML} from './project-services';
 import {join,resolve,dirname} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
-import {appState,installedCLI} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {serviceDefinition} from './init';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
+import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {serviceDefinition} from './init';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
 export function distributionFiles(root:string){
  const files:string[]=[];
  function walk(dir:string){for(const name of readdirSync(join(root,dir)).sort()){const rel=join(dir,name),st=lstatSync(join(root,rel));if(name==='__pycache__'||name.endsWith('.pyc'))continue;if(st.isSymbolicLink())throw Error('Distribution cannot contain symlinks');if(st.isDirectory())walk(rel);else if(st.isFile())files.push(rel);}}
@@ -39,7 +39,7 @@ function runtimeMigration(state:string,home:string,io:typeof installIO){
  return {pinPath,pinBytes,pin,plist,def,plistBytes:readFileSync(plist)};
 }
 export async function installBridge(apply=false,root=resolve(import.meta.dir,'..'),bin?:string,io=installIO){
- if(root.includes('/ADLC Bridge/versions/')&&existsSync(join(io.state(),'installation.json')))root=JSON.parse(readFileSync(join(io.state(),'installation.json'),'utf8')).source;
+  if(root.includes('/ADLC Bridge/versions/'))root=verifiedInstallationSource(io.state())??root;
  const projects=await io.registeredProjects();
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}

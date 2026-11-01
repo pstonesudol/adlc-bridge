@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
-import {installBridge} from '../src/install';import {copyFileSync,readdirSync,existsSync} from 'node:fs';
+import {installBridge} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
 test('installation snapshots exclude credentials, Git data, tests and internal notes and survive checkout edits',()=>{const root=mkdtempSync(join(tmpdir(),'adlc-install-'));try{const source=join(root,'source'),dest=join(root,'versions');for(const d of ['src','config','.git'])mkdirSync(join(source,d),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'original');writeFileSync(join(source,'config/private.json'),'secret');writeFileSync(join(source,'.env'),'secret');writeFileSync(join(source,'IMPLEMENTATION-STATUS.md'),'private');const a=snapshot(source,dest);expect(distributionFiles(source)).toEqual(['src/cli.ts']);writeFileSync(join(source,'src/cli.ts'),'changed');expect(readFileSync(a.cli,'utf8')).toBe('original');expect(snapshot(source,dest).version).not.toBe(a.version);writeFileSync(a.cli,'tampered');writeFileSync(join(source,'src/cli.ts'),'original');expect(()=>snapshot(source,dest)).toThrow('changed');}finally{rmSync(root,{recursive:true,force:true});}});
 test('interrupted snapshot copy leaves no published partial version and can be retried',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-copy-'));try{
@@ -26,5 +26,17 @@ test('installer migrates projects without plists and rolls back gates, record, l
   for(const p of projects.slice(0,2))expect(readFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'utf8')).toBe('old '+p.project);
   expect(calls.filter(x=>x.startsWith('start:'))).toEqual(['start:loaded']);expect(calls.filter(x=>x.startsWith('stop:'))).toEqual(['stop:loaded']);
   expect(readdirSync(join(state,'versions'))).toHaveLength(1);expect(readFileSync(snapshot(source,join(state,'versions')).cli,'utf8')).toBe('original');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('snapshot reinstalls use only a verified installation source and preserve the root when no record exists',async()=>{
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-reinstall-'))),state=join(root,'ADLC Bridge'),installed=join(state,'versions/abc'),source=join(root,'source'),record=join(state,'installation.json');
+ try{
+  for(const dir of [join(installed,'src'),join(source,'src')])mkdirSync(dir,{recursive:true});writeFileSync(join(installed,'src/cli.ts'),'installed');writeFileSync(join(source,'src/cli.ts'),'source');
+  let reads=0;const io:any={state:()=>state,home:()=>root,registeredProjects:async()=>{reads++;return [];}};
+  expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);
+  const valid={source,cli:join(installed,'src/cli.ts')};writeFileSync(record,JSON.stringify(valid),{mode:0o600});expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(source);
+  reads=0;chmodSync(record,0o644);await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('owner-only');expect(reads).toBe(0);chmodSync(record,0o600);
+  writeFileSync(record,JSON.stringify({...valid,source:'relative'}));await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('Invalid installation source');expect(reads).toBe(0);
+  const other=join(root,'other-record');writeFileSync(other,JSON.stringify(valid),{mode:0o600});rmSync(record);symlinkSync(other,record);await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('owner-only');expect(reads).toBe(0);
  }finally{rmSync(root,{recursive:true,force:true});}
 });

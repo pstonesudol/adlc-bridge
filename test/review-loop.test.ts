@@ -148,3 +148,10 @@ test('pilot remediation uses the same submission barrier as shutdown and never s
 test('an attempted pilot send preserves uncertainty and its consumed budget when spawning fails',async()=>{
  const f=templateFixture();try{f.io.spawn=()=>{throw Error('spawn receipt lost');};await expect(f.loop.tick(f.id)).rejects.toThrow('receipt lost');expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});}finally{f.s.close();}
 });
+test('remediation send uses a bounded timeout and keeps a failed receipt uncertain without resending',async()=>{
+ const f=templateFixture();try{
+  let options:any,sends=0;f.io.spawn=(_args:any,opts:any)=>{sends++;options=opts;return {stdout:new Response('').body,stderr:new Response('').body,exited:Promise.resolve(143)};};
+  await f.loop.tick(f.id);expect(options).toEqual({stdout:'pipe',stderr:'pipe',timeout:30000});expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(sends).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
