@@ -2,6 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,realpathSync,existsSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';import {createWorkflowTransport} from '../src/workflow-transport';import {createFeatureAgents} from '../src/feature-transport';
 import {Store} from '../src/core';import {Workflow} from '../src/workflow';import {featureFixture,featureConfig,requirements} from './feature-fixture';
+import {serviceControl} from '../src/service-control';
 const receipt=(exited=Promise.resolve(0))=>({stdout:new Response('{}').body,stderr:new Response('').body,exited});
 function fixture(){
  const state=realpathSync(mkdtempSync(join(tmpdir(),'adlc-turns-'))),turns=turnBarrier(state),calls:string[]=[];let on=true;
@@ -72,5 +73,25 @@ test('nested submissions reuse only their own active submission scope, never a s
  const f=fixture();try{
   await f.turns.submit(async()=>{await turnBarrier(f.state).submit(async()=>{});await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');});
   await f.turns.run(async()=>{await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');});
+ }finally{f.close();}
+});
+test('direct project stops are fenced and nested stack stops reuse only the control scope',async()=>{
+ const f=fixture();try{
+  const calls:string[]=[],operate=async(action:string)=>{calls.push(action);return {};};
+  await f.turns.submit(async()=>{
+   await expect(serviceControl('stop','project',f.turns,operate)).rejects.toThrow('in progress');expect(calls).toEqual([]);
+   await serviceControl('service-status','project',f.turns,operate);await serviceControl('start','project',f.turns,operate);expect(calls).toEqual(['service-status','start']);
+  });
+  calls.length=0;await f.turns.run(async()=>{
+   await serviceControl('stop','project',turnBarrier(f.state),async action=>{calls.push(action);await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');return {};});
+  });expect(calls).toEqual(['stop']);
+ }finally{f.close();}
+});
+test('production project-stop wiring refuses an active submission before touching launchd',()=>{
+ const f=fixture();try{
+  const service=join(import.meta.dir,'../src/service-control.ts'),barrier=join(import.meta.dir,'../src/turn-submission.ts');
+  const script=`import {serviceControl} from ${JSON.stringify(service)};import {turnBarrier} from ${JSON.stringify(barrier)};let reason='';await turnBarrier().submit(async()=>{try{await serviceControl('stop','project');}catch(e){reason=e.message;}});console.log(JSON.stringify({reason}));`;
+  const child=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.state,ADLC_DB:join(f.state,'unused.sqlite')}});
+  expect(child.exitCode).toBe(0);expect(JSON.parse(child.stdout.toString()).reason).toContain('in progress');
  }finally{f.close();}
 });

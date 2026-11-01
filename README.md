@@ -38,6 +38,8 @@ Stop holds it from intake unload and the final inventory scan through
 backend shutdown and leaves submissions paused until a successful `start --all`.
 A delivery already holding it refuses shutdown before unloading any intake
 service, instead of interrupting the send. Retry once that delivery settles.
+Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
+they cannot unload a poll process while it owns an in-flight submission.
 Contention or an abandoned `turn-submission.lock` fails closed; inspect the stack
 and delivery receipts before removing an abandoned lock. This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle

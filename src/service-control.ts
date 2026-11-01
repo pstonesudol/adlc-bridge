@@ -3,6 +3,7 @@ import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from './core';
 import {ProjectServices,registryPath,assertDefinition,readDefinition} from './project-services';
+import {turnBarrier,type TurnBarrier} from './turn-submission';
 async function launch(args:string[]){
  const p=Bun.spawn(['/bin/launchctl',...args],{stdout:'pipe',stderr:'pipe'});
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
@@ -11,7 +12,10 @@ async function launch(args:string[]){
 export async function registeredProjects(){
  const s=new Store(registryPath());try{const registry=new ProjectServices(s);registry.discoverLegacy();return registry.list().map(p=>({...p,definitionInstalled:existsSync(join(homedir(),'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
 }
-export async function serviceControl(action:string,project?:string){
+export async function serviceControl(action:string,project?:string,turns:TurnBarrier=turnBarrier(),operate=controlProject){
+ return action==='stop'?turns.run(()=>operate(action,project)):operate(action,project);
+}
+async function controlProject(action:string,project?:string){
  if(process.platform!=='darwin'||!process.getuid)throw Error('Service controls require macOS');
  const s=new Store(registryPath());
  try{
