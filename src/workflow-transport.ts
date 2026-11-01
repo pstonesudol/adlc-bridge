@@ -8,7 +8,7 @@ import type {WorkflowTransport} from './workflow';
 import {withTurnSubmission} from './turn-submission';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
-import {resolve} from 'node:path';
+import {resolve,basename} from 'node:path';
 
 async function jsonCommand(args:string[]){
  const p=Bun.spawn(args,{stdout:'pipe',stderr:'pipe'});
@@ -84,6 +84,7 @@ export async function installWorkflowHook(configPath:string,api=localAO){
 function shellQuote(s:string){return "'"+s.replaceAll("'","'\\''")+"'";}
 export function bridgePlanningHook(script:string,checkout=resolve(import.meta.dir,'planning-gate.ts'),versions=resolve(homedir(),'Library/Application Support/ADLC Bridge/versions'),sourceGate?:string){
  const command=literalShellWords(script);if(!command||command.length!==2)return false;
+ if(command[0]!==process.execPath&&basename(command[0])!=='bun')return false;
  const path=command[1];
  if(path===checkout||path===sourceGate)return true;
  const prefix=versions+'/';if(!path.startsWith(prefix))return false;
