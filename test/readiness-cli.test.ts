@@ -16,8 +16,29 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
    [`repos/owner/repo/compare/${base}...${head}`]:{behind_by:0},
   };
   const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}}}}}};
+  const query='query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{isResolved isOutdated path comments(first:100){nodes{body author{login} originalCommit{oid}} pageInfo{hasNextPage}}}pageInfo{hasNextPage endCursor}}}}}';
+  const graphqlArgs=['api','graphql','-f',`query=${query}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   // Replace gh entirely; this process has no credentials or network fallback.
-  writeFileSync(join(root,'gh'),`#!${process.execPath}\nconst args=process.argv.slice(2),responses=${JSON.stringify(responses)};if(args[0]!=='api'||args.includes('--method'))throw Error('Read-only fixture only');const key=args.find(x=>Object.hasOwn(responses,x));const result=args.includes('graphql')?${JSON.stringify(graphql)}:responses[key];if(result===undefined)throw Error('Unexpected GitHub read');console.log(JSON.stringify(result));\n`,{mode:0o755});
+  writeFileSync(join(root,'gh'),`#!${process.execPath}
+const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
+if(args[0]!=='api')throw Error('Read-only fixture only');
+let result;
+if(args[1]==='graphql'){
+ // Field flags are allowed only for this exact read-only query and variables.
+ if(JSON.stringify(args)!==JSON.stringify(${JSON.stringify(graphqlArgs)}))throw Error('Read-only fixture only');
+ result=${JSON.stringify(graphql)};
+}else{
+ // REST accepts only plain or paginated GET argument shapes: no -f/-F,
+ // --field/--raw-field, method overrides, inputs, or attached flag forms.
+ if(!(args.length===2||args.length===4&&args[1]==='--paginate'&&args[2]==='--slurp'))throw Error('Read-only fixture only');
+ const key=args.at(-1);if(!Object.hasOwn(responses,key))throw Error('Unexpected GitHub read');result=responses[key];
+}
+console.log(JSON.stringify(result));
+`,{mode:0o755});
+  const path='repos/owner/repo/pulls/1';
+  for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
+   const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
+  }
   for(const metadata of [['Metadata'],[]]){
    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata}));
    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
