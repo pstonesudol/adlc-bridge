@@ -1,6 +1,7 @@
 import {readdirSync,lstatSync,readFileSync,writeFileSync,mkdirSync,mkdtempSync,rmSync,existsSync,copyFileSync,renameSync,unlinkSync} from 'node:fs';
 import {atomicFile as atomic} from './atomic-file';
 import {trustedDaemon} from './daemon-runtime';
+import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {definitionXML} from './project-services';
 import {join,resolve,dirname} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
 import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {serviceDefinition} from './init';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
@@ -45,15 +46,25 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}
  const definitions=projects.map(p=>{const path=join(io.home(),'Library/LaunchAgents',p.label+'.plist');if(!existsSync(path))return {p,path,def:null,original:null};const def=io.readDefinition(path);io.assertDefinition(def,p.label,p.config);return {p,path,def,original:readFileSync(path)};});
  const runtime=runtimeMigration(io.state(),io.home(),io);
- if(!apply)return {preview:true,source:root,launcher,projects:projects.map(p=>p.project),files:distributionFiles(root),runtimeLauncherMigration:!!runtime,note:'Apply creates a pinned runtime snapshot, pauses intake during activation, migrates gates/services and restores prior intake state. No workers are stopped. Runtime launcher changes take effect at the next guarded stop/start.'};
- const built=snapshot(root,join(io.state(),'versions'));const backup=join(io.state(),'backups',`install-${Date.now()}`);mkdirSync(backup,{recursive:true,mode:0o700});
+  if(!apply)return {preview:true,source:root,launcher,projects:projects.map(p=>p.project),files:distributionFiles(root),runtimeLauncherMigration:!!runtime,note:'Apply creates a pinned runtime snapshot, pauses intake during activation, migrates gates/services and restores prior intake state. No workers are stopped. Runtime launcher changes take effect at the next guarded stop/start.'};
+  const turns=turnBarrier(io.state());
+  return turns.run(async()=>{
+  // The default state is appState(), matching independently constructed service
+  // barriers. Keep stop/activation/rollback in this one inherited control scope.
+  const loaded=new Set<string>();
+  for(const {p,def} of definitions)if((await io.serviceControl('service-status',p.project)).loaded){
+   if(!def)throw Error('Loaded intake definition unavailable; service preserved for operator inspection');
+   loaded.add(p.project);
+  }
+  if(loaded.size&&turns.isPaused())throw new TurnSubmissionBlocked('Installation cannot restart loaded intake while submissions are paused; use guarded start --all or establish an unloaded quiescent stack first');
+  const built=snapshot(root,join(io.state(),'versions'));const backup=join(io.state(),'backups',`install-${Date.now()}`);mkdirSync(backup,{recursive:true,mode:0o700});
  const recordPath=join(io.state(),'installation.json');const oldRecord=existsSync(recordPath)?readFileSync(recordPath):null;const oldLauncher=existsSync(launcher)?readFileSync(launcher):null;
  const active:string[]=[];
  const restarted:string[]=[];
  let runtimeChanged=false;
  const originalProjects=[];for(const p of projects){const b=await io.localAO(`projects/${p.project}`);if(b.status!=='ok'||!b.project?.config)throw Error('Cannot back up project settings');originalProjects.push({id:p.project,config:b.project.config});}
  try{
-  for(const {p,def,original} of definitions){if(!def)continue;const current=await io.serviceControl('service-status',p.project);if(current.loaded){active.push(p.project);await io.serviceControl('stop',p.project);}writeFileSync(join(backup,p.label+'.plist'),original!,{mode:0o600});}
+   for(const {p,def,original} of definitions){if(!def)continue;if(loaded.has(p.project)){active.push(p.project);await io.serviceControl('stop',p.project);}writeFileSync(join(backup,p.label+'.plist'),original!,{mode:0o600});}
   atomic(recordPath,JSON.stringify({source:root,...built,launcher,installedAt:new Date().toISOString()},null,2)+'\n');
   for(const {p,path,def} of definitions){if(def){const xml=serviceDefinition(p.config,process.execPath,built.cli,io.home(),p.label);atomic(path,xml);}await io.installWorkflowHook(p.config);}
   if(runtime){
@@ -84,6 +95,7 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
    try{if(oldLauncher)atomic(launcher,oldLauncher.toString(),0o755);else if(existsSync(launcher))unlinkSync(launcher);}catch(error){failed('Launcher rollback',launcher,error);}
    if(!rollbackErrors.length)for(const id of active)try{await io.serviceControl('start',id);}catch(error){failed('Intake restart',id,error);}
    if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
-   throw e;
- }
+    throw e;
+  }
+  });
 }

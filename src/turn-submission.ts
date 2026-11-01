@@ -7,7 +7,8 @@ const controlling=new AsyncLocalStorage<{lock:string;active:boolean}>();
 export class TurnSubmissionBlocked extends Error{}
 export type TurnBarrier={
   run<T>(operation:()=>Promise<T>,mode?:'control'|'start'):Promise<T>;
- submit<T>(operation:()=>Promise<T>):Promise<T>;
+  submit<T>(operation:()=>Promise<T>):Promise<T>;
+  isPaused():boolean;
  pause():void;
  resume():void;
 };
@@ -37,7 +38,7 @@ export function turnBarrier(state=appState()):TurnBarrier{
    const scope={lock,active:true};return submitting.run(scope,async()=>{try{return await operation();}finally{scope.active=false;}});
   });
  };
- return {run,submit,
+  return {run,submit,isPaused,
   pause:()=>{atomicFile(paused,'Paused by stop --all\n');},resume:()=>{if(isPaused())unlinkSync(paused);}};
 }
 export const withTurnSubmission=<T>(operation:()=>Promise<T>)=>turnBarrier().submit(operation);

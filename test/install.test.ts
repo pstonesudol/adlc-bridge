@@ -1,5 +1,21 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
 import {installBridge} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
+import {turnBarrier} from '../src/turn-submission';import {serviceControl} from '../src/service-control';
+function controlFixture(){
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-install-control-'))),source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json'),plist=join(home,'Library/LaunchAgents/local.adlc.project.plist');
+ for(const dir of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(dir,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');writeFileSync(plist,'old plist');
+ let loaded=true,failStart=false,starts=0;const calls:string[]=[],original=Error('activation restart receipt lost');
+ const projects=[{project:'project',label:'local.adlc.project',config:'/project.json'}];
+ const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},
+  serviceControl:(action:string,id:string)=>serviceControl(action,id,turnBarrier(state),async action=>{
+   calls.push(action);expect(existsSync(join(state,'turn-submission.lock'))).toBe(true);await expect(turnBarrier(state).submit(async()=>{})).rejects.toThrow('in progress');
+   if(action==='stop')loaded=false;if(action==='start'){loaded=true;if(++starts===1&&failStart)throw original;}return {loaded};
+  }),
+  localAO:async(_path:string,method?:string)=>{if(method==='PUT')calls.push('restore-settings');return {status:'ok',project:{config:{old:true}}};},
+  installWorkflowHook:async()=>{calls.push('hook');await expect(turnBarrier(state).submit(async()=>{})).rejects.toThrow('in progress');},
+ };
+ return {root,source,state,home,launcher,record,plist,io,projects,calls,original,unload:()=>loaded=false,failStart:()=>failStart=true,close:()=>rmSync(root,{recursive:true,force:true})};
+}
 test('installation snapshots exclude credentials, Git data, tests and internal notes and survive checkout edits',()=>{const root=mkdtempSync(join(tmpdir(),'adlc-install-'));try{const source=join(root,'source'),dest=join(root,'versions');for(const d of ['src','config','.git'])mkdirSync(join(source,d),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'original');writeFileSync(join(source,'config/private.json'),'secret');writeFileSync(join(source,'.env'),'secret');writeFileSync(join(source,'IMPLEMENTATION-STATUS.md'),'private');const a=snapshot(source,dest);expect(distributionFiles(source)).toEqual(['src/cli.ts']);writeFileSync(join(source,'src/cli.ts'),'changed');expect(readFileSync(a.cli,'utf8')).toBe('original');expect(snapshot(source,dest).version).not.toBe(a.version);writeFileSync(a.cli,'tampered');writeFileSync(join(source,'src/cli.ts'),'original');expect(()=>snapshot(source,dest)).toThrow('changed');}finally{rmSync(root,{recursive:true,force:true});}});
 test('interrupted snapshot copy leaves no published partial version and can be retried',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-copy-'));try{
@@ -81,7 +97,7 @@ test('failed rollback pauses preserve activated artifacts and settings without r
 test('successful installation rollback rethrows the original error unchanged',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-rollback-original-'));try{
   const source=join(root,'source');mkdirSync(join(source,'src'),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'cli');const original=Error('hook failure');
-  const io:any={state:()=>join(root,'state'),home:()=>root,registeredProjects:async()=>[{project:'one',label:'local.adlc.one',config:'/one.json'}],localAO:async()=>({status:'ok',project:{config:{}}}),installWorkflowHook:async()=>{throw original;}};
+  const io:any={state:()=>join(root,'state'),home:()=>root,registeredProjects:async()=>[{project:'one',label:'local.adlc.one',config:'/one.json'}],serviceControl:async()=>({loaded:false}),localAO:async()=>({status:'ok',project:{config:{}}}),installWorkflowHook:async()=>{throw original;}};
   expect(await installBridge(true,source,join(root,'adlc'),io).catch(error=>error)).toBe(original);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
@@ -108,4 +124,30 @@ test('successful restoration still attempts intake restarts and aggregates resta
   }return {loaded:true};}};
   const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(2);expect(error.errors[0]).toBe(original);expect(error.errors[1].cause).toBe(restart);expect(calls.slice(-2)).toEqual(['start:first','start:second']);
  }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('installation activation and rollback share one control scope across independent service barriers',async()=>{
+ for(const fail of [false,true]){const f=controlFixture();try{
+  if(fail)f.failStart();const result=await installBridge(true,f.source,f.launcher,f.io).catch(error=>error);
+  if(fail){expect(result).toBe(f.original);expect(f.calls).toEqual(['service-status','stop','hook','start','stop','restore-settings','start']);expect(readFileSync(f.record,'utf8')).toBe('old record');expect(readFileSync(f.plist,'utf8')).toBe('old plist');expect(readFileSync(f.launcher,'utf8')).toBe('old src/cli.ts launcher');}
+  else{expect(result.installed).toBe(true);expect(f.calls).toEqual(['service-status','stop','hook','start']);}
+  expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);await turnBarrier(f.state).submit(async()=>{});
+ }finally{f.close();}}
+});
+test('paused installation with a loaded project refuses before service or activation changes',async()=>{
+ const f=controlFixture();try{
+  turnBarrier(f.state).pause();await expect(installBridge(true,f.source,f.launcher,f.io)).rejects.toThrow('cannot restart loaded intake while submissions are paused');
+  expect(f.calls).toEqual(['service-status']);expect(readFileSync(f.record,'utf8')).toBe('old record');expect(readFileSync(f.plist,'utf8')).toBe('old plist');expect(readFileSync(f.launcher,'utf8')).toBe('old src/cli.ts launcher');expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+  expect(turnBarrier(f.state).isPaused()).toBe(true);expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+ }finally{f.close();}
+});
+test('paused installation with no loaded projects succeeds without resuming intake',async()=>{
+ for(const registered of [false,true]){const f=controlFixture();try{
+  f.unload();if(!registered)f.projects.length=0;turnBarrier(f.state).pause();const result=await installBridge(true,f.source,f.launcher,f.io);
+  expect(result.installed).toBe(true);expect(f.calls).toEqual(registered?['service-status','hook']:[]);expect(turnBarrier(f.state).isPaused()).toBe(true);expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);await expect(turnBarrier(f.state).submit(async()=>{})).rejects.toThrow('paused');
+ }finally{f.close();}}
+});
+test('installation preserves a loaded intake whose definition is unavailable',async()=>{
+ const f=controlFixture();try{
+  rmSync(f.plist);await expect(installBridge(true,f.source,f.launcher,f.io)).rejects.toThrow('Loaded intake definition unavailable');expect(f.calls).toEqual(['service-status']);expect(readFileSync(f.record,'utf8')).toBe('old record');expect(existsSync(join(f.state,'versions'))).toBe(false);
+ }finally{f.close();}
 });
