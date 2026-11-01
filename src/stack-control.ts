@@ -5,6 +5,7 @@ import {AO} from './orchestrator';
 import {trustedDaemon} from './daemon-runtime';
 import {registeredProjects,serviceControl} from './service-control';
 import {readDefinition} from './project-services';
+import {turnBarrier,type TurnBarrier} from './turn-submission';
 
 type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number};
 export type StackOps={
@@ -14,6 +15,7 @@ export type StackOps={
  backendStart():Promise<void>;
  backendStop():Promise<void>;
  blockers():Promise<{session:string;reason:string}[]>;
+ turns:TurnBarrier;
 };
 // Pause every intake before checking workers. A refusal deliberately leaves intake
 // paused, so retries cannot pick up more work while the user finishes existing work.
@@ -21,12 +23,17 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
  const projects=await ops.projects();
  if(action==='status')return {scope:'all',backend:await ops.backend(),projects:await Promise.all(projects.map(p=>ops.project('service-status',p.project)))};
  if(action==='start'){
-  await ops.backendStart();
-  const backend=await ops.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready; intake remains stopped');
+  const backend=await ops.turns.run(async()=>{
+   await ops.backendStart();
+   const backend=await ops.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready; intake remains stopped');
+   ops.turns.resume();return backend;
+  });
   const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
   return {scope:'all',backend,projects:results};
  }
  const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
+ return ops.turns.run(async()=>{
+ ops.turns.pause();
  const backend=await ops.backend();
  if(backend.ready){
   if(!backend.managed)throw Error('Intake paused. Orchestrator is not managed by this bridge; backend preserved');
@@ -36,6 +43,7 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
  await ops.backendStop();
  const stopped=await ops.backend();if(stopped.ready||stopped.loaded)throw Error('Intake paused, but Orchestrator has not fully stopped');
  return {scope:'all',backend:stopped,projects:results,note:'Background stack stopped and disabled at login. Start --all re-enables it. The desktop window may remain open.'};
+ });
 }
 async function command(args:string[]){
  const p=Bun.spawn(args,{stdout:'pipe',stderr:'pipe'});
@@ -101,6 +109,7 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
 export function liveStackOps():StackOps{
  const config=definition();
  return {
+  turns:turnBarrier(),
   projects:registeredProjects,
   project:async(action,id)=>{
    // Full-stack controls persist the user's on/off choice across login.

@@ -30,6 +30,15 @@ unknown, or unreadable worker state refuses backend shutdown and leaves intake
 paused. Finish or stop those workers in Orchestrator, then retry. Do not submit
 new worker requests during shutdown. There is no force-stop flag.
 
+Every bridge-owned session creation and turn delivery shares an inter-process
+barrier with shutdown. Stop holds it from the final inventory scan through
+backend shutdown and leaves submissions paused until a successful `start --all`.
+A delivery already holding it refuses shutdown instead of interrupting the send.
+Contention or an abandoned `turn-submission.lock` fails closed; inspect the stack
+and delivery receipts before removing an abandoned lock. This barrier cannot fence
+manual requests from the Orchestrator UI or other native clients; keep those idle
+during shutdown as well.
+
 These commands control background services. The desktop window may remain open;
 run `start --all` before reopening it when the stack is off. Worktrees, durable
 queue, session history, and credentials are preserved. `status --all` is read-only.

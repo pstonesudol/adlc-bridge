@@ -4,6 +4,7 @@ import {Store} from '../src/core';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {sendPilotRemediation} from '../src/pilot';
+import {turnBarrier} from '../src/turn-submission';import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -51,7 +52,7 @@ function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
  const session:any={session:{id:'session',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
- const io:any={readiness:async()=>e,sessionEvidence:async()=>session,spawn:(args:string[])=>{
+ const io:any={readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
   return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
@@ -137,4 +138,10 @@ test('a description edit creates its review gate before considering an old clear
   await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='edited-body';f.e.failedChecks=[];f.e.findings=[];f.e.clear=true;f.e.botReviewSubmittedAt=Date.now()-1000;
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toHaveLength(1);expect(f.sends()).toBe(1);expect(f.reviews()).toBe(1);
  }finally{f.s.close();}
+});
+test('pilot remediation uses the same submission barrier as shutdown and never spawns through a held fence',async()=>{
+ const f=templateFixture(),state=mkdtempSync(join(tmpdir(),'adlc-pilot-fence-')),turns=turnBarrier(state);try{
+  f.io.submit=turns.submit;await turns.run(async()=>{await expect(f.loop.tick(f.id)).rejects.toThrow('in progress');expect(f.sends()).toBe(0);});
+  expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});expect(f.sends()).toBe(0);
+ }finally{f.s.close();rmSync(state,{recursive:true,force:true});}
 });

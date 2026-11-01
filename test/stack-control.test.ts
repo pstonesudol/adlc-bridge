@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {controlStack,activityBlockers,turnBlockers,workerBlockers,daemonStatus,type StackOps} from '../src/stack-control';
 function fixture(){
  const calls:string[]=[];let on=true;let blocks:{session:string;reason:string}[]=[];
- const ops:StackOps={projects:async()=>[{project:'one'},{project:'two'}],project:async(a,id)=>{calls.push(`${a}:${id}`);return {project:id,loaded:a!=='stop'};},backend:async()=>({ready:on,loaded:on,managed:true}),backendStart:async()=>{calls.push('backend:start');on=true;},backendStop:async()=>{calls.push('backend:stop');on=false;},blockers:async()=>{calls.push('workers:check');return blocks;}};
+ const ops:StackOps={turns:{run:async operation=>operation(),submit:async operation=>operation(),pause:()=>{},resume:()=>{}},projects:async()=>[{project:'one'},{project:'two'}],project:async(a,id)=>{calls.push(`${a}:${id}`);return {project:id,loaded:a!=='stop'};},backend:async()=>({ready:on,loaded:on,managed:true}),backendStart:async()=>{calls.push('backend:start');on=true;},backendStop:async()=>{calls.push('backend:stop');on=false;},blockers:async()=>{calls.push('workers:check');return blocks;}};
  return {calls,ops,block:(value:typeof blocks)=>blocks=value};
 }
 test('stack stop pauses all intake before scanning workers and stopping backend',async()=>{const f=fixture();const r=await controlStack('stop',f.ops);expect(f.calls).toEqual(['stop:one','stop:two','workers:check','backend:stop']);expect(r.backend.ready).toBe(false);});

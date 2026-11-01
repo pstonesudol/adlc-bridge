@@ -5,6 +5,7 @@ import {AO} from './orchestrator';
 import {sessionEvidence} from './session-evidence';
 import {disableNativeFeedback} from './ao-policy';
 import type {WorkflowTransport} from './workflow';
+import {withTurnSubmission} from './turn-submission';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {resolve} from 'node:path';
@@ -21,9 +22,9 @@ export async function localAO(path:string,method='GET',body?:unknown){
  const r=await fetch(`http://127.0.0.1:${state.port}/api/v1/${path}`,{method,headers:{'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(120000)});
  const b:any=await r.json();if(!r.ok)throw Error(`Orchestrator HTTP ${r.status}`);return b;
 }
-export const liveTransport:WorkflowTransport={
- async startPlan(r){
-  const b=await localAO('sessions','POST',{projectId:r.project,branch:r.branch,displayName:r.name,kind:'worker',harness:r.route?.harness??'codex',mode:'chat',approvalMode:'accept-edits',...(r.route?{model:r.route.model}:{}),prompt:r.route?'':r.prompt,clientRequestId:r.clientId});
+export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spawn,api=localAO):WorkflowTransport{return {
+  async startPlan(r){
+   const b=await submit(()=>api('sessions','POST',{projectId:r.project,branch:r.branch,displayName:r.name,kind:'worker',harness:r.route?.harness??'codex',mode:'chat',approvalMode:'accept-edits',...(r.route?{model:r.route.model}:{}),prompt:r.route?'':r.prompt,clientRequestId:r.clientId}));
   if(!b.session?.id||b.session.projectId!==r.project||b.session.branch!==r.branch)throw Error('Invalid planning spawn receipt');
   await disableNativeFeedback(b.session.id);return {id:b.session.id};
  },
@@ -39,13 +40,16 @@ export const liveTransport:WorkflowTransport={
  evidence:sessionEvidence,
  preflightRoute,
  configureRoute:configureSessionRoute,
- async sendImplementation(session,prompt,clientId){
-  const p=Bun.spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe'});
+  async sendImplementation(session,prompt,clientId){
+   return submit(async()=>{
+   const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe'});
   const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
-  if(code!==0)throw Error('Implementation delivery uncertain');
+   if(code!==0)throw Error('Implementation delivery uncertain');
+   });
  },
  disableFeedback:disableNativeFeedback
-};
+};}
+export const liveTransport=createWorkflowTransport();
 
 export async function installWorkflowHook(configPath:string,api=localAO){
  const path=resolve(configPath),c=JSON.parse(readFileSync(path,'utf8'));
