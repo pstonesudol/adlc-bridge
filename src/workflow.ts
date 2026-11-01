@@ -8,6 +8,7 @@ import {capturePlan} from './session-evidence';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy};
 export interface WorkflowTransport{
+ submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
  findPlans(project:string,branch:string):Promise<any[]>;
  evidence(session:string):Promise<any>;
@@ -30,7 +31,9 @@ export class Workflow{
  }
  planning(job:string):any{return this.s.db.query('SELECT * FROM planning_dispatch WHERE job=?').get(job);}
  implementation(job:string):any{return this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job);}
- async startPlanning(job:string,c:WorkflowConfig){
+ private submit<T>(operation:()=>Promise<T>){return this.t.submit?this.t.submit(operation):operation();}
+ async startPlanning(job:string,c:WorkflowConfig){return this.submit(()=>this.startPlanningWithinBarrier(job,c));}
+ private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
   if(this.planning(job))return this.reconcilePlanning(job,c);
   const specification=this.s.get(job).spec;
@@ -97,7 +100,8 @@ export class Workflow{
   const j=this.s.get(job);if(j.state!=='awaiting_approval')throw Error('Captured plan required for implementation routing');
   await this.router.choose(job,'implementation',digest(JSON.stringify([j.spec,j.plan_hash])),`Implement the requested task (planning is complete; supporting checks are part of the change):\n${j.spec}`,c.routing);
  }
- async deliverPlanning(job:string,session:string,route:Route){
+ async deliverPlanning(job:string,session:string,route:Route){return this.submit(()=>this.deliverPlanningWithinBarrier(job,session,route));}
+ private async deliverPlanningWithinBarrier(job:string,session:string,route:Route){
   const r=new Planning(this.s).get(job),j=this.s.get(job);
   if(j.state!=='awaiting_plan'||r.spec_hash!==digest(j.spec))throw Error('Planning eligibility changed');
   const e=await this.t.evidence(session);
@@ -143,7 +147,8 @@ export class Workflow{
    return {job,state:'approved_pending',runtime,paths,mergeEnabled:false};
   })();
  }
- async executeApproved(job:string,c?:WorkflowConfig){
+ async executeApproved(job:string,c?:WorkflowConfig){return this.submit(()=>this.executeApprovedWithinBarrier(job,c));}
+ private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
   const d=this.implementation(job);if(!d)return;
   const l=new Lifecycle(this.s),j=l.current(job),r=new Planning(this.s).get(job);
   if(j.plan_hash!==d.plan_hash||r?.session_id!==d.session_id)throw Error('Execution approval is stale');

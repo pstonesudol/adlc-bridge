@@ -1,10 +1,12 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
+import {Lifecycle} from '../src/lifecycle';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
 
 const config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
@@ -52,6 +54,13 @@ test('one approval records plan and Git scope, delivers once, then yields a PR h
  expect(JSON.parse((s.db.query('SELECT operations FROM git_grants WHERE job=?').get(id) as any).operations)).toEqual(ops);
  f.finishImplementation();const result=await w.tick(config);expect(result[0].state).toBe('pr_handoff');expect(result[0].pr.number).toBe(1);
  await w.tick(config);expect(f.sends.length).toBe(1);s.close();
+});
+test('implementation reservations stay approved_pending when shutdown owns the submission barrier',async()=>{
+ const {s,f,w,id,hash}=await planned(),state=mkdtempSync(join(tmpdir(),'adlc-execution-fence-'));try{
+  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);const turns=turnBarrier(state);Object.assign(f,{submit:createWorkflowTransport(turns.submit).submit});
+  await turns.run(async()=>{await expect(w.executeApproved(id)).rejects.toThrow('in progress');expect(w.implementation(id).state).toBe('approved_pending');expect(new Lifecycle(s).run(id)).toBeNull();expect(f.sends).toEqual([]);});
+  await w.executeApproved(id);expect(f.sends).toHaveLength(1);expect(w.implementation(id).state).toBe('delivery_accepted');
+ }finally{s.close();rmSync(state,{recursive:true,force:true});}
 });
 test('stale approval, missing scope, merge scope and unknown runtime never deliver',async()=>{
  const {s,f,w,id,hash}=await planned();

@@ -31,7 +31,10 @@ paused. Finish or stop those workers in Orchestrator, then retry. Do not submit
 new worker requests during shutdown. There is no force-stop flag.
 
 Every bridge-owned session creation and turn delivery shares an inter-process
-barrier with shutdown. Stop holds it from the final inventory scan through
+barrier with shutdown. Planning, implementation and feature-agent reservations
+stay inside that same barrier through submission; rejected acquisition leaves
+requests pending rather than falsely recording an uncertain delivery.
+Stop holds it from intake unload and the final inventory scan through
 backend shutdown and leaves submissions paused until a successful `start --all`.
 A delivery already holding it refuses shutdown before unloading any intake
 service, instead of interrupting the send. Retry once that delivery settles.

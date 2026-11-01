@@ -23,6 +23,7 @@ export async function localAO(path:string,method='GET',body?:unknown){
  const b:any=await r.json();if(!r.ok)throw Error(`Orchestrator HTTP ${r.status}`);return b;
 }
 export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spawn,api=localAO,disable=disableNativeFeedback):WorkflowTransport{return {
+  submit,
   async startPlan(r){
    return submit(async()=>{
    const b=await api('sessions','POST',{projectId:r.project,branch:r.branch,displayName:r.name,kind:'worker',harness:r.route?.harness??'codex',mode:'chat',approvalMode:'accept-edits',...(r.route?{model:r.route.model}:{}),prompt:r.route?'':r.prompt,clientRequestId:r.clientId});

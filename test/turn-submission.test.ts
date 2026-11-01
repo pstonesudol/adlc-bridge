@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,realpathSync,existsSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';import {createWorkflowTransport} from '../src/workflow-transport';import {createFeatureAgents} from '../src/feature-transport';
+import {Store} from '../src/core';import {Workflow} from '../src/workflow';import {featureFixture,featureConfig,requirements} from './feature-fixture';
 const receipt=(exited=Promise.resolve(0))=>({stdout:new Response('{}').body,stderr:new Response('').body,exited});
 function fixture(){
  const state=realpathSync(mkdtempSync(join(tmpdir(),'adlc-turns-'))),turns=turnBarrier(state),calls:string[]=[];let on=true;
@@ -50,4 +51,26 @@ test('planning setup retains the barrier through receipt validation and native f
   let disabled=false;const invalid=createWorkflowTransport(f.turns.submit,undefined,async()=>({session:{id:'worker',projectId:'foreign',branch:'feature'}}),async()=>{disabled=true;return {};});
   await expect(invalid.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow('Invalid planning spawn receipt');expect(disabled).toBe(false);await f.turns.run(async()=>{});
  }finally{release?.();f.close();}
+});
+test('planning and feature reservations made during project shutdown are refused before becoming uncertain',async()=>{
+ const f=fixture(),s=new Store(':memory:'),feature=featureFixture();let creates=0;
+ try{
+  const transport=createWorkflowTransport(f.turns.submit,undefined,async(_path,_method,body:any)=>{creates++;return {session:{id:'worker',projectId:body.projectId,branch:body.branch}};},async()=>({}));
+  const workflow=new Workflow(s,transport),job=s.enqueue('p','issue','spec'),config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project'}};
+  Object.assign(feature.agents,{submit:createFeatureAgents(f.turns.submit).submit});const plan=await feature.planner.create(featureConfig,JSON.stringify(requirements),'Test');
+  f.ops.projects=async()=>[{project:'intake'}];f.ops.project=async action=>{
+   if(action==='stop'){
+    await expect(workflow.startPlanning(job,config)).rejects.toThrow('in progress');expect(workflow.planning(job)).toBeNull();expect(s.db.query('SELECT * FROM planning_runs').all()).toEqual([]);
+    expect((await feature.planner.tick(plan.id)).state).toBe('planning');expect(feature.s.db.query('SELECT state,started FROM feature_agents').all()).toEqual(Array.from({length:3},()=>({state:'reserved',started:null})));
+   }return {};
+  };
+  await controlStack('stop',f.ops);expect(creates).toBe(0);expect(feature.agents.starts).toEqual([]);
+  await controlStack('start',f.ops);expect((await workflow.startPlanning(job,config))?.state).toBe('planning');await feature.planner.advance(plan.id,'architecture');expect(creates).toBe(1);expect(feature.agents.starts).toHaveLength(1);expect(feature.agents.messages).toHaveLength(1);
+ }finally{s.close();feature.s.close();f.close();}
+});
+test('nested submissions reuse only their own active submission scope, never a shutdown fence',async()=>{
+ const f=fixture();try{
+  await f.turns.submit(async()=>{await turnBarrier(f.state).submit(async()=>{});await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');});
+  await f.turns.run(async()=>{await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');});
+ }finally{f.close();}
 });

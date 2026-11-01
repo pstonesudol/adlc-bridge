@@ -1,9 +1,11 @@
 import {Store,digest} from './core';
 import {parseRequirements,validateDraft,validateReview,extractResult,batchHash,type FeatureDraft} from './feature-schema';
 import {loadOpenChamber,selectRoute,type Route,type RoutingSettings,type RoutingLoader} from './task-routing';
+import {TurnSubmissionBlocked} from './turn-submission';
 export const planningRoles=['architecture','delivery','quality'] as const;
 export type FeatureConfig={name:string;repo:string;linear:{projectId:string;teamId:string;readyLabelId:string;readyStateId:string};routing?:RoutingSettings;featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number}};
 export interface FeatureAgents{
+ submit?<T>(operation:()=>Promise<T>):Promise<T>;
  start(r:{name:string;key:string;route:Route}):Promise<{id:string}>;
  find(name:string):Promise<any[]>;
  evidence(session:string):Promise<any>;
@@ -54,7 +56,8 @@ export class FeaturePlanning{
   }else common.push(instructions[role],'Return ONLY summary (string), recommendations (string[]), questions (string[]). Questions must be genuinely unresolved by the supplied requirements. Propose verifiable outcomes; do not invent product decisions.');
   return common.join('\n\n')+'\n\n'+marker;
  }
- async advance(id:string,role:string){
+ async advance(id:string,role:string){return this.agents.submit?this.agents.submit(()=>this.advanceWithinBarrier(id,role)):this.advanceWithinBarrier(id,role);}
+ private async advanceWithinBarrier(id:string,role:string){
   const p=this.get(id);let a=this.s.db.query('SELECT * FROM feature_agents WHERE plan=? AND role=?').get(id,role) as any;const route=JSON.parse(p.route);
   if(['completed','blocked','cancelled'].includes(a.state))return;
   if(a.state==='reserved'){
@@ -95,7 +98,7 @@ export class FeaturePlanning{
    const rows=this.s.db.query('SELECT * FROM feature_agents WHERE plan=? ORDER BY role').all(id) as any[];
    let active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
    for(const a of rows){if(a.state==='reserved'&&active>=Math.min(maxAgents,3))continue;
-    try{await this.advance(id,a.role);}catch(e){this.s.db.query("UPDATE feature_agents SET state='blocked',reason=? WHERE plan=? AND role=?").run(e instanceof Error?e.message:'Feature agent failed',id,a.role);}
+     try{await this.advance(id,a.role);}catch(e){if(!(e instanceof TurnSubmissionBlocked))this.s.db.query("UPDATE feature_agents SET state='blocked',reason=? WHERE plan=? AND role=?").run(e instanceof Error?e.message:'Feature agent failed',id,a.role);}
     active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
    }
    const blocked=this.s.db.query("SELECT role,reason FROM feature_agents WHERE plan=? AND state='blocked'").all(id);
