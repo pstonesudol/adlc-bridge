@@ -100,10 +100,11 @@ export function reviewGate(e: ReviewEvidence): { clear: boolean; reasons: string
   return { clear: reasons.length === 0, reasons };
 }
 
-export function remediationDecision(attempts: number, actionable: boolean, clear: boolean) {
+export function remediationDecision(attempts: number, actionable: boolean, clear: boolean, limit: number | null = 5) {
   if (!Number.isInteger(attempts) || attempts < 0) throw Error('Invalid attempt count');
+  if (limit !== null && (!Number.isSafeInteger(limit) || limit < 1)) throw Error('Invalid remediation limit');
   if (clear && actionable) return 'blocked';
   if (clear) return 'ready_for_human';
-  if (actionable) return attempts >= 5 ? 'blocked' : 'remediation_pending_authorization';
+  if (actionable) return limit !== null && attempts >= limit ? 'blocked' : 'remediation_pending_authorization';
   return 'waiting_for_review';
 }
