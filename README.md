@@ -42,6 +42,12 @@ Generated services set `ADLC_AO_PATH` to the configured AO executable; legacy
 services retain the bundled-app default. Workflow hooks use the running Bun and
 a stable gate marker; repeating setup replaces prior gates even in versioned
 installation directories while retaining unrelated setup scripts.
+Unmarked legacy gates are automatically replaced only for the current Bridge
+installation's exact gate path. Literal shell quoting, including apostrophes and
+spaces, is decoded without execution. Unknown unmarked `src/planning-gate.ts`
+invocations block setup before any backup or configuration write: an operator
+must reconcile ownership in the existing `postCreate` list instead of allowing
+the installer to delete a user hook or silently add a duplicate Bridge gate.
 (optional prerelease/build suffix). Configure routing paths in the existing project
 JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,
