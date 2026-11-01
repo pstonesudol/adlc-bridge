@@ -75,11 +75,18 @@ realpath containment checks. Execute only after the plan authorizes verification
 
 ```sh
 bun src/cli.ts verification config/local.json /absolute/isolated/worktree --run
+# Container mode also requires the matching runtime configuration:
+bun src/cli.ts verification config/local.json /absolute/isolated/worktree --run --runtime config/runtime.local.json
 ```
 
 Container mode requires an existing image ID/digest; it never builds or pulls.
+The runner rechecks the configured Docker version and executes that absolute
+`tools.docker.path`, never a `docker` selected from the caller's PATH. The runtime
+file must reference the same project config. Missing pins and version mismatches
+fail before copying inputs or starting any container.
 Explicit input paths are copied to a disposable snapshot, filtering common secret
-files, `.env*`, Git metadata, dependencies and symlinks. Never include private
+files, `.env*`, Git metadata, dependencies and symlinks. Selected input symlinks
+and symlinked parent components are rejected before resolving/copying. Never include private
 files in selected inputs: filtering is defense-in-depth, not secret discovery.
 Inputs mount read-only under `/workspace`; bake matching dependencies/tools into
 the pinned image (e.g. `/workspace/node_modules`). Each step starts a fresh

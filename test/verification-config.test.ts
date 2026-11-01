@@ -8,6 +8,7 @@ import {validate} from '../src/linear';
 import {codeRemediationInstructions} from '../src/pilot';
 const host:Verification={version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]};
 const container:Verification={version:1,mode:'container',steps:[{cwd:'frontend',argv:['node','--test','tests']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['frontend']}};
+const dockerExecution={docker:{path:'/configured/bin/docker',version:'28.1.0'},probeDocker:()=>true};
 const uuid='00000000-0000-0000-0000-000000000001';
 const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
 function runtime(root:string):RuntimeConfig{return {version:1,platform:'launchd',projectConfig:join(root,'project.json'),controller:join(root,'cli.ts'),workingDirectory:root,tools:Object.fromEntries(['bun','ao','git','gh'].map(n=>[n,{path:join(root,n),version:'1.4.2'}])),service:{label:'local.adlc.legacy',path:join(root,'service.plist'),interval:60,runAtLoad:false,stdout:join(root,'out.log'),stderr:join(root,'err.log')}};}
@@ -25,11 +26,41 @@ test('host and container argv selection, failures, cleanup and symlink confineme
   mkdirSync(join(root,'.git'));mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'');writeFileSync(join(root,'frontend','.env'),'secret');
   const spawn=((argv:any,options:any)=>{calls.push({argv,options});return {exited:Promise.resolve(0)};}) as any;
   expect((await runVerification(root,host,spawn)).passed).toBe(true);expect(calls[0].argv).toEqual(['bun','test']);
-  expect((await runVerification(root,container,spawn)).passed).toBe(true);
-  const cmd=calls[1].argv;expect(cmd[0]).toBe('docker');expect(cmd).toContain('--pull=never');expect(cmd).toContain('--read-only');expect(cmd).toContain(container.container!.image);
+  expect((await runVerification(root,container,spawn,dockerExecution)).passed).toBe(true);
+  const cmd=calls[1].argv;expect(cmd[0]).toBe(dockerExecution.docker.path);expect(cmd).toContain('--pull=never');expect(cmd).toContain('--read-only');expect(cmd).toContain(container.container!.image);
   expect(existsSync(calls[1].options.cwd)).toBe(false);
   symlinkSync(tmpdir(),join(root,'escape'));await expect(runVerification(root,{...host,steps:[{cwd:'escape',argv:['bun']}]},spawn)).rejects.toThrow('escapes');
   const fail=(()=>({exited:Promise.resolve(1)})) as any;expect((await runVerification(root,host,fail)).passed).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('container rejects selected and ancestor links to private in-worktree inputs before spawning',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-link-test-'));let spawned=false;
+ try{
+  mkdirSync(join(root,'.git'));mkdirSync(join(root,'private'));mkdirSync(join(root,'private','nested'));writeFileSync(join(root,'private','credentials.json'),'private');symlinkSync('private',join(root,'frontend'));
+  const spawn=(()=>{spawned=true;throw Error('must not run');}) as any;
+  for(const input of ['frontend','frontend/','frontend/nested'])await expect(runVerification(root,{...container,container:{...container.container!,inputs:[input]}},spawn,dockerExecution)).rejects.toThrow('cannot be symbolic link');
+  expect(spawned).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('container fails closed for missing/relative Docker pins or a version mismatch before spawning',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-docker-pin-test-'));let spawned=false;
+ try{
+  mkdirSync(join(root,'.git'));
+  const spawn=(()=>{spawned=true;throw Error('must not run');}) as any;
+  await expect(runVerification(root,container,spawn)).rejects.toThrow('requires an absolute Docker');
+  await expect(runVerification(root,container,spawn,{...dockerExecution,docker:{path:'docker',version:'28.1.0'}})).rejects.toThrow('requires an absolute Docker');
+  await expect(runVerification(root,container,spawn,{...dockerExecution,probeDocker:()=>false})).rejects.toThrow('version check failed');
+  expect(spawned).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('runner probes the pinned executable and accepts Docker version punctuation (mocked container)',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-docker-version-test-'));let command:string[]=[];
+ try{
+  mkdirSync(join(root,'.git'));mkdirSync(join(root,'frontend'));
+  const path=join(root,'pinned-docker');writeFileSync(path,'#!/bin/sh\nprintf "Docker version 28.1.0, build fixture\\n"\n',{mode:0o755});
+  const spawn=((argv:string[])=>{command=argv;return {exited:Promise.resolve(0)};}) as any;
+  expect((await runVerification(root,container,spawn,{docker:{path,version:'28.1.0'}})).passed).toBe(true);expect(command[0]).toBe(path);
+  await expect(runVerification(root,container,spawn,{docker:{path,version:'28.1.1'}})).rejects.toThrow('version check failed');
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('both project setup flows preserve config, render deterministically and distinguish mocked probes',()=>{

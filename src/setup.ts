@@ -33,7 +33,7 @@ export function runtimeServiceDefinition(r:RuntimeConfig){
 const liveProbe=(name:string,t:{path:string;version:string})=>{
  if(!existsSync(t.path))return false;
  const p=Bun.spawnSync([t.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
- return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x===t.version||x===`v${t.version}`);
+ return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===t.version||x===`v${t.version}`);
 };
 export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe){
  validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
