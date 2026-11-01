@@ -1,6 +1,6 @@
 import {latestWorkflowChecks} from './check-runs';
 import {templateLogReader} from './gh-logs';
-import {templateCIFindings,templateSignature,metadataCheckEvidence} from './pr-template-ci';
+import {templateCIFindings,templateSignature,metadataCheckEvidence,metadataBodyCovered} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 
@@ -82,13 +82,17 @@ export async function readiness(repo:string, number:number, required:string[],me
   const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
-   const bodyEvidence=metadataCheckEvidence(checks,first.head.sha,metadataChecks);
-   const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),templateLogReader(),bodyEvidence);
+    const bodyEvidence=metadataCheckEvidence(checks,first.head.sha,metadataChecks);
+    const descriptionHash=digest(final.body??'');
+    if(metadataChecks.length&&!metadataBodyCovered({head:first.head.sha,descriptionHash,metadataCheckEvidence:bodyEvidence},metadataChecks)){
+     gate.clear=false;gate.reasons.push('Missing body-bound success evidence for every configured metadata check');
+    }
+    const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,descriptionHash,path=>gh(['api',path]),templateLogReader(),bodyEvidence);
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
     metadataCheckEvidence:bodyEvidence,
-    botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
+     botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }
 
 // Observation only. This function cannot merge or modify a PR.
