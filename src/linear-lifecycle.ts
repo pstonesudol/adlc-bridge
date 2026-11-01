@@ -1,10 +1,53 @@
+import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 export class LinearLifecycle{
- constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));`);}
+ constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));
+  CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));`);}
+ private async comments(issue:string){
+  const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
+  do{
+   const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body createdAt}pageInfo{hasNextPage endCursor}}}}',{id:issue,after});
+   const page=b.issue?.comments;
+   if(b.issue?.id!==issue||!Array.isArray(page?.nodes)||typeof page.pageInfo?.hasNextPage!=='boolean')throw Error('Incomplete remediation notice inventory');
+   result.push(...page.nodes);if(result.length>1000)throw Error('Remediation notice inventory exceeds safe bound');
+   if(!page.pageInfo.hasNextPage)return result;
+   after=page.pageInfo.endCursor;if(!after||seen.has(after))throw Error('Invalid remediation notice cursor');seen.add(after);
+  }while(true);
+ }
+ async notifyBudgetBlocker(job:string){
+  const b=this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
+  if(!b?.stop_reason)return null;
+  const j=this.s.get(job),binding=digest(JSON.stringify([j.plan_hash,b.stop_reason,b.consumed,b.extensions,b.last_head]));
+  let n=this.s.db.query('SELECT * FROM remediation_notices WHERE job=? AND binding=?').get(job,binding) as any;
+  if(n?.state==='posted')return {state:'posted',comment:n.comment_id};
+  if(!n){
+   const cap=b.configured_max_attempts===null?'uncapped':`${b.consumed}/${b.configured_max_attempts+b.extensions}`;
+   const remaining=b.configured_max_attempts===null?'remaining unlimited':`remaining ${Math.max(0,b.configured_max_attempts+b.extensions-b.consumed)}`;
+   let identifier=j.issue;try{identifier=JSON.parse(j.spec).identifier??j.issue}catch{}
+   const body=[`## ADLC remediation stopped — ${identifier}`,`Budget: ${cap} (${remaining}; job window; ${b.no_progress}/${b.configured_max_no_progress} consecutive without progress).`,`Stop reason: \`${b.stop_reason}\``,'No further remediation will be sent automatically. A human can reconcile the PR and prior delivery receipts, then preview and confirm an explicit budget extension. This extension does not merge the PR, deploy, or broaden the approved scope.'].join('\n\n');
+   this.s.db.query('INSERT OR IGNORE INTO remediation_notices(job,binding,comment_id,body,state) VALUES (?,?,?,?,?)').run(job,binding,randomUUID(),body,'reserved');
+   n=this.s.db.query('SELECT * FROM remediation_notices WHERE job=? AND binding=?').get(job,binding) as any;
+  }
+  const comments=await this.comments(j.issue),posted=comments.find(x=>x.id===n.comment_id);
+  if(posted){
+   if(posted.body!==n.body)throw Error('Posted remediation notice changed; reconcile before continuing');
+   this.s.db.query("UPDATE remediation_notices SET state='posted',created=?,reason=NULL WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
+   return {state:'posted',comment:n.comment_id};
+  }
+  if(n.state!=='reserved')throw Error('Remediation notice delivery uncertain; never repost blindly');
+  const claim=this.s.db.query("UPDATE remediation_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
+  if(!claim.changes)return {state:'delivery_uncertain'};
+  const response=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}});
+  const comment=response.commentCreate?.comment;
+  if(!response.commentCreate?.success||comment?.id!==n.comment_id||comment.body!==n.body||!Number.isFinite(Date.parse(comment.createdAt)))throw Error('Remediation notice delivery requires reconciliation');
+  this.s.db.query("UPDATE remediation_notices SET state='posted',created=? WHERE job=? AND binding=?").run(comment.createdAt,job,binding);
+  this.s.event(job,'remediation_blocker_published_to_linear',JSON.stringify({reason:b.stop_reason,comment:n.comment_id}));
+  return {state:'posted',comment:n.comment_id};
+ }
  async move(job:string,phase:string,desired:string,c:SyncConfig){
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear lifecycle identity or label scope mismatch');
@@ -32,6 +75,10 @@ export class LinearLifecycle{
   const rows=this.s.db.query("SELECT j.id,j.state FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state IN ('awaiting_plan','awaiting_approval','approved','blocked')").all(c.linear.projectId) as any[];
   const results=[];
   for(const row of rows)try{
+   if(row.state==='blocked'){
+    const notice=await this.notifyBudgetBlocker(row.id);
+    if(notice){results.push({job:row.id,phase:'remediation-blocker',...notice});continue;}
+   }
    const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;
    if(review){

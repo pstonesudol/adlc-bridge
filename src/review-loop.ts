@@ -6,6 +6,7 @@ import {sessionEvidence} from './session-evidence';
 import {readiness} from './github';
 import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
+import {DEFAULT_REMEDIATION_POLICY,type RemediationPolicy} from './remediation';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -66,9 +67,10 @@ export class ReviewLoop{
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({head,bodyHash}));
   return true;
  }
- async tick(job:string,branchPolicy?:BranchPolicy){
+ async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY){
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
+  l.recordRemediationPolicy(job,remediationPolicy);
   const session=await sessionEvidence(run.session_id);
   if(session.session.isTerminated||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
   const branch=await new BranchUpdates(this.s).ensure(job,t.repo,t.pr,session,branchPolicy);
@@ -114,7 +116,8 @@ export class ReviewLoop{
    const operations=metadataOnly?['open-pr']:['commit','push-feature'];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await disableNativeFeedback(run.session_id);
-   const result=await sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,JSON.parse(t.required_checks));
+   const result=await sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,JSON.parse(t.required_checks),remediationPolicy);
+   if(result.blocked)return this.record(job,{state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
    return {...d,head:e.head,delivery:result};
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};

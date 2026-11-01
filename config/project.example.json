@@ -52,5 +52,10 @@
     "enabled": false,
     "authorizedBy": "",
     "maxUpdates": 3
+  },
+  "remediation": {
+    "maxAttempts": 5,
+    "maxNoProgress": 5,
+    "window": "job"
   }
 }

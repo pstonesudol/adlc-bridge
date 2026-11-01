@@ -181,6 +181,8 @@ and its placeholders must be replaced; it is not an executable configuration.
 | `reviewAllowedPaths` | Approved repository-relative review scope for explicit manual registration |
 | `routing` | Existing OpenChamber configuration and routing runtime directories; supported harness |
 | `statusSync` | Team-specific In Progress, In Review, and Done UUIDs |
+| `remediation.maxAttempts` | Positive per-job remediation budget; `null` enables explicit uncapped mode |
+| `remediation.maxNoProgress` | Consecutive attempts without verified progress before an explicit stop |
 | `featurePlanning.backlogStateId` | Backlog UUID for newly published ticket batches |
 
 Obtain Linear UUIDs through its API or connected tools; do not substitute issue
@@ -285,10 +287,12 @@ Closing a PR without merging does not mark its ticket Done. Unexpected external
 status changes require reconciliation rather than a blind overwrite.
 
 The host checks required CI, current-commit CodeRabbit evidence, and unresolved
-findings. It sends scoped actionable fixes to the existing worker, up to five
-remediation attempts. Missing review blocks after 30 minutes; failed required CI,
-out-of-scope work, or uncertain delivery can also block. This is a bounded loop,
-not a promise of unlimited retries or automatic success.
+findings. It sends scoped actionable fixes to the existing worker under the
+project's remediation budget. Missing review blocks after 30 minutes; failed
+required CI, out-of-scope work, or uncertain delivery can also block. This is a
+bounded loop, not a promise of unlimited retries or automatic success. See
+[Remediation budget](#remediation-budget) for the default, uncapped mode, and
+operator extension procedure.
 
 Orchestrator's board labels are separate from bridge state. “Needs human review”
 does not establish that CodeRabbit has cleared the current commit. The bridge
@@ -526,3 +530,63 @@ A base can move after any observation, so final merge eligibility must still be
 checked by the human and GitHub at merge time. No protection, review, or check is
 bypassed. Workers must fetch and fast-forward their local feature branch before
 further code remediation and stop if it is dirty or divergent.
+
+## Remediation budget
+
+Remediation budgeting is a per-project setting:
+
+```json
+"remediation": {
+  "maxAttempts": 5,
+  "maxNoProgress": 5,
+  "window": "job"
+}
+```
+
+Omitting `remediation`, or any field within it, preserves the five-attempt and
+five-no-progress defaults. `maxAttempts` must be a positive integer or `null`.
+`null` is an explicit uncapped mode, not a zero or infinite numeric value.
+`maxNoProgress` is a positive integer, and `window` currently supports only
+`"job"`. Invalid values reject the project configuration rather than being
+silently clamped. Values above five are used as written.
+
+The budget is enforced over the lifetime of the job. The current project
+setting becomes the configured limit for that tick; it is isolated from other
+projects. `adlc status` and `adlc review-status` report the configured/effective
+limit, consumed and remaining attempts (or uncapped), the job window, consecutive
+no-progress count, and any stop reason. Lowering a limit does not cancel an
+in-flight worker; it applies when the next reservation is evaluated. Raising a
+limit does not bypass approval, scope, failed CI, conflicts, uncertainty, or any
+other stop.
+
+A durable remediation reservation and its delivery count as one attempt.
+Actionable code fixes, verification/evidence or PR-description fixes, CI
+configuration repairs, and failed or uncertain delivery all consume that
+reservation. Waiting or polling, duplicate findings, full-review requests, and
+reconciling a completed receipt do not consume another attempt. `jobs.attempts`
+remains a cumulative audit count and is never cleared by an extension.
+
+A new head, base update, PR-description change, or a different finding set does
+not erase an uncertain delivery or grant fresh authority. Verified progress
+requires a previous remediation receipt to complete and a subsequent materially
+different finding set on a different PR head; that resets only the consecutive
+no-progress counter. It does not increase the configured budget. Repeated
+attempts without verified progress stop at `maxNoProgress`, independently of
+`maxAttempts`. Uncapped mode still stops on repeated no-progress behavior.
+
+When the budget or no-progress threshold stops a job, no further remediation is
+sent automatically and a Linear blocker comment records the stop reason. A human
+can inspect approval, scope, PR head, and prior delivery receipts, then preview an
+extension:
+
+```sh
+adlc extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD
+```
+
+Review the returned `confirmHash`, then apply the same request with
+`--confirm HASH` and an optional `--reason TEXT`. The command refuses uncertain
+delivery, a changed approval/scope/head, or a job that is not stopped for
+remediation. The extension is appended to durable audit history, restores only
+the remediation stop, and never deletes attempts, replays a send, creates another
+session or PR, or forges approval. Uncapped projects do not need extension.
+PR merges remain human-only and deployment is never automatic.

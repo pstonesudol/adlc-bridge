@@ -1,14 +1,29 @@
-import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';
+import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';
 const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
-function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false;
+function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false;const posted:any[]=[];
  const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}});
- const api=async(q:string,v:any)=>{if(q.includes('workflowState'))return {workflowState:{id:v.id,type:v.id==='done'?'completed':'started',team:{id:'t'}}};if(q.includes('issueUpdate')){updates++;state=v.state;if(lost){lost=false;throw Error('Lost status reply');}return {issueUpdate:{success:true,issue:issue()}};}return {issue:issue()};};
+ const api=async(q:string,v:any)=>{
+  if(q.includes('workflowState'))return {workflowState:{id:v.id,type:v.id==='done'?'completed':'started',team:{id:'t'}}};
+  if(q.includes('commentCreate')){const comment={id:v.input.id,body:v.input.body,createdAt:new Date().toISOString()};posted.push(comment);return {commentCreate:{success:true,comment}};}
+  if(q.includes('comments(first'))return {issue:{id:'issue',comments:{nodes:posted,pageInfo:{hasNextPage:false,endCursor:null}}}};
+  if(q.includes('issueUpdate')){updates++;state=v.state;if(lost){lost=false;throw Error('Lost status reply');}return {issueUpdate:{success:true,issue:issue()}};}
+  return {issue:issue()};
+ };
  const sync=new LinearLifecycle(s,api,async()=>({state:merged?'closed':'open',merged}));
- return {s,id,sync,get state(){return state;},get updates(){return updates;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
+ return {s,id,sync,get state(){return state;},get updates(){return updates;},get posted(){return posted;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
 }
 test('owned ticket moves In Progress → In Review → Done only after observed merge',async()=>{
  const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
  await f.sync.sync(c);expect(f.state).toBe('review');expect(f.s.get(f.id).state).not.toBe('done');f.merge();await f.sync.sync(c);expect(f.state).toBe('done');expect(f.s.get(f.id).state).toBe('done');expect(f.updates).toBe(3);
+ }finally{f.s.close();}
+});
+test('exhausted remediation posts one idempotent Linear blocker notice',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO remediation_budget(job,consumed,extensions,no_progress,last_head,stop_reason,configured_max_attempts,configured_max_no_progress,window) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(f.id,5,0,1,'a'.repeat(40),'budget_exhausted',5,5,'job');
+  f.s.db.query("UPDATE jobs SET state='blocked',reason='Remediation budget exhausted' WHERE id=?").run(f.id);
+  const first=await f.sync.sync(c);expect(f.posted.length).toBe(1);expect(first.some((x:any)=>x.phase==='remediation-blocker'&&x.state==='posted')).toBe(true);
+  await f.sync.sync(c);expect(f.posted.length).toBe(1);
  }finally{f.s.close();}
 });
 test('lost status reply reconciles without replay; subsequent manual change is preserved',async()=>{
