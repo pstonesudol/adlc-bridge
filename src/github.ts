@@ -1,4 +1,5 @@
 import {latestWorkflowChecks} from './check-runs';
+import {templateLogReader} from './gh-logs';
 import {templateCIFindings,templateSignature} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
@@ -81,11 +82,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
-  const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),async path=>{
-   const p=Bun.spawn(['gh','api',path,'--allow-escape-sequences'],{stdout:'pipe',stderr:'pipe',timeout:30000});
-   const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
-   if(code!==0)throw Error('Template-check logs unavailable');return out;
-  });
+  const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),templateLogReader());
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,

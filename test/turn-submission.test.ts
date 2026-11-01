@@ -103,3 +103,6 @@ test('start keeps submissions paused through every project start and retains the
   fail=false;await controlStack('start',f.ops);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(false);await f.turns.submit(async()=>{});
  }finally{f.close();}
 });
+test('a failed intake stop retains the durable pause and never proceeds to the worker scan or backend stop',async()=>{
+ const f=fixture();try{f.ops.projects=async()=>[{project:'one'}];f.ops.project=async()=>{throw Error('intake unload failed');};await expect(controlStack('stop',f.ops)).rejects.toThrow('intake unload failed');expect(f.calls).toEqual([]);await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);}finally{f.close();}
+});

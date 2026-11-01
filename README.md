@@ -693,9 +693,10 @@ unconfigured failed checks do not block this gate. Failures in configured
 application checks, unavailable metadata-check logs, identity mismatches,
 out-of-scope work, or exhausted attempts still block for inspection.
 No automatic approval, check bypass, merge, or deployment is added.
-Reading these logs requires a GitHub CLI version supporting the `gh api
---allow-escape-sequences` flag; escape sequences are stripped before the selected
-failure lines are sent to the worker.
+Log retrieval checks the installed GitHub CLI version and passes `gh api
+--allow-escape-sequences` only on version 2.97.0 or newer; older versions omit
+that flag. Escape sequences are stripped before selected failure lines reach
+the worker.
 
 When GitHub returns old and rerun check results for one commit, the bridge verifies
 the workflow run, job, repository, commit, workflow identity, and event before

@@ -32,8 +32,8 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
   });
  }
  return ops.turns.run(async()=>{
- const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
  ops.turns.pause();
+ const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
  const backend=await ops.backend();
  if(backend.ready){
   if(!backend.managed)throw Error('Intake paused. Orchestrator is not managed by this bridge; backend preserved');
