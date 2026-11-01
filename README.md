@@ -40,6 +40,13 @@ A delivery already holding it refuses shutdown before unloading any intake
 service, instead of interrupting the send. Retry once that delivery settles.
 Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
 they cannot unload a poll process while it owns an in-flight submission.
+Acquiring the lock is not proof that a legacy process participates. Loaded
+intake services must also have an owner-only process acknowledgement matching
+their CLI bytes and, while running, PID and process start time. An idle service
+must have a clean completion receipt. Services without that proof are preserved:
+before upgrading a pre-barrier installation, an operator must establish
+quiescence and stop/unload its intake services manually. Never interrupt a
+submission or delete uncertain delivery records to force migration.
 Contention or an abandoned `turn-submission.lock` fails closed; inspect the stack
 and delivery receipts before removing an abandoned lock. This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle

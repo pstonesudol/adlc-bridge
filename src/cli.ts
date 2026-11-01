@@ -30,6 +30,7 @@ import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
+import {acknowledgePoll} from './poll-process';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -204,9 +205,13 @@ Registered approved review targets can request bounded in-scope fixes from their
         if(target.state==='completed')continue;
         try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,{project:c!.linear.projectId,checks:c!.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
       }
-    };if(command==='poll')return await tick();
+    };
+    const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
+    try{
+    if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);
     while(!stop){try{await tick();}catch(e){console.error(e instanceof Error?e.message:'Poll failed');}for(let i=0;i<60&&!stop;i++)await Bun.sleep(1000);}
+    }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
 main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
