@@ -306,3 +306,19 @@ test('a late GitHub review-request receipt preserves the completed target and it
   const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
  }finally{release?.();f.s.close();}
 });
+test('failed review requests revoke stale ready state but retain their reservation and never post twice',async()=>{
+ for(const edited of [false,true]){const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);f.e.clear=edited;f.e.failedChecks=[];f.e.findings=[];f.e.reasons=['CodeRabbit review absent'];f.e.botReviewSubmittedAt=Date.now()-1000;
+  if(edited)f.s.db.query('INSERT INTO description_delivery_gates VALUES (?,?,?,?)').run(f.id,f.head,'previous-body',Date.now()-1000);
+  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head,reason:'Previously approved'});let requests=0;
+  f.loop.postReview=async()=>{requests++;expect(f.loop.get(f.id).state).toBe('needs_reconciliation');throw Error('GitHub request receipt lost');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('receipt lost');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
+  expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});expect((await f.loop.tick(f.id)).state).not.toBe('ready_for_human');expect(requests).toBe(1);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}}
+});
+test('a late failed review request cannot reopen a concurrently completed target',async()=>{
+ const f=templateFixture();try{
+  let terminal:any;f.loop.postReview=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Merge observed'});terminal=f.loop.get(f.id);throw Error('Late GitHub failure');};
+  await expect(f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.s.close();}
+});

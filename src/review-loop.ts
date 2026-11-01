@@ -83,12 +83,13 @@ export class ReviewLoop{
     if(this.completed(job))return false;
    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?)').run(job,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
-   this.s.db.query('UPDATE review_targets SET head_since=? WHERE job=?').run(Date.now(),job);
+    this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason='Full review request delivery uncertain; reconcile before retry' WHERE job=? AND state!='completed'").run(Date.now(),job);
    return true;
   }).immediate();
   if(!reserved)return false;
   // A lost reply keeps its durable reservation: never post the same request again.
-  await this.postReview(t.repo,t.pr);
+   try{await this.postReview(t.repo,t.pr);}
+   catch(error){this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'});throw error;}
   this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(job,head,bodyHash);
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({head,bodyHash}));
   return true;

@@ -8,7 +8,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # PR results validate their own base/merge context, not a main push context.
+  # Never let a push or another PR cancel that required validation.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}-{1}', github.event.pull_request.base.ref, github.event.pull_request.number) || format('push-{0}', github.ref) }}
   cancel-in-progress: true
 
 jobs:
