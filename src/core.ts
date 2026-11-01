@@ -7,6 +7,10 @@ export const digest = (text: string) => createHash('sha256').update(text).digest
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
 export class Store {
   db: Database;
+  static readonly(path:string){
+    const store=Object.create(Store.prototype) as Store;
+    store.db=new Database(path,{readonly:true,create:false});return store;
+  }
   constructor(path: string) {
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });

@@ -95,3 +95,11 @@ test('production project-stop wiring refuses an active submission before touchin
   expect(child.exitCode).toBe(0);expect(JSON.parse(child.stdout.toString()).reason).toContain('in progress');
  }finally{f.close();}
 });
+test('start keeps submissions paused through every project start and retains the pause on partial failure',async()=>{
+ const f=fixture();try{
+  f.ops.projects=async()=>[{project:'one'},{project:'two'}];let fail=true;const started:string[]=[];
+  f.ops.project=async(action,id)=>{expect(action).toBe('start');expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');started.push(id);if(id==='two'&&fail)throw Error('second intake failed');return {};};
+  await expect(controlStack('start',f.ops)).rejects.toThrow('second intake failed');await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');expect(started).toEqual(['one','two']);
+  fail=false;await controlStack('start',f.ops);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(false);await f.turns.submit(async()=>{});
+ }finally{f.close();}
+});

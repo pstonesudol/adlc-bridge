@@ -14,21 +14,22 @@ async function launch(args:string[]){
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  return {stdout,stderr,code};
 }
-export async function registeredProjects(){
- const s=new Store(registryPath());try{const registry=new ProjectServices(s);registry.discoverLegacy();return registry.list().map(p=>({...p,definitionInstalled:existsSync(join(homedir(),'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
+export async function registeredProjects(readOnly=false,home=homedir(),path=registryPath(),read=readDefinition){
+ const s=readOnly?(existsSync(path)?Store.readonly(path):new Store(':memory:')):new Store(path);
+ try{const registry=new ProjectServices(s,!readOnly),legacy=registry.discoverLegacy(home,read,!readOnly),entries=registry.list();if(legacy&&!entries.some(p=>p.project===legacy.project))entries.push(legacy);return entries.map(p=>({...p,definitionInstalled:existsSync(join(home,'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
 }
 export async function serviceControl(action:string,project?:string,turns:TurnBarrier=turnBarrier(),operate=controlProject){
  return action==='stop'?turns.run(()=>operate(action,project)):operate(action,project);
 }
 async function controlProject(action:string,project?:string){
  if(process.platform!=='darwin'||!process.getuid)throw Error('Service controls require macOS');
- const s=new Store(registryPath());
+ const readOnly=action==='service-status',path=registryPath(),s=readOnly?(existsSync(path)?Store.readonly(path):new Store(':memory:')):new Store(path);
  try{
-  const registry=new ProjectServices(s);registry.discoverLegacy();
-  if(action==='service-status'&&!project&&registry.list().length>1){
-   const results=[];for(const p of registry.list())results.push(await serviceControl(action,p.project));return results;
+   const registry=new ProjectServices(s,!readOnly),legacy=registry.discoverLegacy(homedir(),readDefinition,!readOnly),extra=legacy?[legacy]:[],entries=registry.list();if(legacy&&!entries.some(p=>p.project===legacy.project))entries.push(legacy);
+   if(action==='service-status'&&!project&&entries.length>1){
+    const results=[];for(const p of entries)results.push(await serviceControl(action,p.project));return results;
   }
-  const entry=registry.select(project);registry.verify(entry);
+   const entry=registry.select(project,extra);registry.verify(entry);
   const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(homedir(),'Library/LaunchAgents',`${label}.plist`);
   if(existsSync(plist))assertDefinition(readDefinition(plist),label,entry.config);
   const status=async()=>{

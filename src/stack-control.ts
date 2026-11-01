@@ -23,13 +23,13 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
  const projects=await ops.projects();
  if(action==='status')return {scope:'all',backend:await ops.backend(),projects:await Promise.all(projects.map(p=>ops.project('service-status',p.project)))};
  if(action==='start'){
-  const backend=await ops.turns.run(async()=>{
+  return ops.turns.run(async()=>{
+   ops.turns.pause();
    await ops.backendStart();
    const backend=await ops.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready; intake remains stopped');
-   ops.turns.resume();return backend;
+   const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
+   ops.turns.resume();return {scope:'all',backend,projects:results};
   });
-  const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
-  return {scope:'all',backend,projects:results};
  }
  return ops.turns.run(async()=>{
  const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
@@ -106,14 +106,14 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
  return blocked;
 }
-export function liveStackOps():StackOps{
+export function liveStackOps(readOnly=false):StackOps{
  const config=definition();
  return {
   turns:turnBarrier(),
-  projects:registeredProjects,
+  projects:()=>registeredProjects(readOnly),
   project:async(action,id)=>{
    // Full-stack controls persist the user's on/off choice across login.
-   const entries=await registeredProjects(),p=entries.find(x=>x.project===id);if(!p)throw Error('Unknown project');
+   const entries=await registeredProjects(action==='service-status'),p=entries.find(x=>x.project===id);if(!p)throw Error('Unknown project');
    if(action==='start'){const r=await command(['/bin/launchctl','enable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Could not enable project service');}
    const result=await serviceControl(action,id);
    if(action==='stop'){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
@@ -138,7 +138,7 @@ export function liveStackOps():StackOps{
 }
 export async function stackControl(action:'start'|'stop'|'status'){
  if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');
- if(action==='status')return controlStack(action,liveStackOps());
+ if(action==='status')return controlStack(action,liveStackOps(true));
  const lock=join(stateDir(),'stack-control.lock');
  mkdirSync(stateDir(),{recursive:true,mode:0o700});
  try{mkdirSync(lock);}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
