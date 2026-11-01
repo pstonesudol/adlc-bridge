@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,realpathSync,existsSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
-import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';import {createWorkflowTransport} from '../src/workflow-transport';import {createFeatureAgents} from '../src/feature-transport';
+import {turnBarrier,TurnSubmissionBlocked} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';import {createWorkflowTransport} from '../src/workflow-transport';import {createFeatureAgents} from '../src/feature-transport';
 import {Store} from '../src/core';import {Workflow} from '../src/workflow';import {featureFixture,featureConfig,requirements} from './feature-fixture';
 import {serviceControl} from '../src/service-control';
 const receipt=(exited=Promise.resolve(0))=>({stdout:new Response('{}').body,stderr:new Response('').body,exited});
@@ -24,7 +24,7 @@ test('shutdown fences every bridge turn transport during its final scan, backend
   const spawn=(()=>{sends++;return receipt();}) as any,workflow=createWorkflowTransport(f.turns.submit,spawn,async()=>{creates++;return {};});const feature=createFeatureAgents(f.turns.submit,spawn);
   const rejected=async()=>{
    await expect(workflow.sendImplementation('worker','prompt','key')).rejects.toThrow();await expect(feature.send('worker','prompt','key')).rejects.toThrow();
-   await expect(workflow.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow();await expect(feature.start({route:{},name:'feature',key:'key'} as any)).rejects.toThrow();
+   await expect(workflow.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow();await expect(feature.start({route:{},name:'feature',key:'key'} as any)).rejects.toBeInstanceOf(TurnSubmissionBlocked);
   };
   f.ops.blockers=async()=>{await rejected();return [];};const stop=f.ops.backendStop;f.ops.backendStop=async()=>{await rejected();await stop();};
   await controlStack('stop',f.ops);await rejected();expect(sends).toBe(0);expect(creates).toBe(0);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);
