@@ -65,8 +65,8 @@ export class ReviewLoop{
  }
   get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
    private completed(job:string){const t=this.get(job);return t?.state==='completed'?{state:'completed',send:false,head:t.head,reason:t.reason}:undefined;}
-   private uncertainReview(job:string,head:string,body:string){
-    const request=this.s.db.query('SELECT state FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,head,body) as any;
+   private uncertainReview(job:string,head:string){
+    const request=this.s.db.query("SELECT state FROM full_review_requests WHERE job=? AND head=? AND state='delivery_uncertain' LIMIT 1").get(job,head) as any;
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'}:undefined;
    }
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
@@ -80,17 +80,19 @@ export class ReviewLoop{
    return result;
   }).immediate();
  }
-  async requestReview(job:string,head:string,bodyHash:string){
-   const t=this.get(job);if(this.completed(job))return false;
+   async requestReview(job:string,head:string,bodyHash:string){
+    const t=this.get(job);if(this.completed(job))return false;
+    const unresolved=this.uncertainReview(job,head);if(unresolved){this.record(job,unresolved);return false;}
    try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
-   const reserved=this.s.db.transaction(()=>{
-    if(this.completed(job))return false;
+    const reserved=this.s.db.transaction(()=>{
+     if(this.completed(job))return false;
+     if(this.uncertainReview(job,head))return false;
    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?)').run(job,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
     this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason='Full review request delivery uncertain; reconcile before retry' WHERE job=? AND state!='completed'").run(Date.now(),job);
    return true;
   }).immediate();
-  if(!reserved)return false;
+   if(!reserved){const unresolved=this.uncertainReview(job,head);if(unresolved)this.record(job,unresolved);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
    try{await this.postReview(t.repo,t.pr);}
    catch(error){this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'});throw error;}
@@ -130,7 +132,7 @@ export class ReviewLoop{
    // observation here rather than relaxing Lifecycle.current's authorization.
    try{if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');}
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
-   const unresolved=this.uncertainReview(job,e.head,e.descriptionHash);if(unresolved)return this.record(job,unresolved);
+   const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
   // A same-SHA approval can predate a description edit. Reconcile metadata
   // receipts before considering e.clear, so that edit always creates its gate.
@@ -180,7 +182,7 @@ export class ReviewLoop{
   // idle PR. Pending CI and actionable findings must be handled first.
   if(!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
    const requested=await this.requestReview(job,e.head,e.descriptionHash);
-   const unresolved=this.uncertainReview(job,e.head,e.descriptionHash);if(unresolved)return this.record(job,unresolved);
+   const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    if(requested){
      this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND state!='completed'").run(e.head,job);
     return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
@@ -192,7 +194,7 @@ export class ReviewLoop{
    if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
     if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted))await this.requestReview(job,e.head,e.descriptionHash);
-    const unresolved=this.uncertainReview(job,e.head,e.descriptionHash);if(unresolved)return this.record(job,unresolved);
+    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,e.descriptionHash) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
    if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});

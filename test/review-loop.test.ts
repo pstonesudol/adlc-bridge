@@ -333,3 +333,16 @@ test('a concurrently reserved review request cannot be downgraded to a normal wa
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}}
 });
+test('description edits cannot escape same-head review-request uncertainty or trigger another post',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);f.e.failedChecks=[];f.e.findings=[];f.e.reasons=['CodeRabbit review absent'];const originalBody=f.e.descriptionHash;let posts=0;
+  f.loop.postReview=async()=>{posts++;throw Error('Lost request receipt');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Lost request receipt');f.e.descriptionHash='edited-body';
+  for(const clear of [false,true]){f.e.clear=clear;f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');}
+  expect(await f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).toBe(false);expect(posts).toBe(1);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toHaveLength(1);
+  // Even a separately accepted receipt for the new body cannot mask the old
+  // same-head uncertain delivery. Every outstanding receipt must be reconciled.
+  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+  f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
