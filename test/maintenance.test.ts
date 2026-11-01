@@ -70,11 +70,21 @@ test('recovery rechecks PR openness and exact ancestry target after collecting f
  }finally{f.close();}}
 });
 test('recovery validates remediation policy before any reconciliation and binds previews to policy changes',async()=>{
- for(const remediation of [{maxAttempts:0},{maxNoProgress:0},{maxAttempts:'ten'},{unknown:1}]){const f=fixture();try{
+ for(const [remediation,error] of [[{maxAttempts:0},'Remediation maxAttempts must be a positive integer or null for uncapped mode'],[{maxNoProgress:0},'Remediation maxNoProgress must be a positive integer'],[{maxAttempts:'ten'},'Remediation maxAttempts must be a positive integer or null for uncapped mode'],[{unknown:1},'Unknown remediation setting: unknown']] as const){const f=fixture();try{
   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');writeFileSync(f.config,JSON.stringify({...f.c,remediation}));
-  await expect(maintenance(f.s,'recover',f.id,true,'any',f.io)).rejects.toThrow();expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+  await expect(maintenance(f.s,'recover',f.id,false,undefined,f.io)).rejects.toThrow(error);
+  writeFileSync(f.config,JSON.stringify(f.c));const valid=await maintenance(f.s,'recover',f.id,false,undefined,f.io);writeFileSync(f.config,JSON.stringify({...f.c,remediation}));
+  await expect(maintenance(f.s,'recover',f.id,true,valid.confirmation,f.io)).rejects.toThrow(error);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}}
  const f=fixture();try{f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);
   writeFileSync(f.config,JSON.stringify({...f.c,remediation:{maxAttempts:12}}));await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}
+});
+test('recovery confirmation binds effective Linear eligibility and status-sync settings',async()=>{
+ const statusSync={enabled:true,inProgress:'started',inReview:'review',done:'done'};
+ const changes=[(c:any)=>c.linear.teamId='other-team',(c:any)=>c.linear.readyStateId='other-todo',(c:any)=>c.linear.readyLabelId='other-label',(c:any)=>c.statusSync.enabled=false,(c:any)=>c.statusSync.inProgress='other-started',(c:any)=>c.statusSync.inReview='other-review',(c:any)=>c.statusSync.done='other-done'];
+ for(const change of changes){const f=fixture();try{
+  const c={...f.c,linear:{...f.c.linear,teamId:'team',readyStateId:'todo',readyLabelId:'label'},statusSync:{...statusSync}};writeFileSync(f.config,JSON.stringify(c));f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');
+  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);change(c);writeFileSync(f.config,JSON.stringify(c));await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
+ }finally{f.close();}}
 });

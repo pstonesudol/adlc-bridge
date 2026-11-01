@@ -24,7 +24,9 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  const c=configFor(s,job,io.registrations());if(target.repo!==c.githubRepo)throw Error('Registered repository mismatch');
  const budget=remediationPolicy(c.remediation),metadataChecks=[...metadataCheckNames(c.prMetadataChecks)];
  const e=await io.sessionEvidence(run.session_id),pr=await io.gh(`repos/${target.repo}/pulls/${target.pr}`);
- const report={action,job,session:run.session_id,repo:target.repo,pr:target.pr,head:pr.head?.sha,base:pr.base?.sha,planHash:j.plan_hash,state:j.state,reviewState:target.state,reason:target.reason,policy:{remediation:budget,metadataChecks,branchUpdate:c.branchUpdate??null}};
+ const report={action,job,session:run.session_id,repo:target.repo,pr:target.pr,head:pr.head?.sha,base:pr.base?.sha,planHash:j.plan_hash,state:j.state,reviewState:target.state,reason:target.reason,configHash:digest(JSON.stringify(c)),policy:{remediation:budget,metadataChecks,branchUpdate:c.branchUpdate??null,
+  linear:{projectId:c.linear.projectId,teamId:c.linear.teamId??null,readyStateId:c.linear.readyStateId??null,readyLabelId:c.linear.readyLabelId??null},
+  statusSync:c.statusSync?.enabled?{enabled:true,inProgress:c.statusSync.inProgress,inReview:c.statusSync.inReview,done:c.statusSync.done}:{enabled:false}}};
  if(action==='cleanup'){
   assertCleanup(j,run,target,e,pr);
   const tree=e.session.worktree??run.worktree;if(!tree||!existsSync(tree)||realpathSync(tree)===realpathSync(c.repo)||realpathSync(tree)!==realpathSync(run.worktree))throw Error('Verified isolated worktree required');
