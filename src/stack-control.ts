@@ -10,7 +10,8 @@ import {turnBarrier,type TurnBarrier} from './turn-submission';
 type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number};
 export type StackOps={
  projects():Promise<{project:string}[]>;
- project(action:'start'|'stop'|'service-status',id:string):Promise<any>;
+  // A start result must confirm the running poll's PID-bound startup receipt.
+  project(action:'start'|'stop'|'service-status',id:string):Promise<any>;
  backend():Promise<Backend>;
  backendStart():Promise<void>;
  backendStop():Promise<void>;
@@ -27,7 +28,9 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
    ops.turns.pause();
    await ops.backendStart();
    const backend=await ops.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready; intake remains stopped');
-   const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
+    // Polls acknowledge barrier awareness while paused, then wait behind this
+    // fence. Project start confirms their receipts before intake is resumed.
+    const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
    ops.turns.resume();return {scope:'all',backend,projects:results};
   });
  }

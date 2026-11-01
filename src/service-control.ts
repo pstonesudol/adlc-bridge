@@ -4,7 +4,16 @@ import {join} from 'node:path';
 import {Store} from './core';
 import {ProjectServices,registryPath,assertDefinition,readDefinition} from './project-services';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
-import {assertPollQuiescent} from './poll-process';
+import {assertPollQuiescent,assertPollStarted} from './poll-process';
+export async function waitForPollStartup<T extends {loaded:boolean;running?:boolean;pid?:number}>(status:()=>Promise<T>,verify:(current:T)=>void,kickstart:()=>Promise<void>,wait={attempts:100,pause:()=>Bun.sleep(100)}){
+ await kickstart();let last:unknown;
+ for(let attempt=0;attempt<wait.attempts;attempt++){
+  const current=await status();
+  try{if(!current.loaded)throw Error('Intake service is not loaded');verify(current);return current;}catch(error){last=error;}
+  if(attempt+1<wait.attempts)await wait.pause();
+ }
+ throw Error('Poll startup acknowledgement unavailable; intake startup not confirmed',{cause:last});
+}
 export async function stopLoadedIntake(status:{loaded:boolean;pid?:number;running?:boolean},config:string,cli:string,bootout:()=>Promise<void>,verify=assertPollQuiescent){
  if(!status.loaded)return;
  verify(status,config,cli);await bootout();
@@ -51,7 +60,11 @@ async function controlProject(action:string,project?:string){
     if(current.loaded){const def=readDefinition(plist);await stopLoadedIntake(current,entry.config,def.ProgramArguments[1],async()=>{const r=await launch(['bootout',target]);if(r.code!==0)throw Error('Could not stop background service');});}
    }
   for(let attempt=0;attempt<100;attempt++){current=await status();if(current.loaded===(action==='start'))break;await Bun.sleep(100);}
-  if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
+   if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
+   if(action==='start'){
+    const def=readDefinition(plist);
+    current=await waitForPollStartup(status,observed=>assertPollStarted(observed,entry.config,def.ProgramArguments[1]),async()=>{const r=await launch(['kickstart',target]);if(r.code!==0)throw Error('Could not request poll startup');});
+   }
   return {project:entry.project,service:label,...current,workerSessionsStopped:false,note:action==='stop'?'Background coordination stopped. Existing Orchestrator workers continue independently.':'Background coordination enabled; polls approximately every 60 seconds.'};
  }finally{s.close();}
 }
