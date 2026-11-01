@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';
+import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';import {DeliveryRecovery} from '../src/delivery-recovery';
 const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
 function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false,noticeFailure=false,noticeCalls=0;const posted:any[]=[],issueChanges:any={};let beforeAPI:(q:string)=>void=()=>{};
  const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}},...issueChanges});
@@ -39,6 +39,26 @@ test('review-stage branch drift posts one notice and blocks in-review',async()=>
   await f.sync.sync(c);
   expect(f.s.db.query('SELECT count(*) AS n FROM branch_drift_notices').get()).toEqual({n:1});
   expect(f.posted.length).toBe(1);expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
+test('another blocked review identity failure stays out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked','Target is not the owned open feature PR');
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
+test('adopted delivery clears a stale review branch-mismatch blocker',async()=>{
+ const f=fixture();try{
+  const p=f.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(f.id) as any;
+  new DeliveryRecovery(f.s,{} as any).install();
+  f.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,'hash','adopted','worker','/worktree',p.branch,'adlc/existing','owner/repo',7,'a'.repeat(40),'b'.repeat(40),'h'.repeat(64),'s'.repeat(64),'{}');
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; preview recover-handoff';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const result=await f.sync.sync(c);
+  expect(result[0]).toEqual({job:f.id,phase:'in-review',state:'confirmed'});
+  expect(f.state).toBe('review');expect(f.updates).toBe(1);expect(f.posted.length).toBe(0);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBeNull();
  }finally{f.s.close();}
 });
 function budgetBlocked(){

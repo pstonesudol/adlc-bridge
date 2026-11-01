@@ -56,11 +56,11 @@ for(const [name,change] of Object.entries({
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('lost claim receipt reconciles attachment without another claim; concurrent confirms are bounded',async()=>{const f=fixture();try{f.lose();const p=await f.recovery.preview(f.id,f.c);await Promise.allSettled([f.recovery.confirm(f.id,f.c,p.hash),f.recovery.confirm(f.id,f.c,p.hash)]);await f.recovery.confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);}finally{f.s.close();}});
 test('uncertain unattached claim is durable and never replayed',async()=>{const f=fixture();try{f.t.claim=async()=>{throw Error('unknown');};const p=await f.recovery.preview(f.id,f.c);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');let calls=0;f.t.claim=async()=>{calls++;};await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');expect(calls).toBe(0);}finally{f.s.close();}});
-test('repeated confirmation preserves a later dispatch state and reason',async()=>{
+test('repeated confirmation preserves a later blocker and does not report handoff',async()=>{
  const f=fixture();try{
   const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
   f.s.db.query("UPDATE implementation_dispatch SET state='blocked',reason='Later review blocker' WHERE job=?").run(f.id);
-  await f.recovery.confirm(f.id,f.c,p.hash);
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('reconciliation required');
   expect(f.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(f.id)).toEqual({state:'blocked',reason:'Later review blocker'});
  }finally{f.s.close();}
 });

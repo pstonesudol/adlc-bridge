@@ -76,10 +76,16 @@ export class DeliveryRecovery{
      const current=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
      if(current?.state!=='pr_handoff')throw Error('Dispatch state cannot be repaired automatically; reconciliation required');
     }
+    // Adoption makes the verified delivery branch authoritative, so any older
+    // review-stage branch-mismatch reason refers to the superseded reservation.
+    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get())this.s.db.query("UPDATE review_targets SET reason=NULL WHERE job=? AND reason LIKE 'Blocked — branch mismatch%'").run(job);
    }else{
     const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
     if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
-    // Repeated confirmation is idempotent and must preserve any later dispatch state.
+    // Repeated confirmation preserves any later dispatch state, but it must not
+    // report handoff while a later blocker is in force.
+    const current=this.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(job) as any;
+    if(current?.state!=='pr_handoff')throw Error(`Delivery dispatch is ${current?.state??'missing'}; reconciliation required${current?.reason?`: ${current.reason}`:''}`);
    }
    return {job,state:'pr_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash};
   }).immediate();
