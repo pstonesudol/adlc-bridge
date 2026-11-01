@@ -40,6 +40,8 @@ function runtimeMigration(state:string,home:string,io:typeof installIO){
  return {pinPath,pinBytes,pin,plist,def,plistBytes:readFileSync(plist)};
 }
 export async function installBridge(apply=false,root=resolve(import.meta.dir,'..'),bin?:string,io=installIO){
+  const turns=turnBarrier(io.state());
+  const inspectAndInstall=async()=>{
   if(root.includes('/ADLC Bridge/versions/'))root=verifiedInstallationSource(io.state())??root;
  const projects=await io.registeredProjects(!apply);
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
@@ -47,8 +49,6 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
  const definitions=projects.map(p=>{const path=join(io.home(),'Library/LaunchAgents',p.label+'.plist');if(!existsSync(path))return {p,path,def:null,original:null};const def=io.readDefinition(path);io.assertDefinition(def,p.label,p.config);return {p,path,def,original:readFileSync(path)};});
  const runtime=runtimeMigration(io.state(),io.home(),io);
   if(!apply)return {preview:true,source:root,launcher,projects:projects.map(p=>p.project),files:distributionFiles(root),runtimeLauncherMigration:!!runtime,note:'Apply creates a pinned runtime snapshot, pauses intake during activation, migrates gates/services and restores prior intake state. No workers are stopped. Runtime launcher changes take effect at the next guarded stop/start.'};
-  const turns=turnBarrier(io.state());
-  return turns.run(async()=>{
   // The default state is appState(), matching independently constructed service
   // barriers. Keep stop/activation/rollback in this one inherited control scope.
   const loaded=new Set<string>();
@@ -97,5 +97,8 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
    if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
     throw e;
   }
-  });
+  };
+  // Apply must acquire its control scope before reading any mutable baseline.
+  // Preview remains lock-free and uses read-only discovery.
+  return apply?turns.run(inspectAndInstall):inspectAndInstall();
 }
