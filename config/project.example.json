@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "pollingIntervalSeconds": 60,
   "name": "Your project",
   "repo": "/absolute/path/to/your/repository",
   "githubRepo": "OWNER/REPOSITORY",

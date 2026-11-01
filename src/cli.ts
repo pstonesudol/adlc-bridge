@@ -7,6 +7,7 @@ import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {initWizard} from './init';
 import {poll,validate} from './linear';
+import {serveLoop} from './project-settings';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -31,12 +32,16 @@ const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
 async function main(){
-  if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
+  if(['start','stop','service-status','service-config'].includes(command)){
+    if(a.slice(1).some(x=>x!=='--apply')||(a.includes('--apply')&&command!=='service-config'))throw Error('Unsupported service option');
+    return out(await serviceControl(command,a[0],a.includes('--apply')));
+  }
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.5 — Agent Orchestrator + OpenChamber
   projects                             list registered project services
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
+  service-config PROJECT [--apply]     preview interval update; apply reloads loaded service
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
                                        parallel feature planning; no Linear writes
   feature-show ID | feature-list        review proposed ticket batch and dependencies
@@ -70,7 +75,7 @@ async function main(){
   approve-plan JOB HASH HUMAN           record current plan approval
   prepare JOB AO_PROJECT_ID             persist spawn preview; never executes
   poll CONFIG                          one intake, planning, execution and review tick
-  serve CONFIG                         workflow tick every 60 seconds
+  serve CONFIG                         sequential ticks at configured interval (default 60s)
   readiness OWNER/REPO PR CONFIG        read latest-SHA CI/CodeRabbit gate
   handoff WORKTREE                      print OpenChamber handoff checklist
 No arbitrary send, merge, push, deploy or existing-credential-copy command exists.
@@ -168,7 +173,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       }
     };if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);
-    while(!stop){try{await tick();}catch(e){console.error(e instanceof Error?e.message:'Poll failed');}for(let i=0;i<60&&!stop;i++)await Bun.sleep(1000);}
+    await serveLoop(tick,c,()=>stop,Bun.sleep,e=>console.error(e instanceof Error?e.message:'Poll failed'));
   }finally{s.close();}
 }
 main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
