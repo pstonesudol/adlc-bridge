@@ -9,7 +9,7 @@ import {withTurnSubmission} from './turn-submission';
 import {PreSendFailure} from './pre-send';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
-import {resolve,basename} from 'node:path';
+import {resolve,isAbsolute,basename,dirname} from 'node:path';
 
 export async function jsonCommand(args:string[],spawn=Bun.spawn){
  const p=spawn(args,{stdout:'pipe',stderr:'pipe',timeout:30000});
@@ -66,12 +66,46 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
 export const liveTransport=createWorkflowTransport();
 
 export const planningGateMarker='ADLC_RESERVED_WORKTREE_GATE_V1';
-export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir,'planning-gate.ts')){
+// Decode literal shell words only. Never evaluate expansions or execute hook text.
+function literalCommandWords(command:string){
+ const words:string[]=[];let word='',quote='',active=false;
+ for(let i=0;i<command.length;i++){
+  const c=command[i];
+  if(quote==="'"){if(c==="'")quote='';else word+=c;continue;}
+  if(quote==='"'){
+   if(c==='"'){quote='';continue;}
+   if(c==='\\'){const next=command[++i];if(!next||!['\\','"','$','`'].includes(next))return;word+=next;continue;}
+   if(c==='$'||c==='`'||c==='\n'||c==='\r')return;
+   word+=c;continue;
+  }
+  if(c==='\n'||c==='\r')return;
+  if(/\s/.test(c)){if(active){words.push(word);word='';active=false;}continue;}
+  active=true;
+  if(c==="'"||c==='"'){quote=c;continue;}
+  if(c==='\\'){const next=command[++i];if(!next||next==='\n'||next==='\r')return;word+=next;continue;}
+  if(/[;&|<>()$`#]/.test(c))return;
+  word+=c;
+ }
+ if(quote)return;
+ if(active)words.push(word);
+ return words;
+}
+export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir,'planning-gate.ts'),installation?:{sourceGate:string;versions:string}){
  if(!Array.isArray(scripts)||scripts.some(x=>typeof x!=='string'))throw Error('Unexpected setup scripts');
  const hook=`${shellQuote(process.execPath)} ${shellQuote(gate)} # ${planningGateMarker}`;
- // Recognize pre-marker Bridge src gates, not unrelated user scripts or installation directory names.
- const legacyGate=/^(?:'[^']*bun'|"[^"]*bun"|\S*bun)\s+(?:'[^']*\/src\/planning-gate\.ts'|"[^"]*\/src\/planning-gate\.ts"|\S*\/src\/planning-gate\.ts)\s*$/;
- const prior=scripts.filter((x:string)=>!x.includes(planningGateMarker)&&!legacyGate.test(x)&&!x.includes('ADLC execution disabled pending host approval gate'));
+ const prior=scripts.filter((x:string)=>{
+  if(x.includes('ADLC execution disabled pending host approval gate'))return false;
+  const suffix=` # ${planningGateMarker}`,trimmed=x.trimEnd(),marked=trimmed.endsWith(suffix);
+  const words=literalCommandWords(marked?trimmed.slice(0,-suffix.length):x);
+  const gateInvocation=words?.length===2&&isAbsolute(words[1])&&basename(dirname(words[1]))==='src'&&basename(words[1])==='planning-gate.ts';
+  const bunInvocation=words&&(basename(words[0]??'')==='bun'||(isAbsolute(words[0]??'')&&resolve(words[0])===resolve(process.execPath)));
+  if(gateInvocation&&(marked||(bunInvocation&&resolve(words![1])===resolve(gate))))return false;
+  // An owner-validated installation record supplies the source and snapshot namespace.
+  if(installation)return !bridgePlanningHook(x,gate,installation.versions,installation.sourceGate);
+  // A filename, even under src, does not prove ownership of another installation.
+  if(gateInvocation||(!words&&x.includes('/src/planning-gate.ts')))throw Error('Ambiguous legacy planning gate; reconcile postCreate ownership before setup');
+  return true;
+ });
  return [hook,...prior];
 }
 export async function installWorkflowHook(configPath:string,api=localAO){
@@ -82,13 +116,16 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  if(realpathSync(b.project?.path??'')!==realpathSync(c.repo))throw Error('Registered source path mismatch');
  if(b.status!=='ok'||!b.project?.config)throw Error('Complete healthy project configuration required');
  const config=structuredClone(b.project.config);
+ // Fail ambiguous ownership before any backup or project-configuration write.
+ const installed=installedCLI(),source=verifiedInstallationSource();
+ const gate=resolve(installed?resolve(installed,'..'):import.meta.dir,'planning-gate.ts');
+ const installation=installed&&source?{sourceGate:resolve(source,'src/planning-gate.ts'),versions:resolve(homedir(),'Library/Application Support/ADLC Bridge/versions')}:undefined;
+ config.postCreate=workflowGateScripts(config.postCreate??[],gate,installation);
+ const hook=config.postCreate[0];
  const backupDir=resolve(homedir(),'Library','Application Support','ADLC Bridge','backups');
  mkdirSync(backupDir,{recursive:true,mode:0o700});
  const backup=resolve(backupDir,`${project}-${Date.now()}.json`);
  writeFileSync(backup,JSON.stringify(b.project.config,null,2),{mode:0o600,flag:'wx'});
- const installed=installedCLI(),gate=resolve(installed?resolve(installed,'..'):import.meta.dir,'planning-gate.ts');
- config.postCreate=workflowGateScripts(config.postCreate??[],gate);
- const hook=config.postCreate[0];
  config.env={...(config.env??{}),ADLC_WORKFLOW_CONFIG:path};
  delete config.env.ADLC_PLANNING_JOB;delete config.env.ADLC_PLANNING_PROJECT;
  config.agentConfig={...(config.agentConfig??{}),permissions:'accept-edits'};
@@ -100,32 +137,11 @@ export async function installWorkflowHook(configPath:string,api=localAO){
 }
 function shellQuote(s:string){return "'"+s.replaceAll("'","'\\''")+"'";}
 export function bridgePlanningHook(script:string,checkout=resolve(import.meta.dir,'planning-gate.ts'),versions=resolve(homedir(),'Library/Application Support/ADLC Bridge/versions'),sourceGate?:string){
- const command=literalShellWords(script);if(!command||command.length!==2)return false;
+ const suffix=` # ${planningGateMarker}`,trimmed=script.trimEnd();
+ const command=literalCommandWords(trimmed.endsWith(suffix)?trimmed.slice(0,-suffix.length):script);if(!command||command.length!==2)return false;
  if(command[0]!==process.execPath&&basename(command[0])!=='bun')return false;
  const path=command[1];
  if(path===checkout||path===sourceGate)return true;
  const prefix=versions+'/';if(!path.startsWith(prefix))return false;
  return /^[^/]+\/src\/planning-gate\.ts$/.test(path.slice(prefix.length));
-}
-// Decode literal shell words only; never execute or expand hook text. Adjacent
-// quoted/escaped fragments include shellQuote's '\'' apostrophe encoding.
-function literalShellWords(script:string){
- const words:string[]=[];let word='',started=false,quote='';
- for(let i=0;i<script.length;i++){
-  const c=script[i];
-  if(quote==="'"){if(c==="'")quote='';else word+=c;continue;}
-  if(quote==='"'){
-   if(c==='"'){quote='';continue;}
-   if(c==='$'||c==='`')return;
-   if(c==='\\'){const next=script[++i];if(next===undefined)return;if(!['"','\\','$','`'].includes(next))word+='\\';word+=next;}else word+=c;
-   continue;
-  }
-  if(/\s/.test(c)){if(started){words.push(word);word='';started=false;}continue;}
-  started=true;
-  if(c==="'"||c==='"'){quote=c;continue;}
-  if(c==='\\'){if(++i===script.length)return;word+=script[i];continue;}
-  if(/[;&|<>$`()]/.test(c))return;
-  word+=c;
- }
- if(quote)return;if(started)words.push(word);return words;
 }
