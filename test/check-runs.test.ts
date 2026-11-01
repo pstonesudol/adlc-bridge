@@ -29,6 +29,9 @@ test('selectively rerunning one of two same-name jobs cannot hide the other fail
  const checks=[check(1,10),check(2,10),check(3,10)],read=api(undefined,undefined,{1:1,2:1,3:2},true);
  for(const input of [checks,[...checks].reverse()]){
   const kept=await latestWorkflowChecks(repo,head,input,read);expect(kept).toEqual(input);expect(kept.some(c=>c.id===1&&c.conclusion==='failure')).toBe(true);
-  expect(reviewGate({head,observedHead:head,required:['PR body structure'],checks:kept.map(c=>({name:c.name,sha:c.head_sha,app:c.app.slug,status:c.status,conclusion:c.conclusion})),review:{sha:head,author:'coderabbitai[bot]',state:'APPROVED'},unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true}).clear).toBe(false);
+   const bot={name:'CodeRabbit',sha:head,app:'coderabbitai',status:'completed',conclusion:'success'};
+   const evidence={head,observedHead:head,required:['PR body structure'],checks:[...kept.map(c=>({name:c.name,sha:c.head_sha,app:c.app.slug,status:c.status,conclusion:c.conclusion})),bot],review:{sha:head,author:'coderabbitai[bot]',state:'APPROVED'},unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true};
+   expect(reviewGate(evidence)).toEqual({clear:false,reasons:['Required check not clear: PR body structure']});
+   expect(reviewGate({...evidence,checks:[evidence.checks.find(c=>c.app==='github-actions'&&c.conclusion==='success')!,bot]}).clear).toBe(true);
  }
 });

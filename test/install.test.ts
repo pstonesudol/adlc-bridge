@@ -47,7 +47,7 @@ test('install uses read-only project discovery for preview and writable discover
   await installBridge(false,source,join(root,'adlc'),io);expect(existsSync(join(state,'installation.json'))).toBe(false);await installBridge(true,source,join(root,'adlc'),io);expect(modes).toEqual([true,false]);expect(existsSync(join(state,'installation.json'))).toBe(true);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
-test('incomplete installation rollback reports every failure and continues restoration and service restarts',async()=>{
+test('incomplete installation rollback reports every failure and continues restoration without restarting intake',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-rollback-errors-'));try{
   const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json');
   for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');
@@ -59,10 +59,10 @@ test('incomplete installation rollback reports every failure and continues resto
     if(++starts===1){for(const path of [record,plists[0],launcher]){rmSync(path);mkdirSync(path);}throw original;}throw restart;
    }return {};}};
   const error=await installBridge(true,source,launcher,io).catch(error=>error);
-  expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(6);expect(error.errors[0]).toBe(original);expect(error.message).toContain(original.message);
-  expect(error.errors.map((e:any)=>e.cause)).toContain(settings);expect(error.errors.map((e:any)=>e.cause)).toContain(restart);
+   expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(5);expect(error.errors[0]).toBe(original);expect(error.message).toContain(original.message);
+   expect(error.errors.map((e:any)=>e.cause)).toContain(settings);expect(error.errors.map((e:any)=>e.cause)).not.toContain(restart);
   for(const target of [record,plists[0],launcher,'first'])expect(error.message).toContain(target);
-  expect(calls).toContain('PUT:projects/second/config');expect(calls.slice(-2)).toEqual(['start:first','start:second']);expect(readFileSync(plists[1],'utf8')).toBe('old plist');
+   expect(calls).toContain('PUT:projects/second/config');expect(calls.filter(call=>call.startsWith('start:'))).toEqual(['start:first']);expect(readFileSync(plists[1],'utf8')).toBe('old plist');
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('failed rollback pauses preserve activated artifacts and settings without restarting any intake',async()=>{
@@ -83,5 +83,29 @@ test('successful installation rollback rethrows the original error unchanged',as
   const source=join(root,'source');mkdirSync(join(source,'src'),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'cli');const original=Error('hook failure');
   const io:any={state:()=>join(root,'state'),home:()=>root,registeredProjects:async()=>[{project:'one',label:'local.adlc.one',config:'/one.json'}],localAO:async()=>({status:'ok',project:{config:{}}}),installWorkflowHook:async()=>{throw original;}};
   expect(await installBridge(true,source,join(root,'adlc'),io).catch(error=>error)).toBe(original);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('rollback settings restoration failure alone leaves every intake stopped',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-settings-rollback-'));try{
+  const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc');
+  for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher');
+  const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));for(const p of projects)writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old plist');
+  const original=Error('hook failed'),settings=Error('settings PUT failed'),calls:string[]=[];
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:true};},localAO:async(path:string,method?:string)=>{if(method==='PUT'){calls.push(`restore:${path}`);if(path.includes('/first/'))throw settings;}return {status:'ok',project:{config:{old:true}}};}};
+  const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors[0]).toBe(original);expect(error.errors[1].cause).toBe(settings);expect(error.errors).toHaveLength(2);
+  expect(calls).toContain('restore:projects/second/config');expect(calls.filter(call=>call.startsWith('start:'))).toEqual([]);expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');
+  for(const p of projects)expect(readFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'utf8')).toBe('old plist');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('successful restoration still attempts intake restarts and aggregates restart failures',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-restart-rollback-'));try{
+  const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc');
+  for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher');
+  const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));for(const p of projects)writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old plist');
+  const original=Error('hook failed'),restart=Error('first restart failed'),calls:string[]=[];
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},localAO:async()=>({status:'ok',project:{config:{old:true}}}),serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='start'){
+   expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');if(id==='first')throw restart;
+  }return {loaded:true};}};
+  const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(2);expect(error.errors[0]).toBe(original);expect(error.errors[1].cause).toBe(restart);expect(calls.slice(-2)).toEqual(['start:first','start:second']);
  }finally{rmSync(root,{recursive:true,force:true});}
 });

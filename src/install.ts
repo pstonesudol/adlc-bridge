@@ -82,7 +82,7 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
    for(const {path,original} of definitions)if(original)try{atomic(path,original);}catch(error){failed('Service rollback',path,error);}
    if(runtimeChanged&&runtime)for(const [path,bytes] of [[runtime.pinPath,runtime.pinBytes],[runtime.plist,runtime.plistBytes]] as const)try{atomic(path,bytes);}catch(error){failed('Runtime launcher rollback',path,error);}
    try{if(oldLauncher)atomic(launcher,oldLauncher.toString(),0o755);else if(existsSync(launcher))unlinkSync(launcher);}catch(error){failed('Launcher rollback',launcher,error);}
-   for(const id of active)try{await io.serviceControl('start',id);}catch(error){failed('Intake restart',id,error);}
+   if(!rollbackErrors.length)for(const id of active)try{await io.serviceControl('start',id);}catch(error){failed('Intake restart',id,error);}
    if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
    throw e;
  }
