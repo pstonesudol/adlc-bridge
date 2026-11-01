@@ -2,13 +2,17 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {validateVerification,verificationInstructions,runVerification,type Verification} from '../src/verification';
+import {validateVerification,verificationInstructions,runVerification as runConfiguredVerification,type Verification} from '../src/verification';
 import {validateRuntime,runtimeServiceDefinition,setupPreview,sanitizedSetup,type RuntimeConfig} from '../src/setup';
 import {validate} from '../src/linear';
 import {codeRemediationInstructions} from '../src/pilot';
 const host:Verification={version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]};
 const container:Verification={version:1,mode:'container',steps:[{cwd:'frontend',argv:['node','--test','tests']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['frontend']}};
 const dockerExecution={docker:{path:'/configured/bin/docker',version:'28.1.0'},probeDocker:()=>true};
+const gitEnv={PATH:process.env.PATH,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'};
+function git(args:string[]){const p=Bun.spawnSync(['git',...args],{env:gitEnv,stdout:'pipe',stderr:'pipe'});if(p.exitCode!==0)throw Error(p.stderr.toString());}
+function initRepository(root:string){git(['init','--quiet','--template=',root]);}
+function runVerification(root:string,v:Verification,spawn:any,execution:any={}){return runConfiguredVerification(root,v,spawn,{projectRepo:root,...execution});}
 const uuid='00000000-0000-0000-0000-000000000001';
 const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
 function runtime(root:string):RuntimeConfig{return {version:1,platform:'launchd',projectConfig:join(root,'project.json'),controller:join(root,'cli.ts'),workingDirectory:root,tools:Object.fromEntries(['bun','ao','git','gh'].map(n=>[n,{path:join(root,n),version:'1.4.2'}])),service:{label:'local.adlc.legacy',path:join(root,'service.plist'),interval:60,runAtLoad:false,stdout:join(root,'out.log'),stderr:join(root,'err.log')}};}
@@ -23,7 +27,7 @@ test('versioned modes reject unknown fields, mutable images and escaping paths',
 test('host and container argv selection, failures, cleanup and symlink confinement (mocked execution)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-verification-test-'));let calls:any[]=[];
  try{
-  mkdirSync(join(root,'.git'));mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'');writeFileSync(join(root,'frontend','.env'),'secret');
+  initRepository(root);mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'');writeFileSync(join(root,'frontend','.env'),'secret');
   const spawn=((argv:any,options:any)=>{calls.push({argv,options});return {exited:Promise.resolve(0)};}) as any;
   expect((await runVerification(root,host,spawn)).passed).toBe(true);expect(calls[0].argv).toEqual(['bun','test']);
   expect((await runVerification(root,container,spawn,dockerExecution)).passed).toBe(true);
@@ -36,7 +40,7 @@ test('host and container argv selection, failures, cleanup and symlink confineme
 test('container rejects selected and ancestor links to private in-worktree inputs before spawning',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-link-test-'));let spawned=false;
  try{
-  mkdirSync(join(root,'.git'));mkdirSync(join(root,'private'));mkdirSync(join(root,'private','nested'));writeFileSync(join(root,'private','credentials.json'),'private');symlinkSync('private',join(root,'frontend'));
+  initRepository(root);mkdirSync(join(root,'private'));mkdirSync(join(root,'private','nested'));writeFileSync(join(root,'private','credentials.json'),'private');symlinkSync('private',join(root,'frontend'));
   const spawn=(()=>{spawned=true;throw Error('must not run');}) as any;
   for(const input of ['frontend','frontend/','frontend/nested'])await expect(runVerification(root,{...container,container:{...container.container!,inputs:[input]}},spawn,dockerExecution)).rejects.toThrow('cannot be symbolic link');
   expect(spawned).toBe(false);
@@ -45,7 +49,7 @@ test('container rejects selected and ancestor links to private in-worktree input
 test('container fails closed for missing/relative Docker pins or a version mismatch before spawning',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-docker-pin-test-'));let spawned=false;
  try{
-  mkdirSync(join(root,'.git'));
+  initRepository(root);
   const spawn=(()=>{spawned=true;throw Error('must not run');}) as any;
   await expect(runVerification(root,container,spawn)).rejects.toThrow('requires an absolute Docker');
   await expect(runVerification(root,container,spawn,{...dockerExecution,docker:{path:'docker',version:'28.1.0'}})).rejects.toThrow('requires an absolute Docker');
@@ -56,7 +60,7 @@ test('container fails closed for missing/relative Docker pins or a version misma
 test('runner probes the pinned executable and accepts Docker version punctuation (mocked container)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-docker-version-test-'));let command:string[]=[];
  try{
-  mkdirSync(join(root,'.git'));mkdirSync(join(root,'frontend'));
+  initRepository(root);mkdirSync(join(root,'frontend'));
   const path=join(root,'pinned-docker');writeFileSync(path,'#!/bin/sh\nprintf "Docker version 28.1.0, build fixture\\n"\n',{mode:0o755});
   const spawn=((argv:string[])=>{command=argv;return {exited:Promise.resolve(0)};}) as any;
   expect((await runVerification(root,container,spawn,{docker:{path,version:'28.1.0'}})).passed).toBe(true);expect(command[0]).toBe(path);
@@ -80,5 +84,21 @@ test('both project setup flows preserve config, render deterministically and dis
  }
  const r=runtime(root);expect(()=>validateRuntime({...r,credentials:'no'})).toThrow();expect(()=>validateRuntime({...r,version:2})).toThrow();
  r.service.label='unsafe<label';expect(()=>runtimeServiceDefinition(r)).toThrow();
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('verification rejects a different repository and accepts a linked worktree of the configured project',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-repository-scope-test-'));let spawned=0;
+ try{
+  const a=join(root,'a'),b=join(root,'b'),linked=join(root,'linked');initRepository(a);initRepository(b);
+  const spawn=(()=>{spawned++;return {exited:Promise.resolve(0)};}) as any;
+  await expect(runConfiguredVerification(b,host,spawn,{projectRepo:a})).rejects.toThrow('different project repository');
+  await expect(runConfiguredVerification(a,host,spawn)).rejects.toThrow('Configured project repository required');
+  expect(spawned).toBe(0);
+  git(['-C',a,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','commit.gpgsign=false','-c','core.hooksPath=/dev/null','commit','--quiet','--allow-empty','-m','fixture']);
+  git(['-C',a,'-c','core.hooksPath=/dev/null','worktree','add','--quiet','--detach',linked,'HEAD']);
+  expect((await runConfiguredVerification(linked,host,spawn,{projectRepo:a})).passed).toBe(true);expect(spawned).toBe(1);
+  const config=join(root,'project.json');writeFileSync(config,JSON.stringify(project(a,host)));
+  const cli=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'verification',config,b,'--run'],{stdout:'pipe',stderr:'pipe'});
+  expect(cli.exitCode).not.toBe(0);expect(cli.stderr.toString()).toContain('different project repository');
  }finally{rmSync(root,{recursive:true,force:true});}
 });

@@ -11,7 +11,7 @@ import {localAO,installWorkflowHook} from './workflow-transport';
 import {loadOpenChamber} from './task-routing';
 import {serviceControl} from './service-control';
 import {Store} from './core';
-import {ProjectServices,registryPath,legacyLabel,assertDefinition,readDefinition} from './project-services';
+import {ProjectServices,registryPath,legacyLabel,readDefinition} from './project-services';
 
 export async function collectMetadataChecks(ask:(label:string)=>Promise<string>){
  const names:string[]=[];
@@ -103,7 +103,7 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
    const registryStore=new Store(io.registryPath());let entry;
    try{const registry=new ProjectServices(registryStore);registry.discoverLegacy(home);entry=registry.register(path);}finally{registryStore.close();}
    const plist=join(home,'Library/LaunchAgents',`${entry.label}.plist`);
-  if(existsSync(plist)){assertDefinition(readDefinition(plist),entry.label,path);return {configuration:path,project:entry.project,gateInstalled:true,existingServicePreserved:true,note:'Existing matching project service preserved. No start/stop was performed.'};}
+  if(existsSync(plist)){const store=new Store(io.registryPath());try{new ProjectServices(store).assertInstalled(readDefinition(plist),entry.label,path);}finally{store.close();}return {configuration:path,project:entry.project,gateInstalled:true,existingServicePreserved:true,note:'Existing matching project service preserved. No start/stop was performed.'};}
   if(!await yes('Install this project’s 60-second background service (loads at next login)'))return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false};
    mkdirSync(dirname(plist),{recursive:true});mkdirSync(join(home,'Library/Application Support/ADLC Bridge'),{recursive:true,mode:0o700});
    writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),home,entry.label),{flag:'wx',mode:0o600});

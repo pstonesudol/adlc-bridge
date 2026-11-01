@@ -4,3 +4,17 @@ function fixture(){const dir=mkdtempSync(join(tmpdir(),'adlc-projects-')),s=new 
 test('separate projects retain independent labels; ambiguous controls never choose a project',()=>{const f=fixture();try{const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'),legacyLabel),b=f.registry.register(f.config('two','00000000-0000-0000-0000-000000000005'));expect(a.label).toBe(legacyLabel);expect(b.label).not.toBe(a.label);expect(()=>f.registry.select()).toThrow('Multiple');expect(f.registry.select('one')).toEqual(a);expect(f.registry.select('two')).toEqual(b);expect(f.registry.register(a.config)).toEqual(a);}finally{f.close();}});
 test('registration preflight detects conflicts without writing or replacing identities',()=>{const f=fixture();try{const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'));const other=f.config('two','00000000-0000-0000-0000-000000000004');expect(()=>f.registry.register(other,undefined,false)).toThrow('already');expect(f.registry.list()).toEqual([a]);const third=f.config('three','00000000-0000-0000-0000-000000000005');f.registry.register(third,undefined,false);expect(f.registry.list().length).toBe(1);}finally{f.close();}});
 test('launch definitions use independent labels and log paths and reject a mismatched configuration',()=>{const label=projectServiceLabel('second');const xml=serviceDefinition('/config/second.json','/bun',resolve(import.meta.dir,'../src/cli.ts'),'/home/test',label);expect(xml).toContain(`<string>${label}</string>`);expect(xml).toContain(`${label}.log`);expect(()=>assertDefinition({Label:label,ProgramArguments:['/bun',resolve(import.meta.dir,'../src/cli.ts'),'poll','/other.json']},label,'/config/second.json')).toThrow('preserved');});
+test('installed stable controller discovery is independent of running development checkout and identity stays bound',()=>{
+ const f=fixture();try{
+  const config=f.config('stable','00000000-0000-0000-0000-000000000004');
+  const stable=join(f.dir,'stable-install','cli.ts'),other=join(f.dir,'other-install','cli.ts');mkdirSync(join(f.dir,'stable-install'));mkdirSync(join(f.dir,'other-install'));writeFileSync(stable,'');writeFileSync(other,'');
+  const home=join(f.dir,'home'),agents=join(home,'Library','LaunchAgents');mkdirSync(agents,{recursive:true});writeFileSync(join(agents,legacyLabel+'.plist'),'fixture');
+  const def={Label:legacyLabel,ProgramArguments:['/bun',stable,'poll',config]};
+  const entry=f.registry.discoverLegacy(home,()=>def)!;expect(entry.label).toBe(legacyLabel);expect(f.registry.select('stable')).toEqual(entry);
+  expect(()=>f.registry.discoverLegacy(home,()=>def)).not.toThrow();expect(()=>f.registry.assertInstalled(def,entry.label,config)).not.toThrow();
+  expect(()=>f.registry.assertInstalled({...def,ProgramArguments:['/bun',other,'poll',config]},entry.label,config)).toThrow('preserved');
+  expect(()=>f.registry.assertInstalled({...def,Label:'wrong'},entry.label,config)).toThrow('preserved');
+  expect(()=>f.registry.assertInstalled({...def,ProgramArguments:['/bun',stable,'poll','/wrong.json']},entry.label,config)).toThrow('preserved');
+  const fresh=new ProjectServices(f.s);expect(()=>fresh.assertInstalled({...def,ProgramArguments:['/bun',other,'poll',config]},entry.label,config)).toThrow('preserved');expect(fresh.list()).toEqual([entry]);
+ }finally{f.close();}
+});

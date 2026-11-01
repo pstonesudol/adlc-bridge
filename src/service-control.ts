@@ -2,7 +2,7 @@ import {existsSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from './core';
-import {ProjectServices,registryPath,assertDefinition,readDefinition} from './project-services';
+import {ProjectServices,registryPath,readDefinition} from './project-services';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {assertPollQuiescent,assertPollStarted} from './poll-process';
 export async function waitForPollStartup<T extends {loaded:boolean;running?:boolean;pid?:number}>(status:()=>Promise<T>,verify:(current:T)=>void,kickstart:()=>Promise<void>,wait={attempts:100,pause:()=>Bun.sleep(100)}){
@@ -40,7 +40,7 @@ async function controlProject(action:string,project?:string){
   }
    const entry=registry.select(project,extra);registry.verify(entry);
   const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(homedir(),'Library/LaunchAgents',`${label}.plist`);
-  if(existsSync(plist))assertDefinition(readDefinition(plist),label,entry.config);
+  if(existsSync(plist))registry.assertInstalled(readDefinition(plist),label,entry.config,!readOnly);
   const status=async()=>{
    const r=await launch(['print',target]);
    if(r.code!==0&&!/Could not find service/.test(r.stderr+r.stdout))throw Error('Unable to inspect background service');

@@ -29,12 +29,19 @@ setting; staging does not load it. A human must separately approve installation
 and activation, including replacement of installed controller code. Point
 `controller` at a stable installed copy, never at a mutable development worktree.
 Source edits and these commands do not activate that installed copy.
+After human installation, service discovery records the existing user-installed
+controller's canonical path for the registered config/label, rather than tying it
+to whichever development CLI is running. Later controller-identity changes are
+rejected and require explicit reconciliation; discovery never replaces a plist
+or starts a service. Existing registry rows remain compatible.
 
 Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
 container verification is selected. Versions are exact three-component versions
 (the actual `git`, `gh` and `docker` executable names must be on the generated PATH).
 Generated services set `ADLC_AO_PATH` to the configured AO executable; legacy
-services retain the bundled-app default. Workflow hooks use the running Bun.
+services retain the bundled-app default. Workflow hooks use the running Bun and
+a stable gate marker; repeating setup replaces prior gates even in versioned
+installation directories while retaining unrelated setup scripts.
 (optional prerelease/build suffix). Configure routing paths in the existing project
 JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,
@@ -71,7 +78,10 @@ project polling refreshes it, including removal, for existing review targets.
 
 Verification uses argv vectors, not shell strings: globs are not expanded.
 Directories resolve relative to the explicitly supplied isolated worktree, with
-realpath containment checks. Execute only after the plan authorizes verification:
+realpath containment checks. The worktree must share the configured repository's
+Git common directory; another repository is rejected before execution, while
+linked worktrees of the configured repository are accepted. Execute only after
+the plan authorizes verification:
 
 ```sh
 bun src/cli.ts verification config/local.json /absolute/isolated/worktree --run

@@ -65,6 +65,15 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
 };}
 export const liveTransport=createWorkflowTransport();
 
+export const planningGateMarker='ADLC_RESERVED_WORKTREE_GATE_V1';
+export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir,'planning-gate.ts')){
+ if(!Array.isArray(scripts)||scripts.some(x=>typeof x!=='string'))throw Error('Unexpected setup scripts');
+ const hook=`${shellQuote(process.execPath)} ${shellQuote(gate)} # ${planningGateMarker}`;
+ // Recognize pre-marker hooks by their gate filename, not installation directory.
+ const legacyGate=/^(?:'[^']*bun'|"[^"]*bun"|\S*bun)\s+(?:'[^']*\/planning-gate\.ts'|"[^"]*\/planning-gate\.ts"|\S*\/planning-gate\.ts)\s*$/;
+ const prior=scripts.filter((x:string)=>!x.includes(planningGateMarker)&&!legacyGate.test(x)&&!x.includes('ADLC execution disabled pending host approval gate'));
+ return [hook,...prior];
+}
 export async function installWorkflowHook(configPath:string,api=localAO){
  const path=resolve(configPath),c=JSON.parse(readFileSync(path,'utf8'));
  const project=c.automation?.orchestratorProject;
@@ -77,12 +86,9 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  mkdirSync(backupDir,{recursive:true,mode:0o700});
  const backup=resolve(backupDir,`${project}-${Date.now()}.json`);
  writeFileSync(backup,JSON.stringify(b.project.config,null,2),{mode:0o600,flag:'wx'});
- const hook=`${shellQuote(process.execPath)} ${shellQuote(resolve(installedCLI()?resolve(installedCLI()!,'..'):import.meta.dir,'planning-gate.ts'))}`;
- const scripts=config.postCreate??[];
- if(!Array.isArray(scripts)||scripts.some((x:any)=>typeof x!=='string'))throw Error('Unexpected setup scripts');
-  const source=verifiedInstallationSource(),sourceGate=source?resolve(source,'src/planning-gate.ts'):undefined;
-  const prior=scripts.filter((x:string)=>!bridgePlanningHook(x,undefined,undefined,sourceGate)&&!x.includes('ADLC execution disabled pending host approval gate'));
- config.postCreate=[hook,...prior];
+ const installed=installedCLI(),gate=resolve(installed?resolve(installed,'..'):import.meta.dir,'planning-gate.ts');
+ config.postCreate=workflowGateScripts(config.postCreate??[],gate);
+ const hook=config.postCreate[0];
  config.env={...(config.env??{}),ADLC_WORKFLOW_CONFIG:path};
  delete config.env.ADLC_PLANNING_JOB;delete config.env.ADLC_PLANNING_PROJECT;
  config.agentConfig={...(config.agentConfig??{}),permissions:'accept-edits'};

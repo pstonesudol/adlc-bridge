@@ -27,8 +27,18 @@ const probeDocker=(pin:DockerPin)=>{
  const p=Bun.spawnSync([pin.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
  return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===pin.version||x===`v${pin.version}`);
 };
-export async function runVerification(worktree:string,v:Verification,spawn:typeof Bun.spawn=Bun.spawn,execution:{docker?:DockerPin;probeDocker?:(pin:DockerPin)=>boolean}={}){
+export function assertVerificationRepository(worktree:string,projectRepo?:string){
+ if(typeof projectRepo!=='string'||!isAbsolute(projectRepo))throw Error('Configured project repository required');
+ const common=(repo:string)=>{
+  const p=Bun.spawnSync(['git','-C',repo,'rev-parse','--path-format=absolute','--git-common-dir'],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
+  if(p.exitCode!==0)throw Error('Valid project repository/worktree required');
+  return realpathSync(p.stdout.toString().trim());
+ };
+ if(common(worktree)!==common(projectRepo))throw Error('Verification worktree belongs to a different project repository');
+}
+export async function runVerification(worktree:string,v:Verification,spawn:typeof Bun.spawn=Bun.spawn,execution:{projectRepo?:string;docker?:DockerPin;probeDocker?:(pin:DockerPin)=>boolean}={}){
  validateVerification(v);const root=realpathSync(worktree);if(!existsSync(join(root,'.git')))throw Error('Git worktree required');
+ assertVerificationRepository(root,execution.projectRepo);
  const docker=execution.docker;
  if(v.mode==='container'){
   if(!docker||typeof docker.path!=='string'||!isAbsolute(docker.path)||/[\x00-\x1f]/.test(docker.path)||typeof docker.version!=='string'||!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(docker.version))throw Error('Container verification requires an absolute Docker executable and exact version from runtime configuration');
