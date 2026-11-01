@@ -15,8 +15,9 @@ export async function installRuntime(binary:string,apply=false,io=runtimeIO){
  const cli=io.installedCLI();if(!cli)throw Error('Install a stable bridge snapshot first: adlc install --apply');
  const launcher=resolve(cli,'../serve-orchestrator.py'),executable=join(io.state(),'runtimes',sha256,'ao'),plist=join(io.home(),'Library/LaunchAgents',label+'.plist');
  if(!apply)return {preview:true,binary,sha256,executable,launcher,plist,note:'Stop --all before applying. Registers the binary and service without starting them; start --all activates it.'};
- const status=io.command([AO,'status','--json']);const current=daemonStatus({stdout:status.stdout.toString(),code:status.exitCode});if(current.ready)throw Error('Stop the stack before runtime registration');
- const running=io.command(['/bin/launchctl','print',`gui/${process.getuid?.()}/${label}`]);if(running.exitCode===0)throw Error('Unload the existing runtime service first');
+  const status=io.command([AO,'status','--json'],{timeout:30000});const current=daemonStatus({stdout:status.stdout.toString(),code:status.exitCode});if(current.ready)throw Error('Stop the stack before runtime registration');
+  const running=io.command(['/bin/launchctl','print',`gui/${process.getuid?.()}/${label}`],{timeout:30000});if(running.exitCode===0)throw Error('Unload the existing runtime service first');
+  if(!Number.isInteger(running.exitCode)||running.exitCode<1||running.signalCode||!/Could not find service/.test((running.stdout?.toString()??'')+(running.stderr?.toString()??'')))throw Error('Runtime service load state is unknown; registration preserved for inspection');
  const backup=join(io.state(),'backups',`runtime-${Date.now()}`);mkdirSync(backup,{recursive:true,mode:0o700});
  if(existsSync(pinPath))copyFileSync(pinPath,join(backup,'runtime.json'));if(existsSync(plist))copyFileSync(plist,join(backup,'service.plist'));
  mkdirSync(resolve(executable,'..'),{recursive:true,mode:0o700});

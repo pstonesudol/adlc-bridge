@@ -7,7 +7,7 @@ function fixture(){
  const pin=join(state,'orchestrator-runtime.json'),plist=join(home,'Library/LaunchAgents/local.adlc.orchestrator.plist');let status='stopped',failTrust=false;
  const io:any={state:()=>state,home:()=>home,installedCLI:()=>join(root,'versions/version/src/cli.ts'),command:(args:string[])=>{
   if(args[1]==='status'){writeFileSync(binary,'source replaced after initial hash');return {stdout:Buffer.from(JSON.stringify({state:status})),exitCode:0};}
-  return {exitCode:1};
+   return {exitCode:113,stdout:Buffer.from(''),stderr:Buffer.from('Could not find service "local.adlc.orchestrator"')};
  },trustedDaemon:(exe:string)=>!failTrust&&trustedDaemon(exe,pin)};
  return {root,binary,pin,plist,io,status:(s:string)=>status=s,failTrust:()=>failTrust=true,close:()=>rmSync(root,{recursive:true,force:true})};
 }
@@ -19,6 +19,21 @@ test('runtime registration restores both prior files if the post-install trust c
 });
 test('runtime status failures are rejected before creating registrations',async()=>{
  for(const result of [{stdout:Buffer.from('malformed'),exitCode:0},{stdout:Buffer.from('{"state":"stopped"}'),exitCode:1}]){const f=fixture();try{f.io.command=()=>result;await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow();expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);}finally{f.close();}}
+});
+test('runtime registration rejects unknown launchd state and preserves every prior artifact',async()=>{
+ const missing='Could not find service "local.adlc.orchestrator"';
+ for(const result of [{exitCode:1,stderr:Buffer.from('Permission denied')},{exitCode:1,stdout:Buffer.from('')},{exitCode:null,stderr:Buffer.from(missing)},{exitCode:143,signalCode:'SIGTERM',stderr:Buffer.from(missing)},{exitCode:0,stdout:Buffer.from('state = running')}]){const f=fixture();try{
+  mkdirSync(join(f.io.home(),'Library/LaunchAgents'),{recursive:true});writeFileSync(f.pin,'{"serviceLabel":"local.adlc.orchestrator"}',{mode:0o600});writeFileSync(f.plist,'prior plist');const before=[readFileSync(f.pin),readFileSync(f.plist)];let trust=0;
+  f.io.command=(args:string[])=>args[1]==='status'?{stdout:Buffer.from('{"state":"stopped"}'),exitCode:0}:result;f.io.trustedDaemon=()=>{trust++;return true;};
+  await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow(result.exitCode===0?'Unload the existing runtime service':'load state is unknown');expect([readFileSync(f.pin),readFileSync(f.plist)]).toEqual(before);expect(trust).toBe(0);expect(existsSync(join(f.io.state(),'backups'))).toBe(false);expect(existsSync(join(f.io.state(),'runtimes'))).toBe(false);expect(existsSync(join(f.io.state(),'turn-submission.lock'))).toBe(false);
+ }finally{f.close();}}
+});
+test('runtime service inspection timeout fails closed and releases the control fence',async()=>{
+ const f=fixture();try{
+  let killed:ReturnType<typeof Bun.spawnSync>|undefined;const options:any[]=[];
+  f.io.command=(args:string[],opts:any)=>{options.push(opts);if(args[1]==='status')return {stdout:Buffer.from('{"state":"stopped"}'),exitCode:0};killed=Bun.spawnSync([process.execPath,'-e','await Bun.sleep(60000)'],{...opts,timeout:100,env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root}});return killed;};
+  await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow('load state is unknown');expect(options).toEqual([{timeout:30000},{timeout:30000}]);expect(killed!.signalCode).toBe('SIGTERM');expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);expect(existsSync(join(f.io.state(),'backups'))).toBe(false);await turnBarrier(f.io.state()).run(async()=>{});
+ }finally{f.close();}
 });
 test('runtime rollback reports the original failure and every affected path instead of discarding restoration errors',async()=>{
  const f=fixture();try{
