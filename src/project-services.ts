@@ -18,11 +18,17 @@ export function assertDefinition(def:any,label:string,config:string){
  const a=def.ProgramArguments;
  if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||realpathSync(a[1])!==realpathSync(join(import.meta.dir,'cli.ts')))throw Error('Service definition does not match this project; existing service preserved');
 }
+function validateServiceConfig(c:any,validateRuntime:boolean){
+ // Bypass only the two runtime settings for recovery; preserve all older checks.
+ const {pollingIntervalSeconds,...base}=c;
+ const {maxPlanning,...automation}=c.automation??{};
+ validate(validateRuntime?c:{...base,automation});
+}
 export class ProjectServices{
  constructor(public s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);`);}
  list():ProjectService[]{return this.s.db.query('SELECT * FROM project_services ORDER BY project').all() as ProjectService[];}
- register(configPath:string,label?:string,persist=true){
-  const config=realpathSync(configPath),c=JSON.parse(readFileSync(config,'utf8'));validate(c);
+ register(configPath:string,label?:string,persist=true,validateRuntime=true){
+  const config=realpathSync(configPath),c=JSON.parse(readFileSync(config,'utf8'));validateServiceConfig(c,validateRuntime);
   const project=c.automation?.orchestratorProject,generated=projectServiceLabel(project),repo=realpathSync(c.repo);
   const old=this.list().find(p=>p.project===project);
   const selected=label??old?.label??generated;
@@ -42,7 +48,7 @@ export class ProjectServices{
   assertDefinition(b,legacyLabel,config);
   const registered=this.list().find(p=>p.label===legacyLabel&&p.config===realpathSync(config));
   if(recovery&&registered){this.verify(registered,false);return registered;}
-  return this.register(config,legacyLabel);
+  return this.register(config,legacyLabel,true,!recovery);
  }
  select(project?:string){
   const entries=this.list();
@@ -52,11 +58,7 @@ export class ProjectServices{
  }
  verify(entry:ProjectService,validateRuntime=true){
   const c=JSON.parse(readFileSync(entry.config,'utf8'));
-  // Recovery bypasses only the newly introduced runtime settings, not identity
-  // or the pre-existing configuration checks. Never normalize the stored file.
-  const {pollingIntervalSeconds,...base}=c;
-  const {maxPlanning,...automation}=c.automation??{};
-  validate(validateRuntime?c:{...base,automation});
+  validateServiceConfig(c,validateRuntime);
   if(c.automation?.orchestratorProject!==entry.project||c.linear.projectId!==entry.linear_project||realpathSync(c.repo)!==entry.repo)throw Error('Registered project configuration identity changed; reconcile before service control');
   return c;
  }

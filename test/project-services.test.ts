@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {ProjectServices,projectServiceLabel,assertDefinition,legacyLabel} from '../src/project-services';import {serviceDefinition} from '../src/init';import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';
-import {readFileSync} from 'node:fs';
+import {readFileSync,realpathSync} from 'node:fs';
 import {readDefinition} from '../src/project-services';
 import {serviceSettings} from '../src/service-settings';
 import {reloadService} from '../src/service-control';
@@ -73,4 +73,41 @@ test('registered legacy discovery supports recovery without validating edited ru
   expect(()=>f.registry.discoverLegacy(f.dir,read)).toThrow('pollingIntervalSeconds');
   expect(f.registry.discoverLegacy(f.dir,read,true)).toEqual(entry);
  }finally{f.close();}
+});
+
+test.skipIf(process.platform!=='darwin')('service-control recovery handles registered and newly adopted legacy services with invalid settings',async()=>{
+ const {serviceControl}=await import('../src/service-control');
+ for(const registered of [false,true])for(const action of ['stop','service-status'])for(const setting of ['pollingIntervalSeconds','maxPlanning']){
+  const f=fixture();try{
+   const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
+   if(registered){const s=new Store(statePath);try{new ProjectServices(s).register(path,legacyLabel);}finally{s.close();}}
+   mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
+   writeFileSync(join(f.dir,'Library/LaunchAgents',legacyLabel+'.plist'),serviceDefinition(path,process.execPath,resolve(import.meta.dir,'../src/cli.ts'),f.dir,legacyLabel));
+   const config=JSON.parse(readFileSync(path,'utf8'));
+   if(setting==='pollingIntervalSeconds')config.pollingIntervalSeconds=0;else config.automation.maxPlanning=33;
+   const invalid=JSON.stringify(config);writeFileSync(path,invalid);
+   const calls:string[][]=[];let loaded=true;
+   const run=async(args:string[])=>{
+    calls.push(args);
+    if(args[0]==='print')return {code:loaded?0:1,stdout:loaded?'state = running':'',stderr:loaded?'':'Could not find service'};
+    if(args[0]==='bootout'){loaded=false;return {code:0,stdout:'',stderr:''};}
+    throw Error('Unexpected service command');
+   };
+   const options={home:f.dir,statePath,run};
+   const result=await serviceControl(action,'one',false,options);
+   expect(result).toMatchObject({project:'one',loaded:action!=='stop',settingsError:expect.stringContaining(setting==='maxPlanning'?'automation.maxPlanning':setting)});
+   expect(calls.map(c=>c[0])).toEqual(action==='stop'?['print','bootout','print']:['print']);
+   expect(readFileSync(path,'utf8')).toBe(invalid);
+   const after=new Store(statePath);try{expect(new ProjectServices(after).list()[0].label).toBe(legacyLabel);}finally{after.close();}
+   calls.length=0;
+   for(const strict of ['start','service-config'])await expect(serviceControl(strict,'one',false,options)).rejects.toThrow();
+   expect(calls).toEqual([]);
+   // Recovery must still reject changed identities, malformed JSON, and missing config.
+   writeFileSync(path,JSON.stringify({...config,automation:{...config.automation,orchestratorProject:'other'}}));
+   await expect(serviceControl(action,'one',false,options)).rejects.toThrow();
+   writeFileSync(path,'{');await expect(serviceControl(action,'one',false,options)).rejects.toThrow();
+   rmSync(path);await expect(serviceControl(action,'one',false,options)).rejects.toThrow();
+   expect(calls).toEqual([]);
+  }finally{f.close();}
+ }
 });
