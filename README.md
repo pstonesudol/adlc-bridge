@@ -657,8 +657,10 @@ changes can trigger another update. Any failed or uncertain request still stops
 automation for inspection, even if the head later changes. A numeric value from
 1 to 10 retains the optional per-job cap. The bundled project example is disabled
 with a finite limit of 3; setting `null` explicitly opts into unlimited updates.
-After explicit authorization, the wizard asks for the limit and offers
-`unlimited` as its default response (case-insensitive).
+After explicit authorization, the wizard defaults to the finite limit of 3.
+Typing `unlimited` (case-insensitive) additionally requires a separate default-no
+confirmation warning that each update can trigger another CI and CodeRabbit cycle.
+Declining that confirmation keeps the finite limit of 3.
 
 A new commit must pass CI and CodeRabbit again. Even with automatic branch updates
 disabled, the readiness gate refuses to report a branch behind its base as ready.

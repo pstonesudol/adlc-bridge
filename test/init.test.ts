@@ -59,14 +59,14 @@ test('wizard branch-update limits accept case-insensitive unlimited or safe inte
 test('bundled branch-update policy stays disabled with a finite limit until explicitly configured',()=>{
  const example=JSON.parse(readFileSync(join(import.meta.dir,'../config/project.example.json'),'utf8'));expect(example.branchUpdate).toEqual({enabled:false,authorizedBy:'',maxUpdates:3});
 });
-test('wizard saves the authorized finite or unlimited branch-update policy from injected answers',async()=>{
- for(const [answer,maxUpdates] of [['4',4],['UnLiMiTeD',null]] as const){
+test('wizard saves finite defaults and requires separate explicit confirmation for unlimited updates',async()=>{
+  for(const [answer,confirmation,maxUpdates] of [['4',null,4],['',null,3],['UnLiMiTeD','yes',null],['unlimited','no',3],['unlimited','',3]] as const){
   const home=mkdtempSync(join(tmpdir(),'adlc-wizard-policy-'));let closed=false;
   try{
-   const f=fixture(home),path=join(home,'project.json'),answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','no','no','no','yes','Test operator',answer,'no','yes','no'],questions:string[]=[];
+   const f=fixture(home),path=join(home,'project.json'),answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','no','no','no','yes','Test operator',answer,...(confirmation===null?[]:[confirmation]),'no','yes','no'],questions:string[]=[];
    const result=await initWizard(home,['--config',path],{interactive:()=>true,home:()=>home,registryPath:()=>join(home,'registry.sqlite'),log:()=>{},linearToken:()=> 'test-only-placeholder',verifyInitConfig:c=>verifyInitConfig(c,f.api,f.ao),prompts:()=>({question:async(label:string)=>{questions.push(label);if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})});
    expect(result).toMatchObject({configuration:path,gateInstalled:false,serviceEnabled:false});expect(answers).toEqual([]);expect(closed).toBe(true);
-   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [unlimited]: ');expect(questions.some(q=>q.includes('production blocked until body attestation exists'))).toBe(true);
+   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [3]: ');expect(questions.some(q=>q.includes('production blocked until body attestation exists'))).toBe(true);expect(questions.some(q=>q.includes('Explicitly authorize unlimited branch updates')&&q.includes('[no]'))).toBe(confirmation!==null);
   }finally{rmSync(home,{recursive:true,force:true});}
  }
 });

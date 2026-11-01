@@ -82,8 +82,10 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
   }
   if(await yes('Authorize automatic base-branch updates to owned feature PRs (never merges a PR)')){
    const actor=await ask('Your name for branch update authorization');if(!actor)throw Error('Authorizing person required');
-   const limit=await ask('Maximum automatic branch updates per PR (1-10, or "unlimited")','unlimited');
-    c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:branchUpdateLimit(limit)};
+    const limit=await ask('Maximum automatic branch updates per PR (1-10, or "unlimited")','3');
+    let maxUpdates=branchUpdateLimit(limit);
+    if(maxUpdates===null&&!await yes('Explicitly authorize unlimited branch updates, each potentially triggering another CI and CodeRabbit cycle')){maxUpdates=3;io.log('Unlimited updates not authorized; using the finite limit of 3.');}
+    c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates};
   }
   if(await yes('Enable plan approval replies in Linear from your account')){
    const b=await linearAPI('query{viewer{id name app}}');

@@ -24,10 +24,10 @@ for(const [name,run] of [['stack command',stackCommand],['service launch',servic
  test(`${name} timeout preserves failed output and releases its control fence`,async()=>{
   const state=mkdtempSync(join(tmpdir(),'adlc-control-timeout-'));let child:ReturnType<typeof Bun.spawn>|undefined;
   try{
-   let options:any,args:string[]=[],launched!:()=>void;const started=new Promise<void>(resolve=>launched=resolve);
-   const spawn=((input:any,opts:any)=>{options=opts;args=input;child=Bun.spawn(['/bin/sh','-c','printf "partial output"; printf "partial error" >&2; exec /bin/sleep 60'],{...opts,timeout:1000,env:{PATH:'/usr/bin:/bin',HOME:state}});launched();return child;}) as typeof Bun.spawn;
+   let options:any,args:string[]=[],launched!:()=>void;const started=new Promise<void>(resolve=>launched=resolve),readyOutput=JSON.stringify({state:'ready',port:3001,executablePath:'/test/ao'});
+   const spawn=((input:any,opts:any)=>{options=opts;args=input;child=Bun.spawn([process.execPath,'-e',`process.stdout.write(${JSON.stringify(readyOutput)});process.stderr.write("partial error");await Bun.sleep(60000);`],{...opts,timeout:1000,env:{PATH:'/usr/bin:/bin',HOME:state}});launched();return child;}) as typeof Bun.spawn;
    const pending=turnBarrier(state).run(()=>run(['status'],spawn));await started;expect(options.timeout).toBe(30000);expect(args).toEqual(name==='service launch'?['/bin/launchctl','status']:['status']);await expect(turnBarrier(state).submit(async()=>{})).rejects.toThrow('in progress');
-   const result=await pending;expect(result.code).not.toBe(0);expect(result.stdout).toBe('partial output');expect(result.stderr).toBe('partial error');expect(child!.signalCode).toBe('SIGTERM');expect(()=>daemonStatus(result)).toThrow();await turnBarrier(state).run(async()=>{});
+   const result=await pending;expect(result.code).not.toBe(0);expect(result.stdout).toBe(readyOutput);expect(result.stderr).toBe('partial error');expect(child!.signalCode).toBe('SIGTERM');expect(()=>daemonStatus(result)).toThrow('readiness is unknown');expect(daemonStatus({...result,code:0}).ready).toBe(true);await turnBarrier(state).run(async()=>{});
   }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}rmSync(state,{recursive:true,force:true});}
  });
 }
