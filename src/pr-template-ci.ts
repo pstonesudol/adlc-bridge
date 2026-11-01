@@ -1,4 +1,18 @@
 import {digest} from './core';
+// GitHub check/job REST responses do not attest which PR body was evaluated.
+// Do not infer it from the current body, timestamps, check output, or logs.
+// Until a trustworthy body-bound attestation source is supported, production
+// evidence deliberately carries null and metadata-remediation waits fail closed.
+export function metadataCheckEvidence(checks:any[],head:string,allowed:string[]){
+ return checks.filter(c=>allowed.includes(c.name)&&c.app?.slug==='github-actions'&&c.head_sha===head).map(c=>({name:c.name,checkId:c.id,sha:c.head_sha,status:c.status,conclusion:c.conclusion,descriptionHash:null}));
+}
+export function metadataBodyCovered(e:any,allowed:string[]){
+ if(!Array.isArray(e.metadataCheckEvidence)||typeof e.descriptionHash!=='string'||!e.descriptionHash)return false;
+ return allowed.every(name=>{
+  const rows=e.metadataCheckEvidence.filter((c:any)=>c.name===name);
+  return rows.length===1&&Number.isSafeInteger(rows[0].checkId)&&rows[0].checkId>0&&rows[0].sha===e.head&&rows[0].status==='completed'&&rows[0].conclusion==='success'&&rows[0].descriptionHash===e.descriptionHash;
+ });
+}
 export function cleanTemplateLog(raw:string){
  const clean=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'');
  return clean.split('\n').filter(l=>/missing|section|placeholder|verification|summary|related issues|risks|rollout|not.run|template|error|invalid|pr.body/i.test(l)&&!/credential|authorization|token|extraheader/i.test(l)).join('\n').slice(-12000);

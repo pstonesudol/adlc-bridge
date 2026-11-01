@@ -1,6 +1,6 @@
 import {latestWorkflowChecks} from './check-runs';
 import {templateLogReader} from './gh-logs';
-import {templateCIFindings,templateSignature} from './pr-template-ci';
+import {templateCIFindings,templateSignature,metadataCheckEvidence} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 
@@ -86,6 +86,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
+    metadataCheckEvidence:metadataCheckEvidence(checks,first.head.sha,metadataChecks),
     botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
 }
 

@@ -18,3 +18,11 @@ test('logs are bounded and escaped text is removed; rerun signatures track the a
  const log=cleanTemplateLog('\u001b[31mMissing section: Summary\u001b[0m\nerror token=SECRET\nPost cleanup');expect(log).toBe('Missing section: Summary');expect(log).not.toContain('SECRET');
  expect(templateSignature([check],head,['PR body structure'])).not.toBe(templateSignature([{...check,id:23}],head,['PR body structure']));
 });
+import {metadataCheckEvidence,metadataBodyCovered} from '../src/pr-template-ci';
+test('GitHub check metadata cannot attest the evaluated PR body even with successful output or fresh timestamps',()=>{
+ const head='a'.repeat(40),names=['Metadata'],checks=[{name:'Metadata',id:7,head_sha:head,app:{slug:'github-actions'},status:'completed',conclusion:'success',completed_at:new Date().toISOString(),output:{summary:'descriptionHash: current-body'}}];
+ const evidence=metadataCheckEvidence(checks,head,names);
+ expect(evidence).toEqual([{name:'Metadata',checkId:7,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);
+ expect(metadataBodyCovered({head,descriptionHash:'current-body',metadataCheckEvidence:evidence},names)).toBe(false);
+ expect(metadataCheckEvidence([{...checks[0],head_sha:'old'},{...checks[0],app:{slug:'other'}}],head,names)).toEqual([]);
+});

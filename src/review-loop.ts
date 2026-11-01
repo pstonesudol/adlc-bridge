@@ -7,6 +7,7 @@ import {readiness} from './github';
 import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
+import {metadataBodyCovered} from './pr-template-ci';
 
 function metadataFailureCovered(e:any,check:any){
  return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.checkId===check.id&&f.sha===e.head);
@@ -136,7 +137,11 @@ export class ReviewLoop{
     this.s.db.query('INSERT OR IGNORE INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,baseline?.signature??e.templateSignature,Date.now());
    }).immediate();
   }
-  // Request one fresh pass when old review evidence cannot clear an otherwise
+   const waiting=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? AND body=?').get(job,e.head,e.descriptionHash) as any;
+   if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks)){
+    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; missing body-bound success evidence for every configured metadata check'});
+   }
+   // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.
   if(!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
    const requested=await this.requestReview(job,e.head,e.descriptionHash);
@@ -145,7 +150,6 @@ export class ReviewLoop{
     return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
    }
   }
-  const waiting=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? AND body=?').get(job,e.head,e.descriptionHash) as any;
   if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c))&&waiting.signature===e.templateSignature){
    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
   }

@@ -62,13 +62,37 @@ function templateFixture(){
  loop.configureMetadataChecks('project',['PR body structure']);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+// Inject an attested collector response for success-path tests. The production
+// GitHub collector currently cannot supply this and returns a null body hash.
+function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+test('metadata success requires body-bound evidence for every configured check, not timestamps or a clear review',async()=>{
+ const names=['PR body structure','Verification'];
+ for(const invalid of ['missing','empty','partial','null','stale','head','identity','pending','neutral','duplicate']){const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',names);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
+  f.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,f.e.templateSignature,Date.now());
+  const rows:any[]=bodyEvidence(f.e,names);f.e.metadataCheckEvidence=rows;
+  if(invalid==='missing')delete f.e.metadataCheckEvidence;
+  if(invalid==='empty')f.e.metadataCheckEvidence=[];
+  if(invalid==='partial')rows.pop();
+  if(invalid==='null')rows[1].descriptionHash=null;
+  if(invalid==='stale')rows[1].descriptionHash='previous-body';
+  if(invalid==='head')rows[1].sha='old-head';
+  if(invalid==='identity')rows[1].checkId=undefined;
+  if(invalid==='pending')rows[1].status='in_progress';
+  if(invalid==='neutral')rows[1].conclusion='neutral';
+  if(invalid==='duplicate')rows.push({...rows[0]});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_ci',send:false});expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
+  f.s.db.query('UPDATE metadata_waits SET started=?').run(Date.now()-5*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');
+  f.e.metadataCheckEvidence=bodyEvidence(f.e,names);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+ }finally{f.s.close();}}
+});
 test('real template remediation persists baselines, sends once, waits for CI and reevaluates CodeRabbit',async()=>{
  const f=templateFixture(),{s,id,loop,session,e}=f;try{
  await loop.tick(id);expect(f.sends()).toBe(1);await loop.tick(id);expect(f.sends()).toBe(1);
  expect(s.db.query('SELECT kind,baseline_body_hash FROM remediation_context').get()).toEqual({kind:'pr_description',baseline_body_hash:'old-body'});expect(s.db.query('SELECT signature FROM metadata_baselines').get()).toEqual({signature:'old-check'});expect(s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
  session.transcript.turns[0].state='completed';e.descriptionHash='new-body';await loop.tick(id);
  expect((await loop.tick(id)).state).toBe('waiting_for_ci');expect(f.sends()).toBe(1);
- e.failedChecks=[];e.findings=[];e.templateSignature='passed-check';expect((await loop.tick(id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);await loop.tick(id);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+  e.failedChecks=[];e.findings=[];e.templateSignature='passed-check';e.metadataCheckEvidence=bodyEvidence(e);expect((await loop.tick(id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);await loop.tick(id);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
  e.clear=true;e.botReviewSubmittedAt=Date.now()+1000;expect((await loop.tick(id)).state).toBe('ready_for_human');expect(f.sends()).toBe(1);
  }finally{s.close();}
 });
@@ -88,7 +112,7 @@ test('fresh failing check allows bounded remediation instead of a stale CI wait'
  }finally{f.s.close();}
 });
 test('CodeRabbit reevaluation blocks after thirty minutes without duplicate review requests',async()=>{
- const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');const elapsed=Date.now()-30*60*1000-1;f.s.db.query('UPDATE full_review_requests SET requested=?').run(elapsed);f.s.db.query('UPDATE metadata_waits SET started=?').run(elapsed);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
+  const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');const elapsed=Date.now()-30*60*1000-1;f.s.db.query('UPDATE full_review_requests SET requested=?').run(elapsed);f.s.db.query('UPDATE metadata_waits SET started=?').run(elapsed);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
 });
 test('metadata remediation preserves the configured budget after base-branch integration',async()=>{
  const f=templateFixture(),policy={maxAttempts:2,maxNoProgress:5,window:'job' as const};try{
@@ -129,14 +153,14 @@ test('a metadata policy from another project cannot override a job policy',async
 test('metadata wait requires a post-update approval even if all current-head checks and the old approval are clear',async()=>{
  const f=templateFixture();try{
   const started=Date.now();f.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,f.e.templateSignature,started);
-  f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=started-1000;
+   f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=started-1000;f.e.metadataCheckEvidence=bodyEvidence(f.e);
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
   f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
  }finally{f.s.close();}
 });
 test('a description edit creates its review gate before considering an old clear approval',async()=>{
  const f=templateFixture();try{
-  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='edited-body';f.e.failedChecks=[];f.e.findings=[];f.e.clear=true;f.e.botReviewSubmittedAt=Date.now()-1000;
+   await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='edited-body';f.e.failedChecks=[];f.e.findings=[];f.e.clear=true;f.e.botReviewSubmittedAt=Date.now()-1000;f.e.metadataCheckEvidence=bodyEvidence(f.e);
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toHaveLength(1);expect(f.sends()).toBe(1);expect(f.reviews()).toBe(1);
  }finally{f.s.close();}
 });
