@@ -1,4 +1,4 @@
-import {installedCLI} from './install-state';
+import {installedCLI,verifiedInstallationSource} from './install-state';
 import {trustedDaemon} from './daemon-runtime';
 import {configureSessionRoute,preflightRoute} from './routing-session';
 import {AO} from './orchestrator';
@@ -69,7 +69,8 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  const hook=`${shellQuote(process.execPath)} ${shellQuote(resolve(installedCLI()?resolve(installedCLI()!,'..'):import.meta.dir,'planning-gate.ts'))}`;
  const scripts=config.postCreate??[];
  if(!Array.isArray(scripts)||scripts.some((x:any)=>typeof x!=='string'))throw Error('Unexpected setup scripts');
-  const prior=scripts.filter((x:string)=>!bridgePlanningHook(x)&&!x.includes('ADLC execution disabled pending host approval gate'));
+  const source=verifiedInstallationSource(),sourceGate=source?resolve(source,'src/planning-gate.ts'):undefined;
+  const prior=scripts.filter((x:string)=>!bridgePlanningHook(x,undefined,undefined,sourceGate)&&!x.includes('ADLC execution disabled pending host approval gate'));
  config.postCreate=[hook,...prior];
  config.env={...(config.env??{}),ADLC_WORKFLOW_CONFIG:path};
  delete config.env.ADLC_PLANNING_JOB;delete config.env.ADLC_PLANNING_PROJECT;
@@ -81,11 +82,32 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  return {project,backup,hookInstalled:true,planningEnabled:!!c.automation.planningEnabled};
 }
 function shellQuote(s:string){return "'"+s.replaceAll("'","'\\''")+"'";}
-export function bridgePlanningHook(script:string,checkout=resolve(import.meta.dir,'planning-gate.ts'),versions=resolve(homedir(),'Library/Application Support/ADLC Bridge/versions')){
- const command=script.match(/^(?:'[^']*'|"[^"]*"|[^\s]+)\s+(?:'([^']*)'|"([^"]*)"|([^\s]+))\s*$/);
- if(!command)return false;
- const path=command[1]??command[2]??command[3];
- if(path===checkout)return true;
+export function bridgePlanningHook(script:string,checkout=resolve(import.meta.dir,'planning-gate.ts'),versions=resolve(homedir(),'Library/Application Support/ADLC Bridge/versions'),sourceGate?:string){
+ const command=literalShellWords(script);if(!command||command.length!==2)return false;
+ const path=command[1];
+ if(path===checkout||path===sourceGate)return true;
  const prefix=versions+'/';if(!path.startsWith(prefix))return false;
  return /^[^/]+\/src\/planning-gate\.ts$/.test(path.slice(prefix.length));
+}
+// Decode literal shell words only; never execute or expand hook text. Adjacent
+// quoted/escaped fragments include shellQuote's '\'' apostrophe encoding.
+function literalShellWords(script:string){
+ const words:string[]=[];let word='',started=false,quote='';
+ for(let i=0;i<script.length;i++){
+  const c=script[i];
+  if(quote==="'"){if(c==="'")quote='';else word+=c;continue;}
+  if(quote==='"'){
+   if(c==='"'){quote='';continue;}
+   if(c==='$'||c==='`')return;
+   if(c==='\\'){const next=script[++i];if(next===undefined)return;if(!['"','\\','$','`'].includes(next))word+='\\';word+=next;}else word+=c;
+   continue;
+  }
+  if(/\s/.test(c)){if(started){words.push(word);word='';started=false;}continue;}
+  started=true;
+  if(c==="'"||c==='"'){quote=c;continue;}
+  if(c==='\\'){if(++i===script.length)return;word+=script[i];continue;}
+  if(/[;&|<>$`()]/.test(c))return;
+  word+=c;
+ }
+ if(quote)return;if(started)words.push(word);return words;
 }
