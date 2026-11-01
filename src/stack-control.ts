@@ -109,8 +109,8 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
  return blocked;
 }
-export function liveStackOps(readOnly=false):StackOps{
- const config=managedServiceDefinition(),turns=turnBarrier();
+export function liveStackOps(readOnly=false,turns=turnBarrier()):StackOps{
+ const config=managedServiceDefinition();
  return {
   turns,
   projects:()=>registeredProjects(readOnly),
@@ -139,11 +139,13 @@ export function liveStackOps(readOnly=false):StackOps{
   blockers:()=>workerBlockers(config.executable)
  };
 }
-export async function stackControl(action:'start'|'stop'|'status'){
- if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');
- if(action==='status')return controlStack(action,liveStackOps(true));
- const lock=join(stateDir(),'stack-control.lock');
- mkdirSync(stateDir(),{recursive:true,mode:0o700});
+const stackIO={state:stateDir,ops:liveStackOps};
+export async function stackControl(action:'start'|'stop'|'status',io=stackIO){
+  if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');
+  if(action==='status')return controlStack(action,io.ops(true,turnBarrier(io.state())));
+  const lock=join(io.state(),'stack-control.lock');
+  mkdirSync(io.state(),{recursive:true,mode:0o700});
  try{mkdirSync(lock);}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
- try{return await controlStack(action,liveStackOps());}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
+  const turns=turnBarrier(io.state());
+  try{return await turns.run(()=>controlStack(action,io.ops(false,turns)));}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
 }

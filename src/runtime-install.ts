@@ -3,10 +3,12 @@ import {unlinkSync} from 'node:fs';
 import {atomicFile} from './atomic-file';
 import {trustedDaemon} from './daemon-runtime';
 import {daemonStatus} from './stack-control';
+import {turnBarrier} from './turn-submission';
 export function runtimeDefinition(label:string,launcher:string,log:string){const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');return `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>${xml(launcher)}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>30</integer><key>WorkingDirectory</key><string>${xml(join(homedir(),'.ao'))}</string><key>StandardOutPath</key><string>${xml(log)}</string><key>StandardErrorPath</key><string>${xml(log)}</string></dict></plist>\n`;}
 const runtimeIO={state:appState,home:homedir,installedCLI,command:Bun.spawnSync,trustedDaemon};
 export async function installRuntime(binary:string,apply=false,io=runtimeIO){
- if(process.platform!=='darwin')throw Error('Runtime service requires macOS');
+  if(process.platform!=='darwin')throw Error('Runtime service requires macOS');
+  const inspectAndInstall=async()=>{
  binary=realpathSync(binary);const bytes=readFileSync(binary),sha256=createHash('sha256').update(bytes).digest('hex');
  const pinPath=join(io.state(),'orchestrator-runtime.json'),old=existsSync(pinPath)?JSON.parse(readFileSync(pinPath,'utf8')):{};
  const label=old.serviceLabel??'local.adlc.orchestrator';if(!/^local\.adlc\.[a-z0-9.-]+$/.test(label))throw Error('Invalid existing service label');
@@ -32,5 +34,7 @@ export async function installRuntime(binary:string,apply=false,io=runtimeIO){
    if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Runtime installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
    throw e;
  }
- return {installed:true,executable,sha256,service:label,backup,started:false};
+  return {installed:true,executable,sha256,service:label,backup,started:false};
+  };
+  return apply?turnBarrier(io.state()).run(inspectAndInstall):inspectAndInstall();
 }

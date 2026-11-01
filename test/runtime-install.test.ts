@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,realpathSync,readFileSync,writeFileSync,mkdirSync,existsSync,statSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {createHash} from 'node:crypto';
 import {installRuntime} from '../src/runtime-install';import {trustedDaemon} from '../src/daemon-runtime';
+import {stackControl,type StackOps} from '../src/stack-control';import {turnBarrier} from '../src/turn-submission';
 function fixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-runtime-install-'))),state=join(root,'state'),home=join(root,'home'),binary=join(root,'build-ao');mkdirSync(state);mkdirSync(home);writeFileSync(binary,'original binary');
  const pin=join(state,'orchestrator-runtime.json'),plist=join(home,'Library/LaunchAgents/local.adlc.orchestrator.plist');let status='stopped',failTrust=false;
@@ -40,3 +41,31 @@ test('successful runtime rollback preserves the original error identity',async()
   expect(await installRuntime(f.binary,true,f.io).catch(error=>error)).toBe(original);expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);
  }finally{f.close();}
 });
+test('runtime apply excludes stack definition reads and the next start uses the newly registered binary',async()=>{
+ const f=fixture();try{
+  const prior=await installRuntime(f.binary,true,f.io);writeFileSync(f.binary,'new runtime bytes');
+  const stackModule=join(import.meta.dir,'../src/stack-control.ts');
+  const script=`import {stackControl} from ${JSON.stringify(stackModule)};import {readFileSync} from 'node:fs';let reads=0,started=null,on=false,error=null;try{await stackControl('start',{state:()=>${JSON.stringify(f.io.state())},ops:(_readOnly,turns)=>{reads++;const pin=JSON.parse(readFileSync(${JSON.stringify(f.pin)},'utf8'));return {turns,projects:async()=>[],project:async()=>({}),backendStart:async()=>{on=true;started=pin.executable;},backend:async()=>({ready:on,loaded:on,managed:true}),backendStop:async()=>{},blockers:async()=>[]};}});}catch(e){error=e.message;}console.log(JSON.stringify({reads,started,error}));`;
+  const start=()=>Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root}});
+  let overlap:any;const command=f.io.command;f.io.command=(args:string[])=>{if(args[1]==='status')overlap=start();return command(args);};
+  const installed=await installRuntime(f.binary,true,f.io);expect(overlap.exitCode).toBe(0);expect(JSON.parse(overlap.stdout.toString())).toMatchObject({reads:0,started:null,error:expect.stringContaining('in progress')});
+  expect(installed.executable).not.toBe(prior.executable);const later=start();expect(later.exitCode).toBe(0);expect(later.stderr.toString()).toBe('');expect(JSON.parse(later.stdout.toString())).toEqual({reads:1,started:installed.executable,error:null});expect(existsSync(join(f.io.state(),'turn-submission.lock'))).toBe(false);
+ }finally{f.close();}
+},15000);
+test('a held stack-start scope rejects runtime installation before registration preflight',async()=>{
+ const f=fixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let startup:Promise<any>|undefined;
+ try{
+  let entered!:()=>void;const starting=new Promise<void>(resolve=>entered=resolve);let reads=0;
+  const io={state:f.io.state,ops:(_readOnly:boolean,turns:ReturnType<typeof turnBarrier>):StackOps=>{expect(existsSync(join(f.io.state(),'turn-submission.lock'))).toBe(true);return {turns,projects:async()=>[],project:async()=>({}),backendStart:async()=>{entered();await gate;},backend:async()=>({ready:true,loaded:true,managed:true}),backendStop:async()=>{},blockers:async()=>[]};}};
+  startup=stackControl('start',io);await starting;
+  await expect(installRuntime(f.binary,true,{...f.io,installedCLI:()=>{reads++;return f.io.installedCLI();},command:()=>{reads++;throw Error('Must not probe while stack start owns the fence');}})).rejects.toThrow('in progress');expect(reads).toBe(0);expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);
+  release();await startup;expect(existsSync(join(f.io.state(),'turn-submission.lock'))).toBe(false);
+ }finally{release?.();if(startup)await startup.catch(()=>{});f.close();}
+});
+test('runtime preview stays read-only and lock-free while another process owns the control fence',async()=>{
+ const f=fixture();try{
+  const module=join(import.meta.dir,'../src/runtime-install.ts'),script=`import {installRuntime} from ${JSON.stringify(module)};console.log(JSON.stringify(await installRuntime(${JSON.stringify(f.binary)},false,{state:()=>${JSON.stringify(f.io.state())},home:()=>${JSON.stringify(f.io.home())},installedCLI:()=>${JSON.stringify(f.io.installedCLI())},command:()=>{throw Error('Preview must not probe services');},trustedDaemon:()=>{throw Error('Preview must not change registration');}})));`;
+  await turnBarrier(f.io.state()).run(async()=>{const child=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root}});expect(child.exitCode).toBe(0);expect(child.stderr.toString()).toBe('');expect(JSON.parse(child.stdout.toString()).preview).toBe(true);});
+  expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);expect(existsSync(join(f.io.state(),'backups'))).toBe(false);expect(existsSync(join(f.io.state(),'runtimes'))).toBe(false);
+ }finally{f.close();}
+},15000);
