@@ -145,10 +145,13 @@ export class ReviewLoop{
   }
   const d=decision(e,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
-  this.s.db.transaction(()=>{
-   this.s.db.query('UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=?').run(e.head,since,d.state,d.reason,signature,job);
+  const stored=this.s.db.transaction(()=>{
+   const update=this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND state!='completed'").run(e.head,since,d.state,d.reason,signature,job);
+   if(!update.changes)return false;
    if(t.last_signature!==signature)this.s.event(job,'review_state_changed',JSON.stringify({repo:t.repo,pr:t.pr,head:e.head,...d}));
-  })();
+   return true;
+  }).immediate();
+  if(!stored)return {state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
   if(d.send&&t.remediate){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
    if(pending){

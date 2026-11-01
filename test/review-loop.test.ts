@@ -192,3 +192,9 @@ test('readiness failure arriving after completion cannot reopen the target',asyn
   expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,reason:'Concurrent merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
+test('successful review collection after concurrent completion cannot overwrite it or send remediation',async()=>{
+ for(const clear of [false,true]){const f=templateFixture();try{
+  let target:any,events:any;f.loop.io.readiness=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Concurrent merge observed'});target=f.loop.get(f.id);events=f.s.db.query('SELECT count(*) AS n FROM events').get();return {...f.e,clear};};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}}
+});
