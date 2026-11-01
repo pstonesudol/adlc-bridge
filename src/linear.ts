@@ -1,6 +1,7 @@
 import {ApprovalPolicyStore} from './approval-policy';
 import {validScopes} from './file-scope';
 import { Store } from './core';
+import {remediationPolicy,type RemediationConfig} from './remediation';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -10,6 +11,7 @@ export type ProjectConfig = {
   branchUpdate?:{enabled:boolean;authorizedBy:string;maxUpdates:number|null};
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
   featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number};
+  remediation?:RemediationConfig;
 };
 export function validate(c: any): asserts c is ProjectConfig {
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
@@ -17,6 +19,7 @@ export function validate(c: any): asserts c is ProjectConfig {
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||c.branchUpdate.maxUpdates!==null&&(!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
   if(c.statusSync?.enabled)for(const key of ['inProgress','inReview','done'])if(!/^[0-9a-f-]{36}$/i.test(c.statusSync[key]??''))throw Error('Verified status-sync UUIDs required');
+  remediationPolicy(c.remediation);
   for (const key of ['projectId', 'teamId', 'readyStateId', 'readyLabelId']) {
     if (!/^[0-9a-f-]{36}$/i.test(c.linear?.[key] ?? '')) throw Error(`Verified Linear ${key} UUID required`);
   }

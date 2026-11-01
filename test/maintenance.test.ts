@@ -54,3 +54,10 @@ test('recovery refreshes session evidence after ancestry reads and preserves unc
   await expect(maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io)).rejects.toThrow();expect(reads).toBe(2);expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.close();}}
 });
+test('recovery forwards the registered project remediation budget to review reevaluation',async()=>{
+ const f=fixture();try{
+  const remediation={maxAttempts:12,maxNoProgress:8,window:'job'};writeFileSync(f.config,JSON.stringify({...f.c,remediation}));const calls:any[]=[];
+  f.io.review=()=>({configureMetadataChecks:()=>{},tick:async(...args:any[])=>{calls.push(args);return {};}});
+  const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(calls).toEqual([[f.id,undefined,remediation]]);
+ }finally{f.close();}
+});

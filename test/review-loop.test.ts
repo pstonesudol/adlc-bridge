@@ -71,7 +71,7 @@ test('real template remediation persists baselines, sends once, waits for CI and
  }finally{s.close();}
 });
 test('real pilot remediation rejects stale description, check identity and SHA before reserving or sending',async()=>{
- for(const changed of [{descriptionHash:'changed'},{checkId:2},{sha:'changed'}]){const f=templateFixture();try{const findings=JSON.stringify([{...f.e.findings[0],...changed}]);await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],['PR body structure'],f.io)).rejects.toThrow('Template failure changed');expect(f.sends()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);}finally{f.s.close();}}
+ for(const changed of [{descriptionHash:'changed'},{checkId:2},{sha:'changed'}]){const f=templateFixture();try{const findings=JSON.stringify([{...f.e.findings[0],...changed}]);await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,['PR body structure'],f.io)).rejects.toThrow('Template failure changed');expect(f.sends()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);}finally{f.s.close();}}
 });
 test('template wait blocks at five minutes without spending another attempt',async()=>{
  const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.s.db.query('UPDATE metadata_waits SET started=?').run(Date.now()-5*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(1);}finally{f.s.close();}
@@ -87,4 +87,13 @@ test('fresh failing check allows bounded remediation instead of a stale CI wait'
 });
 test('CodeRabbit reevaluation blocks after thirty minutes without duplicate review requests',async()=>{
  const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');f.s.db.query('UPDATE full_review_requests SET requested=?').run(Date.now()-30*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
+});
+test('metadata remediation preserves the configured budget after base-branch integration',async()=>{
+ const f=templateFixture(),policy={maxAttempts:2,maxNoProgress:5,window:'job' as const};try{
+  for(let attempt=1;attempt<=2;attempt++){
+   await f.loop.tick(f.id,undefined,policy);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`budget-body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];
+   await f.loop.tick(f.id,undefined,policy);f.e.templateSignature=`budget-check-${attempt}`;
+  }
+  expect((await f.loop.tick(f.id,undefined,policy)).state).toBe('blocked');expect(f.sends()).toBe(2);expect(f.s.get(f.id).attempts).toBe(2);
+ }finally{f.s.close();}
 });

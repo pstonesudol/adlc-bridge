@@ -1,5 +1,6 @@
 import {existsSync,realpathSync} from 'node:fs';
 import {Lifecycle} from './lifecycle';
+import {remediationPolicy} from './remediation';
 import {Store,digest} from './core';import {sessionEvidence} from './session-evidence';import {ProjectServices,registryPath} from './project-services';import {readFileSync} from 'node:fs';import {localAO} from './workflow-transport';import {ReviewLoop} from './review-loop';import {poll} from './linear';import {linearToken} from './credential';
 async function gh(path:string){const p=Bun.spawn(['gh','api',path],{stdout:'pipe',stderr:'pipe'});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub inspection failed');return JSON.parse(out);}
 export function assertIdle(e:any){if(!['ready','stopped'].includes(e?.transcript?.controller)||!Array.isArray(e.transcript?.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','interrupted','cancelled','recovered'].includes(t?.state)))throw Error('Worker is active or activity is uncertain');}
@@ -57,5 +58,5 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
   for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
   s.event(job,'review_recovery_requested',JSON.stringify({...report,proven}));
  }).immediate();
- await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);return {...report,result:await loop.tick(job,c.branchUpdate)};
+ await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);return {...report,result:await loop.tick(job,c.branchUpdate,remediationPolicy(c.remediation))};
 }

@@ -53,5 +53,10 @@
     "authorizedBy": "",
     "maxUpdates": null
   },
-  "prMetadataChecks": []
+  "prMetadataChecks": [],
+  "remediation": {
+    "maxAttempts": 5,
+    "maxNoProgress": 5,
+    "window": "job"
+  }
 }
