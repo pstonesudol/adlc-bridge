@@ -13,14 +13,20 @@ export function metadataBodyCovered(e:any,allowed:string[]){
   return rows.length===1&&Number.isSafeInteger(rows[0].checkId)&&rows[0].checkId>0&&rows[0].sha===e.head&&rows[0].status==='completed'&&rows[0].conclusion==='success'&&rows[0].descriptionHash===e.descriptionHash;
  });
 }
+export function metadataFailureBodyCovered(e:any,f:any){
+ if(!Array.isArray(e.metadataCheckEvidence)||!e.descriptionHash||f.descriptionHash!==e.descriptionHash||f.sha!==e.head)return false;
+ const rows=e.metadataCheckEvidence.filter((c:any)=>c.name===f.check&&c.checkId===f.checkId);
+ return rows.length===1&&Number.isSafeInteger(f.checkId)&&f.checkId>0&&rows[0].sha===e.head&&rows[0].status==='completed'&&rows[0].conclusion==='failure'&&rows[0].descriptionHash===e.descriptionHash;
+}
 export function cleanTemplateLog(raw:string){
  const clean=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'');
  return clean.split('\n').filter(l=>/missing|section|placeholder|verification|summary|related issues|risks|rollout|not.run|template|error|invalid|pr.body/i.test(l)&&!/credential|authorization|token|extraheader/i.test(l)).join('\n').slice(-12000);
 }
-export async function templateCIFindings(repo:string,head:string,checks:any[],allowed:string[],bodyHash:string,api:(path:string)=>Promise<any>,logs:(path:string)=>Promise<string>){
+export async function templateCIFindings(repo:string,head:string,checks:any[],allowed:string[],bodyHash:string,api:(path:string)=>Promise<any>,logs:(path:string)=>Promise<string>,bodyEvidence:any[]=[]){
  const findings:any[]=[];
  for(const c of checks){
-  if(!allowed.includes(c.name)||c.app?.slug!=='github-actions'||c.head_sha!==head||c.status!=='completed'||c.conclusion!=='failure')continue;
+   if(!allowed.includes(c.name)||c.app?.slug!=='github-actions'||c.head_sha!==head||c.status!=='completed'||c.conclusion!=='failure')continue;
+   if(!metadataFailureBodyCovered({head,descriptionHash:bodyHash,metadataCheckEvidence:bodyEvidence},{check:c.name,checkId:c.id,sha:head,descriptionHash:bodyHash}))continue;
   const url=new URL(c.details_url),prefix=`/${repo}/actions/runs/`,match=url.pathname.match(/\/actions\/runs\/(\d+)\/job\/(\d+)$/);
   if(url.hostname!=='github.com'||!url.pathname.startsWith(prefix)||!match||!Number.isSafeInteger(c.id))throw Error('Unverified template-check job URL');
   const job=await api(`repos/${repo}/actions/jobs/${match[2]}`);

@@ -10,6 +10,7 @@ import {withTurnSubmission} from './turn-submission';
 import {assertDeliveryTarget} from './delivery-identity';
 import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
+import {metadataFailureBodyCovered} from './pr-template-ci';
 
 export async function adoptPilot(s:Store,job:string,session:string){
  const evidence=await sessionEvidence(session),r=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
@@ -40,7 +41,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
  const e=await io.sessionEvidence(r.session_id);if(e.transcript.controller!=='ready'||!Array.isArray(e.transcript.turns)||e.transcript.turns.some((t:any)=>['running','queued'].includes(t.state)))throw Error('Worker must be idle with no queued work');
  const review=await observePilot(s,job,repo,pr,required,metadataChecks,io);
  if(review.head!==head||review.clear)throw Error('Current uncleared PR head required');
- if(parsed.some((f:any)=>f.source==='github-ci'&&(f.descriptionHash!==review.descriptionHash||!review.findings.some((x:any)=>x.source==='github-ci'&&x.checkId===f.checkId&&x.sha===f.sha))))throw Error('Template failure changed; recheck before delivery');
+  if(parsed.some((f:any)=>f.source==='github-ci'&&(!metadataChecks.includes(f.check)||!metadataFailureBodyCovered(review,f)||!review.findings.some((x:any)=>x.source==='github-ci'&&x.check===f.check&&x.checkId===f.checkId&&x.sha===f.sha&&x.descriptionHash===f.descriptionHash))))throw Error('Template failure changed or body-bound evidence unavailable; recheck before delivery');
  const router=new TaskRouting(s),settings=router.settings(job);
  if(settings&&router.get(job,'planning')){
   const phase=`remediation:${head}:${digest(findings).slice(0,16)}`;

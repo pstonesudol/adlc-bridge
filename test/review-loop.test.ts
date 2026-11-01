@@ -51,7 +51,7 @@ test('one project service cannot select another project’s PR targets',()=>{
 
 function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
- const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
+ const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,metadataCheckEvidence:[{name:'PR body structure',checkId:1,sha:head,status:'completed',conclusion:'failure',descriptionHash:'old-body'}]};
  const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
@@ -65,6 +65,34 @@ function templateFixture(){
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+function failureEvidence(e:any){return e.findings.map((f:any)=>({name:f.check,checkId:f.checkId,sha:f.sha,status:'completed',conclusion:'failure',descriptionHash:f.descriptionHash}));}
+test('initial clear metadata checks cannot bypass body evidence without a preexisting wait',async()=>{
+ const f=templateFixture();try{
+  f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_ci',send:false});const rows=f.s.db.query('SELECT * FROM metadata_waits').all();expect(rows).toHaveLength(1);
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual(rows);expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
+  f.s.db.query('UPDATE metadata_waits SET started=?').run(Date.now()-5*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');
+  f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+ }finally{f.s.close();}
+});
+test('an empty metadata policy skips wait creation and ignores historical metadata waits',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];delete f.e.metadataCheckEvidence;
+  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual([]);
+  f.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(f.id,f.head,'previous-body','previous-check',Date.now());const rows=f.s.db.query('SELECT * FROM metadata_waits').all();
+  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual(rows);expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+test('pilot rejects matching check identities and findings when failure body attestation is missing or stale',async()=>{
+ for(const invalid of ['missing','null','old-body','identity','success']){const f=templateFixture();try{
+  const finding=f.e.findings[0];
+  if(invalid==='missing')delete f.e.metadataCheckEvidence;
+  else{const evidence=f.e.metadataCheckEvidence[0];if(invalid==='null')evidence.descriptionHash=null;if(invalid==='old-body')evidence.descriptionHash='earlier-body';if(invalid==='identity')evidence.checkId=999;if(invalid==='success')evidence.conclusion='success';}
+  expect((await f.loop.tick(f.id)).state).toBe('blocked');
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify([finding]),'owner/repo',1,['CI'],undefined,['PR body structure'],f.io)).rejects.toThrow('body-bound evidence unavailable');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}}
+});
 test('metadata success requires body-bound evidence for every configured check, not timestamps or a clear review',async()=>{
  const names=['PR body structure','Verification'];
  for(const invalid of ['missing','empty','partial','null','stale','head','identity','pending','neutral','duplicate']){const f=templateFixture();try{
@@ -118,7 +146,7 @@ test('same-head description edits preserve stale failure suppression but allow f
  const f=templateFixture();try{
   await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='body-B';await f.loop.tick(f.id);
   f.e.descriptionHash='body-C';expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');expect(f.sends()).toBe(1);expect(f.reviews()).toBe(0);
-  f.e.templateSignature='fresh-C-failure';f.e.findings[0].descriptionHash='body-C';f.e.findings[0].checkId=2;f.e.failedChecks[0].id=2;
+  f.e.templateSignature='fresh-C-failure';f.e.findings[0].descriptionHash='body-C';f.e.findings[0].checkId=2;f.e.failedChecks[0].id=2;f.e.metadataCheckEvidence=failureEvidence(f.e);
   expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(2);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}
 });
@@ -131,7 +159,7 @@ test('template wait blocks at five minutes without spending another attempt',asy
 test('fresh failing check allows bounded remediation instead of a stale CI wait',async()=>{
  const f=templateFixture();try{
   for(let attempt=1;attempt<=5;attempt++){
-   await f.loop.tick(f.id);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;
+    await f.loop.tick(f.id);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;f.e.metadataCheckEvidence=failureEvidence(f.e);
    await f.loop.tick(f.id);f.e.templateSignature=`check-${attempt}`;
   }
   await f.loop.tick(f.id);expect(f.sends()).toBe(5);expect(f.s.get(f.id).attempts).toBe(5);
@@ -143,7 +171,7 @@ test('CodeRabbit reevaluation blocks after thirty minutes without duplicate revi
 test('metadata remediation preserves the configured budget after base-branch integration',async()=>{
  const f=templateFixture(),policy={maxAttempts:2,maxNoProgress:5,window:'job' as const};try{
   for(let attempt=1;attempt<=2;attempt++){
-   await f.loop.tick(f.id,undefined,policy);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`budget-body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;
+    await f.loop.tick(f.id,undefined,policy);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`budget-body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;f.e.metadataCheckEvidence=failureEvidence(f.e);
    await f.loop.tick(f.id,undefined,policy);f.e.templateSignature=`budget-check-${attempt}`;
   }
   expect((await f.loop.tick(f.id,undefined,policy)).state).toBe('blocked');expect(f.sends()).toBe(2);expect(f.s.get(f.id).attempts).toBe(2);
@@ -251,7 +279,7 @@ test('successful review collection after concurrent completion cannot overwrite 
 test('a late GitHub review-request receipt preserves the completed target and its newer head',async()=>{
  const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
  try{
-  f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.loop.postReview=async()=>{entered();await gate;};
+  f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.e.metadataCheckEvidence=bodyEvidence(f.e);f.loop.postReview=async()=>{entered();await gate;};
   const pending=f.loop.tick(f.id);await started;const newer='b'.repeat(40);f.s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';");f.s.db.query("UPDATE review_targets SET state='completed',head=?,reason='Merge observed' WHERE job=?").run(newer,f.id);
   const target=f.loop.get(f.id),changes=f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get();release();expect(await pending).toEqual({state:'completed',send:false,head:newer,reason:'Merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get()).toEqual(changes);expect(f.sends()).toBe(0);
   const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);

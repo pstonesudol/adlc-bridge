@@ -82,11 +82,12 @@ export async function readiness(repo:string, number:number, required:string[],me
   const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
-  const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),templateLogReader());
+   const bodyEvidence=metadataCheckEvidence(checks,first.head.sha,metadataChecks);
+   const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),templateLogReader(),bodyEvidence);
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
-    metadataCheckEvidence:metadataCheckEvidence(checks,first.head.sha,metadataChecks),
+    metadataCheckEvidence:bodyEvidence,
     botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash:digest(final.body??''),mergeEnabled:false};
 }
 

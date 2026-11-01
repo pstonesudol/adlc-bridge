@@ -7,10 +7,10 @@ import {readiness} from './github';
 import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
-import {metadataBodyCovered} from './pr-template-ci';
+import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
 
-function metadataFailureCovered(e:any,check:any){
- return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.checkId===check.id&&f.sha===e.head);
+function metadataFailureCovered(e:any,check:any,bodyBound=true){
+  return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.check===check.name&&f.checkId===check.id&&f.sha===e.head&&(!bodyBound||metadataFailureBodyCovered(e,f)));
 }
 import {DEFAULT_REMEDIATION_POLICY,type RemediationPolicy} from './remediation';
 import {assertDeliveryTarget} from './delivery-identity';
@@ -128,7 +128,7 @@ export class ReviewLoop{
   // A same-SHA approval can predate a description edit. Reconcile metadata
   // receipts before considering e.clear, so that edit always creates its gate.
   const metadataPending=this.s.db.query("SELECT r.*,c.baseline_body_hash FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.state='delivery_uncertain' AND c.kind='pr_description' ORDER BY r.attempt DESC LIMIT 1").get(job) as any;
-  if(metadataPending?.head===e.head&&metadataPending.baseline_body_hash!==e.descriptionHash){
+   if(metadataChecks.length>0&&metadataPending?.head===e.head&&metadataPending.baseline_body_hash!==e.descriptionHash){
    const handle=`adlc-fix-${job.slice(0,12)}-${metadataPending.attempt}`,entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
    if(turn?.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous metadata remediation is uncertain or incomplete; never infer completion'});
    const baseline=this.s.db.query('SELECT signature FROM metadata_baselines WHERE job=? AND attempt=?').get(job,metadataPending.attempt) as any;
@@ -140,14 +140,20 @@ export class ReviewLoop{
    // Once metadata remediation creates a gate, another same-head body edit
    // cannot escape it. Carry its baseline forward and restart review freshness
    // for each newly observed body, including a return to an earlier body.
-   const waiting=this.s.db.transaction(()=>{
+   const needsBodyEvidence=metadataChecks.length>0&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks);
+   const waiting=metadataChecks.length===0?null:this.s.db.transaction(()=>{
     const prior=this.s.db.query('SELECT * FROM metadata_waits WHERE job=? AND head=? ORDER BY started DESC,rowid DESC LIMIT 1').get(job,e.head) as any;
-    if(!prior||prior.body===e.descriptionHash)return prior;
+    if(!prior){
+     if(!needsBodyEvidence)return null;
+     const started=Date.now();this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,e.templateSignature,started);
+     return {body:e.descriptionHash,signature:e.templateSignature,started};
+    }
+    if(prior.body===e.descriptionHash)return prior;
     const started=Math.max(Date.now(),prior.started+1);
     this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?) ON CONFLICT(job,head,body) DO UPDATE SET signature=excluded.signature,started=excluded.started').run(job,e.head,e.descriptionHash,prior.signature,started);
     return {...prior,body:e.descriptionHash,started};
    }).immediate();
-   if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!metadataBodyCovered(e,metadataChecks)){
+   if(needsBodyEvidence){
     return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; missing body-bound success evidence for every configured metadata check'});
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
@@ -159,7 +165,7 @@ export class ReviewLoop{
     return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
    }
   }
-  if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c))&&waiting.signature===e.templateSignature){
+   if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){
    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
   }
   if(waiting&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
