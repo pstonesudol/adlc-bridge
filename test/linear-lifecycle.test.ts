@@ -1,8 +1,9 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';
 const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
-function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false,noticeFailure=false,noticeCalls=0;const posted:any[]=[],issueChanges:any={};
+function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false,noticeFailure=false,noticeCalls=0;const posted:any[]=[],issueChanges:any={};let beforeAPI:(q:string)=>void=()=>{};
  const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}},...issueChanges});
  const api=async(q:string,v:any)=>{
+  beforeAPI(q);
   if(q.includes('workflowState'))return {workflowState:{id:v.id,type:v.id==='done'?'completed':'started',team:{id:'t'}}};
   if(q.includes('commentCreate')){noticeCalls++;if(noticeFailure)throw Error('Lost notice reply');const comment={id:v.input.id,body:v.input.body,createdAt:new Date().toISOString()};posted.push(comment);return {commentCreate:{success:true,comment}};}
   if(q.includes('comments(first'))return {issue:{id:'issue',comments:{nodes:posted,pageInfo:{hasNextPage:false,endCursor:null}}}};
@@ -10,7 +11,7 @@ function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new R
   return {issue:issue()};
  };
  const sync=new LinearLifecycle(s,api,async()=>({state:merged?'closed':'open',merged}));
- return {s,id,sync,issueChanges,get noticeCalls(){return noticeCalls;},failNotice(){noticeFailure=true;},get state(){return state;},get updates(){return updates;},get posted(){return posted;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
+ return {s,id,sync,issueChanges,intercept(callback:(q:string)=>void){beforeAPI=callback;},get noticeCalls(){return noticeCalls;},failNotice(){noticeFailure=true;},get state(){return state;},get updates(){return updates;},get posted(){return posted;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
 }
 test('owned ticket moves In Progress → In Review → Done only after observed merge',async()=>{
  const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
@@ -98,5 +99,57 @@ test('notice failure does not bypass requirements validation for merged work',as
   expect(result.some((x:any)=>x.phase==='remediation-blocker'&&x.error)).toBe(true);
   expect(result.some((x:any)=>x.error==='Requirements changed; refusing status update')).toBe(true);
   expect(f.state).toBe('todo');expect(f.s.get(f.id).state).toBe('blocked');expect(f.updates).toBe(0);expect(f.noticeCalls).toBe(1);
+ }finally{f.s.close();}
+});
+
+test('concurrent intake cannot complete old work against refreshed requirements',async()=>{
+ for(const during of ['commentCreate','workflowState','issueUpdate']){
+  const f=budgetBlocked();try{
+   f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["src/**"]',Date.now());
+   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(f.id,'correlation','hash','blocked');
+   f.failNotice();f.merge();let changed=false;
+   f.intercept(q=>{
+    if(!changed&&q.includes(during)){
+     changed=true;f.issueChanges.description='new requirements';
+     f.s.enqueue('p','issue',JSON.stringify({identifier:'DEV-1',title:'Task',description:'new requirements'}));
+    }
+   });
+   const result=await f.sync.sync(c);expect(changed).toBe(true);
+   expect(result.some((x:any)=>x.error?.includes('Run requirements binding changed or missing'))).toBe(true);
+   expect(f.s.get(f.id).state).toBe('awaiting_plan');expect(f.s.get(f.id).approved_hash).toBeNull();
+   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe('blocked');
+   expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).not.toBe('completed');
+   expect(f.updates).toBe(during==='issueUpdate'?1:0);
+   const transition=f.s.db.query("SELECT state FROM linear_transitions WHERE job=? AND phase='done'").get(f.id) as any;
+   expect(transition?.state??null).toBe(during==='issueUpdate'?'delivery_uncertain':null);
+  }finally{f.s.close();}
+ }
+});
+
+test('missing or replaced planning binding fails closed before status writes',async()=>{
+ for(const binding of ['', 'stale']){
+  const f=fixture();try{
+   f.s.db.query('UPDATE planning_runs SET spec_hash=? WHERE job=?').run(binding,f.id);
+   const result=await f.sync.sync(c);expect(result[0].error).toContain('Run requirements binding changed or missing');
+   expect(f.updates).toBe(0);expect(f.state).toBe('todo');
+  }finally{f.s.close();}
+ }
+});
+
+test('requirements binding is rechecked inside terminal completion transaction',async()=>{
+ const f=budgetBlocked();try{
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["src/**"]',Date.now());
+  f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(f.id,'correlation','hash','blocked');
+  const move=f.sync.move.bind(f.sync);
+  f.sync.move=async(...args:Parameters<typeof move>)=>{
+   const result=await move(...args);
+   f.s.enqueue('p','issue',JSON.stringify({identifier:'DEV-1',title:'Task',description:'new requirements'}));
+   return result;
+  };
+  f.merge();const result=await f.sync.sync(c);
+  expect(result.some((x:any)=>x.error?.includes('Run requirements binding changed or missing'))).toBe(true);
+  expect(f.s.get(f.id).state).toBe('awaiting_plan');
+  expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe('blocked');
+  expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).not.toBe('completed');
  }finally{f.s.close();}
 });
