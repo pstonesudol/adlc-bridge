@@ -6,6 +6,7 @@ import {homedir} from 'node:os';
 import {linearAPI,type LinearAPI} from './linear-api';
 import {linearToken} from './credential';
 import {validate} from './linear';
+import {effectiveSettings} from './project-settings';
 import {validScopes} from './file-scope';
 import {localAO,installWorkflowHook} from './workflow-transport';
 import {loadOpenChamber} from './task-routing';
@@ -28,7 +29,8 @@ export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO)
 export function saveInitConfig(path:string,c:any){
  mkdirSync(dirname(path),{recursive:true});writeFileSync(path,JSON.stringify(c,null,2)+'\n',{flag:'wx',mode:0o600});
 }
-export function serviceDefinition(config:string,bun=process.execPath,source=resolve(import.meta.dir,'cli.ts'),home=homedir(),label=legacyLabel){
+export function serviceDefinition(config:string,bun=process.execPath,source=resolve(import.meta.dir,'cli.ts'),home=homedir(),label=legacyLabel,settings={pollingIntervalSeconds:60}){
+ const {pollingIntervalSeconds}=effectiveSettings(settings);
  const xml=(v:string)=>v.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
  const state=join(home,'Library','Application Support','ADLC Bridge');
  const logName=label===legacyLabel?'intake':label;
@@ -37,7 +39,7 @@ export function serviceDefinition(config:string,bun=process.execPath,source=reso
 <key>ProgramArguments</key><array>${[bun,source,'poll',config].map(x=>`<string>${xml(x)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${xml(dirname(source))}</string>
 <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(dirname(bun))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
-<key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>
+<key>StartInterval</key><integer>${pollingIntervalSeconds}</integer><key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>${xml(join(state,`${logName}.log`))}</string>
 <key>StandardErrorPath</key><string>${xml(join(state,`${logName}-error.log`))}</string>
 </dict></plist>\n`;
@@ -56,7 +58,10 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   if(existsSync(path))throw Error(`Configuration already exists: ${path}. Preserved; use another --config path.`);
   if(!linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
   const c:any={version:1,name,repo,githubRepo:await ask('GitHub owner/repository'),automation:{planningEnabled:true,orchestratorProject:await ask('Existing Orchestrator project ID'),maxPlanning:1},linear:{projectId:await ask('Linear project UUID'),teamId:await ask('Linear team UUID'),readyStateId:await ask('Todo state UUID'),readyLabelId:await ask('agent-ready label UUID')},requiredChecks:(await ask('Required GitHub Actions check names (comma separated)')).split(',').map(x=>x.trim()).filter(Boolean),reviewAllowedPaths:(await ask('Allowed review path patterns (comma separated)','src/**')).split(',').map(x=>x.trim()),approval:{mode:'manual'}};
-  if(await yes('Enable shared OpenChamber task routing')){
+   c.pollingIntervalSeconds=Number(await ask('Polling interval seconds (5–86400)','60'));
+   c.automation.maxPlanning=Number(await ask('Concurrent planning stages (1–32; not implementation/review workers)','1'));
+   validate(c);
+   if(await yes('Enable shared OpenChamber task routing')){
    c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};
    await loadOpenChamber(c.routing);
   }
@@ -88,9 +93,9 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   try{const registry=new ProjectServices(registryStore);registry.discoverLegacy();entry=registry.register(path);}finally{registryStore.close();}
   const plist=join(homedir(),'Library/LaunchAgents',`${entry.label}.plist`);
   if(existsSync(plist)){assertDefinition(readDefinition(plist),entry.label,path);return {configuration:path,project:entry.project,gateInstalled:true,existingServicePreserved:true,note:'Existing matching project service preserved. No start/stop was performed.'};}
-  if(!await yes('Install this project’s 60-second background service (loads at next login)'))return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false};
+   if(!await yes(`Install this project’s ${c.pollingIntervalSeconds}-second background service (loads at next login)`))return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false};
   mkdirSync(dirname(plist),{recursive:true});mkdirSync(join(homedir(),'Library/Application Support/ADLC Bridge'),{recursive:true,mode:0o700});
-  writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),homedir(),entry.label),{flag:'wx',mode:0o600});
+   writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),homedir(),entry.label,c),{flag:'wx',mode:0o600});
   if(await yes('Start this project now (can pick up eligible tickets and perform authorized work)'))return {configuration:path,project:entry.project,gateInstalled:true,service:await serviceControl('start',entry.project)};
   return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false,note:'Service installed but not loaded; it can load at next login.'};
  }finally{rl.close();}

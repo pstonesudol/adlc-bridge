@@ -498,6 +498,45 @@ Linear credential that can access each configured project. Services installed
 before multi-project support keep their existing log names; new services log to
 files named after their service label in the ADLC Bridge support directory.
 
+## Project polling and planning capacity
+
+Project JSON supports `"pollingIntervalSeconds": 60` at the top level and
+`"automation": { "maxPlanning": 1 }` alongside the other automation fields.
+Omitted values retain defaults of 60 seconds and one planning stage. Polling must
+be an integer from **5 to 86400 seconds**; maxPlanning must be an integer from
+**1 to 32**. Invalid values are rejected, never silently clamped. Setup prompts
+for both values; the static service example represents the default interval.
+
+Intake durably records all eligible tickets before dispatch, independently of
+available slots. Overflow stays queued. Reservations are made transactionally
+across polls/restarts, including uncertain dispatches and reconciliation blockers;
+these consume slots and are never blindly retried. Lowering a limit stops further
+starts until capacity becomes available, without terminating existing workers.
+`maxPlanning` limits ticket planning stages only, not implementation/review workers
+or the separate feature-planning agent pool. It grants no execution authorization:
+approval gates, scoped Git permissions, human-only merges and no deployment remain.
+
+After editing a project's JSON, preview and explicitly apply its service interval:
+
+```sh
+adlc service-config PROJECT_ID
+adlc service-config PROJECT_ID --apply
+adlc service-status PROJECT_ID
+```
+
+Preview makes no service changes. Apply validates project identity and changes
+only StartInterval in the existing definition, preserving arguments, environment,
+logs and unrelated keys; other projects are untouched. An already-loaded service
+is reloaded (and can immediately pick up authorized work); a stopped service stays
+stopped. Existing worker sessions are not terminated. If reload fails, inspect
+service-status and use start PROJECT_ID after resolving the error. Status reports
+effective configured settings and the installed definition interval; a loaded
+service needs apply/reload after interval changes. maxPlanning changes are read
+on the next launched poll, without service regeneration. `serve CONFIG` snapshots
+settings at startup: restart it after edits. Its ticks are sequential, sleeping
+the configured interval after each tick; launchd schedules approximately at the
+configured interval and does not run concurrent instances of the same service.
+
 ## Keep feature PR branches current
 
 A project can explicitly authorize updating owned feature branches from their

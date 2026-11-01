@@ -1,9 +1,12 @@
 import {ApprovalPolicyStore} from './approval-policy';
 import {validScopes} from './file-scope';
 import { Store } from './core';
+import {effectiveSettings} from './project-settings';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
+  pollingIntervalSeconds?:number;
+  automation?:{planningEnabled?:boolean;orchestratorProject?:string;maxPlanning?:number};
   linear: { projectId: string; teamId: string; readyStateId: string; readyLabelId: string };
   statusSync?:{enabled:boolean;inProgress:string;inReview:string;done:string};
   branchUpdate?:{enabled:boolean;authorizedBy:string;maxUpdates:number};
@@ -11,6 +14,7 @@ export type ProjectConfig = {
   featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number};
 };
 export function validate(c: any): asserts c is ProjectConfig {
+  effectiveSettings(c??{});
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');

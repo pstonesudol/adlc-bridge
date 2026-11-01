@@ -84,6 +84,34 @@ test('planning concurrency limit holds across overlapping ticks',async()=>{
  await Promise.all([w.tick(config),w.tick(config)]);expect(f.starts.length).toBe(1);s.close();
 });
 
+test('capacity above two queues overflow, lowering waits, completion admits queued work',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+ const c={...config,automation:{...config.automation,maxPlanning:3}};
+ for(let i=0;i<6;i++)s.enqueue('p',String(i),'spec');
+ await Promise.all([w.tick(c),w.tick(c)]);expect(f.starts.length).toBe(3);expect(s.list().length).toBe(6);
+ await w.tick(config);expect(f.starts.length).toBe(3);
+ f.completePlan('session-1');await w.tick(c);expect(f.starts.length).toBe(4);expect(f.sends.length).toBe(0);s.close();
+});
+test('uncertain reservations survive separate connections and restart, even after eligibility loss',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-reservations-'));let s=new Store(join(dir,'db'));let other:Store|undefined;
+ try{
+  const f=new Fake(s);f.startPlan=async r=>{f.starts.push(r);throw Error('unknown');};
+  let w=new Workflow(s,f);const ids=[s.enqueue('p','a','spec'),s.enqueue('p','b','spec'),s.enqueue('p','c','spec')];
+  other=new Store(join(dir,'db'));const w2=new Workflow(other,f);
+  await Promise.all([w.tick(config),w2.tick(config)]);expect(f.starts.length).toBe(1);
+  s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(ids[0]);
+  other.close();other=undefined;s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+  await w.tick(config);expect(f.starts.length).toBe(1);expect(s.list().length).toBe(3);
+ }finally{other?.close();s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('two projects have independent planning capacities and omitted concurrency defaults to one',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+ for(const project of ['p','q'])for(let i=0;i<5;i++)s.enqueue(project,String(i),'spec');
+ const a={...config,automation:{planningEnabled:true,orchestratorProject:'project'}};
+ const b={...config,linear:{projectId:'q'},automation:{...config.automation,orchestratorProject:'other',maxPlanning:4}};
+ await Promise.all([w.tick(a),w.tick(b)]);expect(f.starts.filter(x=>x.project==='project').length).toBe(1);expect(f.starts.filter(x=>x.project==='other').length).toBe(4);s.close();
+});
+
 test('Docker approval is rejected and local execution remains available',async()=>{
  const {s,f,w,id,hash}=await planned();
  expect(()=>w.approve(id,hash,'human',['src/a.ts'],'docker',ops)).toThrow('removed');

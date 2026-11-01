@@ -2,6 +2,17 @@ import {test,expect} from 'bun:test';import {Store} from '../src/core';import {P
 const c={version:1 as const,...featureConfig,statusSync:{enabled:true,inProgress:'00000000-0000-0000-0000-000000000006',inReview:'00000000-0000-0000-0000-000000000007',done:'00000000-0000-0000-0000-000000000008'}};
 function issue(id:string,state:string){return {id,identifier:'DEV-1',title:'Task',description:'Requirements',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{id:state},labels:{nodes:[{id:c.linear.readyLabelId}],pageInfo:{hasNextPage:false}}};}
 const response=(nodes:any[])=>new Response(JSON.stringify({data:{issues:{nodes,pageInfo:{hasNextPage:false}}}}));
+test('full paginated intake queues overflow even when all planning slots are uncertain',async()=>{
+ const old=globalThis.fetch,s=new Store(':memory:');let starts=0;
+ const w=new Workflow(s,{startPlan:async()=>{starts++;throw Error('unknown');},findPlans:async()=>[]} as any);
+ const config={...c,statusSync:undefined,routing:undefined,automation:{planningEnabled:true,orchestratorProject:'test',maxPlanning:1}};
+ try{
+  globalThis.fetch=(async(_url:any,init:any)=>{const after=JSON.parse(init.body).variables.after;return new Response(JSON.stringify({data:{issues:{nodes:Array.from({length:3},(_,i)=>issue(`${after?'b':'a'}${i}`,c.linear.readyStateId)),pageInfo:{hasNextPage:!after,endCursor:after?null:'next'}}}}));}) as any;
+  await poll(config,s,'test');expect(s.list().length).toBe(6);await w.tick(config);expect(starts).toBe(1);
+  await poll(config,s,'test');await w.tick(config);expect(s.list().length).toBe(6);expect(starts).toBe(1);
+  expect(s.db.query('SELECT count(*) AS n FROM planning_dispatch').get()).toEqual({n:1});
+ }finally{globalThis.fetch=old;s.close();}
+});
 test('owned In Progress tickets remain eligible, while unrelated in-progress tickets are never adopted',async()=>{
  const old=globalThis.fetch,s=new Store(':memory:');new Workflow(s,{} as any);try{
  const source=issue('owned',c.statusSync.inProgress),id=s.enqueue(c.linear.projectId,'owned',JSON.stringify({identifier:source.identifier,title:source.title,description:source.description})),p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');
