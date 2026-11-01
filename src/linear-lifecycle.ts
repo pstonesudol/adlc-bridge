@@ -4,19 +4,50 @@ import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
+const driftBody=(reason:string)=>reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.';
 export class LinearLifecycle{
  constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));
   CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));
-  CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);}
-  async driftNotice(job:string,reason:string,c:SyncConfig){
-   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
-   if(issue?.project?.id!==c.linear.projectId||issue?.team?.id!==c.linear.teamId||j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Requirements changed; refusing branch drift notice');
-   const signature=digest(reason),claimed=this.s.db.query('INSERT OR IGNORE INTO branch_drift_notices VALUES (?,?,?)').run(job,signature,'delivery_uncertain');
-   if(!claimed.changes)return;
-   const result=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',{input:{issueId:j.issue,body:reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.'}});
-   if(!result.commentCreate?.success)throw Error('Branch drift notice delivery uncertain; no blind replay');
-   this.s.db.query("UPDATE branch_drift_notices SET state='confirmed' WHERE job=? AND signature=?").run(job,signature);
+ CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,comment_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);
+  if(!(s.db.query('PRAGMA table_info(branch_drift_notices)').all() as any[]).some(x=>x.name==='comment_id'))s.db.exec('ALTER TABLE branch_drift_notices ADD COLUMN comment_id TEXT');}
+ async driftComment(issueId:string,commentId:string,body:string){
+  let after:string|null=null;
+  for(;;){
+   const b=await this.api('query($id:String!,$after:String){issue(id:$id){comments(first:100,after:$after){nodes{id body} pageInfo{hasNextPage endCursor}}}}',{id:issueId,after});
+   const page=b?.issue?.comments;
+   if(!page?.pageInfo||!Array.isArray(page.nodes))throw Error('Branch drift notice comment evidence unavailable');
+   if(page.nodes.some((x:any)=>x.id===commentId&&x.body===body))return true;
+   if(!page.pageInfo.hasNextPage)return false;
+   if(!page.pageInfo.endCursor||page.pageInfo.endCursor===after)throw Error('Branch drift notice comment evidence unavailable');
+   after=page.pageInfo.endCursor;
   }
+ }
+ async driftNotice(job:string,reason:string,c:SyncConfig){
+  const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
+  if(issue?.project?.id!==c.linear.projectId||issue?.team?.id!==c.linear.teamId||j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Requirements changed; refusing branch drift notice');
+  const signature=digest(reason),body=driftBody(reason),find=()=>this.s.db.query('SELECT * FROM branch_drift_notices WHERE job=? AND signature=?').get(job,signature) as any;
+  let row=find();
+  if(row?.state==='confirmed')return;
+  if(!row){
+   const commentId=randomUUID();
+   const claimed=this.s.db.query('INSERT OR IGNORE INTO branch_drift_notices(job,signature,comment_id,state) VALUES (?,?,?,?)').run(job,signature,commentId,'delivery_uncertain');
+   row=find();
+   if(claimed.changes){
+    const result=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',{input:{id:commentId,issueId:j.issue,body}});
+    if(!result.commentCreate?.success)throw Error('Branch drift notice delivery uncertain; no blind replay');
+    this.s.db.query("UPDATE branch_drift_notices SET state='confirmed' WHERE job=? AND signature=? AND state='delivery_uncertain'").run(job,signature);
+    return;
+   }
+   if(row?.state==='confirmed')return;
+  }
+  // A prior attempt may have created the comment before its response was lost.
+  // Confirm only the exact client-generated ID and body; never replay it.
+  if(row?.comment_id&&await this.driftComment(j.issue,row.comment_id,body)){
+   this.s.db.query("UPDATE branch_drift_notices SET state='confirmed' WHERE job=? AND signature=? AND state='delivery_uncertain'").run(job,signature);
+   return;
+  }
+  throw Error('Branch drift notice delivery uncertain; no blind replay');
+ }
  private async comments(issue:string){
   const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
   do{

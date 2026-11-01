@@ -38,12 +38,21 @@ test('preview is read only; exact adoption preserves reservation, budget, and po
  expect(()=>assertDeliveryTarget(f.s,f.id,session,'owner/repo',8,snapshot)).toThrow('mismatched');
  }finally{f.s.close();}
 });
+test('canonical worktree comparison accepts equivalent paths and persists the raw authorization',async()=>{
+ const f=fixture();try{
+  f.s.db.query("UPDATE planning_runs SET worktree='/worktree/' WHERE job=?").run(f.id);
+  f.s.db.query("UPDATE runs SET worktree='/worktree/' WHERE job=?").run(f.id);
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  expect(f.s.db.query('SELECT worktree FROM delivery_adoptions WHERE job=?').get(f.id).worktree).toBe('/worktree/');
+  expect(deliveryBranch(f.s,f.id,{id:'worker',branch:f.r.branch},'owner/repo',7)).toBe(f.facts.branch);
+ }finally{f.s.close();}
+});
 for(const [name,change] of Object.entries({
  lineage:(f:DeliveryFacts)=>f.lineage=false,dirty:(f:DeliveryFacts)=>f.clean=false,shared:(f:DeliveryFacts)=>f.isolated=false,queued:(f:DeliveryFacts)=>f.idle=false,receipt:(f:DeliveryFacts)=>f.completed=false,
  owner:(f:DeliveryFacts)=>f.owners.push('other'),duplicate:(f:DeliveryFacts)=>f.candidates.push({...f.candidates[0]}),missing:(f:DeliveryFacts)=>f.candidates=[],
  fork:(f:DeliveryFacts)=>f.candidates[0].fork=true,similar:(f:DeliveryFacts)=>f.candidates[0].repo='owner/repo-evil',diverged:(f:DeliveryFacts)=>f.candidates[0].head='c'.repeat(40),default:(f:DeliveryFacts)=>f.candidates[0].defaultBranch=f.branch,
  session:(f:DeliveryFacts)=>f.session='imposter',branch:(f:DeliveryFacts)=>f.candidates[0].branch='similar',closed:(f:DeliveryFacts)=>f.candidates[0].state='closed'
-}))test(`recovery fails closed: ${name}`,async()=>{const f=fixture();try{change(f.facts);await expect(f.recovery.preview(f.id,f.c)).rejects.toThrow();expect(f.calls()).toBe(0);}finally{f.s.close();}});
+}))test(`recovery fails closed: ${name}`,async()=>{const f=fixture();const expected:Record<string,string>={lineage:'Reserved branch lineage',dirty:'Clean registered isolated worktree',shared:'Clean registered isolated worktree',queued:'Idle controller',receipt:'Completed original implementation',owner:'Another active session',duplicate:'Exactly one unambiguous',missing:'Exactly one unambiguous',fork:'Existing PR repository',similar:'Existing PR repository',diverged:'Existing PR repository',default:'Existing PR repository',branch:'Existing PR repository',closed:'Existing PR repository',session:'identity mismatch'};try{change(f.facts);await expect(f.recovery.preview(f.id,f.c)).rejects.toThrow(expected[name]);expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('lost claim receipt reconciles attachment without another claim; concurrent confirms are bounded',async()=>{const f=fixture();try{f.lose();const p=await f.recovery.preview(f.id,f.c);await Promise.allSettled([f.recovery.confirm(f.id,f.c,p.hash),f.recovery.confirm(f.id,f.c,p.hash)]);await f.recovery.confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);}finally{f.s.close();}});
 test('uncertain unattached claim is durable and never replayed',async()=>{const f=fixture();try{f.t.claim=async()=>{throw Error('unknown');};const p=await f.recovery.preview(f.id,f.c);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');let calls=0;f.t.claim=async()=>{calls++;};await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');expect(calls).toBe(0);}finally{f.s.close();}});

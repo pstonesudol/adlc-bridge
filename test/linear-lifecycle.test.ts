@@ -154,10 +154,18 @@ test('requirements binding is rechecked inside terminal completion transaction',
  }finally{f.s.close();}
 });
 
-test('branch mismatch notice is deduplicated including uncertain delivery',async()=>{
+test('branch mismatch sync posts one notice and confirms uncertain delivery by comment ID',async()=>{
  const f=fixture();try{
-  let calls=0;const original=f.sync.api;f.sync.api=async(q,v)=>{if(q.includes('commentCreate')){calls++;expect(v.input.body).toContain('reserved old; actual new');expect(v.input.body).toContain('--confirm HASH');throw Error('Lost receipt');}return original(q,v);};
   const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
-  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');await f.sync.driftNotice(f.id,reason,c);expect(calls).toBe(1);expect(f.updates).toBe(0);
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'a'.repeat(64),'worker','client','blocked','["**"]','supervised-host','human',reason);
+  const comments:any[]=[];let calls=0;const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){calls++;expect(v.input.id).toMatch(/^[0-9a-f-]{36}$/);expect(v.input.body).toContain('reserved old; actual new');expect(v.input.body).toContain('--confirm HASH');comments.push({id:v.input.id,body:v.input.body});throw Error('Lost receipt');}
+   if(q.includes('comments('))return {issue:{comments:{nodes:comments.slice(),pageInfo:{hasNextPage:false,endCursor:null}}}};
+   return original(q,v);
+  };
+  const first=await f.sync.sync(c);expect(first[0].error).toBe('Lost receipt');expect(calls).toBe(1);expect(f.updates).toBe(0);
+  const second=await f.sync.sync(c);expect(second[0]).toEqual({job:f.id,state:'blocked',reason});expect(calls).toBe(1);expect(comments.length).toBe(1);expect(f.updates).toBe(0);
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices').all()).toEqual([{state:'confirmed'}]);
  }finally{f.s.close();}
 });

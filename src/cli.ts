@@ -120,8 +120,9 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?JSON.parse(readFileSync(req(a[0],'Config'),'utf8')):null;if(c)validate(c);
    if(command==='recover-handoff'){
-    const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));
+    const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
+    if(!existsSync(db))throw Error('Existing state database required');
     const store=new Store(db,a.length===2);
     try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
    }

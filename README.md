@@ -592,7 +592,7 @@ session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
 
-# Existing worker PR recovery
+## Existing worker PR recovery
 
 Workers must retain the reserved planning branch. At completed delivery, the
 bridge verifies the registered worktree branch/HEAD and PR identity. Drift is

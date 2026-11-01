@@ -1,4 +1,11 @@
+import {realpathSync} from 'node:fs';
+import {resolve} from 'node:path';
 import {Store,digest} from './core';
+
+// Evidence reports the resolved worktree root, while authorization keeps the
+// originally registered value. Compare canonical forms, but persist the raw
+// authorized value so later consumers compare like with like.
+const canonical=(p:string)=>{try{return realpathSync(p);}catch{return resolve(p);}};
 
 export type DeliveryFacts={session:string;project:string;reserved:string;worktree:string;branch:string;head:string;anchor:string;clean:boolean;isolated:boolean;lineage:boolean;idle:boolean;completed:boolean;owners:string[];candidates:{repo:string;pr:number;url:string;branch:string;head:string;baseBranch:string;defaultBranch:string;fork:boolean;state:string;draft:boolean}[]};
 export type RecoveryTransport={inspect(job:string,c:any):Promise<DeliveryFacts>;claim(session:string,url:string):Promise<void>;attached(session:string,url:string):Promise<boolean>};
@@ -19,7 +26,7 @@ export class DeliveryRecovery{
  async preview(job:string,c:any){
   // No constructors with schema side effects and no intake/Linear mutations here.
   const auth=this.authorization(job,c),f=await this.t.inspect(job,c);
-  if(f.session!==auth.session||f.project!==auth.project||f.reserved!==auth.reserved||f.worktree!==auth.worktree)throw Error('Originating session/worktree identity mismatch');
+  if(f.session!==auth.session||f.project!==auth.project||f.reserved!==auth.reserved||f.worktree!==canonical(auth.worktree))throw Error('Originating session/worktree identity mismatch');
   if(!f.idle)throw Error('Idle controller with no queued or running turns required');
   if(!f.completed)throw Error('Completed original implementation delivery receipt required');
   if(!f.isolated||!f.clean)throw Error('Clean registered isolated worktree required');
@@ -42,7 +49,7 @@ export class DeliveryRecovery{
    this.authorization(job,c);
    const old=this.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(job) as any;
    if(old){if(old.proposal!==hash)throw Error('Existing adoption requires reconciliation; never overwrite');return false;}
-   this.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(job,hash,'claim_uncertain',p.session,p.worktree,p.reserved,p.branch,p.candidate.repo,p.candidate.pr,p.head,p.anchor,p.auth.plan,p.auth.spec,JSON.stringify(p));
+   this.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(job,hash,'claim_uncertain',p.session,p.auth.worktree,p.reserved,p.branch,p.candidate.repo,p.candidate.pr,p.head,p.anchor,p.auth.plan,p.auth.spec,JSON.stringify(p));
    this.s.event(job,'delivery_adoption_reserved',JSON.stringify({hash,session:p.session,pr:p.candidate.url,reserved:p.reserved,branch:p.branch}));return true;
   }).immediate();
   if(claim){
