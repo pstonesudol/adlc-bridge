@@ -10,6 +10,13 @@ async function launch(args:string[]){
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  return {stdout,stderr,code};
 }
+export async function reloadService(apply:boolean,loaded:boolean,domain:string,target:string,plist:string,run:(args:string[])=>Promise<{code:number}>=launch){
+ // Explicit apply also retries a previous failed unload after the file was updated.
+ if(!apply||!loaded)return false;
+ if((await run(['bootout',target])).code!==0)throw Error('Service unload failed; inspect service-status and retry service-config PROJECT --apply');
+ if((await run(['bootstrap',domain,plist])).code!==0)throw Error('Service reload failed; inspect service-status and use start PROJECT');
+ return true;
+}
 export async function registeredProjects(){
  const s=new Store(registryPath());try{const registry=new ProjectServices(s);registry.discoverLegacy();return registry.list().map(p=>({...p,definitionInstalled:existsSync(join(homedir(),'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
 }
@@ -35,11 +42,8 @@ export async function serviceControl(action:string,project?:string,apply=false){
    if(action==='service-config'){
     const current=await status();
     const update=serviceSettings(plist,label,entry.config,projectConfig,apply);
-    if(update.applied&&current.loaded){
-     if((await launch(['bootout',target])).code!==0)throw Error('Definition updated but unload failed; inspect service-status before retrying');
-     if((await launch(['bootstrap',domain,plist])).code!==0)throw Error('Definition updated but reload failed; inspect service-status and use start PROJECT');
-    }
-    return {project:entry.project,...update,reloaded:update.applied&&current.loaded,workerSessionsStopped:false};
+    const reloaded=await reloadService(apply,current.loaded,domain,target,plist);
+    return {project:entry.project,...update,reloaded,workerSessionsStopped:false};
    }
   if(!['start','stop'].includes(action))throw Error('Unknown service action');
   let current=await status();

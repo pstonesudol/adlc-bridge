@@ -84,6 +84,23 @@ test('planning concurrency limit holds across overlapping ticks',async()=>{
  await Promise.all([w.tick(config),w.tick(config)]);expect(f.starts.length).toBe(1);s.close();
 });
 
+test('manually completed planning frees slots in tick and direct transactional admission',async()=>{
+ for(const state of ['awaiting_approval','approved','done'])for(const direct of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   await w.startPlanning(first,config);
+   const hash=s.propose(first,'Manually submitted plan');
+   if(state!=='awaiting_approval')s.approve(first,hash,'human');
+   if(state==='done')s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(first);
+   expect(w.planning(first).state).toBe('planning');
+   if(direct)await w.startPlanning(next,config);else await w.tick(config);
+   expect(f.starts.length).toBe(2);expect(w.planning(next).state).toBe('planning');
+   expect(f.sends).toEqual([]);
+  }finally{s.close();}
+ }
+});
+
 test('capacity above two queues overflow, lowering waits, completion admits queued work',async()=>{
  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
  const c={...config,automation:{...config.automation,maxPlanning:3}};

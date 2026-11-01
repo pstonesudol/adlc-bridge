@@ -2,13 +2,14 @@ import {test,expect} from 'bun:test';import {Store} from '../src/core';import {P
 import {readFileSync} from 'node:fs';
 import {readDefinition} from '../src/project-services';
 import {serviceSettings} from '../src/service-settings';
+import {reloadService} from '../src/service-control';
 function fixture(){const dir=mkdtempSync(join(tmpdir(),'adlc-projects-')),s=new Store(':memory:'),registry=new ProjectServices(s);
  const config=(id:string,linear:string)=>{const repo=join(dir,id);mkdirSync(repo);const path=join(dir,id+'.json');writeFileSync(path,JSON.stringify({version:1,name:id,repo,automation:{orchestratorProject:id},linear:{projectId:linear,teamId:'00000000-0000-0000-0000-000000000001',readyStateId:'00000000-0000-0000-0000-000000000002',readyLabelId:'00000000-0000-0000-0000-000000000003'}}));return path;};return {dir,s,registry,config,close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};}
 test('separate projects retain independent labels; ambiguous controls never choose a project',()=>{const f=fixture();try{const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'),legacyLabel),b=f.registry.register(f.config('two','00000000-0000-0000-0000-000000000005'));expect(a.label).toBe(legacyLabel);expect(b.label).not.toBe(a.label);expect(()=>f.registry.select()).toThrow('Multiple');expect(f.registry.select('one')).toEqual(a);expect(f.registry.select('two')).toEqual(b);expect(f.registry.register(a.config)).toEqual(a);}finally{f.close();}});
 test('registration preflight detects conflicts without writing or replacing identities',()=>{const f=fixture();try{const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'));const other=f.config('two','00000000-0000-0000-0000-000000000004');expect(()=>f.registry.register(other,undefined,false)).toThrow('already');expect(f.registry.list()).toEqual([a]);const third=f.config('three','00000000-0000-0000-0000-000000000005');f.registry.register(third,undefined,false);expect(f.registry.list().length).toBe(1);}finally{f.close();}});
 test('launch definitions use independent labels and log paths and reject a mismatched configuration',()=>{const label=projectServiceLabel('second');const xml=serviceDefinition('/config/second.json','/bun',resolve(import.meta.dir,'../src/cli.ts'),'/home/test',label);expect(xml).toContain(`<string>${label}</string>`);expect(xml).toContain(`${label}.log`);expect(()=>assertDefinition({Label:label,ProgramArguments:['/bun',resolve(import.meta.dir,'../src/cli.ts'),'poll','/other.json']},label,'/config/second.json')).toThrow('preserved');});
 
-test.skipIf(process.platform!=='darwin')('service preview is read-only and apply changes only the selected interval',()=>{
+test.skipIf(process.platform!=='darwin')('service preview is read-only and apply changes only the selected interval',async()=>{
  const f=fixture();try{
   const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004')),b=f.registry.register(f.config('two','00000000-0000-0000-0000-000000000005'));
   const source=resolve(import.meta.dir,'../src/cli.ts'),pa=join(f.dir,'a.plist'),pb=join(f.dir,'b.plist');
@@ -20,6 +21,24 @@ test.skipIf(process.platform!=='darwin')('service preview is read-only and apply
   expect(serviceSettings(pa,a.label,a.config,settings,true).applied).toBe(true);
   expect(readDefinition(pa)).toEqual({...definition,StartInterval:15});expect(readFileSync(pb,'utf8')).toBe(other);
   expect(serviceSettings(pa,a.label,a.config,settings,true).applied).toBe(false);
+  // The file now matches, but the first unload can fail. Explicit apply must retry.
+  const calls:string[][]=[];let fail=true;
+  const run=async(args:string[])=>{calls.push(args);return {code:args[0]==='bootout'&&fail?1:0};};
+   await expect(reloadService(true,true,'gui/test',a.label,pa,run)).rejects.toThrow('retry');
+   expect(calls.map(x=>x[0])).toEqual(['bootout']);fail=false;
+   expect(serviceSettings(pa,a.label,a.config,settings,true).applied).toBe(false);
+   expect(await reloadService(true,true,'gui/test',a.label,pa,run)).toBe(true);
+   expect(calls.map(x=>x[0])).toEqual(['bootout','bootout','bootstrap']);
   expect(()=>serviceSettings(pa,a.label,a.config,{pollingIntervalSeconds:0},true)).toThrow('pollingIntervalSeconds');
  }finally{f.close();}
+});
+
+test('reload leaves previews and stopped services alone and reports bootstrap failure',async()=>{
+ const calls:string[][]=[];
+ const run=async(args:string[])=>{calls.push(args);return {code:args[0]==='bootstrap'?1:0};};
+ expect(await reloadService(false,true,'domain','target','plist',run)).toBe(false);
+ expect(await reloadService(true,false,'domain','target','plist',run)).toBe(false);
+ expect(calls).toEqual([]);
+ await expect(reloadService(true,true,'domain','target','plist',run)).rejects.toThrow('use start PROJECT');
+ expect(calls).toEqual([['bootout','target'],['bootstrap','domain','plist']]);
 });
