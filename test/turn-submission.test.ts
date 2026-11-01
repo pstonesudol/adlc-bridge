@@ -10,6 +10,7 @@ function fixture(){
 test('an in-flight implementation send retains the shared barrier until the delivery receipt settles',async()=>{
  const f=fixture();let finish!:(value:number)=>void;const exited=new Promise<number>(resolve=>finish=resolve);let sends=0;
  try{
+  f.ops.projects=async()=>[{project:'intake'}];f.ops.project=async action=>{f.calls.push(`${action}:intake`);return {};};
   const transport=createWorkflowTransport(f.turns.submit,(()=>{sends++;return receipt(exited);}) as any),delivery=transport.sendImplementation('worker','prompt','key');
   await expect(controlStack('stop',f.ops)).rejects.toThrow('submission or shutdown is in progress');expect(f.calls).toEqual([]);expect(sends).toBe(1);
   finish(0);await delivery;f.ops.blockers=async()=>[{session:'worker',reason:'queued turn'}];await expect(controlStack('stop',f.ops)).rejects.toThrow('queued turn');expect(f.calls).not.toContain('stop');
@@ -39,4 +40,14 @@ test('the turn barrier coordinates independent processes and never steals an act
 });
 test('failed backend startup never removes a persisted submission pause',async()=>{
  const f=fixture();try{await controlStack('stop',f.ops);f.ops.backendStart=async()=>{throw Error('startup failed');};await expect(controlStack('start',f.ops)).rejects.toThrow('startup failed');await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);}finally{f.close();}
+});
+test('planning setup retains the barrier through receipt validation and native feedback setup',async()=>{
+ const f=fixture();let release!:()=>void;let entered!:()=>void;const setupEntered=new Promise<void>(resolve=>entered=resolve),setupGate=new Promise<void>(resolve=>release=resolve);
+ try{
+  const transport=createWorkflowTransport(f.turns.submit,undefined,async()=>({session:{id:'worker',projectId:'p',branch:'feature'}}),async()=>{entered();await setupGate;return {};});
+  const setup=transport.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'});await setupEntered;
+  await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');release();expect(await setup).toEqual({id:'worker'});await f.turns.run(async()=>{});
+  let disabled=false;const invalid=createWorkflowTransport(f.turns.submit,undefined,async()=>({session:{id:'worker',projectId:'foreign',branch:'feature'}}),async()=>{disabled=true;return {};});
+  await expect(invalid.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow('Invalid planning spawn receipt');expect(disabled).toBe(false);await f.turns.run(async()=>{});
+ }finally{release?.();f.close();}
 });

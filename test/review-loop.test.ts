@@ -4,7 +4,7 @@ import {Store} from '../src/core';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {sendPilotRemediation} from '../src/pilot';
-import {turnBarrier} from '../src/turn-submission';import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -140,8 +140,11 @@ test('a description edit creates its review gate before considering an old clear
  }finally{f.s.close();}
 });
 test('pilot remediation uses the same submission barrier as shutdown and never spawns through a held fence',async()=>{
- const f=templateFixture(),state=mkdtempSync(join(tmpdir(),'adlc-pilot-fence-')),turns=turnBarrier(state);try{
-  f.io.submit=turns.submit;await turns.run(async()=>{await expect(f.loop.tick(f.id)).rejects.toThrow('in progress');expect(f.sends()).toBe(0);});
-  expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});expect(f.sends()).toBe(0);
- }finally{f.s.close();rmSync(state,{recursive:true,force:true});}
+ const home=mkdtempSync(join(tmpdir(),'adlc-pilot-fence-'));try{
+  const child=Bun.spawnSync([process.execPath,join(import.meta.dir,'pilot-barrier-fixture.ts')],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:home,ADLC_DB:join(home,'unused.sqlite')}});
+  expect(child.exitCode).toBe(0);const result=JSON.parse(child.stdout.toString());expect(result.rejection).toContain('in progress');expect(result.sends).toBe(0);expect(result.attempts).toBe(0);expect(result.rows).toEqual([]);
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+test('an attempted pilot send preserves uncertainty and its consumed budget when spawning fails',async()=>{
+ const f=templateFixture();try{f.io.spawn=()=>{throw Error('spawn receipt lost');};await expect(f.loop.tick(f.id)).rejects.toThrow('receipt lost');expect(f.s.get(f.id).attempts).toBe(1);expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});}finally{f.s.close();}
 });

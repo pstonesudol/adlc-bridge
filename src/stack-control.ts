@@ -31,8 +31,8 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
   const results=[];for(const p of projects)results.push(await ops.project('start',p.project));
   return {scope:'all',backend,projects:results};
  }
- const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
  return ops.turns.run(async()=>{
+ const results=[];for(const p of projects)results.push(await ops.project('stop',p.project));
  ops.turns.pause();
  const backend=await ops.backend();
  if(backend.ready){
