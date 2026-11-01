@@ -22,8 +22,10 @@ test('maintenance preview and stale confirmation never perform external or durab
   const before=f.s.db.query('SELECT count(*) AS n FROM events').get();const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);expect(preview.preview).toBe(true);
   await expect(maintenance(f.s,'recover',f.id,true,'stale',f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(before);
   f.done();const cleanup=await maintenance(f.s,'cleanup',f.id,false,undefined,f.io);expect(cleanup.preview).toBe(true);await expect(maintenance(f.s,'cleanup',f.id,true,'stale',f.io)).rejects.toThrow('confirmation');expect(f.writes).toEqual([]);
- }finally{f.close();}
-});
+  }finally{f.close();}
+ // Hosted macOS runners can spend several seconds starting the first native Git
+ // command. Keep every no-write assertion, but allow bounded cold-start time.
+},15000);
 test('cleanup rejects dirty and ignored files even with a previously valid confirmation',async()=>{
  for(const file of ['dirty','ignored']){const f=fixture();try{f.done();const preview=await maintenance(f.s,'cleanup',f.id,false,undefined,f.io);writeFileSync(join(f.tree,file),'preserve');await expect(maintenance(f.s,'cleanup',f.id,true,preview.confirmation,f.io)).rejects.toThrow('preserved');expect(f.writes).toEqual([]);expect(readFileSync(join(f.tree,file),'utf8')).toBe('preserve');}finally{f.close();}}
 });
