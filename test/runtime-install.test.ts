@@ -19,3 +19,24 @@ test('runtime registration restores both prior files if the post-install trust c
 test('runtime status failures are rejected before creating registrations',async()=>{
  for(const result of [{stdout:Buffer.from('malformed'),exitCode:0},{stdout:Buffer.from('{"state":"stopped"}'),exitCode:1}]){const f=fixture();try{f.io.command=()=>result;await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow();expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);}finally{f.close();}}
 });
+test('runtime rollback reports the original failure and every affected path instead of discarding restoration errors',async()=>{
+ const f=fixture();try{
+  mkdirSync(join(f.io.home(),'Library/LaunchAgents'),{recursive:true});writeFileSync(f.pin,'{"serviceLabel":"local.adlc.orchestrator"}',{mode:0o600});writeFileSync(f.plist,'prior plist');const original=Error('trust check failed');
+  f.io.trustedDaemon=()=>{for(const path of [f.pin,f.plist]){rmSync(path);mkdirSync(path);}throw original;};
+  const error=await installRuntime(f.binary,true,f.io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(3);expect(error.errors[0]).toBe(original);expect(error.message).toContain(original.message);
+  for(const [i,path] of [f.pin,f.plist].entries()){expect(error.message).toContain(path);expect(error.errors[i+1].message).toContain(path);expect(error.errors[i+1].cause).toBeInstanceOf(Error);}
+ }finally{f.close();}
+});
+test('runtime rollback continues restoring the plist after pin restoration fails',async()=>{
+ const f=fixture();try{
+  mkdirSync(join(f.io.home(),'Library/LaunchAgents'),{recursive:true});writeFileSync(f.pin,'{"serviceLabel":"local.adlc.orchestrator"}',{mode:0o600});writeFileSync(f.plist,'prior plist');
+  f.io.trustedDaemon=()=>{rmSync(f.pin);mkdirSync(f.pin);return false;};
+  const error=await installRuntime(f.binary,true,f.io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(2);expect(error.errors[0].message).toContain('not trusted');expect(error.message).toContain(f.pin);expect(readFileSync(f.plist,'utf8')).toBe('prior plist');
+ }finally{f.close();}
+});
+test('successful runtime rollback preserves the original error identity',async()=>{
+ const f=fixture();try{
+  const original=Error('trust read failed');f.io.trustedDaemon=()=>{throw original;};
+  expect(await installRuntime(f.binary,true,f.io).catch(error=>error)).toBe(original);expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);
+ }finally{f.close();}
+});

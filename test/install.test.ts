@@ -47,3 +47,28 @@ test('install uses read-only project discovery for preview and writable discover
   await installBridge(false,source,join(root,'adlc'),io);expect(existsSync(join(state,'installation.json'))).toBe(false);await installBridge(true,source,join(root,'adlc'),io);expect(modes).toEqual([true,false]);expect(existsSync(join(state,'installation.json'))).toBe(true);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('incomplete installation rollback reports every failure and continues restoration and service restarts',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-rollback-errors-'));try{
+  const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json');
+  for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');
+  const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`})),plists=projects.map(p=>join(home,'Library/LaunchAgents',p.label+'.plist'));for(const path of plists)writeFileSync(path,'old plist');
+  const original=Error('activation failed'),pause=Error('rollback stop failed'),settings=Error('settings restore failed'),restart=Error('restart failed'),calls:string[]=[];let starts=0;
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{},
+   localAO:async(path:string,method?:string)=>{calls.push(`${method??'GET'}:${path}`);if(method==='PUT'&&path.includes('/first/'))throw settings;return {status:'ok',project:{config:{old:true}}};},
+   serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {loaded:true};if(action==='start'&&id==='first'){
+    if(++starts===1){for(const path of [record,plists[0],launcher]){rmSync(path);mkdirSync(path);}throw original;}throw restart;
+   }if(action==='stop'&&id==='first'&&starts)throw pause;return {};}};
+  const error=await installBridge(true,source,launcher,io).catch(error=>error);
+  expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(7);expect(error.errors[0]).toBe(original);expect(error.message).toContain(original.message);
+  expect(error.errors.map((e:any)=>e.cause)).toContain(pause);expect(error.errors.map((e:any)=>e.cause)).toContain(settings);expect(error.errors.map((e:any)=>e.cause)).toContain(restart);
+  for(const target of [record,plists[0],launcher,'first'])expect(error.message).toContain(target);
+  expect(calls).toContain('PUT:projects/second/config');expect(calls.slice(-2)).toEqual(['start:first','start:second']);expect(readFileSync(plists[1],'utf8')).toBe('old plist');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('successful installation rollback rethrows the original error unchanged',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-rollback-original-'));try{
+  const source=join(root,'source');mkdirSync(join(source,'src'),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'cli');const original=Error('hook failure');
+  const io:any={state:()=>join(root,'state'),home:()=>root,registeredProjects:async()=>[{project:'one',label:'local.adlc.one',config:'/one.json'}],localAO:async()=>({status:'ok',project:{config:{}}}),installWorkflowHook:async()=>{throw original;}};
+  expect(await installBridge(true,source,join(root,'adlc'),io).catch(error=>error)).toBe(original);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});

@@ -51,14 +51,14 @@ async function command(args:string[]){
 }
 const stateDir=()=>join(homedir(),'Library/Application Support/ADLC Bridge');
 function owned(path:string){const s=lstatSync(path);if(!s.isFile()||s.isSymbolicLink()||s.uid!==process.getuid?.()||(s.mode&0o022)!==0)throw Error('Managed service files must be owned by you and not writable by others');}
-function definition(){
- const path=join(stateDir(),'orchestrator-runtime.json');owned(path);
+export function managedServiceDefinition(state=stateDir(),home=homedir(),trust=trustedDaemon){
+ const path=join(state,'orchestrator-runtime.json');owned(path);
  const pin=JSON.parse(readFileSync(path,'utf8'));
  if(!/^local\.adlc\.[a-z0-9.-]+$/.test(pin.serviceLabel??''))throw Error('No managed Orchestrator service registered');
- if(!trustedDaemon(pin.executable))throw Error('Managed Orchestrator binary does not match its registered hash');
- const plist=join(homedir(),'Library/LaunchAgents',pin.serviceLabel+'.plist');owned(plist);
+ if(!trust(pin.executable))throw Error('Managed Orchestrator binary does not match its registered hash');
+ const plist=join(home,'Library/LaunchAgents',pin.serviceLabel+'.plist');owned(plist);
  const d=readDefinition(plist);
- if(d.Label!==pin.serviceLabel||!Array.isArray(d.ProgramArguments)||d.ProgramArguments.length!==2||d.ProgramArguments[1]!==pin.launcher)throw Error('Managed Orchestrator service definition changed');
+ if(d.Label!==pin.serviceLabel||!Array.isArray(d.ProgramArguments)||d.ProgramArguments.length!==2||d.ProgramArguments[0]!=='/usr/bin/python3'||d.ProgramArguments[1]!==pin.launcher)throw Error('Managed Orchestrator service definition changed');
  owned(pin.launcher);
  return {...pin,plist,target:`gui/${process.getuid()}/${pin.serviceLabel}`,domain:`gui/${process.getuid()}`};
 }
@@ -107,7 +107,7 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  return blocked;
 }
 export function liveStackOps(readOnly=false):StackOps{
- const config=definition(),turns=turnBarrier();
+ const config=managedServiceDefinition(),turns=turnBarrier();
  return {
   turns,
   projects:()=>registeredProjects(readOnly),

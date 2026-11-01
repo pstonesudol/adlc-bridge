@@ -26,9 +26,11 @@ export async function installRuntime(binary:string,apply=false,io=runtimeIO){
   atomicFile(plist,runtimeDefinition(label,launcher,join(io.state(),'orchestrator.log')));
   atomicFile(pinPath,JSON.stringify({executable,sha256,serviceLabel:label,launcher,appRunId:old.appRunId??'adlc-native-ci-fix-v1'},null,2)+'\n');
   if(!io.trustedDaemon(executable))throw Error('Installed runtime registration is not trusted');
- }catch(e){
-  for(const [path,prior] of [[pinPath,oldPin],[plist,oldPlist]] as const)try{if(prior)atomicFile(path,prior);else if(existsSync(path))unlinkSync(path);}catch{console.error('Runtime registration rollback needs inspection:',path);}
-  throw e;
+  }catch(e){
+   const rollbackErrors:Error[]=[];
+   for(const [path,prior] of [[pinPath,oldPin],[plist,oldPlist]] as const)try{if(prior)atomicFile(path,prior);else if(existsSync(path))unlinkSync(path);}catch(error){rollbackErrors.push(new Error(`Runtime registration rollback needs inspection: ${path}`,{cause:error}));}
+   if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Runtime installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
+   throw e;
  }
  return {installed:true,executable,sha256,service:label,backup,started:false};
 }

@@ -68,15 +68,18 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
   atomic(launcher,`#!/bin/sh\nexec ${quote(process.execPath)} ${quote(built.cli)} "$@"\n`,0o755);
   for(const id of active){restarted.push(id);await io.serviceControl('start',id);}
   return {installed:true,...built,launcher,backup,projects:projects.map(p=>p.project),runtimeRestartRequired:!!runtime,note:runtime?'Runtime launcher migrated. Use guarded stop --all/start --all to activate it; no backend was restarted.':undefined};
- }catch(e){
-  // Restore intake definitions/launcher; keep backups and the immutable snapshot.
-  for(const id of restarted)try{await io.serviceControl('stop',id);}catch{console.error('Intake rollback pause needs inspection:',id);}
-  try{if(oldRecord)atomic(recordPath,oldRecord.toString());else if(existsSync(recordPath))unlinkSync(recordPath);}catch{console.error('Installation record rollback needs inspection:',recordPath);}
-  for(const p of originalProjects)try{await io.localAO(`projects/${p.id}/config`,'PUT',{config:p.config});}catch{console.error('Project settings rollback needs inspection:',p.id);}
-  for(const {path,original} of definitions)if(original)try{atomic(path,original);}catch{console.error('Service rollback needs inspection:',path);}
-  if(runtimeChanged&&runtime)for(const [path,bytes] of [[runtime.pinPath,runtime.pinBytes],[runtime.plist,runtime.plistBytes]] as const)try{atomic(path,bytes);}catch{console.error('Runtime launcher rollback needs inspection:',path);}
-  try{if(oldLauncher)atomic(launcher,oldLauncher.toString(),0o755);else if(existsSync(launcher))unlinkSync(launcher);}catch{console.error('Launcher rollback needs inspection:',launcher);}
-  for(const id of active)try{await io.serviceControl('start',id);}catch{console.error('Intake restart needs inspection:',id);}
-  throw e;
+  }catch(e){
+   // Restore intake definitions/launcher; keep backups and the immutable snapshot.
+   const rollbackErrors:Error[]=[];
+   const failed=(operation:string,target:string,error:unknown)=>rollbackErrors.push(new Error(`${operation} needs inspection: ${target}`,{cause:error}));
+   for(const id of restarted)try{await io.serviceControl('stop',id);}catch(error){failed('Intake rollback pause',id,error);}
+   try{if(oldRecord)atomic(recordPath,oldRecord.toString());else if(existsSync(recordPath))unlinkSync(recordPath);}catch(error){failed('Installation record rollback',recordPath,error);}
+   for(const p of originalProjects)try{await io.localAO(`projects/${p.id}/config`,'PUT',{config:p.config});}catch(error){failed('Project settings rollback',p.id,error);}
+   for(const {path,original} of definitions)if(original)try{atomic(path,original);}catch(error){failed('Service rollback',path,error);}
+   if(runtimeChanged&&runtime)for(const [path,bytes] of [[runtime.pinPath,runtime.pinBytes],[runtime.plist,runtime.plistBytes]] as const)try{atomic(path,bytes);}catch(error){failed('Runtime launcher rollback',path,error);}
+   try{if(oldLauncher)atomic(launcher,oldLauncher.toString(),0o755);else if(existsSync(launcher))unlinkSync(launcher);}catch(error){failed('Launcher rollback',launcher,error);}
+   for(const id of active)try{await io.serviceControl('start',id);}catch(error){failed('Intake restart',id,error);}
+   if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; ${rollbackErrors.map(error=>error.message).join('; ')}`);
+   throw e;
  }
 }

@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,realpathSync,mkdirSync,writeFileSync,readFileSync,existsSync,rmSync,symlinkSync} from 'node:fs';import {join,dirname} from 'node:path';import {tmpdir} from 'node:os';import {createHash} from 'node:crypto';
 import {installBridge} from '../src/install';import {trustedDaemon} from '../src/daemon-runtime';import {readDefinition,definitionXML} from '../src/project-services';
+import {managedServiceDefinition} from '../src/stack-control';
 function fixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-runtime-migration-'))),home=join(root,'home'),state=join(root,'state'),source=join(root,'source'),launcher=join(root,'adlc');
  const prior=join(state,'versions/prior/src/serve-orchestrator.py'),binary=join(state,'runtimes/binary/ao'),pinPath=join(state,'orchestrator-runtime.json'),plist=join(home,'Library/LaunchAgents/local.adlc.orchestrator.plist');
@@ -34,4 +35,19 @@ test('runtime migration refuses untrusted binaries, mismatched plists and symlin
  for(const change of [(f:any)=>writeFileSync(f.binary,'tampered'),(f:any)=>writeFileSync(f.plist,definitionXML({...f.def,ProgramArguments:['/bin/sh',f.prior]})),(f:any)=>{const saved=join(f.state,'saved-pin');writeFileSync(saved,readFileSync(f.pinPath),{mode:0o600});rmSync(f.pinPath);symlinkSync(saved,f.pinPath);}]){const f=fixture();try{
   change(f);await expect(installBridge(true,f.source,f.launcher,f.io)).rejects.toThrow();expect(readFileSync(join(f.state,'installation.json'),'utf8')).toBe('prior record');expect(f.calls).toEqual([]);expect(existsSync(join(f.state,'backups'))).toBe(false);
  }finally{f.close();}}
+});
+test('managed stack definition validates the Python interpreter before checking the launcher or controlling services',()=>{
+ const f=fixture();try{
+  const trust=(binary:string)=>trustedDaemon(binary,f.pinPath);
+  expect(managedServiceDefinition(f.state,f.home,trust)).toMatchObject({launcher:f.prior,plist:f.plist});
+  writeFileSync(f.plist,definitionXML({...f.def,ProgramArguments:['/bin/sh',f.prior]}));rmSync(f.prior);
+  expect(()=>managedServiceDefinition(f.state,f.home,trust)).toThrow('Managed Orchestrator service definition changed');expect(f.calls).toEqual([]);
+ }finally{f.close();}
+});
+test('bridge rollback aggregates runtime pin and plist restoration failures and still restores the launcher and record',async()=>{
+ const f=fixture();try{
+  let checks=0;f.io.trustedDaemon=(binary:string,path:string)=>{if(++checks===1)return trustedDaemon(binary,path);for(const file of [f.pinPath,f.plist]){rmSync(file);mkdirSync(file);}return false;};
+  const error=await installBridge(true,f.source,f.launcher,f.io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(3);expect(error.errors[0].message).toContain('trust verification');
+  expect(error.message).toContain(f.pinPath);expect(error.message).toContain(f.plist);expect(readFileSync(f.launcher,'utf8')).toBe('prior src/cli.ts launcher');expect(readFileSync(join(f.state,'installation.json'),'utf8')).toBe('prior record');expect(f.calls).toEqual([]);
+ }finally{f.close();}
 });
