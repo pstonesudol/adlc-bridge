@@ -4,9 +4,9 @@ import {assertDefinition,readDefinition} from './project-services';
 import {effectiveSettings,type ProjectSettings} from './project-settings';
 
 // Change only StartInterval. Retain arguments, environment, logs and all unknown keys.
-export function serviceSettings(path:string,label:string,config:string,c:ProjectSettings,apply=false){
+export function serviceSettings(path:string,label:string,config:string,c:ProjectSettings,apply=false,verify=(def:any)=>assertDefinition(def,label,config)){
  const settings=effectiveSettings(c),before=readFileSync(path),definition=readDefinition(path);
- assertDefinition(definition,label,config);
+ verify(definition);
  const result={...settings,installedIntervalSeconds:definition.StartInterval,changed:definition.StartInterval!==settings.pollingIntervalSeconds,applied:false};
  if(!apply||!result.changed)return result;
  const dir=mkdtempSync(join(dirname(path),'.adlc-service-'));
