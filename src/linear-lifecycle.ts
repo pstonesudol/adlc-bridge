@@ -6,7 +6,17 @@ export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;don
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 export class LinearLifecycle{
  constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));
-  CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));`);}
+  CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));
+  CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);}
+  async driftNotice(job:string,reason:string,c:SyncConfig){
+   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
+   if(issue?.project?.id!==c.linear.projectId||issue?.team?.id!==c.linear.teamId||j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Requirements changed; refusing branch drift notice');
+   const signature=digest(reason),claimed=this.s.db.query('INSERT OR IGNORE INTO branch_drift_notices VALUES (?,?,?)').run(job,signature,'delivery_uncertain');
+   if(!claimed.changes)return;
+   const result=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',{input:{issueId:j.issue,body:reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.'}});
+   if(!result.commentCreate?.success)throw Error('Branch drift notice delivery uncertain; no blind replay');
+   this.s.db.query("UPDATE branch_drift_notices SET state='confirmed' WHERE job=? AND signature=?").run(job,signature);
+  }
  private async comments(issue:string){
   const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
   do{
@@ -92,6 +102,10 @@ export class LinearLifecycle{
     }catch(e){
      results.push({job:row.id,phase:'remediation-blocker',error:e instanceof Error?e.message:'Linear blocker notice failed'});
     }
+   }
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()){
+    const delivery=this.s.db.query('SELECT reason FROM implementation_dispatch WHERE job=?').get(row.id) as any;
+    if(delivery?.reason?.startsWith('Blocked — branch mismatch')){await this.driftNotice(row.id,delivery.reason,c);results.push({job:row.id,state:'blocked',reason:delivery.reason});continue;}
    }
    const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;

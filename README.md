@@ -591,3 +591,42 @@ the remediation stop, and never deletes attempts, replays a send, creates anothe
 session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
+
+# Existing worker PR recovery
+
+Workers must retain the reserved planning branch. At completed delivery, the
+bridge verifies the registered worktree branch/HEAD and PR identity. Drift is
+reported as **Blocked — branch mismatch**, with a deduplicated Linear comment
+when lifecycle status sync is enabled. A PR title or worker message is not
+ownership evidence.
+
+```sh
+bun src/cli.ts recover-handoff JOB CONFIG
+# Operator only, after reviewing the exact preview:
+bun src/cli.ts recover-handoff JOB CONFIG --confirm HASH
+bun src/cli.ts tick-review JOB CONFIG
+```
+
+Recovery defaults to a read-only database connection and does not run intake,
+refresh approval, post Linear comments, or claim a PR. It requires current
+approval and scope, completed original delivery, idle AO activity/controller
+with no queued turns, a clean registered isolated worktree, reserved-branch
+ancestry, exact GitHub repository/feature ref/HEAD, and no conflicting active
+owner. Missing or truncated evidence fails closed; inspect the stated blocker
+rather than editing identity records. A stale eligibility snapshot requires
+normal authorized coordination, not a recovery-command bypass.
+
+Confirmation re-reads evidence and rejects changed proposals. It reserves a
+durable claim intent before using AO's supported `claim-pr --no-takeover`.
+Lost receipts reconcile authoritative attachment; an uncertain unattached claim
+is never replayed automatically. Adoption stores a distinct delivery identity,
+preserving reservation rows, audit history, and remediation/update budgets.
+Normal polling registers the existing PR after successful adoption; no worker
+is restarted and implementation is never resent. Manual review now requires
+CONFIG and uses the same branch policy and identity checks as periodic review.
+
+The bridge does not rename/delete branches or add native AO cleanup/resume
+operations. Run reconciliation cannot replace an adopted session/worktree.
+Native reservation metadata stays unchanged. Human merges remain mandatory;
+there is no auto-merge or deployment. DEV-30/#7 validation for DEV-31 is preview
+only; any live adoption is a separate operator action after reviewed installation.

@@ -153,3 +153,11 @@ test('requirements binding is rechecked inside terminal completion transaction',
   expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).not.toBe('completed');
  }finally{f.s.close();}
 });
+
+test('branch mismatch notice is deduplicated including uncertain delivery',async()=>{
+ const f=fixture();try{
+  let calls=0;const original=f.sync.api;f.sync.api=async(q,v)=>{if(q.includes('commentCreate')){calls++;expect(v.input.body).toContain('reserved old; actual new');expect(v.input.body).toContain('--confirm HASH');throw Error('Lost receipt');}return original(q,v);};
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');await f.sync.driftNotice(f.id,reason,c);expect(calls).toBe(1);expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});

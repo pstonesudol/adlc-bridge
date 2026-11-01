@@ -14,3 +14,5 @@ test('comparison resolves current base ref instead of trusting stale PR base SHA
  const read=async(args:string[])=>{const path=args[1];if(path.endsWith('/pulls/1'))return {head:{sha:head,ref:'adlc/test',repo:{full_name:'owner/repo'}},base:{sha:'a'.repeat(40),ref:'main',repo:{full_name:'owner/repo',default_branch:'main'}},state:'open',draft:false,mergeable:true};if(path.includes('/git/ref/heads/'))return {ref:'refs/heads/main',object:{type:'commit',sha:current}};compared=path;return {behind_by:7};};
  const snapshot=await readBranchSnapshot('owner/repo',1,read);expect(snapshot.base).toBe(current);expect(snapshot.behind).toBe(7);expect(compared).toContain(`${current}...${head}`);
 });
+
+test('disabled automatic updates do not bypass delivery branch validation',async()=>{const f=fixture();try{f.b.branch='unexpected';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('Blocked — branch mismatch');expect(f.calls()).toBe(0);}finally{f.s.close();}});

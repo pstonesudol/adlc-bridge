@@ -1,6 +1,7 @@
 import {ApprovalPolicyStore} from './approval-policy';
 import {Store,digest} from './core';
 import {DEFAULT_REMEDIATION_POLICY,remediationPolicy,remediationSummary,type RemediationPolicy,type RemediationSummary} from './remediation';
+import {adoptedDelivery} from './delivery-identity';
 
 export type Session = {id:string;correlation:string;worktree:string;controller:'running'|'stopped'|'unknown'};
 export type Transport = {start(request:{correlation:string;spec:string;plan:string}):Promise<Session>};
@@ -161,6 +162,8 @@ export class Lifecycle {
         this.s.db.query("UPDATE runs SET state='needs_reconciliation',reason=? WHERE job=?").run(matches.length?'Multiple matching sessions':'No matching session; human recovery required',job);
       }else{
         const x=matches[0];const j=this.s.get(job);
+        const adopted=adoptedDelivery(this.s,job);
+        if(adopted&&(adopted.session!==x.id||adopted.worktree!==x.worktree||adopted.plan_hash!==j.plan_hash||adopted.spec_hash!==digest(j.spec)))throw Error('Adopted delivery identity changed; explicit reconciliation required');
         const valid=j.state==='approved'&&j.approved_hash===r.plan_hash&&j.plan_hash===r.plan_hash;
         const state=r.owner==='human'?(x.controller==='stopped'?'human_control':'needs_reconciliation'):
           valid&&x.controller==='running'?'running':'needs_reconciliation';
