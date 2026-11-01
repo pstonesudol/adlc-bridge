@@ -313,7 +313,7 @@ export class Workflow{
   const deadline=first+graceMs;
   if(now<deadline)return {state:'awaiting_pr',outcome:'awaiting_pr',reason:`Waiting for PR metadata until ${new Date(deadline).toISOString()}; implementation will not be resent`,questions:[],dependencies:[],source,confidence,graceDeadline:deadline};
   if(receipt?.outcome==='pr-handoff')return {state:'needs_reconciliation',outcome:'uncertain',reason:'Worker reported PR handoff but no open PR metadata appeared within the grace period; verify the worker PR manually and never resend',questions:[],dependencies:[],source:'receipt',confidence:'high'};
-  if(readiness&&readiness.plan_hash===d.plan_hash&&readiness.source==='plan-text'&&readiness.questions.length)return {state:'needs_input',outcome:'needs_input',reason:`PR metadata grace expired; legacy plan text records unresolved questions: ${readiness.reason}`,questions:readiness.questions,dependencies:readiness.dependencies,source:'legacy-plan',confidence:'low'};
+  if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved&&readiness.source==='plan-text'&&readiness.questions.length)return {state:'needs_input',outcome:'needs_input',reason:`PR metadata grace expired; legacy plan text records unresolved questions: ${readiness.reason}`,questions:readiness.questions,dependencies:readiness.dependencies,source:'legacy-plan',confidence:'low'};
   return {state:'needs_reconciliation',outcome:'uncertain',reason:'Completed implementation turn has no open PR and no structured outcome after the PR metadata grace period; interpretation is uncertain and no work will be resent',questions:[],dependencies:[],source,confidence};
  }
  async previewReconcile(c:WorkflowConfig){
@@ -356,12 +356,14 @@ export class Workflow{
   if(e.session?.id!==d.session_id||r.session_id!==d.session_id||run.session_id!==d.session_id||e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Existing execution session identity changed');
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   if(prs.length)throw Error(prs.length===1?'A PR already exists; use its handoff instead of resuming':'Multiple PRs require reconciliation');
+  const unresolved=this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state IN ('reserved','delivery_uncertain','delivery_accepted') ORDER BY id DESC LIMIT 1").get(job,j.plan_hash) as any;
+  if(unresolved){
+   if(unresolved.state==='delivery_uncertain'||unresolved.state==='reserved')throw Error('Continuation delivery is uncertain; never resend. Reconcile the existing session first');
+   throw Error('A continuation is already in flight for this plan; wait for its outcome before recording another resolution');
+  }
   const binding=digest(JSON.stringify([resolution.binding,resolution.source,resolution.actor,resolution.detail,resolution.at]));
   const existing=this.s.db.query('SELECT * FROM continuations WHERE job=? AND plan_hash=? AND binding=?').get(job,j.plan_hash,binding) as any;
-  if(existing){
-   if(['reserved','delivery_uncertain'].includes(existing.state))throw Error('Continuation delivery is uncertain; never resend. Reconcile the existing session first');
-   throw Error('This resolution already has a continuation; obtain a new verified answer before resuming again');
-  }
+  if(existing)throw Error('This resolution already has a continuation; obtain a new verified answer before resuming again');
   const clientId=`adlc-continue-${digest(JSON.stringify([job,j.plan_hash,binding])).slice(0,32)}`;
   const prompt=[
     'ADLC GUARDED CONTINUATION. Delivery: '+clientId+'.',

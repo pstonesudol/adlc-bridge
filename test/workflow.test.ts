@@ -301,7 +301,21 @@ test('uncertain continuation send is never resent',async()=>{
  recordResolution(s,id,'human-answer','Alice','SKU-42');
  f.loseSend=true;const first=await w.resume(id,config);expect(first.state).toBe('continuation_delivery_uncertain');
  await expect(w.resume(id,config)).rejects.toThrow('never resend');
+ recordResolution(s,id,'human-answer','Alice','A newer answer recorded after the uncertain send');
+ await expect(w.resume(id,config)).rejects.toThrow('never resend');
  expect(f.sends.length).toBe(2);s.close();
+});
+test('a resolved legacy plan blocker does not resurface after PR grace',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const c={...config,workflow:{prGraceMs:0}};
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(c);f.legacyPlan();await w.tick(c);
+ recordResolution(s,id,'human-answer','Alice','Identifier SKU-42 confirmed');
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(c);f.workerReceipt('Completed without a status receipt.');f.sessions.get('session-1').session.prs=[];
+ const result=(await w.tick(c))[0];
+ expect(result.state).toBe('needs_reconciliation');expect(result.questions).toEqual([]);
+ s.close();
 });
 
 test('preview reconciliation exposes the three reported blockers without applying repairs',async()=>{

@@ -11,7 +11,7 @@ function fixture(){
  const id=s.enqueue('p','issue',spec);
  const planHash=digest(JSON.stringify([spec,'plan']));
  s.db.query("UPDATE jobs SET state='approved',plan='plan',plan_hash=?,approved_hash=?,actor='human' WHERE id=?").run(planHash,planHash,id);
- let labels=['ready','team'],comments:any[]=[],updates=0,creates=0,calls=0,lostCreate=false,lostReplyAfterCreate=false,failLabelVerification=false,badIdentity=false;
+ let labels=['ready','team'],comments:any[]=[],updates=0,creates=0,calls=0,lostCreate=false,lostReplyAfterCreate=false,failLabelVerification=false,badIdentity=false,injectHumanLabelBeforeUpdate=false;
  const issue=()=>({id:'issue',...JSON.parse(spec),project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:labels.map(id=>({id})),pageInfo:{hasNextPage:false}}});
  const api=async(q:string,v:any)=>{
   calls++;
@@ -26,6 +26,8 @@ function fixture(){
   }
   if(q.includes('issueUpdate')){
    updates++;
+   if(injectHumanLabelBeforeUpdate){injectHumanLabelBeforeUpdate=false;if(!labels.includes('human-concurrent'))labels.push('human-concurrent');}
+   if(v.labelIds)labels=[...v.labelIds];
    if(v.added)labels=[...new Set([...labels,...v.added])];
    if(v.removed)labels=labels.filter((id:string)=>!v.removed.includes(id));
    if(failLabelVerification){
@@ -50,6 +52,7 @@ function fixture(){
   loseReplyAfterCreate(){lostReplyAfterCreate=true;},
   failLabel(){failLabelVerification=true;},
   badIdentity(){badIdentity=true;},
+  injectHumanLabel(){injectHumanLabelBeforeUpdate=true;},
   running(){s.db.query("UPDATE worker_outcomes SET outcome='running',reason='Continuation accepted' WHERE job=?").run(id);},
   staleEvidence(){s.db.query("UPDATE worker_outcomes SET plan_hash=? WHERE job=?").run(digest('other-plan'),id);},
   addLabel(id:string){if(!labels.includes(id))labels.push(id);},
@@ -132,6 +135,15 @@ test('additive label updates preserve human removals and unrelated additions',as
   expect(f.labels).not.toContain('ready');
   await f.blockers().retract(f.id,f.config);
   expect(f.labels).not.toContain(labelId);expect(f.labels).toContain('human-choice');expect(f.labels).not.toContain('ready');
+ }finally{f.s.close();}
+});
+test('a human label added between the read and update survives synchronization',async()=>{
+ const f=fixture();try{
+  f.injectHumanLabel();
+  await f.blockers().sync(f.config);
+  expect(f.labels).toContain('human-concurrent');
+  expect(f.labels).toContain(labelId);
+  expect(f.labels).toContain('ready');
  }finally{f.s.close();}
 });
 test('uncertain comment delivery is never reposted blindly',async()=>{
