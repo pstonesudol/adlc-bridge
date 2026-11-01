@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {verifyInitConfig,saveInitConfig,serviceDefinition} from '../src/init';
+import {verifyInitConfig,saveInitConfig,serviceDefinition,branchUpdateLimit} from '../src/init';
 import {validate,metadataCheckNames} from '../src/linear';
 const uuid=(n:number)=>`00000000-0000-0000-0000-${String(n).padStart(12,'0')}`;
 function fixture(repo:string){
@@ -50,4 +50,12 @@ test('readiness CLI rejects malformed metadata checks before constructing provid
    expect(result.exitCode).not.toBe(0);expect(result.stderr.toString()).toContain('Explicit PR metadata check names required');
   }
  }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('wizard branch-update limits accept case-insensitive unlimited or safe integers from one to ten',()=>{
+ for(const value of ['unlimited','UNLIMITED','Unlimited','  UnLiMiTeD  '])expect(branchUpdateLimit(value)).toBeNull();
+ for(let n=1;n<=10;n++)expect(branchUpdateLimit(` ${n} `)).toBe(n);
+ for(const value of ['', '0','11','-1','1.5','NaN','Infinity','9007199254740992','0x2','1e0','many'])expect(()=>branchUpdateLimit(value)).toThrow('branchUpdate.maxUpdates must be an integer from 1 through 10 or "unlimited"');
+});
+test('bundled branch-update policy stays disabled with a finite limit until explicitly configured',()=>{
+ const example=JSON.parse(readFileSync(join(import.meta.dir,'../config/project.example.json'),'utf8'));expect(example.branchUpdate).toEqual({enabled:false,authorizedBy:'',maxUpdates:3});
 });

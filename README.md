@@ -450,7 +450,6 @@ the Orchestrator backend must be running: apply uses it to back up project setti
 ```sh
 bun src/cli.ts install
 bun src/cli.ts install --apply
-adlc status --all
 ```
 
 The first command previews. Apply creates a content-addressed runtime under
@@ -486,8 +485,10 @@ Install Go 1.27.1 and Xcode Command Line Tools (required for the runtime service
 bun scripts/build-orchestrator.ts /absolute/new/build-directory
 # ADLC_GO=/absolute/path/to/go can select the Go binary.
 adlc install-runtime --binary /absolute/new/build-directory/ao
-adlc stop --all
+# Existing managed stack only: adlc stop --all
+# First install: quit the vendor app/daemon instead; no managed stack exists yet.
 adlc install-runtime --binary /absolute/new/build-directory/ao --apply
+adlc status --all
 adlc start --all
 ```
 
@@ -656,7 +657,10 @@ block automatic updates. Requests are reserved durably before delivery, and the
 same head/base pair is never blindly retried. With `maxUpdates: null`, successful updates have no lifetime cap: further base
 changes can trigger another update. Any failed or uncertain request still stops
 automation for inspection, even if the head later changes. A numeric value from
-1 to 10 retains the optional per-job cap. New projects default to no lifetime cap.
+1 to 10 retains the optional per-job cap. The bundled project example is disabled
+with a finite limit of 3; setting `null` explicitly opts into unlimited updates.
+After explicit authorization, the wizard asks for the limit and offers
+`unlimited` as its default response (case-insensitive).
 
 A new commit must pass CI and CodeRabbit again. Even with automatic branch updates
 disabled, the readiness gate refuses to report a branch behind its base as ready.

@@ -17,6 +17,12 @@ export async function collectMetadataChecks(ask:(label:string)=>Promise<string>)
  const names:string[]=[];
  for(;;){const name=(await ask('PR-description-only CI check name (one exact name; blank to finish)')).trim();if(!name)return names;if(!names.includes(name))names.push(name);if(names.length>10)throw Error('At most 10 PR metadata checks supported');}
 }
+export function branchUpdateLimit(answer:string){
+ const value=answer.trim().toLowerCase();if(value==='unlimited')return null;
+ const limit=Number(value);
+ if(!/^\d+$/.test(value)||!Number.isSafeInteger(limit)||limit<1||limit>10)throw Error('branchUpdate.maxUpdates must be an integer from 1 through 10 or "unlimited"');
+ return limit;
+}
 export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO){
  validate(c);
  if(!/^[\w.-]+\/[\w.-]+$/.test(c.githubRepo)||!c.requiredChecks?.length||c.requiredChecks.some((x:any)=>typeof x!=='string'||!x.trim())||!validScopes(c.reviewAllowedPaths))throw Error('Repository, required checks and safe review scope required');
@@ -75,7 +81,7 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   if(await yes('Authorize automatic base-branch updates to owned feature PRs (never merges a PR)')){
    const actor=await ask('Your name for branch update authorization');if(!actor)throw Error('Authorizing person required');
    const limit=await ask('Maximum automatic branch updates per PR (1-10, or "unlimited")','unlimited');
-   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:limit==='unlimited'?null:Number(limit)};
+    c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:branchUpdateLimit(limit)};
   }
   if(await yes('Enable plan approval replies in Linear from your account')){
    const b=await linearAPI('query{viewer{id name app}}');
