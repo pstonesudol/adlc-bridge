@@ -169,3 +169,40 @@ test('branch mismatch sync posts one notice and confirms uncertain delivery by c
   expect(f.s.db.query('SELECT state FROM branch_drift_notices').all()).toEqual([{state:'confirmed'}]);
  }finally{f.s.close();}
 });
+
+test('uncertain drift notice stays fail-closed without an exact comment',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  let comments:any[]=[];const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){comments=[{id:v.input.id,body:v.input.body}];throw Error('Lost receipt');}
+   if(q.includes('comments('))return {issue:{comments:{nodes:comments,pageInfo:{hasNextPage:false,endCursor:null}}}};
+   return original(q,v);
+  };
+  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');
+  const commentId=(f.s.db.query('SELECT comment_id FROM branch_drift_notices WHERE job=?').get(f.id) as any).comment_id;
+  comments=[];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  comments=[{id:commentId,body:'different body'}];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+ }finally{f.s.close();}
+});
+test('drift notice confirms a matching comment on a later page',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  let commentId='',body='',pages=0;const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){commentId=v.input.id;body=v.input.body;throw Error('Lost receipt');}
+   if(q.includes('comments(')){
+    pages++;
+    if(pages===1)return {issue:{comments:{nodes:[{id:'unrelated',body:'other'}],pageInfo:{hasNextPage:true,endCursor:'cursor-1'}}}};
+    expect(v.after).toBe('cursor-1');
+    return {issue:{comments:{nodes:[{id:commentId,body}],pageInfo:{hasNextPage:false,endCursor:null}}}};
+   }
+   return original(q,v);
+  };
+  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');
+  await f.sync.driftNotice(f.id,reason,c);
+  expect(pages).toBe(2);expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('confirmed');
+ }finally{f.s.close();}
+});

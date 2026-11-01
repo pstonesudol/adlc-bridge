@@ -116,3 +116,19 @@ test('collector rejects an origin URL that differs from the configured repositor
   f.state.origin='git@github.com:other/repo.git';await expect(f.inspect()).rejects.toThrow('Worktree origin differs from configured repository');
  }finally{f.cleanup();}
 });
+test('claim always passes --no-takeover',async()=>{
+ const f=fixture();try{
+  const calls:string[][]=[],url='https://github.com/owner/repo/pull/7';
+  await recoveryTransport(f.s,async(args:string[])=>{calls.push(args);return '';},async()=>f.state.evidence).claim('worker',url);
+  expect(calls).toEqual([[AO,'session','claim-pr','worker',url,'--no-takeover','--json']]);
+ }finally{f.cleanup();}
+});
+test('attached requires one open PR on a non-terminated session',async()=>{
+ const f=fixture();try{
+  const url='https://github.com/owner/repo/pull/7',t=()=>recoveryTransport(f.s,f.run,async()=>f.state.evidence),prs=f.state.evidence.session.prs;
+  expect(await t().attached('worker',url)).toBe(true);
+  prs.push({state:'open',number:7,url});expect(await t().attached('worker',url)).toBe(false);
+  prs.pop();prs[0].state='closed';expect(await t().attached('worker',url)).toBe(false);
+  prs[0].state='open';f.state.evidence.session.isTerminated=true;expect(await t().attached('worker',url)).toBe(false);
+ }finally{f.cleanup();}
+});
