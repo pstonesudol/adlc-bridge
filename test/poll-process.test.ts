@@ -1,10 +1,21 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,writeFileSync,readFileSync,readdirSync,chmodSync,rmSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {acknowledgePoll,assertPollQuiescent,assertPollStarted} from '../src/poll-process';import {stopLoadedIntake,waitForPollStartup} from '../src/service-control';import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';
+import {TurnSubmissionBlocked} from '../src/turn-submission';
 function fixture(){
  const root=mkdtempSync(join(tmpdir(),'adlc-poll-proof-')),state=join(root,'state'),config=join(root,'project.json'),cli=join(root,'cli.ts');writeFileSync(config,'{}');writeFileSync(cli,'barrier-aware CLI');const turns=turnBarrier(state);
  const started=()=> 'known start',verify=(status:any,c=config,program=cli)=>assertPollQuiescent(status,c,program,state,started);
  return {root,state,config,cli,turns,started,verify,receipt:()=>join(state,'poll-processes',readdirSync(join(state,'poll-processes'))[0]),close:()=>rmSync(root,{recursive:true,force:true})};
 }
+test('foreground startup reports blocking once while retrying and silent startup needs no notification',async()=>{
+ for(const interactive of [false,true]){const f=fixture();try{
+  let attempts=0,pauses=0,notices=0;
+  const finish=await acknowledgePoll(f.config,f.cli,f.state,f.started,async operation=>{if(++attempts<=3)throw new TurnSubmissionBlocked('paused');return operation();},{timeoutMs:Infinity,pause:async()=>{pauses++;expect(notices).toBe(interactive?1:0);},onBlocked:interactive?()=>{notices++;}:undefined});
+  expect(attempts).toBe(4);expect(pauses).toBe(3);expect(notices).toBe(interactive?1:0);assertPollStarted({running:true,pid:process.pid},f.config,f.cli,f.state,f.started);finish();f.verify({running:false});
+ }finally{f.close();}}
+});
+test('unblocked startup never emits the waiting notice',async()=>{
+ const f=fixture();try{let notices=0;const finish=await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit,{timeoutMs:Infinity,pause:async()=>{},onBlocked:()=>{notices++;}});expect(notices).toBe(0);finish();}finally{f.close();}
+});
 test('loaded legacy intake is preserved even when the new barrier is available and launchd reports idle',async()=>{
  const f=fixture();try{let bootouts=0;for(const status of [{loaded:true,running:true,pid:process.pid},{loaded:true,running:false}])await f.turns.run(async()=>{await expect(stopLoadedIntake(status,f.config,f.cli,async()=>{bootouts++;},f.verify)).rejects.toThrow('barrier support is unverified');});expect(bootouts).toBe(0);
   await stopLoadedIntake({loaded:false},f.config,f.cli,async()=>{bootouts++;},()=>{throw Error('Unloaded legacy service needs no receipt');});expect(bootouts).toBe(0);

@@ -12,15 +12,15 @@ function readReceipt(path:string){
  const st=lstatSync(path);if(!st.isFile()||st.isSymbolicLink()||st.uid!==process.getuid?.()||(st.mode&0o077)!==0)throw Error('Intake process receipt must be owner-only');
  return JSON.parse(readFileSync(path,'utf8'));
 }
-export async function acknowledgePoll(config:string,cli:string,state=appState(),started=processStarted,submit=withTurnSubmission,wait={timeoutMs:Number.POSITIVE_INFINITY,pause:()=>Bun.sleep(100)}){
+export async function acknowledgePoll(config:string,cli:string,state=appState(),started=processStarted,submit=withTurnSubmission,wait:{timeoutMs:number;pause:()=>Promise<unknown>;onBlocked?:()=>void}={timeoutMs:Number.POSITIVE_INFINITY,pause:()=>Bun.sleep(100),onBlocked:process.stdin.isTTY&&process.stderr.isTTY?()=>console.error('Intake startup is waiting for the submission pause or control operation to clear; polling has not started.'):undefined}){
   config=realpathSync(config);cli=realpathSync(cli);const path=receiptPath(state,config),record={version:1,config,cli,cliHash:hash(readFileSync(cli)),pid:process.pid,started:started(process.pid),idle:false};
   // Publish barrier awareness before waiting: stack startup holds the fence
   // while verifying this PID-bound receipt. No polling or submission is allowed
   // until submit succeeds after the stack resumes and releases its fence.
   atomicFile(path,JSON.stringify(record));
   const finished=()=>{const current=readReceipt(path);if(current.pid===record.pid&&current.started===record.started)atomicFile(path,JSON.stringify({...record,idle:true}));};
-  const deadline=Date.now()+wait.timeoutMs;
-  try{for(;;){try{await submit(async()=>{});break;}catch(error){if(!(error instanceof TurnSubmissionBlocked)||Date.now()>=deadline)throw error;await wait.pause();}}}
+  const deadline=Date.now()+wait.timeoutMs;let notified=false;
+  try{for(;;){try{await submit(async()=>{});break;}catch(error){if(!(error instanceof TurnSubmissionBlocked)||Date.now()>=deadline)throw error;if(!notified){notified=true;wait.onBlocked?.();}await wait.pause();}}}
   catch(error){try{finished();}catch(cleanup){throw new AggregateError([error,cleanup],'Poll startup failed and completion receipt could not be recorded');}throw error;}
   return finished;
 }
