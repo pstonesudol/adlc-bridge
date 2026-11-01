@@ -661,9 +661,11 @@ attempt; a new failed check can be addressed within the configured per-project
 remediation budget (five attempts by default). After CI clears, CodeRabbit is reevaluated on the current commit and
 description. Delivery uncertainty never causes a blind duplicate send.
 
-Unconfigured failed CI checks, application test failures, unavailable logs,
-identity mismatches, out-of-scope work, or exhausted attempts still block for
-inspection. No automatic approval, check bypass, merge, or deployment is added.
+Only configured `requiredChecks` and `prMetadataChecks` block CI readiness;
+unconfigured failed checks do not block this gate. Failures in configured
+application checks, unavailable metadata-check logs, identity mismatches,
+out-of-scope work, or exhausted attempts still block for inspection.
+No automatic approval, check bypass, merge, or deployment is added.
 Reading these logs requires a GitHub CLI version supporting the `gh api
 --allow-escape-sequences` flag; escape sequences are stripped before the selected
 failure lines are sent to the worker.

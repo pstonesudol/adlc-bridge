@@ -49,7 +49,7 @@ test('one project service cannot select another project’s PR targets',()=>{
 
 function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
- const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
+ const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
  const session:any={session:{id:'session',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readiness:async()=>e,sessionEvidence:async()=>session,spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
@@ -79,7 +79,7 @@ test('template wait blocks at five minutes without spending another attempt',asy
 test('fresh failing check allows bounded remediation instead of a stale CI wait',async()=>{
  const f=templateFixture();try{
   for(let attempt=1;attempt<=5;attempt++){
-   await f.loop.tick(f.id);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];
+   await f.loop.tick(f.id);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;
    await f.loop.tick(f.id);f.e.templateSignature=`check-${attempt}`;
   }
   await f.loop.tick(f.id);expect(f.sends()).toBe(5);expect(f.s.get(f.id).attempts).toBe(5);
@@ -91,9 +91,33 @@ test('CodeRabbit reevaluation blocks after thirty minutes without duplicate revi
 test('metadata remediation preserves the configured budget after base-branch integration',async()=>{
  const f=templateFixture(),policy={maxAttempts:2,maxNoProgress:5,window:'job' as const};try{
   for(let attempt=1;attempt<=2;attempt++){
-   await f.loop.tick(f.id,undefined,policy);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`budget-body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];
+   await f.loop.tick(f.id,undefined,policy);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`budget-body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];f.e.failedChecks[0].id=attempt+1;
    await f.loop.tick(f.id,undefined,policy);f.e.templateSignature=`budget-check-${attempt}`;
   }
   expect((await f.loop.tick(f.id,undefined,policy)).state).toBe('blocked');expect(f.sends()).toBe(2);expect(f.s.get(f.id).attempts).toBe(2);
+ }finally{f.s.close();}
+});
+test('missing or malformed metadata policy fails closed before provider inspection',async()=>{
+ const f=templateFixture();try{
+  let reads=0;f.loop.io.sessionEvidence=async()=>{reads++;return f.session;};f.s.db.exec('DELETE FROM metadata_check_policy');
+  await expect(f.loop.tick(f.id)).rejects.toThrow('metadata-check policy required');expect(reads).toBe(0);expect(f.sends()).toBe(0);
+  f.s.db.query('INSERT INTO metadata_check_policy VALUES (?,?)').run('project','"not an array"');await expect(f.loop.tick(f.id)).rejects.toThrow('metadata check names');expect(reads).toBe(0);
+ }finally{f.s.close();}
+});
+test('concurrent ticks retain their explicitly supplied check policy despite shared policy replacement or caller mutation',async()=>{
+ const f=templateFixture();try{
+  f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve),seen:any[]=[];
+  f.loop.io.sessionEvidence=async()=>{await gate;return f.session;};f.loop.io.readiness=async(_repo,_pr,required,metadata)=>{seen.push({required,metadata});return f.e;};
+  const checks=['Strict metadata'],strict=f.loop.tick(f.id,undefined,undefined,checks),empty=f.loop.tick(f.id,undefined,undefined,[]);
+  checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await Promise.all([strict,empty]);
+  expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']},{required:['CI'],metadata:[]}]);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+test('same-name failures require matching check-run identity and head for remediation or metadata waiting',async()=>{
+ const f=templateFixture();try{
+  for(const altered of [{id:2},{sha:'old'},{id:undefined}])expect(decision({...f.e,failedChecks:[{...f.e.failedChecks[0],...altered}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
+  f.e.failedChecks.push({...f.e.failedChecks[0],id:2});expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(0);
+  f.e.failedChecks.pop();f.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,f.e.templateSignature,Date.now());
+  f.e.findings[0].checkId=2;expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });

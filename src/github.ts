@@ -78,7 +78,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(final.base.ref!==first.base.ref||await baseTip(repo,final.base.ref)!==currentBase){gate.clear=false;gate.reasons.push('Base branch changed during review collection');}
   if(final.state!=='open' || final.draft || final.mergeable!==true){gate.clear=false;gate.reasons.push('PR closed, draft, conflicted or mergeability unknown');}
   const requiredChecks=checks.filter((c:any)=>required.includes(c.name)&&c.head_sha===first.head.sha&&c.app?.slug==='github-actions');
-  const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({name:c.name,conclusion:c.conclusion,url:c.details_url}));
+  const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
   const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,digest(final.body??''),path=>gh(['api',path]),async path=>{

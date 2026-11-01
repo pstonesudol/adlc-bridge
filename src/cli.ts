@@ -161,7 +161,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='tick-review'&&a[1]){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation)));
+      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation),config.prMetadataChecks??[]));
     }
     if(command==='tick-review'){const job=req(a[0],'Job');return out(await reviewLoop.tick(job,undefined,lifecycle.budgetPolicy(job)));}
     if(command==='extend-budget'){
@@ -197,7 +197,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const featureUpdates=await features.tickProject(c);if(featureUpdates.length)out({features:featureUpdates});
       for(const target of reviewLoop.list(c.linear.projectId) as any[]){
         if(target.state==='completed')continue;
-        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
+        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,c!.prMetadataChecks??[])});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
       }
     };if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);

@@ -60,5 +60,5 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
   for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
   s.event(job,'review_recovery_requested',JSON.stringify({...report,proven}));
  }).immediate();
- await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);return {...report,result:await loop.tick(job,c.branchUpdate,remediationPolicy(c.remediation))};
+ await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);return {...report,result:await loop.tick(job,c.branchUpdate,remediationPolicy(c.remediation),c.prMetadataChecks??[])};
 }

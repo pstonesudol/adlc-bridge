@@ -4,8 +4,8 @@ const api=async()=>({id:22,run_id:11,head_sha:head,conclusion:'failure',check_ru
 test('only explicitly configured current-SHA GitHub metadata checks produce description findings',async()=>{
  const findings=await templateCIFindings('owner/repo',head,[check],['PR body structure'],'body',api,async()=> 'Missing section: Related issues\nUse .github/pull_request_template.md');
  expect(findings[0]).toMatchObject({kind:'pr_description',source:'github-ci',check:'PR body structure',sha:head,descriptionHash:'body'});
- const e={clear:false,reasons:['CI failure'],failedChecks:[{name:'PR body structure'}],findings};expect(decision(e,['src/**'],0).send).toBe(true);
- expect(decision({...e,failedChecks:[...e.failedChecks,{name:'backend'}]},['src/**'],0).send).toBe(false);
+ const e={clear:false,head,reasons:['CI failure'],failedChecks:[{id:check.id,sha:head,name:'PR body structure'}],findings};expect(decision(e,['src/**'],0).send).toBe(true);
+ expect(decision({...e,failedChecks:[...e.failedChecks,{id:23,sha:head,name:'backend'}]},['src/**'],0).send).toBe(false);
  expect(await templateCIFindings('owner/repo',head,[check],[],'body',api,async()=>{throw Error('Must not read');})).toEqual([]);
  expect(await templateCIFindings('owner/repo','newhead',[check],['PR body structure'],'body',api,async()=>{throw Error('Must not read');})).toEqual([]);
 });
