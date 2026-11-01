@@ -178,11 +178,13 @@
 +}
 --- /dev/null
 +++ b/backend/internal/adapters/scm/github/check_reruns_test.go
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,133 @@
 +package github
 +
 +import (
++	"encoding/json"
 +	"fmt"
++	"net/http"
 +	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 +	"testing"
 +)
@@ -241,5 +243,72 @@
 +		if ciSummaryFromGraphQL(pr) != domain.CIFailing {
 +			t.Fatal("unverified failure hidden")
 +		}
++	}
++}
++
++// Exercise the real REST provenance resolver, not only the grouping helper.
++func TestNormalizeCheckRerunsProvenanceAndAttempts(t *testing.T) {
++	for _, conclusion := range []string{"SUCCESS", "FAILURE"} {
++		for _, reverse := range []bool{false, true} {
++			t.Run(fmt.Sprintf("%s/reverse=%v", conclusion, reverse), func(t *testing.T) {
++				f := newFakeGH(t)
++				for id := 1; id <= 2; id++ {
++					id := id
++					f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++						_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)})
++					})
++				}
++				f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++					_ = json.NewEncoder(w).Encode(map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}})
++				})
++				old := "FAILURE"
++				if conclusion == "FAILURE" { old = "SUCCESS" }
++				a, b := rerunCheck(1, "COMPLETED", old), rerunCheck(2, "COMPLETED", conclusion)
++				a["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/1"
++				b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
++				if reverse { a, b = b, a }
++				pr := rerunPR(a, b)
++				if err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr); err != nil { t.Fatal(err) }
++				kept := nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])
++				if len(kept) != 1 || int(num(kept[0]["databaseId"])) != 2 { t.Fatalf("wrong attempt kept: %#v", kept) }
++				want := domain.CIPassing
++				if conclusion == "FAILURE" { want = domain.CIFailing }
++				if ciSummaryFromGraphQL(pr) != want || ciSummaryFromRollupState(pr) != want { t.Fatal("newest attempt conclusion hidden") }
++			})
++		}
++	}
++	for _, field := range []string{"job.head_sha", "job.check_run_url", "job.run_id", "run.head_sha", "run.repository", "url.host", "url.path"} {
++		t.Run(field, func(t *testing.T) {
++			f := newFakeGH(t)
++			for id := 1; id <= 2; id++ {
++				id := id
++				f.on(http.MethodGet, fmt.Sprintf("/repos/owner/repo/actions/jobs/%d", id), func(w http.ResponseWriter, _ *http.Request) {
++					job := map[string]any{"id": id, "run_id": 10, "head_sha": "head", "run_attempt": id, "check_run_url": fmt.Sprintf("https://api.github.com/repos/owner/repo/check-runs/%d", id)}
++					if id == 2 {
++						switch field {
++						case "job.head_sha": job["head_sha"] = "forged"
++						case "job.check_run_url": job["check_run_url"] = "https://api.github.com/repos/foreign/repo/check-runs/2"
++						case "job.run_id": job["run_id"] = 99
++						}
++					}
++					_ = json.NewEncoder(w).Encode(job)
++				})
++			}
++			f.on(http.MethodGet, "/repos/owner/repo/actions/runs/10", func(w http.ResponseWriter, _ *http.Request) {
++				run := map[string]any{"id": 10, "head_sha": "head", "workflow_id": 5, "run_number": 7, "event": "pull_request", "repository": map[string]any{"full_name": "owner/repo"}}
++				if field == "run.head_sha" { run["head_sha"] = "forged" }
++				if field == "run.repository" { run["repository"] = map[string]any{"full_name": "foreign/repo"} }
++				_ = json.NewEncoder(w).Encode(run)
++			})
++			a, b := rerunCheck(1, "COMPLETED", "FAILURE"), rerunCheck(2, "COMPLETED", "SUCCESS")
++			a["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/1"
++			b["detailsUrl"] = "https://github.com/owner/repo/actions/runs/10/job/2"
++			if field == "url.host" { b["detailsUrl"] = "https://evil.test/owner/repo/actions/runs/10/job/2" }
++			if field == "url.path" { b["detailsUrl"] = "https://github.com/foreign/repo/actions/runs/10/job/2" }
++			pr := rerunPR(a, b)
++			err := newProviderForTest(t, f).normalizeCheckReruns(ctx(), "owner", "repo", "head", pr)
++			if field != "url.host" && field != "url.path" && err == nil { t.Fatal("forged provenance accepted") }
++			if ciSummaryFromGraphQL(pr) != domain.CIFailing || len(nodes(statusRollup(pr)["contexts"].(map[string]any)["nodes"])) != 2 { t.Fatal("unverified failure suppressed") }
++		})
 +	}
 +}

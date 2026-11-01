@@ -418,7 +418,8 @@ implemented; the supported controller runs locally on macOS.
 
 ### Stable installation and self-hosting
 
-From a reviewed checkout with Bun installed:
+From a reviewed checkout with Bun installed. When projects are already registered,
+the Orchestrator backend must be running: apply uses it to back up project settings.
 
 ```sh
 bun src/cli.ts install
@@ -447,7 +448,8 @@ fixes superseded GitHub Actions results in both native SCM adapters. The build
 recipe verifies the SHA-256 of the official source archive at a pinned revision,
 applies the patch without Git, runs adapter race tests and builds the daemon.
 Upstream code is Apache-2.0; its license is in `patches/ORCHESTRATOR-LICENSE`.
-Install Go 1.27.1 and run:
+Install Go 1.27.1 and Xcode Command Line Tools (required for the runtime service's
+`/usr/bin/python3`), then run:
 
 ```sh
 bun scripts/build-orchestrator.ts /absolute/new/build-directory

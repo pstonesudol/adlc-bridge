@@ -70,7 +70,8 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   }
   if(await yes('Authorize automatic base-branch updates to owned feature PRs (never merges a PR)')){
    const actor=await ask('Your name for branch update authorization');if(!actor)throw Error('Authorizing person required');
-   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:null};
+   const limit=await ask('Maximum automatic branch updates per PR (1-10, or "unlimited")','unlimited');
+   c.branchUpdate={enabled:true,authorizedBy:actor,maxUpdates:limit==='unlimited'?null:Number(limit)};
   }
   if(await yes('Enable plan approval replies in Linear from your account')){
    const b=await linearAPI('query{viewer{id name app}}');

@@ -1,16 +1,25 @@
 from pathlib import Path
-import os,subprocess,base64,hmac,hashlib,re,time,json,urllib.request,signal,shlex,secrets
+import os,subprocess,base64,hmac,hashlib,re,time,json,urllib.request,signal,shlex,secrets,stat
 root=Path.home()/'Library/Application Support/ADLC Bridge'
 manifest=json.loads((root/'orchestrator-runtime.json').read_text())
 exe=Path(manifest['executable'])
 assert hashlib.sha256(exe.read_bytes()).hexdigest()==manifest['sha256'],'Hotfix binary changed'
 data=Path.home()/'.ao/data'
-data.mkdir(parents=True,exist_ok=True)
+data.mkdir(parents=True,exist_ok=True,mode=0o700)
 keypath=data/'browser-runtime.key'
-if not keypath.exists():
- with keypath.open('x') as f:f.write(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')+'\n')
- keypath.chmod(0o600)
-raw=keypath.read_text()
+try:
+ fd=os.open(keypath,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+except FileExistsError:
+ pass
+else:
+ with os.fdopen(fd,'w') as f:
+  f.write(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('=')+'\n')
+fd=os.open(keypath,os.O_RDONLY|os.O_NOFOLLOW)
+with os.fdopen(fd) as f:
+ st=os.fstat(f.fileno())
+ if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode&0o077:
+  raise SystemExit('Browser runtime key must be an owner-only regular file')
+ raw=f.read()
 records=raw.split('\n')[:-1] if '\n' in raw else [raw]
 record=next(x.strip() for x in records if re.fullmatch(r'[A-Za-z0-9_-]{43}',x.strip()))
 key=base64.urlsafe_b64decode(record+'=')

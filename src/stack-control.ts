@@ -59,13 +59,13 @@ async function loaded(target:string){
  if(r.code!==0&&!/Could not find service/.test(r.stdout+r.stderr))throw Error('Unable to inspect Orchestrator service');
  return r.code===0;
 }
-async function probe(){
- const r=await command([AO,'status','--json']);
+export function daemonStatus(r:{stdout:string;code:number}){
  let s:any;try{s=JSON.parse(r.stdout);}catch{throw Error('Unable to inspect Orchestrator daemon');}
- if(s.state==='stopped'||s.state==='not_running')return {ready:false};
+ if(r.code===0&&(s?.state==='stopped'||s?.state==='not_running'))return {ready:false};
  if(r.code!==0||s.state!=='ready'||!Number.isSafeInteger(s.port)||s.port<1||s.port>65535)throw Error('Orchestrator readiness is unknown; backend preserved');
  return {...s,ready:true};
 }
+async function probe(){return daemonStatus(await command([AO,'status','--json']));}
 async function get(port:number,path:string){
  const r=await fetch(`http://127.0.0.1:${port}/api/v1/${path}`,{signal:AbortSignal.timeout(10000)});
  if(!r.ok)throw Error('Cannot verify worker activity; intake paused and backend preserved');return r.json() as Promise<any>;
@@ -78,6 +78,25 @@ export function turnBlockers(session:string,c:any){
  if(!Array.isArray(c.turns))throw Error(`Cannot verify queued work for ${session}; backend preserved`);
  const bad=c.turns.filter((t:any)=>!terminalTurns.has(t.state));
  return bad.map((t:any)=>({session,reason:`${t.state??'unknown'} turn`}));
+}
+export async function workerBlockers(executable:string,inspect=probe,read=get){
+ const s=await inspect();if(!s.ready||s.executablePath!==executable)throw Error('Managed backend identity changed; preserved');
+ const scan=async(sessions:any[])=>{
+  const blocked=activityBlockers(sessions);
+  for(const x of sessions){
+   if(x.isTerminated||x.activity?.state==='exited')continue;
+   if(typeof x.id!=='string'||! /^[\w-]+$/.test(x.id))throw Error('Invalid worker identity; backend preserved');
+   blocked.push(...turnBlockers(x.id,await read(s.port,`sessions/${x.id}/conversation`)));
+  }
+  return blocked;
+ };
+ const snapshot=await read(s.port,'sessions');if(!Array.isArray(snapshot?.sessions))throw Error('Cannot verify worker inventory; backend preserved');
+ const blocked=await scan(snapshot.sessions);
+ // Re-read turns as well as activity: idle activity can lag a newly queued turn.
+ const latest=await read(s.port,'sessions');if(!Array.isArray(latest?.sessions))throw Error('Cannot recheck workers; backend preserved');
+ blocked.push(...await scan(latest.sessions));
+ const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
+ return blocked;
 }
 export function liveStackOps():StackOps{
  const config=definition();
@@ -105,27 +124,14 @@ export function liveStackOps():StackOps{
    for(let i=0;i<100;i++){try{if(!(await probe()).ready&&!await loaded(config.target))return;}catch{}await Bun.sleep(200);}
    throw Error('Orchestrator shutdown is still pending');
   },
-  blockers:async()=>{
-   const s=await probe();if(!s.ready||s.executablePath!==config.executable)throw Error('Managed backend identity changed; preserved');
-   const snapshot=await get(s.port,'sessions');if(!Array.isArray(snapshot.sessions))throw Error('Cannot verify worker inventory; backend preserved');
-   const blocked=activityBlockers(snapshot.sessions);
-   for(const x of snapshot.sessions){
-    if(x.isTerminated||x.activity?.state==='exited')continue;
-    if(!/^[\w-]+$/.test(x.id))throw Error('Invalid worker identity; backend preserved');
-    blocked.push(...turnBlockers(x.id,await get(s.port,`sessions/${x.id}/conversation`)));
-   }
-   // Catch activity or newly created sessions that changed during the turn scan.
-   const latest=await get(s.port,'sessions');if(!Array.isArray(latest.sessions))throw Error('Cannot recheck workers; backend preserved');
-   blocked.push(...activityBlockers(latest.sessions));
-   const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
-   return blocked;
-  }
+  blockers:()=>workerBlockers(config.executable)
  };
 }
 export async function stackControl(action:'start'|'stop'|'status'){
  if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');
  if(action==='status')return controlStack(action,liveStackOps());
  const lock=join(stateDir(),'stack-control.lock');
- try{mkdirSync(lock);}catch{throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');}
- try{return await controlStack(action,liveStackOps());}finally{rmdirSync(lock);}
+ mkdirSync(stateDir(),{recursive:true,mode:0o700});
+ try{mkdirSync(lock);}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
+ try{return await controlStack(action,liveStackOps());}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
 }

@@ -1,2 +1,30 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
+import {installBridge} from '../src/install';import {copyFileSync,readdirSync,existsSync} from 'node:fs';
 test('installation snapshots exclude credentials, Git data, tests and internal notes and survive checkout edits',()=>{const root=mkdtempSync(join(tmpdir(),'adlc-install-'));try{const source=join(root,'source'),dest=join(root,'versions');for(const d of ['src','config','.git'])mkdirSync(join(source,d),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'original');writeFileSync(join(source,'config/private.json'),'secret');writeFileSync(join(source,'.env'),'secret');writeFileSync(join(source,'IMPLEMENTATION-STATUS.md'),'private');const a=snapshot(source,dest);expect(distributionFiles(source)).toEqual(['src/cli.ts']);writeFileSync(join(source,'src/cli.ts'),'changed');expect(readFileSync(a.cli,'utf8')).toBe('original');expect(snapshot(source,dest).version).not.toBe(a.version);writeFileSync(a.cli,'tampered');writeFileSync(join(source,'src/cli.ts'),'original');expect(()=>snapshot(source,dest)).toThrow('changed');}finally{rmSync(root,{recursive:true,force:true});}});
+test('interrupted snapshot copy leaves no published partial version and can be retried',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-copy-'));try{
+  const source=join(root,'source'),dest=join(root,'versions');mkdirSync(join(source,'src'),{recursive:true});writeFileSync(join(source,'src/cli.ts'),'original');
+  expect(()=>snapshot(source,dest,(from,to)=>{copyFileSync(from,to);throw Error('interrupted copy');})).toThrow('interrupted');expect(readdirSync(dest)).toEqual([]);
+  const built=snapshot(source,dest);expect(readFileSync(built.cli,'utf8')).toBe('original');expect(existsSync(join(dest,built.version,'manifest.json'))).toBe(true);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('installer migrates projects without plists and rolls back gates, record, launcher and exact plists on failure',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-rollback-'));try{
+  const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc');
+  for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'original');
+  const projects=['loaded','unloaded','no-plist'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));
+  for(const p of projects.slice(0,2))writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old '+p.project);
+  writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher',{mode:0o755});
+  const calls:string[]=[],hooks:string[]=[],restored:string[]=[];
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({Label:'old'}),assertDefinition:()=>{},
+   serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:id==='loaded'};},
+   localAO:async(path:string,method?:string,body?:any)=>{if(method==='PUT'){restored.push(path);expect(body.config).toEqual({original:path.split('/')[1]});return {};}return {status:'ok',project:{config:{original:path.split('/')[1]}}};},
+   installWorkflowHook:async(path:string)=>{hooks.push(path);if(path==='/no-plist.json')throw Error('hook failed');}};
+  await expect(installBridge(true,source,launcher,io)).rejects.toThrow('hook failed');
+  expect(hooks).toEqual(projects.map(p=>p.config));expect(restored).toHaveLength(3);
+  expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');
+  for(const p of projects.slice(0,2))expect(readFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'utf8')).toBe('old '+p.project);
+  expect(calls.filter(x=>x.startsWith('start:'))).toEqual(['start:loaded']);expect(calls.filter(x=>x.startsWith('stop:'))).toEqual(['stop:loaded']);
+  expect(readdirSync(join(state,'versions'))).toHaveLength(1);expect(readFileSync(snapshot(source,join(state,'versions')).cli,'utf8')).toBe('original');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});

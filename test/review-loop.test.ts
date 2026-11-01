@@ -3,6 +3,7 @@ import {decision,ReviewLoop} from '../src/review-loop';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
+import {sendPilotRemediation} from '../src/pilot';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -46,19 +47,44 @@ test('one project service cannot select another project’s PR targets',()=>{
  expect(loop.list('a').map(t=>t.pr)).toEqual([1]);expect(loop.list('b').map(t=>t.pr)).toEqual([2]);expect(loop.list().length).toBe(2);s.close();
 });
 
-test('template remediation sends once, waits for fresh CI after body edit, then reevaluates CodeRabbit',async()=>{
+function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
- const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',sha:head}],failedChecks:[{name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
+ const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true};
  const session:any={session:{id:'session',prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
- const loop=new ReviewLoop(s,async()=>{reviews++;},{readiness:async()=>e,sessionEvidence:async()=>session,disableNativeFeedback:async()=>({}),sendPilotRemediation:async()=>{
-  sends++;const a=l.reserveRemediation(id,head,JSON.stringify(e.findings)) as any;s.db.query("UPDATE remediation SET state='delivery_uncertain' WHERE job=?").run(id);s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(id,a.attempt,'pr_description',e.descriptionHash);s.db.query('INSERT INTO metadata_baselines VALUES (?,?,?)').run(id,a.attempt,e.templateSignature);session.transcript.entries.push({clientMessageId:`adlc-fix-${id.slice(0,12)}-${a.attempt}`,turnId:'fix'});session.transcript.turns.push({id:'fix',state:'running'});return a;
- }} as any);
+ const io:any={readiness:async()=>e,sessionEvidence:async()=>session,spawn:(args:string[])=>{
+  sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
+  session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
+  return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
+ }};
+ const loop=new ReviewLoop(s,async()=>{reviews++;},{readiness:io.readiness,sessionEvidence:io.sessionEvidence,disableNativeFeedback:async()=>({}),sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)} as any);
  loop.configureMetadataChecks('project',['PR body structure']);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
- try{
- await loop.tick(id);expect(sends).toBe(1);await loop.tick(id);expect(sends).toBe(1);
+ return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
+}
+test('real template remediation persists baselines, sends once, waits for CI and reevaluates CodeRabbit',async()=>{
+ const f=templateFixture(),{s,id,loop,session,e}=f;try{
+ await loop.tick(id);expect(f.sends()).toBe(1);await loop.tick(id);expect(f.sends()).toBe(1);
+ expect(s.db.query('SELECT kind,baseline_body_hash FROM remediation_context').get()).toEqual({kind:'pr_description',baseline_body_hash:'old-body'});expect(s.db.query('SELECT signature FROM metadata_baselines').get()).toEqual({signature:'old-check'});expect(s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
  session.transcript.turns[0].state='completed';e.descriptionHash='new-body';await loop.tick(id);
- expect((await loop.tick(id)).state).toBe('waiting_for_ci');expect(sends).toBe(1);
- e.failedChecks=[];e.findings=[];e.templateSignature='passed-check';expect((await loop.tick(id)).state).toBe('waiting_for_coderabbit');expect(reviews).toBe(1);await loop.tick(id);expect(reviews).toBe(1);expect(sends).toBe(1);
- e.clear=true;expect((await loop.tick(id)).state).toBe('ready_for_human');expect(sends).toBe(1);
+ expect((await loop.tick(id)).state).toBe('waiting_for_ci');expect(f.sends()).toBe(1);
+ e.failedChecks=[];e.findings=[];e.templateSignature='passed-check';expect((await loop.tick(id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);await loop.tick(id);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+ e.clear=true;expect((await loop.tick(id)).state).toBe('ready_for_human');expect(f.sends()).toBe(1);
  }finally{s.close();}
+});
+test('real pilot remediation rejects stale description, check identity and SHA before reserving or sending',async()=>{
+ for(const changed of [{descriptionHash:'changed'},{checkId:2},{sha:'changed'}]){const f=templateFixture();try{const findings=JSON.stringify([{...f.e.findings[0],...changed}]);await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],['PR body structure'],f.io)).rejects.toThrow('Template failure changed');expect(f.sends()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);}finally{f.s.close();}}
+});
+test('template wait blocks at five minutes without spending another attempt',async()=>{
+ const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.s.db.query('UPDATE metadata_waits SET started=?').run(Date.now()-5*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(1);}finally{f.s.close();}
+});
+test('fresh failing check allows bounded remediation instead of a stale CI wait',async()=>{
+ const f=templateFixture();try{
+  for(let attempt=1;attempt<=5;attempt++){
+   await f.loop.tick(f.id);expect(f.sends()).toBe(attempt);f.session.transcript.turns.at(-1).state='completed';f.e.descriptionHash=`body-${attempt}`;f.e.findings=[{...f.e.findings[0],descriptionHash:f.e.descriptionHash,checkId:attempt+1}];
+   await f.loop.tick(f.id);f.e.templateSignature=`check-${attempt}`;
+  }
+  await f.loop.tick(f.id);expect(f.sends()).toBe(5);expect(f.s.get(f.id).attempts).toBe(5);
+ }finally{f.s.close();}
+});
+test('CodeRabbit reevaluation blocks after thirty minutes without duplicate review requests',async()=>{
+ const f=templateFixture();try{await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';f.e.descriptionHash='new-body';await f.loop.tick(f.id);f.e.failedChecks=[];f.e.findings=[];expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');f.s.db.query('UPDATE full_review_requests SET requested=?').run(Date.now()-30*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);}finally{f.s.close();}
 });
