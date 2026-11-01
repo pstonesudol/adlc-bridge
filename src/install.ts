@@ -73,6 +73,10 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
    const rollbackErrors:Error[]=[];
    const failed=(operation:string,target:string,error:unknown)=>rollbackErrors.push(new Error(`${operation} needs inspection: ${target}`,{cause:error}));
    for(const id of restarted)try{await io.serviceControl('stop',id);}catch(error){failed('Intake rollback pause',id,error);}
+   // A possibly running intake may still use the newly published artifacts.
+   // Never restore files/settings underneath it or restart other intake until
+   // every restarted service has acknowledged the rollback pause.
+   if(rollbackErrors.length)throw new AggregateError([e,...rollbackErrors],`Installation failed (${e instanceof Error?e.message:String(e)}) and rollback was incomplete; artifacts preserved; ${rollbackErrors.map(error=>error.message).join('; ')}`);
    try{if(oldRecord)atomic(recordPath,oldRecord.toString());else if(existsSync(recordPath))unlinkSync(recordPath);}catch(error){failed('Installation record rollback',recordPath,error);}
    for(const p of originalProjects)try{await io.localAO(`projects/${p.id}/config`,'PUT',{config:p.config});}catch(error){failed('Project settings rollback',p.id,error);}
    for(const {path,original} of definitions)if(original)try{atomic(path,original);}catch(error){failed('Service rollback',path,error);}

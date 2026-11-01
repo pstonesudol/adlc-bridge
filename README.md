@@ -711,9 +711,13 @@ that flag. Escape sequences are stripped before selected failure lines reach
 the worker.
 
 When GitHub returns old and rerun check results for one commit, the bridge verifies
-the workflow run, job, repository, commit, workflow identity, and event before
-letting a newer run supersede an older one. Identically named checks from different
-workflows/events remain separate and cannot silently hide a failure. Orchestrator’s
+the workflow run, job, repository, commit, workflow identity, and event. Supersession
+also requires the same job provenance: GitHub REST job IDs are attempt-specific
+and do not establish a stable logical-job identity across attempts. Distinct job
+IDs are therefore retained even for successful reruns of same-name checks. This
+can leave readiness blocked or ambiguous for inspection; it cannot hide another
+job’s failure during a selective rerun. Identically named checks from different
+workflows/events also remain separate. Orchestrator’s
 own card may aggregate or cache check results differently; `adlc review-status`
 reports the bridge gate used for automation.
 
