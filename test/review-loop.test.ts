@@ -180,3 +180,15 @@ test('readiness collection failure replaces stale ready state with a durable sen
   expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'GitHub readiness unavailable'});expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason:'GitHub readiness unavailable'});expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}
 });
+test('late review records preserve completed targets and do not emit stale state changes',()=>{
+ const f=templateFixture();try{
+  f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Merge observed'});const target=f.loop.get(f.id),events=f.s.db.query('SELECT count(*) AS n FROM events').get();
+  expect(f.loop.record(f.id,{state:'blocked',send:false,reason:'Late provider failure'})).toEqual({state:'completed',send:false,head:target.head,reason:'Merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ }finally{f.s.close();}
+});
+test('readiness failure arriving after completion cannot reopen the target',async()=>{
+ const f=templateFixture();try{
+  let target:any,events:any;f.loop.io.readiness=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Concurrent merge observed'});target=f.loop.get(f.id);events=f.s.db.query('SELECT count(*) AS n FROM events').get();throw Error('Late readiness failure');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,reason:'Concurrent merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});

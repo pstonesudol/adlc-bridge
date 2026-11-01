@@ -65,10 +65,13 @@ export class ReviewLoop{
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
  record(job:string,result:any){
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
-  this.s.db.transaction(()=>{
-   const t=this.get(job);this.s.db.query('UPDATE review_targets SET state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=?').run(result.state,result.reason,signature,job);
+  return this.s.db.transaction(()=>{
+   const t=this.get(job);
+   if(t.state==='completed')return {state:'completed',send:false,head:t.head,reason:t.reason};
+   this.s.db.query("UPDATE review_targets SET state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND state!='completed'").run(result.state,result.reason,signature,job);
    if(t.last_signature!==signature)this.s.event(job,'review_state_changed',JSON.stringify(result));
-  })();return result;
+   return result;
+  }).immediate();
  }
  async requestReview(job:string,head:string,bodyHash:string){
   const t=this.get(job);new Lifecycle(this.s).current(job);
