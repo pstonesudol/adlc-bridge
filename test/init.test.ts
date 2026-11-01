@@ -66,7 +66,7 @@ test('wizard saves the authorized finite or unlimited branch-update policy from 
    const f=fixture(home),path=join(home,'project.json'),answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','no','no','no','yes','Test operator',answer,'no','yes','no'],questions:string[]=[];
    const result=await initWizard(home,['--config',path],{interactive:()=>true,home:()=>home,registryPath:()=>join(home,'registry.sqlite'),log:()=>{},linearToken:()=> 'test-only-placeholder',verifyInitConfig:c=>verifyInitConfig(c,f.api,f.ao),prompts:()=>({question:async(label:string)=>{questions.push(label);if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})});
    expect(result).toMatchObject({configuration:path,gateInstalled:false,serviceEnabled:false});expect(answers).toEqual([]);expect(closed).toBe(true);
-   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [unlimited]: ');
+   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [unlimited]: ');expect(questions.some(q=>q.includes('production blocked until body attestation exists'))).toBe(true);
   }finally{rmSync(home,{recursive:true,force:true});}
  }
 });

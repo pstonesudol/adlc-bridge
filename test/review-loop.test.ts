@@ -69,10 +69,16 @@ function failureEvidence(e:any){return e.findings.map((f:any)=>({name:f.check,ch
 test('initial clear metadata checks cannot bypass body evidence without a preexisting wait',async()=>{
  const f=templateFixture();try{
   f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
-  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_ci',send:false});const rows=f.s.db.query('SELECT * FROM metadata_waits').all();expect(rows).toHaveLength(1);
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_ci',send:false,reason:'Missing body-bound success evidence for every configured metadata check'});const rows=f.s.db.query('SELECT * FROM metadata_waits').all();expect(rows).toHaveLength(1);
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_ci');expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual(rows);expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
   f.s.db.query('UPDATE metadata_waits SET started=?').run(Date.now()-5*60*1000-1);expect((await f.loop.tick(f.id)).state).toBe('blocked');
   f.e.metadataCheckEvidence=bodyEvidence(f.e);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+ }finally{f.s.close();}
+});
+test('readiness collection continues without open-pr permission when automatic updates are disabled',async()=>{
+ const f=templateFixture();try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['fetch','push-feature'],'human');f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.metadataCheckEvidence=bodyEvidence(f.e);
+  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 test('an empty metadata policy skips wait creation and ignores historical metadata waits',async()=>{

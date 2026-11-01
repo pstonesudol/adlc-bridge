@@ -29,7 +29,7 @@ export class BranchUpdates{
   if(policy?.enabled&&(!policy.authorizedBy?.trim()||policy.maxUpdates!==null&&(!Number.isSafeInteger(policy.maxUpdates)||policy.maxUpdates<1||policy.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1)throw Error('Valid PR required');
   const l=new Lifecycle(this.s),j=l.current(job),run=l.run(job),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
-  const operations=policy?.enabled?['fetch','push-feature']:['open-pr'];
+   const operations=policy?.enabled?['fetch','push-feature']:[];
   if(!run||run.owner!=='orchestrator'||run.session_id!==session.session?.id||run.plan_hash!==j.plan_hash||!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Existing approved feature branch execution required');
   const b=await this.transport.read(repo,pr);
   assertDeliveryTarget(this.s,job,session.session,repo,pr,b);

@@ -176,7 +176,7 @@ export class ReviewLoop{
    }).immediate();
     const waiting=checkWait??deliveryWait;
     if(needsBodyEvidence){
-    return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; missing body-bound success evidence for every configured metadata check'});
+     return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'Missing body-bound success evidence for every configured metadata check'});
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.

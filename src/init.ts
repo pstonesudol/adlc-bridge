@@ -15,7 +15,7 @@ import {ProjectServices,registryPath,legacyLabel,assertDefinition,readDefinition
 
 export async function collectMetadataChecks(ask:(label:string)=>Promise<string>){
  const names:string[]=[];
- for(;;){const name=(await ask('PR-description-only CI check name (one exact name; blank to finish)')).trim();if(!name)return names;if(!names.includes(name))names.push(name);if(names.length>10)throw Error('At most 10 PR metadata checks supported');}
+ for(;;){const name=(await ask('PR-description-only CI check name (production blocked until body attestation exists; one exact name; blank to finish)')).trim();if(!name)return names;if(!names.includes(name))names.push(name);if(names.length>10)throw Error('At most 10 PR metadata checks supported');}
 }
 export function branchUpdateLimit(answer:string){
  const value=answer.trim().toLowerCase();if(value==='unlimited')return null;

@@ -25,3 +25,10 @@ test('unlimited branch authorization must be explicit; malformed limits are reje
  const f=fixture();try{for(const value of [undefined,0,-1,11,'unlimited'])await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:value as any})).rejects.toThrow('authorization');expect(f.calls()).toBe(0);}finally{f.s.close();}
 });
 test('disabled automatic updates do not bypass delivery branch validation',async()=>{const f=fixture();try{f.b.branch='unexpected';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('Blocked — branch mismatch');expect(f.calls()).toBe(0);}finally{f.s.close();}});
+test('disabled updates allow observation under either existing scoped grant while enabled updates still require fetch and push',async()=>{
+ for(const grant of [['fetch','push-feature'],['open-pr']]){const f=fixture();try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,grant as any,'human');expect(await f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).toBeNull();expect(f.calls()).toBe(0);
+  if(grant[0]==='open-pr')await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('approved feature branch execution');
+  f.s.db.exec('DELETE FROM git_grants');await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).rejects.toThrow('approved feature branch execution');expect(f.calls()).toBe(0);
+ }finally{f.s.close();}}
+});
