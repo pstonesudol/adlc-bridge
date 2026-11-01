@@ -61,7 +61,8 @@ export class ReviewLoop{
   this.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)').run(job,repo,pr,JSON.stringify(required),JSON.stringify(paths),Number(remediate),Date.now());
   this.s.event(job,'review_target_registered',JSON.stringify({repo,pr,remediate}));return this.get(job);
  }
- get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
+  get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
+  private completed(job:string){const t=this.get(job);return t?.state==='completed'?{state:'completed',send:false,head:t.head,reason:t.reason}:undefined;}
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
  record(job:string,result:any){
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
@@ -73,9 +74,11 @@ export class ReviewLoop{
    return result;
   }).immediate();
  }
- async requestReview(job:string,head:string,bodyHash:string){
-  const t=this.get(job);new Lifecycle(this.s).current(job);
-  const reserved=this.s.db.transaction(()=>{
+  async requestReview(job:string,head:string,bodyHash:string){
+   const t=this.get(job);if(this.completed(job))return false;
+   try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
+   const reserved=this.s.db.transaction(()=>{
+    if(this.completed(job))return false;
    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?)').run(job,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
    this.s.db.query('UPDATE review_targets SET head_since=? WHERE job=?').run(Date.now(),job);
@@ -88,7 +91,8 @@ export class ReviewLoop{
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({head,bodyHash}));
   return true;
  }
- async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]}){
+  async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]}){
+   const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
   if(policy!==undefined&&policy.project!==this.s.get(job).project)throw Error('Metadata policy configuration does not belong to the job project');
@@ -104,13 +108,21 @@ export class ReviewLoop{
    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
-  const branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);
-  if(branch)return this.record(job,branch);
+   const collected=this.completed(job);if(collected)return collected;
+   let branch;
+   try{branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
+   if(branch)return this.record(job,branch);
+   const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
   try{e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);}
   catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
-  if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');
+   const reviewed=this.completed(job);if(reviewed)return reviewed;
+   // Completed jobs no longer satisfy execution approval; handle that terminal
+   // observation here rather than relaxing Lifecycle.current's authorization.
+   try{if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
   const since=t.head===e.head?t.head_since:Date.now();
   // A same-SHA approval can predate a description edit. Reconcile metadata
   // receipts before considering e.clear, so that edit always creates its gate.
@@ -129,7 +141,7 @@ export class ReviewLoop{
   if(!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
    const requested=await this.requestReview(job,e.head,e.descriptionHash);
    if(requested){
-    this.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(e.head,job);
+     this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND state!='completed'").run(e.head,job);
     return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
    }
   }

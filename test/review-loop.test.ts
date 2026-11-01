@@ -194,7 +194,16 @@ test('readiness failure arriving after completion cannot reopen the target',asyn
 });
 test('successful review collection after concurrent completion cannot overwrite it or send remediation',async()=>{
  for(const clear of [false,true]){const f=templateFixture();try{
-  let target:any,events:any;f.loop.io.readiness=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Concurrent merge observed'});target=f.loop.get(f.id);events=f.s.db.query('SELECT count(*) AS n FROM events').get();return {...f.e,clear};};
+  let target:any,events:any;f.loop.io.readiness=async()=>{f.s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';");f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Concurrent merge observed'});target=f.loop.get(f.id);events=f.s.db.query('SELECT count(*) AS n FROM events').get();return {...f.e,clear};};
   expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
  }finally{f.s.close();}}
+});
+test('a late GitHub review-request receipt preserves the completed target and its newer head',async()=>{
+ const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
+ try{
+  f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.loop.postReview=async()=>{entered();await gate;};
+  const pending=f.loop.tick(f.id);await started;const newer='b'.repeat(40);f.s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';");f.s.db.query("UPDATE review_targets SET state='completed',head=?,reason='Merge observed' WHERE job=?").run(newer,f.id);
+  const target=f.loop.get(f.id),changes=f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get();release();expect(await pending).toEqual({state:'completed',send:false,head:newer,reason:'Merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get()).toEqual(changes);expect(f.sends()).toBe(0);
+  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ }finally{release?.();f.s.close();}
 });
