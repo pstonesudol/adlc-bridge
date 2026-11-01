@@ -113,6 +113,15 @@ test('recovery never restores revoked approval or resends implementation',async(
  expect(s.get(id).state).toBe('awaiting_approval');expect(f.sends.length).toBe(1);s.close();
 });
 
+test('evidence refresh failure invalidates a recorded handoff',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();expect((await w.tick(config))[0].state).toBe('pr_handoff');
+ f.evidence=async()=>{throw Error('evidence unavailable');};
+ const result=await w.tick(config);
+ expect(result[0].error).toContain('evidence unavailable');
+ expect(w.implementation(id).state).toBe('needs_reconciliation');
+ s.close();
+});
 test('actual branch drift blocks even when native session has no PR metadata',async()=>{
  const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
  await w.tick(config);f.finishImplementation();f.sessions.get('session-1').session.prs=[];
