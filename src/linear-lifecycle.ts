@@ -134,9 +134,14 @@ export class LinearLifecycle{
      results.push({job:row.id,phase:'remediation-blocker',error:e instanceof Error?e.message:'Linear blocker notice failed'});
     }
    }
+   let branchMismatch=false;
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()){
     const delivery=this.s.db.query('SELECT reason FROM implementation_dispatch WHERE job=?').get(row.id) as any;
-    if(delivery?.reason?.startsWith('Blocked — branch mismatch')){await this.driftNotice(row.id,delivery.reason,c);results.push({job:row.id,state:'blocked',reason:delivery.reason});continue;}
+    if(delivery?.reason?.startsWith('Blocked — branch mismatch')){
+     branchMismatch=true;
+     try{await this.driftNotice(row.id,delivery.reason,c);results.push({job:row.id,state:'blocked',reason:delivery.reason});}
+     catch(e){results.push({job:row.id,phase:'branch-drift',error:e instanceof Error?e.message:'Linear branch drift notice failed'});}
+    }
    }
    const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;
@@ -147,7 +152,7 @@ export class LinearLifecycle{
     else if(facts.state!=='open'){results.push({job:row.id,state:'blocked',reason:'PR closed without merge; not marking Done'});continue;}
     else{if(row.state==='blocked')continue;phase='in-review';desired=c.statusSync.inReview;}
    }
-   if(row.state==='blocked'&&phase!=='done')continue;
+   if((row.state==='blocked'||branchMismatch)&&phase!=='done')continue;
    const result=await this.move(row.id,phase,desired,c,row.spec_hash);results.push({job:row.id,phase,...result});
    if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
     this.assertSpecification(row.id,row.spec_hash);

@@ -209,3 +209,21 @@ test('drift notice confirms a matching comment on a later page',async()=>{
   expect(pages).toBe(2);expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('confirmed');
  }finally{f.s.close();}
 });
+
+test('combined budget and branch blockers preserve observed merge completion and requirements checks',async()=>{
+ for(const noticeFails of [false,true])for(const merged of [false,true])for(const changed of [false,true]){
+  const f=budgetBlocked();try{
+   const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7';
+   f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'hash','worker','client','blocked','["src/**"]','supervised-host','human',reason);
+   f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(f.id,'correlation','hash','blocked');
+   f.sync.driftNotice=async()=>{if(noticeFails)throw Error('Drift notice unavailable');};
+   if(merged)f.merge();if(changed)f.issueChanges.description='changed';
+   const result=await f.sync.sync(c),done=merged&&!changed;
+   expect(f.s.get(f.id).state).toBe(done?'done':'blocked');
+   expect(f.state).toBe(done?'done':'todo');expect(f.updates).toBe(done?1:0);
+   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe(done?'completed':'blocked');
+   if(noticeFails)expect(result.some((x:any)=>x.phase==='branch-drift'&&x.error==='Drift notice unavailable')).toBe(true);
+  }finally{f.s.close();}
+ }
+});
