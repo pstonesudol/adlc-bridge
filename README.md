@@ -183,6 +183,8 @@ and its placeholders must be replaced; it is not an executable configuration.
 | `statusSync` | Team-specific In Progress, In Review, and Done UUIDs |
 | `remediation.maxAttempts` | Positive per-job remediation budget; `null` enables explicit uncapped mode |
 | `remediation.maxNoProgress` | Consecutive attempts without verified progress before an explicit stop |
+| `blockerSync` | Additive needs-human label UUID for worker blocker comments; never grants readiness |
+| `workflow.prGraceMs` | Delay before an unexplained zero-PR completion becomes a reconciliation blocker (default 120000) |
 | `featurePlanning.backlogStateId` | Backlog UUID for newly published ticket batches |
 
 Obtain Linear UUIDs through its API or connected tools; do not substitute issue
@@ -302,6 +304,50 @@ For a missed handoff after an eligible ticket's original authorization was
 revoked, see [Existing worker PR recovery](#existing-worker-pr-recovery).
 Recovery previews read-only by default and applies only the reviewed proposal
 with `--confirm HASH`; normal polling registers the review target afterwards.
+
+### Plan readiness and worker blockers
+
+Planning agents must end with a machine-readable `ADLC_PLAN_STATUS` receipt:
+`ready`, `needs-input`, or `blocked-by-dependency`, with concrete questions and
+dependency references. Missing or malformed receipts are non-actionable. The
+`ready-queue` standing policy can authorize only a current, valid `ready` plan;
+ordinary non-blocking risks do not prevent execution. Human plan approval does
+not silently resolve a structured question or dependency.
+
+Inspect readiness and worker blockers with `adlc status`. When a completed
+implementation turn has no PR, the bridge prefers the worker's
+`ADLC_WORKER_STATUS` receipt. A needs-input or blocked-dependency receipt becomes
+a visible blocker instead of an indefinite `awaiting_pr`. If PR metadata is merely
+delayed, `workflow.prGraceMs` allows it to attach; after expiry the state becomes
+an explicit reconciliation blocker. Legacy sessions without a receipt are
+interpreted conservatively, and their confidence is shown.
+
+With `blockerSync.enabled`, polls add the configured needs-human label and one
+deduplicated Linear comment with the exact question and dependency references.
+The update is additive: existing labels and human changes are preserved, and it
+never grants readiness or implementation authority.
+
+Record a human answer or satisfied dependency, then resume the existing owned
+worker explicitly:
+
+```sh
+adlc resolve-plan JOB_ID --source human-answer --human "Your name" \
+  --answer "Use product ID SKU-42"
+adlc resume-job JOB_ID config/local.json
+```
+
+Resume validates the current spec, plan version, approval, scoped permissions,
+resolution and session identity. It reserves one continuation before delivery,
+never resends the original implementation request, and refuses uncertain sends
+or duplicate resumes. Material requirement or scope changes require replanning
+and reapproval. To preview reconciliation without writing state:
+
+```sh
+adlc reconcile-preview config/local.json
+```
+
+The preview reports existing session outcomes and questions but applies no repair
+and never restarts work.
 
 ## Feature requirements to ticket batches
 

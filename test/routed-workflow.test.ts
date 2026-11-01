@@ -20,7 +20,7 @@ class Fake implements WorkflowTransport{
   const plan=clientId.startsWith('adlc-plan-message-'),turn=plan?'plan':'implement';
   this.session.transcript.entries.push({sequence:1,role:'user',kind:'message',clientMessageId:clientId,turnId:turn,text:prompt});
   this.session.transcript.turns.push({id:turn,state:plan?'completed':'running'});
-  if(plan){this.session.transcript.entries.push({sequence:2,role:'assistant',kind:'message',origin:'provider',streaming:false,turnId:turn,text:prompt.match(/<!-- ADLC_PLAN_READY:[a-f0-9]+ -->/)![0]+'\nChange src/a.ts and run lint.'});}
+  if(plan){this.session.transcript.entries.push({sequence:2,role:'assistant',kind:'message',origin:'provider',streaming:false,turnId:turn,text:prompt.match(/<!-- ADLC_PLAN_READY:[a-f0-9]+ -->/)![0]+'\nChange src/a.ts and run lint.\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->'});}
   else this.session.transcript.controller='busy';
   if(this.lost)throw Error('Lost response after delivery');
  }

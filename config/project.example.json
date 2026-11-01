@@ -23,6 +23,13 @@
   "approval": {
     "mode": "manual"
   },
+  "workflow": {
+    "prGraceMs": 120000
+  },
+  "blockerSync": {
+    "enabled": false,
+    "labelId": "REPLACE_WITH_NEEDS_HUMAN_LABEL_UUID"
+  },
   "routing": {
     "enabled": false,
     "dataDir": "/absolute/path/to/.config/openchamber",

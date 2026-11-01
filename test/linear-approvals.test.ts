@@ -4,6 +4,7 @@ import {Workflow} from '../src/workflow';
 import {Planning} from '../src/planning';
 import {ApprovalPolicyStore} from '../src/approval-policy';
 import {LinearApprovals} from '../src/linear-approvals';
+import {recordReadiness} from '../src/readiness';
 function fixture(){
  const s=new Store(':memory:'),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
@@ -11,7 +12,7 @@ function fixture(){
  const spec=JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description});
  const w=new Workflow(s,{startPlan:async()=>{throw Error('Unexpected start');},findPlans:async()=>[],disableFeedback:async()=>{},sendImplementation:async()=>{sends++;},evidence:async()=>({session:{id:'worker',projectId:'ao',branch:p.get(id).branch,isTerminated:false},transcript:{controller:'ready',entries:[],turns:[]}})});
  const id=s.enqueue('p','issue',spec),p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');
- s.propose(id,'Plan: edit src/a.ts and run checks');s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(id,digest(spec),'awaiting_approval','worker',null,'plan');
+ s.propose(id,'Plan: edit src/a.ts and run checks');recordReadiness(s,id,'Plan: edit src/a.ts and run checks\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->',s.get(id).plan_hash,digest(spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(id,digest(spec),'awaiting_approval','worker',null,'plan');
  new ApprovalPolicyStore(s).snapshot('p',new Set(['issue']),Date.now(),new Set(['issue']));
  const comments:any[]=[];
  const api=async(q:string,v:any)=>{
