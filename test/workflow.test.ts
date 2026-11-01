@@ -101,6 +101,26 @@ test('manually completed planning frees slots in tick and direct transactional a
  }
 });
 
+test('manual proposal after an uncertain or reconciliation-blocked spawn keeps its planning slot',async()=>{
+ for(const blocked of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);f.loseSpawn=true;
+  try{
+   const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   expect((await w.startPlanning(first,config)).state).toBe('dispatch_uncertain');
+   if(blocked){
+    s.enqueue('p','first','changed specification');await w.tick(config);
+    expect(w.planning(first).state).toBe('needs_reconciliation');
+   }
+   expect(f.starts.length).toBe(1);
+   s.propose(first,'Manually submitted plan');
+   expect(s.get(first).state).toBe('awaiting_approval');
+   await expect(w.startPlanning(next,config)).rejects.toThrow('Planning concurrency limit reached');
+   await w.tick(config);
+   expect(f.starts.length).toBe(1);expect(w.planning(next)).toBe(null);
+  }finally{s.close();}
+ }
+});
+
 test('capacity above two queues overflow, lowering waits, completion admits queued work',async()=>{
  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
  const c={...config,automation:{...config.automation,maxPlanning:3}};
