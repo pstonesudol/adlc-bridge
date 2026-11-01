@@ -7,6 +7,9 @@ import {readiness} from './github';
 import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {DEFAULT_REMEDIATION_POLICY,type RemediationPolicy} from './remediation';
+import {assertDeliveryTarget} from './delivery-identity';
+import {readBranchSnapshot} from './branch-updates';
+import {worktreeIdentity} from './delivery-evidence';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -71,8 +74,14 @@ export class ReviewLoop{
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   l.recordRemediationPolicy(job,remediationPolicy);
-  const session=await sessionEvidence(run.session_id);
-  if(session.session.isTerminated||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
+  let session;
+  try{
+   session=await sessionEvidence(run.session_id);
+   if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
+   const snapshot=await readBranchSnapshot(t.repo,t.pr),local=await worktreeIdentity(this.s,job);
+   assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
+   if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
+  }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
   const branch=await new BranchUpdates(this.s).ensure(job,t.repo,t.pr,session,branchPolicy);
   if(branch)return this.record(job,branch);
   const e=await readiness(t.repo,t.pr,JSON.parse(t.required_checks));

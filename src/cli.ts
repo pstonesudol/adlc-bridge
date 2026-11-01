@@ -26,6 +26,8 @@ import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
+import {DeliveryRecovery} from './delivery-recovery';
+import {recoveryTransport} from './delivery-evidence';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -64,10 +66,10 @@ async function main(){
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
   adopt-pilot JOB SESSION               reconcile existing supervised worker only
   observe-pilot JOB OWNER/REPO PR CONFIG persist latest-SHA review evidence
-  recover-handoff JOB CONFIG           reconnect an existing authorized worker PR
+  recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
   register-review JOB REPO PR CONFIG    register bounded review target
   review-status                        show CI/review waits, blockers and remediation budget
-  tick-review JOB                      check CI/review; send bounded in-scope fixes
+  tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
                                        preview or apply an audited exhausted-budget extension
   approve-plan JOB HASH HUMAN           record current plan approval
@@ -117,19 +119,18 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
   if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?JSON.parse(readFileSync(req(a[0],'Config'),'utf8')):null;if(c)validate(c);
-  const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
+   if(command==='recover-handoff'){
+    const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+    if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
+    if(!existsSync(db))throw Error('Existing state database required');
+    const store=new Store(db,a.length===2);
+    try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
+   }
+   const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
   try{
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
     if(command==='review-status')return out(reviewLoop.list().map(t=>({...t,remediation:lifecycle.budgetSummary(t.job)})));
     if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewLoop.list(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
-    if(command==='recover-handoff'){
-      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
-      await poll(config,s,linearToken());
-      const stage=await workflow.recoverHandoff(req(a[0],'Job'),config);
-      await disableNativeFeedback(stage.session);
-      reviewLoop.register(stage.job,config.githubRepo,stage.pr.number,config.requiredChecks,JSON.parse(workflow.implementation(stage.job).paths),true);
-      return out(stage);
-    }
     if(command==='show-plan'){const j=s.get(req(a[0],'Job'));return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),routing:new TaskRouting(s).list(j.id)});}
     if(command==='approve-job'){
       const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
@@ -143,11 +144,13 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
       return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true));
     }
-    if(command==='tick-review'&&a[1]){
+    if(command==='tick-review'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
-      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation)));
+      const job=req(a[0],'Job'),target=reviewLoop.get(job);
+      if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+      new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
+      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation)));
     }
-    if(command==='tick-review'){const job=req(a[0],'Job');return out(await reviewLoop.tick(job,undefined,lifecycle.budgetPolicy(job)));}
     if(command==='extend-budget'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       const flag=(name:string)=>{const i=a.indexOf(name);return i<0?undefined:req(a[i+1],name);};

@@ -4,7 +4,7 @@ import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from '../src/approva
 const policy:ApprovalPolicy={mode:'ready-queue',id:'test-queue-policy',authorizedBy:'test human',scope:['**'],gitScope:'feature-pr'};
 const config={repo:'/repo',linear:{projectId:'project'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:policy};
 function fixture(){
- const s=new Store(':memory:'),messages:any[]=[],session={session:{id:'worker',projectId:'ao',branch:'',prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
+ const s=new Store(':memory:'),messages:any[]=[],session={session:{id:'worker',projectId:'ao',branch:'',isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
  const w=new Workflow(s,{startPlan:async()=>{throw Error('No new worker expected');},findPlans:async()=>[],evidence:async()=>session,disableFeedback:async()=>{},sendImplementation:async(id,prompt,clientId)=>{messages.push({id,prompt,clientId});session.transcript.controller='busy';(session.transcript.entries as any[]).push({clientMessageId:clientId,turnId:'implementation'});(session.transcript.turns as any[]).push({id:'implementation',state:'running'});}});
  const id=s.enqueue('project','issue','User queued task'),p=new Planning(s);p.reserve(id,'ao');const r=p.get(id);session.session.branch=r.branch;p.gate(id,'ao','worker',r.branch,'/worktree');
  const hash=s.propose(id,'Captured plan');s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest('User queued task'),'awaiting_approval','worker','planning-id');
