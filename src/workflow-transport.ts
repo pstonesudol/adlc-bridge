@@ -57,7 +57,7 @@ export async function installWorkflowHook(configPath:string,api=localAO){
  mkdirSync(backupDir,{recursive:true,mode:0o700});
  const backup=resolve(backupDir,`${project}-${Date.now()}.json`);
  writeFileSync(backup,JSON.stringify(b.project.config,null,2),{mode:0o600,flag:'wx'});
- const hook=`/opt/homebrew/bin/bun ${shellQuote(resolve(import.meta.dir,'planning-gate.ts'))}`;
+ const hook=`${shellQuote(process.execPath)} ${shellQuote(resolve(import.meta.dir,'planning-gate.ts'))}`;
  const scripts=config.postCreate??[];
  if(!Array.isArray(scripts)||scripts.some((x:any)=>typeof x!=='string'))throw Error('Unexpected setup scripts');
  const prior=scripts.filter((x:string)=>!x.includes('/adlc-bridge/src/planning-gate.ts')&&!x.includes('ADLC execution disabled pending host approval gate'));

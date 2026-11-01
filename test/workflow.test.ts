@@ -41,6 +41,14 @@ async function planned(path=':memory:'){
  const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue',JSON.stringify({identifier:'DEMO-1',title:'Test',description:'Update src/a.ts'}));
  await w.tick(config);f.completePlan();await w.tick(config);return {s,f,w,id,hash:s.get(id).plan_hash};
 }
+test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{
+ const {s,f,w,id,hash}=await planned();
+ try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);
+  await w.executeApproved(id,{...config,verification:{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]}});
+  expect(f.sends[0].prompt).toContain('execution mode: host');expect(f.sends[0].prompt).toContain('["bun","test"]');expect(f.sends[0].prompt).not.toContain('Use the configured Docker');
+ }finally{s.close();}
+});
 test('eligible ticket plans automatically, captures actual response, and stops without implementation',async()=>{
  const {s,f,w,id}=await planned();expect(f.starts.length).toBe(1);expect(f.starts[0].name).toContain('DEMO-1');
  expect(f.starts[0].prompt).toContain('Return text only');expect(s.get(id).state).toBe('awaiting_approval');

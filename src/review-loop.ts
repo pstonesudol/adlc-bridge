@@ -6,6 +6,7 @@ import {sessionEvidence} from './session-evidence';
 import {readiness} from './github';
 import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
+import {validateVerification,type Verification} from './verification';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -34,14 +35,18 @@ export class ReviewLoop{
   head_since INTEGER NOT NULL,last_signature TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS remediation_context(job TEXT NOT NULL,attempt INTEGER NOT NULL,kind TEXT NOT NULL,baseline_body_hash TEXT,PRIMARY KEY(job,attempt));
   CREATE TABLE IF NOT EXISTS review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,head,body_hash));
-  CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));`);}
- register(job:string,repo:string,pr:number,required:string[],paths:string[],remediate=false){
+  CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));
+  CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);`);}
+ register(job:string,repo:string,pr:number,required:string[],paths:string[],remediate=false,verification?:Verification){
+  if(verification)validateVerification(verification);
   const l=new Lifecycle(this.s);l.current(job);if(!l.run(job))throw Error('Existing approved run required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1||!required.length||!paths.length||paths.some(p=>p.startsWith('/')||p.split('/').includes('..')))throw Error('Invalid review target');
-  const old=this.get(job);if(old){if(old.repo!==repo||old.pr!==pr||old.required_checks!==JSON.stringify(required)||old.allowed_paths!==JSON.stringify(paths)||old.remediate!==Number(remediate))throw Error('Target changed; explicit reconciliation required');return old;}
+  const old=this.get(job);if(old){if(old.repo!==repo||old.pr!==pr||old.required_checks!==JSON.stringify(required)||old.allowed_paths!==JSON.stringify(paths)||old.remediate!==Number(remediate))throw Error('Target changed; explicit reconciliation required');this.setVerification(job,verification);return old;}
   this.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)').run(job,repo,pr,JSON.stringify(required),JSON.stringify(paths),Number(remediate),Date.now());
+  this.setVerification(job,verification);
   this.s.event(job,'review_target_registered',JSON.stringify({repo,pr,remediate}));return this.get(job);
  }
+ setVerification(job:string,v?:Verification){if(v){validateVerification(v);this.s.db.query('INSERT INTO review_verification VALUES (?,?) ON CONFLICT(job) DO UPDATE SET configuration=excluded.configuration').run(job,JSON.stringify(v));}else this.s.db.query('DELETE FROM review_verification WHERE job=?').run(job);}
  get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
  record(job:string,result:any){
@@ -114,7 +119,8 @@ export class ReviewLoop{
    const operations=metadataOnly?['open-pr']:['commit','push-feature'];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await disableNativeFeedback(run.session_id);
-   const result=await sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,JSON.parse(t.required_checks));
+   const verification=this.s.db.query('SELECT configuration FROM review_verification WHERE job=?').get(job) as any;
+   const result=await sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,JSON.parse(t.required_checks),verification?JSON.parse(verification.configuration):undefined);
    return {...d,head:e.head,delivery:result};
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};
