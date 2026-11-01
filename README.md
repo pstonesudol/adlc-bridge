@@ -591,3 +591,67 @@ the remediation stop, and never deletes attempts, replays a send, creates anothe
 session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
+
+# DEV-18 independent answer adapter (not activated)
+
+`src/clarification-answers.ts` is a read-only, dependency-injected parser for
+authorized human answer **candidates**. It is not registered in intake or CLI
+polling. A complete candidate is neither a semantic resolution nor permission to
+continue. Ordinary single-question prose is supported; multiple questions use
+exact question IDs (`q1: answer`). Edited, quoted, stale and duplicate replies
+fail closed. Partial answers return the remaining IDs without inferring answers.
+The host must retain partial evidence durably and validate meaning and scope;
+this module does not accumulate answers or write receipts.
+
+## Pending foundation integration
+
+Inspected read-only: proposed DEV-17 PR #4 at
+`f7eb9500dee57dca404b89086ca6a39b0818a800` (open and unmerged when inspected).
+No foundation code is copied here, and the tests are isolated parser contract
+tests, **not** integrated Linear or continuation tests.
+
+Once an approved base contains the foundation, integration must:
+
+- Obtain the current question set from `Workflow.outcomes` and bind the request
+  to issue/job, current requirements/plan hashes and `resolutionBinding` (which
+  includes `readinessBinding` and the worker outcome). Do not substitute
+  `LinearBlockers.binding`, whose purpose is notice publication deduplication.
+- Extend `LinearBlockers`' existing publication/receipts, not create another
+  blocker table or publisher. Add exact question instructions, discovery evidence,
+  why each answer is essential, and the issue/job/version-bound reference there.
+- Inject complete paginated Linear comment evidence including author identity,
+  bot/app identity, creation and edit times, and issue association. Use explicit
+  configured authorized human IDs, never display names or ticket content.
+- After semantic validation of **all** blocking questions and dependencies,
+  record the validated evidence with `recordResolution(..., 'human-answer', ...)`.
+  Recheck binding and authorization atomically before activating a resolution;
+  partial answers must never call this function. Scope changes require replanning.
+- Use `activeResolution`/`currentResolution` and `Workflow.resume` for the existing
+  owned session. Reconcile its existing continuation receipts; no new dispatcher,
+  worker spawn, or original implementation resend is permitted.
+- Reuse bridge-owned label provenance and deduplicated publication for cleanup
+  and acknowledgment; preserve other unresolved blockers and human-applied labels.
+
+Contract questions still requiring foundation coordination:
+
+1. `recordResolution` at the inspected SHA activates immediately and overwrites
+   an active resolution's timestamp. What atomic expected-binding and durable
+   consumed-comment/partial-answer receipt will prevent repeated polls from
+   changing the continuation binding? The parser's injected `consumed` read is
+   not an atomic claim and cannot provide delivery idempotency.
+2. Who validates answer meaning, unresolved dependencies and material scope
+   changes? Structural parsing alone cannot distinguish an answer from a request
+   to change scope. Until that validator exists, candidates cannot resolve work.
+3. `LinearBlockers` reads only comment ID/body/time at the inspected SHA. Its
+   publisher needs contextual discovery and reply-reference inputs, and answer
+   reads need authenticated author/edit metadata without a second publisher.
+4. How are active-worker answers queued, and how are label changes reconciled
+   after lost receipts or human remove/re-add? The proposed label-applied flag
+   alone does not prove continuous ownership. Cleanup must fail closed.
+5. How will bounded resolution detail (currently 4,000 characters) reference
+   multiple durable partial answers without truncating essential task context?
+
+Remaining acceptance work includes discovery-before-asking, publication and label
+ownership, durable partial-answer receipts, semantic validation, acknowledgment,
+runtime wiring and restart/overlapping-poll continuation tests. No live project
+configuration, Linear labels, sessions or execution authority are changed here.
