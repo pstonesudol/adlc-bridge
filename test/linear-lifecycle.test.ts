@@ -64,3 +64,39 @@ test('human merge of budget-blocked PR still completes Linear, job, run and revi
   expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).toBe('completed');
  }finally{f.s.close();}
 });
+
+test('notice failures do not prevent observed merge completion or replay uncertain comments',async()=>{
+ for(const failure of ['initial','uncertain','tampered']){
+  const f=budgetBlocked();try{
+   f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["src/**"]',Date.now());
+   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(f.id,'correlation','hash','blocked');
+   f.failNotice();
+   if(failure!=='initial'){
+    await f.sync.sync(c);expect(f.state).toBe('todo');expect(f.s.get(f.id).state).toBe('blocked');
+    if(failure==='tampered'){
+     const n=f.s.db.query('SELECT * FROM remediation_notices WHERE job=?').get(f.id) as any;
+     f.posted.push({id:n.comment_id,body:'tampered',createdAt:new Date().toISOString()});
+    }
+   }
+   f.merge();const result=await f.sync.sync(c);
+   expect(result[0]).toMatchObject({job:f.id,phase:'remediation-blocker'});
+   expect(result[0].error).toContain(failure==='initial'?'Lost notice reply':failure==='uncertain'?'never repost blindly':'Posted remediation notice changed');
+   expect(result.some((x:any)=>x.phase==='done'&&x.state==='confirmed')).toBe(true);
+   expect(f.state).toBe('done');expect(f.s.get(f.id).state).toBe('done');expect(f.noticeCalls).toBe(1);
+   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe('completed');
+   expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).toBe('completed');
+   expect((f.s.db.query('SELECT state FROM remediation_notices WHERE job=?').get(f.id) as any).state).toBe('delivery_uncertain');
+  }finally{f.s.close();}
+ }
+});
+
+test('notice failure does not bypass requirements validation for merged work',async()=>{
+ const f=budgetBlocked();try{
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["src/**"]',Date.now());
+  f.failNotice();await f.sync.sync(c);f.issueChanges.description='changed';f.merge();
+  const result=await f.sync.sync(c);
+  expect(result.some((x:any)=>x.phase==='remediation-blocker'&&x.error)).toBe(true);
+  expect(result.some((x:any)=>x.error==='Requirements changed; refusing status update')).toBe(true);
+  expect(f.state).toBe('todo');expect(f.s.get(f.id).state).toBe('blocked');expect(f.updates).toBe(0);expect(f.noticeCalls).toBe(1);
+ }finally{f.s.close();}
+});

@@ -79,8 +79,12 @@ export class LinearLifecycle{
   const results=[];
   for(const row of rows)try{
    if(row.state==='blocked'){
-    const notice=await this.notifyBudgetBlocker(row.id,c);
-    if(notice)results.push({job:row.id,phase:'remediation-blocker',...notice});
+    try{
+     const notice=await this.notifyBudgetBlocker(row.id,c);
+     if(notice)results.push({job:row.id,phase:'remediation-blocker',...notice});
+    }catch(e){
+     results.push({job:row.id,phase:'remediation-blocker',error:e instanceof Error?e.message:'Linear blocker notice failed'});
+    }
    }
    const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;
