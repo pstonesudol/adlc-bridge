@@ -5,9 +5,15 @@ import {sessionEvidence} from './session-evidence';
 import {AO} from './orchestrator';
 import type {FeatureAgents} from './feature-planning';
 import {withTurnSubmission} from './turn-submission';
-export function createFeatureAgents(submit=withTurnSubmission,spawn=Bun.spawn):FeatureAgents{return {
+import {PreSendFailure} from './pre-send';
+export function createFeatureAgents(submit=withTurnSubmission,spawn=Bun.spawn,api=localAO,preflight=preflightRoute,disable=disableNativeFeedback):FeatureAgents{return {
  submit,
- async start(r){return submit(async()=>{await preflightRoute(r.route);const b=await localAO('sessions','POST',{kind:'worker',harness:r.route.harness,mode:'chat',approvalMode:'accept-edits',model:r.route.model,displayName:r.name,clientRequestId:r.key});if(!b.session?.id||b.session.projectId)throw Error('Standalone planning receipt required');await disableNativeFeedback(b.session.id);return {id:b.session.id};});},
+ async start(r){return submit(async()=>{
+  try{await preflight(r.route,api);}catch{throw new PreSendFailure('Feature preflight failed before session creation');}
+  const b=await api('sessions','POST',{kind:'worker',harness:r.route.harness,mode:'chat',approvalMode:'accept-edits',model:r.route.model,displayName:r.name,clientRequestId:r.key},r.beforeSend);
+  try{if(!b.session?.id||b.session.projectId)throw Error('Standalone planning receipt required');await disable(b.session.id);return {id:b.session.id};}
+  catch(e){if(e instanceof PreSendFailure)throw Error('Feature session setup outcome uncertain',{cause:e});throw e;}
+ });},
  async find(name){const b=await localAO('sessions?active=true');if(!Array.isArray(b.sessions)||b.nextCursor)throw Error('Incomplete feature session inventory');return b.sessions.filter((s:any)=>s.displayName===name&&!s.projectId&&!s.isTerminated);},
  evidence:sessionEvidence,
  configure:configureSessionRoute,

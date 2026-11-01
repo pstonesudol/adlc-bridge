@@ -107,15 +107,15 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  return blocked;
 }
 export function liveStackOps(readOnly=false):StackOps{
- const config=definition();
+ const config=definition(),turns=turnBarrier();
  return {
-  turns:turnBarrier(),
+  turns,
   projects:()=>registeredProjects(readOnly),
   project:async(action,id)=>{
    // Full-stack controls persist the user's on/off choice across login.
    const entries=await registeredProjects(action==='service-status'),p=entries.find(x=>x.project===id);if(!p)throw Error('Unknown project');
    if(action==='start'){const r=await command(['/bin/launchctl','enable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Could not enable project service');}
-   const result=await serviceControl(action,id);
+   const result=await serviceControl(action,id,turns);
    if(action==='stop'){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
    return result;
   },

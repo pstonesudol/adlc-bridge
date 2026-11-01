@@ -2,11 +2,12 @@ import {Store,digest} from './core';
 import {parseRequirements,validateDraft,validateReview,extractResult,batchHash,type FeatureDraft} from './feature-schema';
 import {loadOpenChamber,selectRoute,type Route,type RoutingSettings,type RoutingLoader} from './task-routing';
 import {TurnSubmissionBlocked} from './turn-submission';
+import {PreSendFailure} from './pre-send';
 export const planningRoles=['architecture','delivery','quality'] as const;
 export type FeatureConfig={name:string;repo:string;linear:{projectId:string;teamId:string;readyLabelId:string;readyStateId:string};routing?:RoutingSettings;featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number}};
 export interface FeatureAgents{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
- start(r:{name:string;key:string;route:Route}):Promise<{id:string}>;
+  start(r:{name:string;key:string;route:Route;beforeSend?:()=>void}):Promise<{id:string}>;
  find(name:string):Promise<any[]>;
  evidence(session:string):Promise<any>;
  configure(session:string,route:Route):Promise<unknown>;
@@ -61,8 +62,15 @@ export class FeaturePlanning{
   const p=this.get(id);let a=this.s.db.query('SELECT * FROM feature_agents WHERE plan=? AND role=?').get(id,role) as any;const route=JSON.parse(p.route);
   if(['completed','blocked','cancelled'].includes(a.state))return;
   if(a.state==='reserved'){
-   const claimed=this.s.db.query("UPDATE feature_agents SET state='spawn_uncertain',started=? WHERE plan=? AND role=? AND state='reserved'").run(Date.now(),id,role);if(!claimed.changes)return;
-   try{const r=await this.agents.start({name:a.name,key:a.client_id,route});this.s.db.query("UPDATE feature_agents SET session=?,state='configuring' WHERE plan=? AND role=?").run(r.id,id,role);}catch{this.event(id,'feature_spawn_uncertain',role);return;}
+   const claimed=this.s.db.query("UPDATE feature_agents SET state='preparing_spawn',started=? WHERE plan=? AND role=? AND state='reserved'").run(Date.now(),id,role);if(!claimed.changes)return;
+   try{
+    const r=await this.agents.start({name:a.name,key:a.client_id,route,beforeSend:()=>{this.s.db.query("UPDATE feature_agents SET state='spawn_uncertain' WHERE plan=? AND role=? AND state='preparing_spawn'").run(id,role);}});
+    this.s.db.query("UPDATE feature_agents SET session=?,state='configuring',reason=NULL WHERE plan=? AND role=?").run(r.id,id,role);
+   }catch(e){
+    if(e instanceof PreSendFailure){this.s.db.query("UPDATE feature_agents SET state='reserved',started=NULL,reason=? WHERE plan=? AND role=? AND session IS NULL").run(e.message,id,role);this.event(id,'feature_pre_send_failed',role);}
+    else{this.s.db.query("UPDATE feature_agents SET state='spawn_uncertain' WHERE plan=? AND role=? AND session IS NULL").run(id,role);this.event(id,'feature_spawn_uncertain',role);}
+    return;
+   }
    a=this.s.db.query('SELECT * FROM feature_agents WHERE plan=? AND role=?').get(id,role);
   }
   if(!a.session){
@@ -96,10 +104,10 @@ export class FeaturePlanning{
   try{
    let p=this.get(id);if(!['planning','synthesizing'].includes(p.state))return {id,state:p.state};
    const rows=this.s.db.query('SELECT * FROM feature_agents WHERE plan=? ORDER BY role').all(id) as any[];
-   let active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
+   let active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('preparing_spawn','spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
    for(const a of rows){if(a.state==='reserved'&&active>=Math.min(maxAgents,3))continue;
      try{await this.advance(id,a.role);}catch(e){if(!(e instanceof TurnSubmissionBlocked))this.s.db.query("UPDATE feature_agents SET state='blocked',reason=? WHERE plan=? AND role=?").run(e instanceof Error?e.message:'Feature agent failed',id,a.role);}
-    active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
+    active=(this.s.db.query("SELECT count(*) AS n FROM feature_agents a JOIN feature_plans p ON p.id=a.plan WHERE p.project=? AND a.state IN ('preparing_spawn','spawn_uncertain','configuring','delivery_uncertain','running')").get(p.project) as any).n;
    }
    const blocked=this.s.db.query("SELECT role,reason FROM feature_agents WHERE plan=? AND state='blocked'").all(id);
    if(blocked.length){

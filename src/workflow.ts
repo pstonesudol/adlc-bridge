@@ -9,6 +9,7 @@ import {deliveryBranch,assertDeliveryTarget} from './delivery-identity';
 import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
+import {PreSendFailure} from './pre-send';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy};
 export interface WorkflowTransport{
@@ -63,8 +64,18 @@ export class Workflow{
    this.s.event(job,'automatic_planning_dispatched',session.id);
    if(route)return this.reconcilePlanning(job,c);
    return {state:'planning',session:session.id};
-  }catch{
-   this.s.db.query("UPDATE planning_dispatch SET reason='Spawn outcome uncertain; reconcile inventory, never blindly repeat' WHERE job=?").run(job);
+   }catch(e){
+    if(e instanceof PreSendFailure){
+     const released=this.s.db.transaction(()=>{
+      const dispatch=this.planning(job),run=new Planning(this.s).get(job);
+      if(dispatch?.client_id!==row.clientId||dispatch.session_id||run?.state!=='reserved'||run.session_id||run.worktree||this.s.get(job).state!=='awaiting_plan')return false;
+      this.s.db.query('DELETE FROM planning_dispatch WHERE job=?').run(job);
+      this.s.db.query('DELETE FROM planning_runs WHERE job=?').run(job);
+      this.s.event(job,'planning_pre_send_failed',e.message);return true;
+     }).immediate();
+     if(released)return {state:'awaiting_plan',reason:e.message};
+    }
+    this.s.db.query("UPDATE planning_dispatch SET reason='Spawn outcome uncertain; reconcile inventory, never blindly repeat' WHERE job=?").run(job);
    return {state:'dispatch_uncertain'};
   }
  }

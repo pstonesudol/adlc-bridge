@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,existsSync,readdirSync,rmSync} from 'node:fs';import {join,isAbsolute} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,existsSync,readdirSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 test('install rejects missing, option-like or relative --bin values before filesystem operations',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-cli-bin-')),home=mkdtempSync(join(tmpdir(),'adlc-cli-home-'));try{
    for(const args of [['install','--apply','--bin','--apply'],['install','--bin'],['install','--bin','-x'],['install','--apply','--bin','relative/adlc'],['install','--bin','./adlc']]){
@@ -12,7 +12,7 @@ test('install rejects missing, option-like or relative --bin values before files
     // HOME is isolated, but /opt/homebrew/bin/adlc is a host-wide candidate.
     // Its intentional preservation guard is not a CLI argument failure.
     expect(defaults.stderr.toString()).not.toContain('--bin requires');
-    if(defaults.exitCode===0){expect(JSON.parse(defaults.stdout.toString()).preview).toBe(true);expect(isAbsolute(JSON.parse(defaults.stdout.toString()).launcher)).toBe(true);}
+    if(defaults.exitCode===0){expect(JSON.parse(defaults.stdout.toString()).preview).toBe(true);expect(JSON.parse(defaults.stdout.toString()).launcher).toBe(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(home,'.local/bin/adlc'));}
     else{expect(defaults.stderr.toString()).toContain('Existing launcher is not recognizable; choose --bin PATH');expect(existsSync('/opt/homebrew/bin/adlc')).toBe(true);}
     expect(existsSync(join(home,'Library/Application Support/ADLC Bridge/installation.json'))).toBe(false);
  }finally{rmSync(root,{recursive:true,force:true});rmSync(home,{recursive:true,force:true});}

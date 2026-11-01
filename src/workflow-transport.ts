@@ -6,6 +6,7 @@ import {sessionEvidence} from './session-evidence';
 import {disableNativeFeedback} from './ao-policy';
 import type {WorkflowTransport} from './workflow';
 import {withTurnSubmission} from './turn-submission';
+import {PreSendFailure} from './pre-send';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {resolve,basename} from 'node:path';
@@ -15,20 +16,30 @@ async function jsonCommand(args:string[]){
  const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(code!==0)throw Error('Orchestrator operation failed');return JSON.parse(text);
 }
-export async function localAO(path:string,method='GET',body?:unknown){
- const state=await jsonCommand([AO,'status','--json']);
- if(state.state!=='ready'||!trustedDaemon(state.executablePath)||!Number.isSafeInteger(state.port))throw Error('Verified Orchestrator daemon is not ready');
+export function createLocalAO(status=jsonCommand,send=fetch,trust=trustedDaemon){return async(path:string,method='GET',body?:unknown,beforeSend?:()=>void)=>{
+ let url:string,options:RequestInit;
+ try{
+ const state=await status([AO,'status','--json']);
+ if(state.state!=='ready'||!trust(state.executablePath)||!Number.isSafeInteger(state.port))throw Error('Verified Orchestrator daemon is not ready');
  // This module constructs paths internally. Never proxy arbitrary worker input.
- const r=await fetch(`http://127.0.0.1:${state.port}/api/v1/${path}`,{method,headers:{'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(120000)});
+ url=`http://127.0.0.1:${state.port}/api/v1/${path}`;options={method,headers:{'Content-Type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(120000)};
+ beforeSend?.();
+ }catch{throw new PreSendFailure('Orchestrator request not sent: readiness or request preparation failed');}
+ try{
+ const r=await send(url,options);
  const b:any=await r.json();if(!r.ok)throw Error(`Orchestrator HTTP ${r.status}`);return b;
-}
+ }catch(e){if(e instanceof PreSendFailure)throw Error('Orchestrator delivery outcome uncertain',{cause:e});throw e;}
+};}
+export const localAO=createLocalAO();
 export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spawn,api=localAO,disable=disableNativeFeedback):WorkflowTransport{return {
   submit,
   async startPlan(r){
    return submit(async()=>{
-   const b=await api('sessions','POST',{projectId:r.project,branch:r.branch,displayName:r.name,kind:'worker',harness:r.route?.harness??'codex',mode:'chat',approvalMode:'accept-edits',...(r.route?{model:r.route.model}:{}),prompt:r.route?'':r.prompt,clientRequestId:r.clientId});
+    const b=await api('sessions','POST',{projectId:r.project,branch:r.branch,displayName:r.name,kind:'worker',harness:r.route?.harness??'codex',mode:'chat',approvalMode:'accept-edits',...(r.route?{model:r.route.model}:{}),prompt:r.route?'':r.prompt,clientRequestId:r.clientId});
+   try{
   if(!b.session?.id||b.session.projectId!==r.project||b.session.branch!==r.branch)throw Error('Invalid planning spawn receipt');
-   await disable(b.session.id);return {id:b.session.id};
+    await disable(b.session.id);return {id:b.session.id};
+   }catch(e){if(e instanceof PreSendFailure)throw Error('Planning session setup outcome uncertain',{cause:e});throw e;}
    });
  },
  async findPlans(project,branch){
