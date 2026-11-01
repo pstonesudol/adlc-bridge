@@ -12,6 +12,7 @@ import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
 import {PreSendFailure} from './pre-send';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
+import {effectiveSettings} from './project-settings';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 export interface WorkflowTransport{
@@ -58,6 +59,7 @@ export class Workflow{
  private submit<T>(operation:()=>Promise<T>){return this.t.submit?this.t.submit(operation):operation();}
  async startPlanning(job:string,c:WorkflowConfig){return this.submit(()=>this.startPlanningWithinBarrier(job,c));}
  private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
+  const {maxPlanning}=effectiveSettings(c);
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
   if(this.planning(job))return this.reconcilePlanning(job,c);
   const specification=this.s.get(job).spec;
@@ -67,8 +69,8 @@ export class Workflow{
    const j=this.s.get(job);if(j.project!==c.linear.projectId||j.state!=='awaiting_plan')throw Error('Eligible project job required');
    if(this.planning(job))return null;
    if(route&&this.router.get(job,'planning')?.binding!==digest(j.spec))throw Error('Specification changed during route selection');
-   const active=this.s.db.query("SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND j.state='awaiting_plan'").get(c.linear.projectId) as any;
-   if(active.n>=Math.min(c.automation!.maxPlanning??1,2))throw Error('Planning concurrency limit reached');
+   const active=this.s.db.query("SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND d.state!='awaiting_approval'").get(c.linear.projectId) as any;
+   if(active.n>=maxPlanning)throw Error('Planning concurrency limit reached');
    const p=new Planning(this.s),r=p.reserve(job,c.automation!.orchestratorProject);
    this.s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,client_id) VALUES (?,?,?,?)').run(job,digest(j.spec),'dispatch_uncertain',`adlc-plan-${r.correlation}`);
    const args=p.request(job);return {r,args,clientId:`adlc-plan-${r.correlation}`};
@@ -449,6 +451,7 @@ export class Workflow{
 
  }
  async tick(c:WorkflowConfig){
+  const {maxPlanning}=effectiveSettings(c);
   const results:any[]=[];
   new ApprovalPolicyStore(this.s).revokeChanged(c.linear.projectId,c.approval);
   this.s.db.query('INSERT INTO project_execution_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET runtime=excluded.runtime').run(c.linear.projectId,'supervised-host');
@@ -466,8 +469,8 @@ export class Workflow{
   const implementations=this.s.db.query('SELECT d.job FROM implementation_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND j.state=?').all(c.linear.projectId,'approved') as any[];
   for(const d of implementations)try{results.push({job:d.job,...await this.executeApproved(d.job,c)});}catch(e){results.push({job:d.job,error:e instanceof Error?e.message:'Execution reconcile failed'});}
   if(c.automation?.planningEnabled){
-   const active=this.s.db.query("SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND j.state='awaiting_plan'").get(c.linear.projectId) as any;
-   const slots=Math.max(0,Math.min(c.automation.maxPlanning??1,2)-active.n);
+   const active=this.s.db.query("SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND d.state!='awaiting_approval'").get(c.linear.projectId) as any;
+   const slots=Math.max(0,maxPlanning-active.n);
    const jobs=this.s.db.query("SELECT j.id FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.project=? AND j.state='awaiting_plan' AND d.job IS NULL ORDER BY j.updated,j.id LIMIT ?").all(c.linear.projectId,slots) as any[];
    for(const j of jobs)try{results.push({job:j.id,...await this.startPlanning(j.id,c)});}catch(e){results.push({job:j.id,error:e instanceof Error?e.message:'Planning dispatch failed'});}
   }
