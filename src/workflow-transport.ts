@@ -11,8 +11,8 @@ import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {resolve,basename} from 'node:path';
 
-async function jsonCommand(args:string[]){
- const p=Bun.spawn(args,{stdout:'pipe',stderr:'pipe'});
+export async function jsonCommand(args:string[],spawn=Bun.spawn){
+ const p=spawn(args,{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(code!==0)throw Error('Orchestrator operation failed');return JSON.parse(text);
 }

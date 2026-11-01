@@ -67,7 +67,7 @@ export class FeaturePlanning{
     const r=await this.agents.start({name:a.name,key:a.client_id,route,beforeSend:()=>{this.s.db.query("UPDATE feature_agents SET state='spawn_uncertain' WHERE plan=? AND role=? AND state='preparing_spawn'").run(id,role);}});
     this.s.db.query("UPDATE feature_agents SET session=?,state='configuring',reason=NULL WHERE plan=? AND role=?").run(r.id,id,role);
    }catch(e){
-    if(e instanceof PreSendFailure){this.s.db.query("UPDATE feature_agents SET state='reserved',started=NULL,reason=? WHERE plan=? AND role=? AND session IS NULL").run(e.message,id,role);this.event(id,'feature_pre_send_failed',role);}
+    if(e instanceof PreSendFailure){const reset=this.s.db.query("UPDATE feature_agents SET state='reserved',started=NULL,reason=? WHERE plan=? AND role=? AND state='preparing_spawn' AND session IS NULL").run(e.message,id,role);if(reset.changes)this.event(id,'feature_pre_send_failed',role);}
     else{this.s.db.query("UPDATE feature_agents SET state='spawn_uncertain' WHERE plan=? AND role=? AND session IS NULL").run(id,role);this.event(id,'feature_spawn_uncertain',role);}
     return;
    }
