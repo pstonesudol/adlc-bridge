@@ -74,6 +74,25 @@ test('adoption clears a stale review branch-mismatch reason',async()=>{
   expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBeNull();
  }finally{f.s.close();}
 });
+test('adoption leaves a non-branch review blocker unchanged',async()=>{
+ const f=fixture();try{
+  new ReviewLoop(f.s);
+  const reason='Target is not the owned open feature PR';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBe(reason);
+ }finally{f.s.close();}
+});
+test('repeated confirmation leaves a later review branch blocker unchanged',async()=>{
+ const f=fixture();try{
+  new ReviewLoop(f.s);
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  const reason='Blocked — branch mismatch: reserved old; actual new';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  await f.recovery.confirm(f.id,f.c,p.hash);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBe(reason);
+ }finally{f.s.close();}
+});
 test('confirmation rejects a revoked feature PR grant before claiming',async()=>{
  const f=fixture();try{
   const p=await f.recovery.preview(f.id,f.c);

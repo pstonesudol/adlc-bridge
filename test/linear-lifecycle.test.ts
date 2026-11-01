@@ -14,7 +14,7 @@ function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new R
  return {s,id,sync,issueChanges,intercept(callback:(q:string)=>void){beforeAPI=callback;},get noticeCalls(){return noticeCalls;},failNotice(){noticeFailure=true;},get state(){return state;},get updates(){return updates;},get posted(){return posted;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
 }
 test('owned ticket moves In Progress → In Review → Done only after observed merge',async()=>{
- const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
+ const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','pr_handoff','["**"]','supervised-host','human',null);f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
  await f.sync.sync(c);expect(f.state).toBe('review');expect(f.s.get(f.id).state).not.toBe('done');f.merge();await f.sync.sync(c);expect(f.state).toBe('done');expect(f.s.get(f.id).state).toBe('done');expect(f.updates).toBe(3);
  }finally{f.s.close();}
 });
@@ -59,6 +59,14 @@ test('post-adoption review branch mismatch remains a blocker',async()=>{
   expect(result[0]).toEqual({job:f.id,state:'blocked',reason});
   expect(f.state).toBe('todo');expect(f.updates).toBe(0);expect(f.posted.length).toBe(1);
   expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBe(reason);
+ }finally{f.s.close();}
+});
+test('missing delivery receipt keeps review status out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','needs_reconciliation','["src/**"]','supervised-host','human','No authoritative delivery receipt; never resend');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
  }finally{f.s.close();}
 });
 test('blocked dispatch identity failure stays out of in-review',async()=>{

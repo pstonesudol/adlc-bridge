@@ -152,7 +152,10 @@ export class LinearLifecycle{
     else if(facts.state!=='open'){results.push({job:row.id,state:'blocked',reason:'PR closed without merge; not marking Done'});continue;}
     else{if(row.state==='blocked')continue;phase='in-review';desired=c.statusSync.inReview;}
    }
-   if((row.state==='blocked'||branchMismatch||delivery?.state==='blocked'||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
+   // A registered review target requires a confirmed handoff; ambiguous or
+   // unconfirmed delivery evidence must not advance the issue to In Review.
+   const reviewHandoffMissing=review&&delivery?.state!=='pr_handoff';
+   if((row.state==='blocked'||branchMismatch||reviewHandoffMissing||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
    const result=await this.move(row.id,phase,desired,c,row.spec_hash);results.push({job:row.id,phase,...result});
    if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
     this.assertSpecification(row.id,row.spec_hash);
