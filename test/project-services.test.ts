@@ -42,3 +42,35 @@ test('reload leaves previews and stopped services alone and reports bootstrap fa
  await expect(reloadService(true,true,'domain','target','plist',run)).rejects.toThrow('use start PROJECT');
  expect(calls).toEqual([['bootout','target'],['bootstrap','domain','plist']]);
 });
+
+test('registered recovery tolerates only invalid runtime settings and preserves identity/config checks',()=>{
+ const f=fixture();try{
+  const entry=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'));
+  const original=JSON.parse(readFileSync(entry.config,'utf8'));
+  for(const override of [{pollingIntervalSeconds:0},{automation:{...original.automation,maxPlanning:33}}]){
+   const invalid={...original,...override};writeFileSync(entry.config,JSON.stringify(invalid));
+   expect(()=>f.registry.verify(entry)).toThrow();
+   expect(f.registry.verify(entry,false)).toEqual(invalid);
+   expect(JSON.parse(readFileSync(entry.config,'utf8'))).toEqual(invalid);
+   writeFileSync(entry.config,JSON.stringify({...invalid,automation:{...invalid.automation,orchestratorProject:'other'}}));
+   expect(()=>f.registry.verify(entry,false)).toThrow('identity changed');
+  }
+  writeFileSync(entry.config,JSON.stringify({...original,name:'',pollingIntervalSeconds:0}));
+  expect(()=>f.registry.verify(entry,false)).toThrow('Invalid project configuration');
+  writeFileSync(entry.config,'{');expect(()=>f.registry.verify(entry,false)).toThrow();
+  rmSync(entry.config);expect(()=>f.registry.verify(entry,false)).toThrow();
+ }finally{f.close();}
+});
+
+test('registered legacy discovery supports recovery without validating edited runtime limits',()=>{
+ const f=fixture();try{
+  const entry=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'),legacyLabel);
+  const config=JSON.parse(readFileSync(entry.config,'utf8'));config.pollingIntervalSeconds=0;
+  writeFileSync(entry.config,JSON.stringify(config));
+  mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
+  writeFileSync(join(f.dir,'Library/LaunchAgents',legacyLabel+'.plist'),'placeholder');
+  const read=()=>({Label:legacyLabel,ProgramArguments:['/bun',resolve(import.meta.dir,'../src/cli.ts'),'poll',entry.config]});
+  expect(()=>f.registry.discoverLegacy(f.dir,read)).toThrow('pollingIntervalSeconds');
+  expect(f.registry.discoverLegacy(f.dir,read,true)).toEqual(entry);
+ }finally{f.close();}
+});
