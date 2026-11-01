@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {Store} from '../src/core';
+import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
@@ -56,6 +56,35 @@ for(const [name,change] of Object.entries({
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('lost claim receipt reconciles attachment without another claim; concurrent confirms are bounded',async()=>{const f=fixture();try{f.lose();const p=await f.recovery.preview(f.id,f.c);await Promise.allSettled([f.recovery.confirm(f.id,f.c,p.hash),f.recovery.confirm(f.id,f.c,p.hash)]);await f.recovery.confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);}finally{f.s.close();}});
 test('uncertain unattached claim is durable and never replayed',async()=>{const f=fixture();try{f.t.claim=async()=>{throw Error('unknown');};const p=await f.recovery.preview(f.id,f.c);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');let calls=0;f.t.claim=async()=>{calls++;};await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');expect(calls).toBe(0);}finally{f.s.close();}});
+test('repeated confirmation preserves a later dispatch state and reason',async()=>{
+ const f=fixture();try{
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  f.s.db.query("UPDATE implementation_dispatch SET state='blocked',reason='Later review blocker' WHERE job=?").run(f.id);
+  await f.recovery.confirm(f.id,f.c,p.hash);
+  expect(f.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(f.id)).toEqual({state:'blocked',reason:'Later review blocker'});
+ }finally{f.s.close();}
+});
+test('confirmation rejects a revoked feature PR grant before claiming',async()=>{
+ const f=fixture();try{
+  const p=await f.recovery.preview(f.id,f.c);
+  f.s.db.query('UPDATE git_grants SET operations=? WHERE job=?').run(JSON.stringify(['inspect','fetch','worktree','branch','commit','open-pr']),f.id);
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('Current feature PR Git grant required');
+  expect(f.calls()).toBe(0);
+ }finally{f.s.close();}
+});
+test('confirmation rejects a standing approval changed after preview',async()=>{
+ const f=fixture();try{
+  const {ApprovalPolicyStore}=await import('../src/approval-policy');
+  const policy=new ApprovalPolicyStore(f.s),approval={mode:'ready-queue' as const,id:'test',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr' as const},c={...f.c,approval};
+  policy.snapshot('project',new Set(['issue']));
+  const j=f.s.get(f.id);
+  f.s.db.query('INSERT INTO policy_authorizations(job,plan_hash,spec_hash,policy_hash,policy_id,authorized_by,scope) VALUES (?,?,?,?,?,?,?)').run(f.id,j.plan_hash,digest(j.spec),policy.hash(approval),'test','human',JSON.stringify(['src/**']));
+  const p=await f.recovery.preview(f.id,c);
+  f.s.db.query("UPDATE policy_authorizations SET policy_hash='changed' WHERE job=?").run(f.id);
+  await expect(f.recovery.confirm(f.id,c,p.hash)).rejects.toThrow('Fresh unchanged standing approval and scope required');
+  expect(f.calls()).toBe(0);
+ }finally{f.s.close();}
+});
 test('changed requirements and revoked approval cannot adopt',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.s.enqueue('project','issue','changed');await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('approval');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('preview opens existing database read-only without schema writes',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-preview-'));try{const path=join(dir,'state.sqlite'),f=fixture(path),p=await f.recovery.preview(f.id,f.c);f.s.close();const read=new Store(path,true);try{expect((await new DeliveryRecovery(read,f.t).preview(f.id,f.c)).hash).toBe(p.hash);expect(()=>read.db.exec('CREATE TABLE forbidden(x)')).toThrow();}finally{read.close();}}finally{rmSync(dir,{recursive:true,force:true});}

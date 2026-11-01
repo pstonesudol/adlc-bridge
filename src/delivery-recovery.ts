@@ -66,12 +66,21 @@ export class DeliveryRecovery{
   return this.s.db.transaction(()=>{
    this.authorization(job,c);
    const changed=this.s.db.query("UPDATE delivery_adoptions SET state='adopted' WHERE job=? AND proposal=? AND state='claim_uncertain'").run(job,hash);
-   if(changed.changes)this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
-   else{
+   if(changed.changes){
+    this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
+    // Only the dispatch states written before handoff may be repaired. An
+    // already-recorded handoff is a no-op; any other zero-row result is a
+    // reconciliation condition rather than permission to overwrite state.
+    const handoff=this.s.db.query("UPDATE implementation_dispatch SET state='pr_handoff',reason=NULL WHERE job=? AND state IN ('approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr')").run(job);
+    if(!handoff.changes){
+     const current=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
+     if(current?.state!=='pr_handoff')throw Error('Dispatch state cannot be repaired automatically; reconciliation required');
+    }
+   }else{
     const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
     if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
+    // Repeated confirmation is idempotent and must preserve any later dispatch state.
    }
-   this.s.db.query("UPDATE implementation_dispatch SET state='pr_handoff',reason=NULL WHERE job=?").run(job);
    return {job,state:'pr_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash};
   }).immediate();
  }

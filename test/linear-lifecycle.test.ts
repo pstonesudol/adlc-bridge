@@ -31,6 +31,16 @@ test('lost status reply reconciles without replay; subsequent manual change is p
  const f=fixture();try{f.lost();await f.sync.sync(c);expect(f.updates).toBe(1);await f.sync.sync(c);expect(f.updates).toBe(1);f.manual('todo');const result=await f.sync.sync(c);expect(result[0].state).toBe('needs_reconciliation');expect(f.state).toBe('todo');expect(f.updates).toBe(1);}finally{f.s.close();}
 });
 
+test('review-stage branch drift posts one notice and blocks in-review',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; preview recover-handoff';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const first=await f.sync.sync(c);expect(first[0]).toEqual({job:f.id,state:'blocked',reason});
+  await f.sync.sync(c);
+  expect(f.s.db.query('SELECT count(*) AS n FROM branch_drift_notices').get()).toEqual({n:1});
+  expect(f.posted.length).toBe(1);expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
 function budgetBlocked(){
  const f=fixture();f.s.db.query('INSERT INTO remediation_budget(job,consumed,stop_reason,configured_max_attempts,configured_max_no_progress) VALUES (?,?,?,?,?)').run(f.id,5,'budget_exhausted',5,5);
  f.s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(f.id);return f;

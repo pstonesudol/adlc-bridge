@@ -135,15 +135,15 @@ export class LinearLifecycle{
     }
    }
    let branchMismatch=false;
-   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()){
-    const delivery=this.s.db.query('SELECT reason FROM implementation_dispatch WHERE job=?').get(row.id) as any;
-    if(delivery?.reason?.startsWith('Blocked — branch mismatch')){
-     branchMismatch=true;
-     try{await this.driftNotice(row.id,delivery.reason,c);results.push({job:row.id,state:'blocked',reason:delivery.reason});}
-     catch(e){results.push({job:row.id,phase:'branch-drift',error:e instanceof Error?e.message:'Linear branch drift notice failed'});}
-    }
+   const delivery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()
+    ?this.s.db.query('SELECT reason FROM implementation_dispatch WHERE job=?').get(row.id) as any:null;
+   const review=this.s.db.query('SELECT repo,pr,reason FROM review_targets WHERE job=?').get(row.id) as any;
+   const reason=[delivery?.reason,review?.reason].find((r:any)=>r?.startsWith('Blocked — branch mismatch'));
+   if(reason){
+    branchMismatch=true;
+    try{await this.driftNotice(row.id,reason,c);results.push({job:row.id,state:'blocked',reason});}
+    catch(e){results.push({job:row.id,phase:'branch-drift',error:e instanceof Error?e.message:'Linear branch drift notice failed'});}
    }
-   const review=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(row.id) as any;
    let phase='in-progress',desired=c.statusSync.inProgress;
    if(review){
     if(review.repo!==c.githubRepo)throw Error('PR repository differs from status-sync project');
