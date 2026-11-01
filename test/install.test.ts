@@ -15,13 +15,13 @@ test('installer migrates projects without plists and rolls back gates, record, l
   const projects=['loaded','unloaded','no-plist'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));
   for(const p of projects.slice(0,2))writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old '+p.project);
   writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher',{mode:0o755});
-  const calls:string[]=[],hooks:string[]=[],restored:string[]=[];
+  const calls:string[]=[],hooks:string[]=[],restored:{path:string;config:any}[]=[];
   const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({Label:'old'}),assertDefinition:()=>{},
    serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:id==='loaded'};},
-   localAO:async(path:string,method?:string,body?:any)=>{if(method==='PUT'){restored.push(path);expect(body.config).toEqual({original:path.split('/')[1]});return {};}return {status:'ok',project:{config:{original:path.split('/')[1]}}};},
+   localAO:async(path:string,method?:string,body?:any)=>{if(method==='PUT'){restored.push({path,config:body.config});return {};}return {status:'ok',project:{config:{original:path.split('/')[1]}}};},
    installWorkflowHook:async(path:string)=>{hooks.push(path);if(path==='/no-plist.json')throw Error('hook failed');}};
   await expect(installBridge(true,source,launcher,io)).rejects.toThrow('hook failed');
-  expect(hooks).toEqual(projects.map(p=>p.config));expect(restored).toHaveLength(3);
+  expect(hooks).toEqual(projects.map(p=>p.config));expect(restored).toEqual(projects.map(p=>({path:`projects/${p.project}/config`,config:{original:p.project}})));
   expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');
   for(const p of projects.slice(0,2))expect(readFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'utf8')).toBe('old '+p.project);
   expect(calls.filter(x=>x.startsWith('start:'))).toEqual(['start:loaded']);expect(calls.filter(x=>x.startsWith('stop:'))).toEqual(['stop:loaded']);

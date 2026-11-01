@@ -476,7 +476,7 @@ upgrades before retiring or rebuilding this version-pinned hotfix.
 adlc recover JOB
 adlc recover JOB --apply --confirm HASH_FROM_PREVIEW
 adlc cleanup JOB
-adlc cleanup JOB --apply --confirm HASH_FROM_PREVIEW
+# Cleanup is inspection-only until native guarded termination is available.
 ```
 
 Recovery refreshes eligibility and reevaluates the existing owned PR. An uncertain
@@ -486,12 +486,15 @@ budgets, rewrites approval, or blindly resends uncertain dispatch/review request
 Changed requirements, ambiguous dispatch and exhausted remediation still need
 operator investigation; use `recover-handoff` for an initial missed PR handoff.
 
-Cleanup is opt-in per job and previewed before application. It requires observed
+Cleanup inspection is opt-in per job. It requires observed
 completion, a matching actually merged PR, idle worker with no queued work, and
-a clean isolated worktree at that PR head. Apply archives the session through
-Orchestrator and requests native workspace reclamation. It does not ask to delete
-artifacts or GitHub branches. Dirty/divergent work, open/closed-unmerged PRs,
-unknown activity and non-owned sessions are preserved. No cleanup scheduler runs.
+a clean isolated worktree at that PR head, with no ignored files. **Cleanup apply
+is disabled**: the pinned Orchestrator kill endpoint does not atomically check
+idleness while preventing new turns. A second activity read or bridge-local lock
+cannot close that race. Inspection reports `applySupported: false`; even a valid
+confirmation cannot send a kill request. Session history, worktrees, artifacts and
+GitHub branches are preserved. Native conditional termination and replay semantics
+must be established before enabling apply. No cleanup scheduler runs.
 
 ### Review coordination status
 

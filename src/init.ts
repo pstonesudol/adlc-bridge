@@ -13,6 +13,10 @@ import {serviceControl} from './service-control';
 import {Store} from './core';
 import {ProjectServices,registryPath,legacyLabel,assertDefinition,readDefinition} from './project-services';
 
+export async function collectMetadataChecks(ask:(label:string)=>Promise<string>){
+ const names:string[]=[];
+ for(;;){const name=(await ask('PR-description-only CI check name (one exact name; blank to finish)')).trim();if(!name)return names;if(!names.includes(name))names.push(name);if(names.length>10)throw Error('At most 10 PR metadata checks supported');}
+}
 export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO){
  validate(c);
  if(!/^[\w.-]+\/[\w.-]+$/.test(c.githubRepo)||!c.requiredChecks?.length||c.requiredChecks.some((x:any)=>typeof x!=='string'||!x.trim())||!validScopes(c.reviewAllowedPaths))throw Error('Repository, required checks and safe review scope required');
@@ -56,7 +60,7 @@ export async function initWizard(repoArg?:string,args:string[]=[]){
   if(existsSync(path))throw Error(`Configuration already exists: ${path}. Preserved; use another --config path.`);
   if(!linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
   const c:any={version:1,name,repo,githubRepo:await ask('GitHub owner/repository'),automation:{planningEnabled:true,orchestratorProject:await ask('Existing Orchestrator project ID'),maxPlanning:1},linear:{projectId:await ask('Linear project UUID'),teamId:await ask('Linear team UUID'),readyStateId:await ask('Todo state UUID'),readyLabelId:await ask('agent-ready label UUID')},requiredChecks:(await ask('Required GitHub Actions check names (comma separated)')).split(',').map(x=>x.trim()).filter(Boolean),reviewAllowedPaths:(await ask('Allowed review path patterns (comma separated)','src/**')).split(',').map(x=>x.trim()),approval:{mode:'manual'}};
-  c.prMetadataChecks=(await ask('PR-description-only CI check names (comma separated; blank for none)')).split(',').map(x=>x.trim()).filter(Boolean);
+   c.prMetadataChecks=await collectMetadataChecks(ask);
   if(await yes('Enable shared OpenChamber task routing')){
    c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};
    await loadOpenChamber(c.routing);

@@ -31,5 +31,8 @@ test('worker inventory rejects new sessions, unreadable conversations and malfor
 test('unready backend after start leaves every intake stopped',async()=>{const f=fixture();f.ops.backend=async()=>({ready:false,loaded:true,managed:true});await expect(controlStack('start',f.ops)).rejects.toThrow('not ready');expect(f.calls).toEqual(['backend:start']);});
 test('daemon status handles both stopped states and fails closed on errors or malformed output',()=>{
  for(const state of ['stopped','not_running'])expect(daemonStatus({stdout:JSON.stringify({state}),code:0})).toEqual({ready:false});
- for(const stdout of ['no json','null','{}','{"state":"ready","port":0}','{"state":"stopped"}'])expect(()=>daemonStatus({stdout,code:1})).toThrow();
+ for(const stdout of ['no json','null','{}','{"state":"ready","port":0}'])expect(()=>daemonStatus({stdout,code:0})).toThrow();
+ expect(()=>daemonStatus({stdout:'null',code:0})).toThrow('readiness is unknown');
+ expect(()=>daemonStatus({stdout:'{"state":"stopped"}',code:1})).toThrow('readiness is unknown');
+ expect(daemonStatus({stdout:'{"state":"ready","port":3001}',code:0})).toMatchObject({ready:true,port:3001});
 });

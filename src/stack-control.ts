@@ -62,7 +62,7 @@ async function loaded(target:string){
 export function daemonStatus(r:{stdout:string;code:number}){
  let s:any;try{s=JSON.parse(r.stdout);}catch{throw Error('Unable to inspect Orchestrator daemon');}
  if(r.code===0&&(s?.state==='stopped'||s?.state==='not_running'))return {ready:false};
- if(r.code!==0||s.state!=='ready'||!Number.isSafeInteger(s.port)||s.port<1||s.port>65535)throw Error('Orchestrator readiness is unknown; backend preserved');
+ if(r.code!==0||s?.state!=='ready'||!Number.isSafeInteger(s.port)||s.port<1||s.port>65535)throw Error('Orchestrator readiness is unknown; backend preserved');
  return {...s,ready:true};
 }
 async function probe(){return daemonStatus(await command([AO,'status','--json']));}

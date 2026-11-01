@@ -24,3 +24,7 @@ test('init never replaces an existing config and writes owner-only configuration
 test('generated launchd definition escapes user paths and uses explicit poll arguments',()=>{
  const xml=serviceDefinition('/a & b/config.json','/bun','/code/cli.ts','/home/a');expect(xml).toContain('/a &amp; b/config.json');expect(xml).toContain('<string>poll</string>');expect(xml).toContain('<integer>60</integer>');expect(xml).not.toContain('linear-token');
 });
+import {collectMetadataChecks} from '../src/init';
+test('metadata check prompts preserve exact names with commas and allow none',async()=>{
+ const names=['CI, PR body','Second check','CI, PR body',''];expect(await collectMetadataChecks(async()=>names.shift()!)).toEqual(['CI, PR body','Second check']);expect(await collectMetadataChecks(async()=>'')).toEqual([]);
+});
