@@ -985,7 +985,15 @@ Confirmed conflicts may instead use this **separate, disabled-by-default** polic
 Verification is an explicit ordered list of argv arrays, not inferred shell
 commands. Each runs in the registered worktree with a ten-minute timeout; the
 first failure stops publication. Configure the project's approved Docker
-verification command here when appropriate. This bridge's full suite uses the
+verification command here when appropriate. Both automatic and manual verification
+use only `PATH`, temporary-directory variables (`TMPDIR`, `TMP`, `TEMP`), `LANG`,
+`LC_ALL`, `TZ` and `CI` from the host environment. Host tokens, `HOME`, Git context,
+credential variables, and arbitrary tool configuration are not inherited, even
+for a configured verification command named `git`. Internal Git operations use a
+separate environment for authentication. Tools requiring additional environment
+must fail closed rather than receiving host secrets. This is environment isolation,
+not filesystem/network containment: supervised-host code still runs as the same
+OS user. Use an approved container workflow for stronger isolation. This bridge's full suite uses the
 supported macOS host runtime, as in its CI. Verification output tails and exit
 codes are retained with the recovery, so do not configure commands that print
 secrets. Configuration is operator-trusted execution input, not reviewer text.

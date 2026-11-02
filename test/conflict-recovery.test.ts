@@ -7,7 +7,7 @@ import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
 import {Lifecycle} from '../src/lifecycle';
 import {featureGit} from '../src/approval-policy';
-import {ConflictRecovery,recoveryCommand,type RecoveryCommand} from '../src/conflict-recovery';
+import {ConflictRecovery,recoveryCommand,verificationCommand,type RecoveryCommand} from '../src/conflict-recovery';
 import {validateConflictPolicy} from '../src/conflict-policy';
 import {BranchUpdates} from '../src/branch-updates';
 import {sendPilotRemediation} from '../src/pilot';
@@ -134,11 +134,47 @@ test('marker inspection detects diff3 base and CRLF separators in literal confli
   await f.recovery.assertResolved(r,{index,conflicts:[]});
  }finally{f.close();}
 });
+test('verification allowlist excludes host secrets in automatic and manual recovery',async()=>{
+ const keys=['ADLC_LINEAR_TOKEN','GH_TOKEN','GITHUB_TOKEN','AWS_SECRET_ACCESS_KEY','UNLISTED_SECRET','NODE_OPTIONS'];
+ const saved=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+ try{
+  for(const key of keys)process.env[key]='sentinel-host-secret';
+  // NODE_OPTIONS must also be absent: do not allow inherited runtime injection.
+  const argv=[process.execPath,'-e',`const allowed=${JSON.stringify(['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI'])};const bad=Object.keys(process.env).filter(k=>!allowed.includes(k));if(bad.length)process.exit(17);console.log('isolated')`];
+  for(const mode of ['automatic','manual']){
+   const f=await fixture();try{
+    f.config.conflictRecovery.verification=[argv];
+    await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+    if(mode==='automatic')expect(await f.recovery.tick(f.job,f.config,'owner/repo',1)).toBeNull();
+    else{
+     const io={...f.io,command:async(args:string[],cwd:string)=>{const result=await f.io.command(args,cwd);if(args.includes('commit')&&args[0]==='git')throw Error('Lost commit receipt');return result;}};
+     await new ConflictRecovery(f.s,io as any).tick(f.job,f.config,'owner/repo',1);
+     await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+     const preview=await f.recovery.manualPreview(f.job,f.config);
+     expect((await f.recovery.manualConfirm(f.job,f.config,preview.confirmation,'human')).state).toBe('completed');
+    }
+    const evidence=JSON.parse(f.recovery.row(f.job).detail).verification[0];
+    expect(evidence.code).toBe(0);expect(evidence.stdout.trim()).toBe('isolated');
+   }finally{f.close();}
+  }
+  // Verification named `git` still uses the allowlist, not the Git-only runner.
+  const f=await fixture();try{
+   const result=await verificationCommand(['git','-c',`alias.probe=!${process.execPath} -e 'process.exit(process.env.ADLC_LINEAR_TOKEN?18:0)'`,'probe'],f.tree);
+   expect(result.code).toBe(0);
+   const gitOnly=await recoveryCommand([process.execPath,'-e',"console.log(process.env.ADLC_LINEAR_TOKEN)"],f.tree);
+   expect(gitOnly.out.trim()).toBe('sentinel-host-secret');
+  }finally{f.close();}
+ }finally{for(const key of keys){if(saved[key]===undefined)delete process.env[key];else process.env[key]=saved[key];}}
+});
 test('base-side trailing whitespace does not reject a valid merged index',async()=>{
  const f=await fixture();try{
-  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();await f.git(f.tree,'add','app.txt');
-  writeFileSync(join(f.tree,'safeguard.txt'),'Markdown hard break  \n');await f.git(f.tree,'add','safeguard.txt');
-  const r=f.recovery.row(f.job),d=JSON.parse(r.detail);d.index=await f.recovery.index(r);
+  writeFileSync(join(f.source,'app.txt'),'feature=old\nsafety=new  \n');
+  await f.git(f.source,'add','app.txt');await f.git(f.source,'commit','-m','Base safety whitespace');await f.git(f.source,'push','origin','main');
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  writeFileSync(join(f.tree,'app.txt'),'feature=new\nsafety=new  \n');await f.git(f.tree,'add','app.txt');
+  const r=f.recovery.row(f.job),d=JSON.parse(r.detail);
+  expect(d.conflicts).toContain('app.txt');
+  expect((await f.io.command(['git','diff','--cached','--check','--','app.txt'],f.tree)).code).not.toBe(0);
   await f.recovery.assertResolved(r,d);
  }finally{f.close();}
 });

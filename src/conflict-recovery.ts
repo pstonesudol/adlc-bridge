@@ -22,12 +22,20 @@ export const recoveryCommand:RecoveryCommand=async(args,cwd)=>{
  const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
 };
-export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;evidence:typeof sessionEvidence;command:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
+// Verification executes worker-edited code. Never select its environment by
+// executable name: even a configured `git` argv must not get host credentials.
+export const verificationCommand:RecoveryCommand=async(args,cwd)=>{
+ const env:Record<string,string>={};
+ for(const key of ['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI'])if(process.env[key]!==undefined)env[key]=process.env[key]!;
+ const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
+ const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
+};
+export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;evidence:typeof sessionEvidence;command:RecoveryCommand;verify:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
 const sha=(v:string)=>/^[a-f0-9]{40,64}$/.test(v);
 export class ConflictRecovery{
  io:ConflictIO;
  constructor(public s:Store,overrides:Partial<ConflictIO>={}){
-  this.io={facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides};
+   this.io={facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides};
  }
  install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS conflict_recoveries(
  id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),plan TEXT NOT NULL,worktree TEXT NOT NULL,
@@ -89,7 +97,7 @@ export class ConflictRecovery{
    this.set(r,'manual_verifying',d);
    try{
     for(const argv of c.conflictRecovery.verification){
-     const result=await this.io.command(argv,r.worktree);d.verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});this.set(r,'manual_verifying',d);
+     const result=await this.io.verify(argv,r.worktree);d.verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});this.set(r,'manual_verifying',d);
      if(result.code!==0)throw Error(`Verification failed (${result.code}); no publication`);
     }
     const x=await this.guard(r,c,proof.head);await this.noOperation(r.worktree);await this.assertResolved(r,d);
@@ -232,7 +240,7 @@ export class ConflictRecovery{
   d.tree=await this.git(r.worktree,'write-tree');if(!sha(d.tree))throw Error('Invalid merged tree');
   this.set(r,'verifying',d);d.verification=[];
   for(const argv of c.conflictRecovery.verification){
-   const result=await this.io.command(argv,r.worktree);
+   const result=await this.io.verify(argv,r.worktree);
    d.verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});this.set(r,'verifying',d);
    if(result.code!==0)throw Error(`Verification failed (${result.code}); no publication`);
   }
