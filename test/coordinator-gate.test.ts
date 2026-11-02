@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Database} from 'bun:sqlite';
-import {mkdtempSync,mkdirSync,rmSync,realpathSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,rmSync,realpathSync,existsSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {tryVerifiedCoordinator,verifiedCoordinator} from '../src/coordinator-gate';
@@ -30,6 +30,7 @@ test('a missing, corrupt or unsupported AO registry closes coordinator admission
   const source=join(root,'repo'),cwd=join(root,'worktrees','demo','orchestrator','demo-orchestrator');
   mkdirSync(source);mkdirSync(cwd,{recursive:true});
   expect(tryVerifiedCoordinator('demo',source,cwd,root)).toBe(false);
+  expect(existsSync(join(root,'ao.db'))).toBe(false);
   writeFileSync(join(root,'ao.db'),'not a database');
   expect(tryVerifiedCoordinator('demo',source,cwd,root)).toBe(false);
   rmSync(join(root,'ao.db'));
