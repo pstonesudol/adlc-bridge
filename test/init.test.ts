@@ -87,3 +87,21 @@ test('wizard rejects nondecimal or unsupported polling/capacity before writing c
   }finally{rmSync(home,{recursive:true,force:true});}
  }
 });
+
+test('wizard persists non-default polling interval and planning capacity',async()=>{
+ const home=mkdtempSync(join(tmpdir(),'adlc-wizard-custom-settings-'));let closed=false;
+ try{
+  const f=fixture(home),path=join(home,'project.json');
+  const answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','120','4','no','no','no','no','no','yes','no'];
+  const result=await initWizard(home,['--config',path],{
+   interactive:()=>true,home:()=>home,registryPath:()=>join(home,'registry.sqlite'),log:()=>{},linearToken:()=> 'test-only-placeholder',
+   verifyInitConfig:c=>verifyInitConfig(c,f.api,f.ao),
+   prompts:()=>({question:async(label:string)=>{if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})
+  });
+  expect(result).toMatchObject({configuration:path,gateInstalled:false,serviceEnabled:false});
+  expect(answers).toEqual([]);expect(closed).toBe(true);
+  const saved=JSON.parse(readFileSync(path,'utf8'));
+  expect(saved.pollingIntervalSeconds).toBe(120);expect(saved.automation.maxPlanning).toBe(4);
+  expect(saved.approval).toEqual({mode:'manual'});
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
