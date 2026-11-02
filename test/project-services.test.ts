@@ -1,8 +1,10 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {ProjectServices,projectServiceLabel,assertDefinition,legacyLabel} from '../src/project-services';import {serviceDefinition} from '../src/init';import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';
-import {readFileSync,realpathSync} from 'node:fs';
+import {existsSync,readFileSync,realpathSync} from 'node:fs';
 import {readDefinition} from '../src/project-services';
 import {serviceSettings} from '../src/service-settings';
 import {reloadService} from '../src/service-control';
+import {acknowledgePoll} from '../src/poll-process';
+import {turnBarrier} from '../src/turn-submission';
 function fixture(){const dir=mkdtempSync(join(tmpdir(),'adlc-projects-')),s=new Store(':memory:'),registry=new ProjectServices(s);
  const config=(id:string,linear:string)=>{const repo=join(dir,id);mkdirSync(repo);const path=join(dir,id+'.json');writeFileSync(path,JSON.stringify({version:1,name:id,repo,requiredChecks:['CI'],automation:{orchestratorProject:id},linear:{projectId:linear,teamId:'00000000-0000-0000-0000-000000000001',readyStateId:'00000000-0000-0000-0000-000000000002',readyLabelId:'00000000-0000-0000-0000-000000000003'}}));return path;};return {dir,s,registry,config,close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};}
 test('separate projects retain independent labels; ambiguous controls never choose a project',()=>{const f=fixture();try{const a=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'),legacyLabel),b=f.registry.register(f.config('two','00000000-0000-0000-0000-000000000005'));expect(a.label).toBe(legacyLabel);expect(b.label).not.toBe(a.label);expect(()=>f.registry.select()).toThrow('Multiple');expect(f.registry.select('one')).toEqual(a);expect(f.registry.select('two')).toEqual(b);expect(f.registry.register(a.config)).toEqual(a);}finally{f.close();}});
@@ -96,7 +98,7 @@ test('registered legacy discovery supports recovery without validating edited ru
   writeFileSync(join(f.dir,'Library/LaunchAgents',legacyLabel+'.plist'),'placeholder');
   const read=()=>({Label:legacyLabel,ProgramArguments:['/bun',resolve(import.meta.dir,'../src/cli.ts'),'poll',entry.config]});
   expect(()=>f.registry.discoverLegacy(f.dir,read)).toThrow('pollingIntervalSeconds');
-  expect(f.registry.discoverLegacy(f.dir,read,true)).toEqual(entry);
+  expect(f.registry.discoverLegacy(f.dir,read,true,true)).toEqual(entry);
  }finally{f.close();}
 });
 
@@ -114,16 +116,20 @@ test.skipIf(process.platform!=='darwin')('service-control recovery handles regis
    const calls:string[][]=[];let loaded=true;
    const run=async(args:string[])=>{
     calls.push(args);
-    if(args[0]==='print')return {code:loaded?0:1,stdout:loaded?'state = running':'',stderr:loaded?'':'Could not find service'};
+    if(args[0]==='print')return {code:loaded?0:1,stdout:loaded?'state = waiting':'',stderr:loaded?'':'Could not find service'};
     if(args[0]==='bootout'){loaded=false;return {code:0,stdout:'',stderr:''};}
     throw Error('Unexpected service command');
    };
-   const options={home:f.dir,statePath,run};
+   const options={home:f.dir,statePath,run,turns:turnBarrier(join(f.dir,'fence')),pollState:join(f.dir,'poll-state')};
+   // Satisfy main's idle-process receipt gate without touching live state.
+   const finished=await acknowledgePoll(path,resolve(import.meta.dir,'../src/cli.ts'),options.pollState,undefined,async operation=>operation());finished();
    const result=await serviceControl(action,'one',false,options);
    expect(result).toMatchObject({project:'one',loaded:action!=='stop',settingsError:expect.stringContaining(setting==='maxPlanning'?'automation.maxPlanning':setting)});
    expect(calls.map(c=>c[0])).toEqual(action==='stop'?['print','bootout','print']:['print']);
    expect(readFileSync(path,'utf8')).toBe(invalid);
-   const after=new Store(statePath);try{expect(new ProjectServices(after).list()[0].label).toBe(legacyLabel);}finally{after.close();}
+   if(registered||action==='stop'){
+    const after=Store.readonly(statePath);try{expect(new ProjectServices(after,false).list()[0].label).toBe(legacyLabel);}finally{after.close();}
+   }else expect(existsSync(statePath)).toBe(false); // status must not register legacy state
    calls.length=0;
    for(const strict of ['start','service-config'])await expect(serviceControl(strict,'one',false,options)).rejects.toThrow();
    expect(calls).toEqual([]);
@@ -135,4 +141,24 @@ test.skipIf(process.platform!=='darwin')('service-control recovery handles regis
    expect(calls).toEqual([]);
   }finally{f.close();}
  }
+});
+
+test.skipIf(process.platform!=='darwin')('service-config apply preserves fences and requires a verified idle receipt before definition changes',async()=>{
+ const {serviceControl}=await import('../src/service-control');const f=fixture();try{
+  const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
+  const s=new Store(statePath);let entry;try{entry=new ProjectServices(s).register(path);}finally{s.close();}
+  mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
+  const plist=join(f.dir,'Library/LaunchAgents',entry.label+'.plist');
+  writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'../src/cli.ts'),f.dir,entry.label));
+  const before=readFileSync(plist,'utf8'),config=JSON.parse(readFileSync(path,'utf8'));config.pollingIntervalSeconds=15;writeFileSync(path,JSON.stringify(config));
+  const calls:string[][]=[],turns=turnBarrier(join(f.dir,'fence'));
+  const run=async(args:string[])=>{calls.push(args);if(args[0]!=='print')throw Error('Unexpected mutation');return {code:0,stdout:'state = waiting',stderr:''};};
+  const options={home:f.dir,statePath,run,turns,pollState:join(f.dir,'receipts')};
+  await expect(serviceControl('service-config','one',true,options)).rejects.toThrow('barrier support is unverified');
+  expect(calls.map(x=>x[0])).toEqual(['print']);expect(readFileSync(plist,'utf8')).toBe(before);calls.length=0;
+  await turns.submit(async()=>{
+   await expect(serviceControl('service-config','one',true,options)).rejects.toThrow('in progress');
+  });
+  expect(calls).toEqual([]);expect(readFileSync(plist,'utf8')).toBe(before);
+ }finally{f.close();}
 });

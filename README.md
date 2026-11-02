@@ -967,7 +967,8 @@ adlc service-status PROJECT_ID
 Preview makes no service changes. Apply validates project identity and changes
 only StartInterval in the existing definition, preserving arguments, environment,
 logs and unrelated keys; other projects are untouched. An already-loaded service
-is reloaded even if the definition already matches, allowing a failed unload to be
+requires verified intake quiescence under the submission fence before changing its
+definition or unloading. It is reloaded even if the definition already matches, allowing a failed unload to be
 retried (and can immediately pick up authorized work); a stopped service stays
 stopped. Existing worker sessions are not terminated. If reload fails, inspect
 service-status and use start PROJECT_ID after resolving the error. Status reports
