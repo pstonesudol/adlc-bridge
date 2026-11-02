@@ -377,6 +377,17 @@ test('the reservation transaction refuses an in-flight continuation even if the 
  expect(f.sends.length).toBe(1);s.close();
 });
 
+test('blocked-by-dependency plans still require human answers for non-dependency questions',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ const plan=JSON.stringify({version:1,readiness:'blocked-by-dependency',questions:[{id:'q1',question:'May we change access?',kind:'security-scope'}],dependencies:[{ref:'DEV-9',reason:'Upstream wording'}],risks:[]});
+ await w.tick(config);f.completePlan('session-1',plan);await w.tick(config);
+ recordResolution(s,id,'dependency-satisfied','Alice','DEV-9 complete');
+ expect(()=>w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops)).toThrow('unresolved');
+ recordResolution(s,id,'human-answer','Alice','Access scope approved');
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+ s.close();
+});
 test('acknowledgement cannot satisfy a structured blocker at approval',async()=>{
  const {recordResolution}=await import('../src/readiness');
  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');

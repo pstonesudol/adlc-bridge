@@ -188,7 +188,11 @@ export function applicableResolution(s:Store,job:string):any{
    if(resolution.source==='dependency-satisfied'&&readiness.questions.every((q:any)=>q.kind==='dependency'))return resolution;
    return null;
   }
-  if(readiness.valid&&readiness.state==='blocked-by-dependency')return ['human-answer','dependency-satisfied'].includes(resolution.source)?resolution:null;
+  if(readiness.valid&&readiness.state==='blocked-by-dependency'){
+   if(resolution.source==='human-answer')return resolution;
+   if(resolution.source==='dependency-satisfied'&&readiness.questions.every((q:any)=>q.kind==='dependency'))return resolution;
+   return null;
+  }
   if(!readiness.valid&&readiness.source==='plan-text'&&readiness.questions.length)return resolution.source==='human-answer'?resolution:null;
   return resolution;
 }
