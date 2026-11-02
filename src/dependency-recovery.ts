@@ -173,7 +173,9 @@ export class DependencyRecovery{
    const outcome={plan_hash:row.plan,outcome:row.state,reason:row.reason,questions:'[]',dependencies:JSON.stringify((definition?.prerequisites??[]).map((d:any)=>({ref:d.ref,reason:`${d.repo}#${d.pr}; ${d.kind}; capabilities ${d.capabilities.map((x:any)=>x.path).join(', ')}`})))};
    const reason=row.state==='resumed'?`Verified dependency evidence ${p.id}; continuation accepted in the existing session. No new authorization or runtime activation.`:row.reason;
    await blockers.leave(row.job,outcome,c,{binding:digest(JSON.stringify([row.job,row.plan,row.state,reason,p.id??definition])),applyLabel:row.state!=='resumed',body:`## ADLC: ${row.state==='waiting_for_dependencies'?'Waiting for dependencies':row.state}\n\n${reason??''}\n\nPrerequisites: ${outcome.dependencies}\n\nPlan: ${row.plan}\nNext action: ${row.state==='resumed'?'Wait for the existing worker; do not resend.':'inspect dependency-preview; reconcile failed evidence before dependency-resume.'} No new authorization or runtime activation.`,guard:(issue)=>{if(issue.id!==j.issue||this.s.get(j.id).plan_hash!==row.plan)throw Error('Dependency notice identity changed');}});
-    if(row.state==='resumed')await blockers.retract(row.job,c);
+     const current=this.workflow.outcomes(row.job);
+     const activeBlocker=current?.plan_hash===j.plan_hash&&['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(current.outcome);
+     if(row.state==='resumed'&&!activeBlocker)await blockers.retract(row.job,c);
     results.push({job:row.job,state:'posted'});
     }catch(error){results.push({job:row.job,state:'blocked',reason:error instanceof Error?error.message:'Dependency notice failed'});}
    }

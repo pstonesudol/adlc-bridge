@@ -133,17 +133,23 @@ test('provider proof requires exact merge inclusion and capability bytes, never 
 });
 test('deduplicated dependency/resolution notices share publisher and retain waiting label',async()=>{
  const f=await fixture();try{
-  const comments:any[]=[],label=one;f.c.blockerSync={enabled:true,labelId:label};
+   const comments:any[]=[],label=one;let labelWrites=0;f.c.blockerSync={enabled:true,labelId:label};
   const blockers=new LinearBlockers(f.s,async(q,v)=>{
    if(q.includes('commentCreate')){const comment={...v.input,createdAt:'2026-11-02T00:00:00Z'};comments.push(comment);return {commentCreate:{success:true,comment}};}
    if(q.includes('comments(first:100'))return {issue:{id:root,comments:{nodes:comments,pageInfo:{hasNextPage:false}}}};
-   if(q.includes('issueUpdate')){f.issue.labels.nodes=v.added?[...f.issue.labels.nodes,{id:label}]:f.issue.labels.nodes.filter(l=>l.id!==label);return {issueUpdate:{success:true,issue:f.issue}};}
+    if(q.includes('issueUpdate')){labelWrites++;f.issue.labels.nodes=v.added?[...f.issue.labels.nodes,{id:label}]:f.issue.labels.nodes.filter(l=>l.id!==label);return {issueUpdate:{success:true,issue:f.issue}};}
    return {issue:f.issue};
   });
   await f.r.tick(f.job,f.c);await f.r.notices(f.c,blockers);await f.r.notices(f.c,blockers);await blockers.sync(f.c);
   expect(comments).toHaveLength(1);expect(comments[0].body).toContain('Waiting for dependencies');expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(true);
   f.setMerged(2);await f.r.tick(f.job,f.c);await f.r.notices(f.c,blockers);await f.r.tick(f.job,f.c);await f.r.notices(f.c,blockers);
-  expect(comments).toHaveLength(2);expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(false);
+   expect(comments).toHaveLength(2);expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(false);
+   for(const outcome of ['needs_input','failed','uncertain','needs_reconciliation']){
+    f.s.db.query('UPDATE worker_outcomes SET outcome=? WHERE job=?').run(outcome,f.job);
+    await blockers.sync(f.c);const before=labelWrites,notices=comments.length;
+    for(let i=0;i<2;i++){await f.r.notices(f.c,blockers);await blockers.sync(f.c);}
+    expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(true);expect(labelWrites).toBe(before);expect(comments).toHaveLength(notices);
+   }
  }finally{f.s.close();}
 });
 test('explicit confirmation reconciles interrupted pre-update Git stage, automatic poll does not',async()=>{
