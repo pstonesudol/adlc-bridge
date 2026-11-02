@@ -8,6 +8,8 @@ test('accepted-update observation requires both inputs and stable current head; 
   expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
   f.b.head='c'.repeat(40);f.updater.transport.contains=async()=>false;
   await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
+  f.updater.transport.contains=async(_repo,ancestor)=>ancestor===old;
+  await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
   f.updater.transport.contains=async()=>true;
   const stale={...f.b};f.b.head='d'.repeat(40);
   await f.updater.observeAccepted(f.id,'owner/repo',1,stale);expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');

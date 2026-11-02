@@ -79,13 +79,15 @@ test('publication confirmation rejects remote/base changes and revoked approval 
    f.lose();await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
    await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator repair');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
    const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','human');
+   const before=f.recovery.row(f.job),review=f.s.db.query('SELECT * FROM review_targets').get();
    const io={...f.io,verify:async()=>{
     if(change==='approval')f.s.db.query("UPDATE jobs SET approved_hash=NULL WHERE id=?").run(f.job);
     else{const tree=change==='base'?f.source:f.tree;await f.git(tree,'commit','--allow-empty','-m','Concurrent change');await f.git(tree,'push','origin',change==='base'?'main':`HEAD:refs/heads/${f.branch}`);}
     return {code:0,out:'ok',err:''};
    }};
-   await expect(new ConflictRecovery(f.s,io as any).publishedConfirm(f.job,f.config,'merge','human',preview.confirmation)).rejects.toThrow();
-   expect(f.recovery.row(f.job).state).not.toBe('completed');expect(f.sends()).toBe(1);
+   const expected={head:'Evidence changed during verification',base:'Required old/current base not included',approval:'Current unchanged execution approval'};
+   await expect(new ConflictRecovery(f.s,io as any).publishedConfirm(f.job,f.config,'merge','human',preview.confirmation)).rejects.toThrow(expected[change]);
+   expect(f.recovery.row(f.job)).toEqual(before);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(review);expect(f.sends()).toBe(1);
   }finally{f.close();}
  }
 },60000);
@@ -138,8 +140,10 @@ test('publication proof rejects detached/dirty/unpublished work, lifecycle and i
    if(kind==='unpublished')await f.git(f.tree,'commit','--allow-empty','-m','Unpublished');
    if(kind==='owner')f.setOwners(['worker','another']);
    const io={...f.io,snapshot:async()=>({...await f.io.snapshot(),...kind==='closed'?{state:'closed'}:kind==='retargeted'?{baseBranch:'other'}:kind==='fork'?{headRepo:'fork/repo'}:{}})};
-   await expect(new ConflictRecovery(f.s,io as any).publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow();
-   expect(f.recovery.row(f.job).state).not.toBe('completed');
+   const before=f.recovery.row(f.job),review=f.s.db.query('SELECT * FROM review_targets').get();
+   const expected={dirty:'Dirty, unpublished or divergent local work',unpublished:'Dirty, unpublished or divergent local work',closed:'Target is not the owned open feature PR',retargeted:'Owned isolated delivery repository/base/worktree evidence mismatch',fork:'Target is not the owned open feature PR',owner:'Owned isolated delivery repository/base/worktree evidence mismatch'};
+   await expect(new ConflictRecovery(f.s,io as any).publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow(expected[kind]);
+   expect(f.recovery.row(f.job)).toEqual(before);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(review);
   }finally{f.close();}
  }
 },60000);
@@ -150,6 +154,20 @@ test('quoted Unicode conflict paths keep raw index identities through resolution
   expect(JSON.parse(f.recovery.row(f.job).detail).conflicts).toEqual([filename]);
   f.resolve();expect(await f.recovery.tick(f.job,f.config,'owner/repo',1)).toBeNull();
   expect(readFileSync(join(f.tree,filename),'utf8')).toBe('feature=new\nsafety=new\n');
+ }finally{f.close();}
+},60000);
+test('publication scope checks both source deletion and destination of a rename',async()=>{
+ const f=await fixture();try{
+  f.s.db.query('UPDATE implementation_dispatch SET paths=?').run(JSON.stringify(['app.txt','moved.txt']));
+  f.lose();await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator merge');
+  await f.git(f.tree,'config','diff.renames','true');await f.git(f.tree,'mv','safeguard.txt','moved.txt');await f.git(f.tree,'commit','-m','Rename outside scope');
+  await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  const b=await f.io.snapshot(),shown=await f.git(f.tree,'diff','--name-only',`${b.base}...${b.head}`);
+  expect(shown).toContain('moved.txt');expect(shown).not.toContain('safeguard.txt');
+  const before=f.recovery.row(f.job),review=f.s.db.query('SELECT * FROM review_targets').get();
+  await expect(f.recovery.publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow('safeguard.txt');
+  expect(f.recovery.row(f.job)).toEqual(before);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(review);
  }finally{f.close();}
 },60000);
 test('rejected normal push retains merge commit and never overwrites a competing actor',async()=>{

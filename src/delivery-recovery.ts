@@ -4,8 +4,8 @@ import {Store,digest} from './core';
 import {assertWorktreeAvailable} from './worktree-reservation';
 
 // Evidence reports the resolved worktree root, while authorization keeps the
-// originally registered value. Compare canonical forms, but persist the raw
-// authorized value so later consumers compare like with like.
+// active run value. Compare canonical forms, but persist the run representation
+// so downstream adoption/session checks compare like with like.
 const canonical=(p:string)=>{try{return realpathSync(p);}catch{return resolve(p);}};
 
 export type DeliveryFacts={session:string;project:string;reserved:string;worktree:string;branch:string;head:string;anchor:string;clean:boolean;isolated:boolean;lineage:boolean;idle:boolean;completed:boolean;owners:string[];candidates:{repo:string;pr:number;url:string;branch:string;head:string;baseBranch:string;defaultBranch:string;fork:boolean;state:string;draft:boolean}[]};
@@ -22,7 +22,7 @@ export class DeliveryRecovery{
    const e=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any,manual=this.s.db.query('SELECT required FROM ticket_approval_requirements WHERE job=?').get(job) as any;
    if(manual?.required||!e?.ready||e.project!==j.project||e.spec_hash!==digest(j.spec)||Date.now()-e.observed>120000||e.observed>Date.now()+5000||proof.policy_hash!==digest(JSON.stringify(c.approval??{mode:'manual'}))||proof.spec_hash!==digest(j.spec)||proof.plan_hash!==j.plan_hash||proof.scope!==d.paths)throw Error('Fresh unchanged standing approval and scope required');
   }
-  return {plan:j.plan_hash,spec:digest(j.spec),session:d.session_id,project:r.project,reserved:r.branch,worktree:r.worktree,delivery:d.client_id,paths:d.paths,grant:g.operations,actor:j.actor,policy:proof?.policy_hash??null};
+  return {plan:j.plan_hash,spec:digest(j.spec),session:d.session_id,project:r.project,reserved:r.branch,worktree:run.worktree,delivery:d.client_id,paths:d.paths,grant:g.operations,actor:j.actor,policy:proof?.policy_hash??null};
  }
  async preview(job:string,c:any){
   // No constructors with schema side effects and no intake/Linear mutations here.

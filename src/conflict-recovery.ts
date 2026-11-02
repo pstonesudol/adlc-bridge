@@ -142,7 +142,7 @@ export class ConflictRecovery{
    }
    proofs.push({head:input.head,base:input.base,descendant,equivalence});
   }
-  const paths=(await this.git(x.facts.worktree,'diff','--name-only','-z',`${x.b.base}...${x.b.head}`)).split('\0').filter(Boolean);
+  const paths=(await this.git(x.facts.worktree,'diff','--name-only','--no-renames','-z',`${x.b.base}...${x.b.head}`)).split('\0').filter(Boolean);
   if(paths.some(path=>!scopeAllows(path,JSON.parse(auth.paths))))throw Error(`Published feature changes outside current scope: ${JSON.stringify(paths)}`);
   const markers=paths.length?await this.io.command(['git','grep','-n','-I','-E','^(<<<<<<< |[|]{7} |=======[[:space:]]*$|>>>>>>> )',x.b.head,'--',...paths.map(p=>`:(literal)${p}`)],x.facts.worktree):{code:1};
   if(markers.code!==1)throw Error('Published conflict markers remain or inspection failed');

@@ -5,6 +5,8 @@ import {assertWorktreeAvailable} from './worktree-reservation';
 export type BranchPolicy={enabled:boolean;authorizedBy:string;maxUpdates:number|null};
 export type BranchSnapshot={head:string;base:string;branch:string;baseBranch:string;defaultBranch:string;headRepo:string;baseRepo:string;state:string;draft:boolean;mergeable:boolean|null;behind:number};
 export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>;contains?(repo:string,ancestor:string,head:string):Promise<boolean>};
+export class BranchObservationFailure extends Error{}
+async function providerObservation<T>(read:()=>Promise<T>){try{return await read();}catch(error){throw new BranchObservationFailure('Provider branch/ancestry observation unavailable',{cause:error});}}
 async function gh(args:string[]){const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub branch operation failed; inspect before retry');return JSON.parse(out);}
 export async function baseTip(repo:string,branch:string,read=gh){
  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||typeof branch!=='string'||!branch||/[\s\x00-\x1f]/.test(branch))throw Error('Valid base repository and branch required');
@@ -32,8 +34,8 @@ export class BranchUpdates{
    // Keep uncertainty separate; operator reconciliation handles rewritten history.
    const rows=this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND state='accepted' AND head!=?").all(job,b.head) as any[];
    for(const row of rows){
-    if(!this.transport.contains||!await this.transport.contains(repo,row.head,b.head)||!await this.transport.contains(repo,row.base,b.head))continue;
-    const fresh=await this.transport.read(repo,pr);
+    if(!this.transport.contains||!await providerObservation(()=>this.transport.contains!(repo,row.head,b.head))||!await providerObservation(()=>this.transport.contains!(repo,row.base,b.head)))continue;
+    const fresh=await providerObservation(()=>this.transport.read(repo,pr));
     if(fresh.head!==b.head||fresh.base!==b.base)continue;
     this.s.db.transaction(()=>{new Lifecycle(this.s).current(job);this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head=? AND base=? AND state='accepted'").run(job,row.head,row.base);}).immediate();
    }
@@ -45,7 +47,7 @@ export class BranchUpdates{
   const l=new Lifecycle(this.s),j=l.current(job),run=l.run(job),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const operations=policy?.enabled?['fetch','push-feature']:[];
   if(!run||run.owner!=='orchestrator'||run.session_id!==session.session?.id||run.plan_hash!==j.plan_hash||!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Existing approved feature branch execution required');
-  const b=await this.transport.read(repo,pr);
+  const b=await providerObservation(()=>this.transport.read(repo,pr));
   assertDeliveryTarget(this.s,job,session.session,repo,pr,b);
   if(!policy?.enabled)return null;
   await this.observeAccepted(job,repo,pr,b);
@@ -58,7 +60,7 @@ export class BranchUpdates{
   const row=this.s.db.query('SELECT * FROM branch_updates WHERE job=? AND head=? AND base=?').get(job,b.head,b.base) as any;
   if(row)return {state:row.reason||Date.now()-row.requested>=10*60*1000?'blocked':'updating_branch',send:false,head:b.head,reason:'Branch update already requested or uncertain; never resend for the same commit/base'};
   // Re-read before the mutation; GitHub also enforces expected_head_sha.
-  const fresh=await this.transport.read(repo,pr);
+  const fresh=await providerObservation(()=>this.transport.read(repo,pr));
   if(JSON.stringify(fresh)!==JSON.stringify(b))return {state:'updating_branch',send:false,head:fresh.head,reason:'Branch changed during inspection; recheck next poll'};
   l.current(job);
    const claim=this.s.db.transaction(()=>{

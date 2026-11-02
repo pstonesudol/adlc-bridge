@@ -1,4 +1,4 @@
-import {BranchUpdates,branchTransport,type BranchPolicy} from './branch-updates';
+import {BranchUpdates,BranchObservationFailure,branchTransport,type BranchPolicy} from './branch-updates';
 import {scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {Lifecycle} from './lifecycle';
@@ -55,7 +55,7 @@ async function postFullReview(repo:string,pr:number){
 export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
-const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity};
+const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,contains:branchTransport.contains!};
 export class ReviewLoop{
  io:typeof reviewIO;
  constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
@@ -160,14 +160,17 @@ export class ReviewLoop{
     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
     catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
    }
-  let session;
+  let session,snapshot;
   try{
    session=await this.io.sessionEvidence(run.session_id);
+   snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);
+  }catch(e){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
+  try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
-   const snapshot=await this.io.readBranchSnapshot(t.repo,t.pr),local=await this.io.worktreeIdentity(this.s,job);
+   const local=await this.io.worktreeIdentity(this.s,job);
    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
-  }catch(e){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
+  }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
    let branch;
    if(config?.conflictRecovery?.enabled===true){
@@ -176,16 +179,16 @@ export class ReviewLoop{
     catch(error){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
     if(snapshot.behind>0&&snapshot.mergeable===null){observation?.failed(job);return this.record(job,{state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; bounded provider observation only, no remediation attempt'});}
     if(snapshot.mergeable===false&&snapshot.behind>0){
-     try{await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).observeAccepted(job,t.repo,t.pr,snapshot);}
-     catch(error){observation?.failed(job);return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:'Accepted base update evidence unavailable; inspect published recovery'});}
+     try{await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).observeAccepted(job,t.repo,t.pr,snapshot);}
+     catch(error){if(error instanceof BranchObservationFailure)observation?.failed(job);return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
      observation?.clear(job);
      try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
      catch(error){return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
-    observation?.clear(job);
    }
-   try{branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
-   catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
+   try{branch=await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:error.message});}throw error;}
+   observation?.clear(job);
    if(branch)return this.record(job,branch);
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
