@@ -23,6 +23,7 @@ import {RecoveryObservation} from './recovery-observation';
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
+ if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
  if(e.failedChecks.length&&!e.failedChecks.every((c:any)=>metadataFailureCovered(e,c)))return {state:'blocked',send:false,reason:'Required CI failed; inspect failure and ticket scope before remediation'};
  if(e.findings.length){
@@ -71,6 +72,7 @@ export class ReviewLoop{
    CREATE TABLE IF NOT EXISTS description_delivery_gates(job TEXT PRIMARY KEY,head TEXT NOT NULL,body TEXT NOT NULL,started INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));
   CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS custom_description_obligations(job TEXT PRIMARY KEY REFERENCES jobs(id),baseline_body_hash TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);}
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
@@ -202,6 +204,14 @@ export class ReviewLoop{
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
+   const outcome=this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get()?this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any:null;
+   if(outcome?.plan_hash===run.plan_hash&&typeof outcome.source==='string'&&outcome.source.startsWith('remediation:')&&['needs_input','blocked_dependency','failed','uncertain'].includes(outcome.outcome)){
+    const handle=outcome.source.slice('remediation:'.length),entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
+    if(turn?.state==='completed')this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state='delivery_uncertain'").run(job,Number(handle.split('-').at(-1)));
+    return this.record(job,{state:'blocked',send:false,head:e.head,reason:`Verification remediation ${outcome.outcome}: ${outcome.reason}; see the scoped Linear clarification/blocker flow`});
+   }
+   const customObligation=this.s.db.query('SELECT * FROM custom_description_obligations WHERE job=?').get(job) as any;
+   const reviewBodyKey=customObligation&&e.descriptionVersion?e.descriptionVersion:e.descriptionHash;
   // A same-SHA approval can predate a description edit. Reconcile metadata
   // receipts before considering e.clear, so that edit always creates its gate.
   const metadataPending=this.s.db.query("SELECT r.*,c.baseline_body_hash FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.state='delivery_uncertain' AND c.kind='pr_description' ORDER BY r.attempt DESC LIMIT 1").get(job) as any;
@@ -219,6 +229,7 @@ export class ReviewLoop{
    // A delivered description edit creates a review obligation independently of
    // mutable metadata-check policy. Clearing that policy cannot clear delivery
    // uncertainty or make an approval for the previous body current.
+   if(customObligation&&customObligation.baseline_body_hash!==e.descriptionHash)this.s.db.query('INSERT OR IGNORE INTO description_delivery_gates VALUES (?,?,?,?)').run(job,e.head,e.descriptionHash,Date.now());
    const deliveryWait=this.s.db.transaction(()=>{
     const prior=this.s.db.query('SELECT * FROM description_delivery_gates WHERE job=?').get(job) as any;
     if(!prior||prior.head===e.head&&prior.body===e.descriptionHash)return prior;
@@ -242,14 +253,15 @@ export class ReviewLoop{
     this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?) ON CONFLICT(job,head,body) DO UPDATE SET signature=excluded.signature,started=excluded.started').run(job,e.head,e.descriptionHash,prior.signature,started);
     return {...prior,body:e.descriptionHash,started};
    }).immediate();
-    const waiting=checkWait??deliveryWait;
+   const waiting=checkWait??deliveryWait;
+   if(waiting&&customObligation&&!e.descriptionVersion)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'CodeRabbit custom-check failure: current description edit version is unavailable; restore GitHub body-version access before requesting review'});
     if(needsBodyEvidence){
      return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'Missing body-bound success evidence for every configured metadata check'});
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.
   if(!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
-   const requested=await this.requestReview(job,e.head,e.descriptionHash);
+   const requested=await this.requestReview(job,e.head,reviewBodyKey);
    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    if(requested){
      this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND state!='completed'").run(e.head,job);
@@ -261,11 +273,11 @@ export class ReviewLoop{
   }
    if(waiting&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
-    if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted))await this.requestReview(job,e.head,e.descriptionHash);
+    if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,e.head,reviewBodyKey);
     const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
-   const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,e.descriptionHash) as any;
+   const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,reviewBodyKey) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
-   if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
+   if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
@@ -298,7 +310,7 @@ export class ReviewLoop{
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
-   const operations=metadataOnly?['open-pr']:['commit','push-feature'];
+   const operations=metadataOnly?['open-pr']:['commit','push-feature',...(reviewView.findings.some((f:any)=>f.kind==='pr_description')?['open-pr']:[])];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await this.io.disableNativeFeedback(run.session_id);
    const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);

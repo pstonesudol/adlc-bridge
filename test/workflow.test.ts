@@ -7,6 +7,7 @@ import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
+import {ReviewLoop} from '../src/review-loop';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
@@ -56,6 +57,23 @@ async function planned(path=':memory:'){
  const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue',JSON.stringify({identifier:'DEMO-1',title:'Test',description:'Update src/a.ts'}));
  await w.tick(config);f.completePlan();await w.tick(config);return {s,f,w,id,hash:s.get(id).plan_hash};
 }
+test('an existing PR does not hide a delivered remediation blocker; only the reconciled owned target can continue',async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
+  const loop=new ReviewLoop(s);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
+  const l=new Lifecycle(s),attempt=l.reserveRemediation(id,'a'.repeat(40),'custom evidence') as any;
+  s.db.query("UPDATE remediation SET state='completed' WHERE job=?").run(id);
+  s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(id,attempt.attempt,'pr_description','old-body');
+  const e=f.sessions.get('session-1'),handle=`adlc-fix-${id.slice(0,12)}-${attempt.attempt}`;
+  e.transcript.entries.push({sequence:4,clientMessageId:handle,turnId:'fix'});e.transcript.turns.push({id:'fix',state:'completed'});
+  e.transcript.entries.push({sequence:5,kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'fix',text:'<!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Checked approved commands, ticket and existing verification artifacts; browser runtime path absent","necessity":"A validated runtime path is essential before the configured check can run"} -->\n<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"needs-input","reason":"Validated runtime path is missing","questions":[{"id":"runtime","question":"Which validated runtime configuration should the configured verification runner use?","kind":"requirement"}],"dependencies":[]} -->'});
+  expect((await w.executionStatus(id,e,config)).outcome).toBe('needs_input');
+  expect(w.outcomes(id).source).toBe(`remediation:${handle}`);expect(JSON.parse(w.outcomes(id).discovery).summary).toContain('runtime path absent');
+  (await import('../src/readiness')).recordResolution(s,id,'human-answer','Patrick','Use the already authorized runtime configuration');
+  const result=await w.resume(id,config);expect(result.state).toBe('continuation_delivery_accepted');
+  expect(f.sends.at(-1).prompt).toContain('Description and verification only');expect(f.sends).toHaveLength(2);expect(s.get(id).attempts).toBe(1);
+ }finally{s.close();}
+});
 test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{
  const {s,f,w,id,hash}=await planned();
  try{

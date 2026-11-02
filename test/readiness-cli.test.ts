@@ -10,6 +10,7 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
   const checks=['CI','Metadata','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
   const review={user:{login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
   const responses:any={
+   'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review]],
@@ -72,6 +73,7 @@ for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-p
   if(mode==='nested-errors')(commentPage as any).errors=[{message:'Unavailable'}];
   if(mode==='nested-pageInfo')delete inner.pageInfo;
   const responses:any={
+   'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review]],

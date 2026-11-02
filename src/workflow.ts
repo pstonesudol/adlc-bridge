@@ -276,11 +276,18 @@ export class Workflow{
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
   const cont=this.continuation(job);
   const clientId=cont?cont.client_id:d.client_id;
-  const entry=e.transcript?.entries?.find((x:any)=>x.clientMessageId===clientId);
+  let entry=e.transcript?.entries?.find((x:any)=>x.clientMessageId===clientId);
+  // A later owned remediation turn can ask for clarification even though its
+  // PR already exists. Do not keep interpreting the original handoff forever.
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='remediation_context'").get()){
+   const latest=this.s.db.query('SELECT attempt FROM remediation_context WHERE job=? ORDER BY attempt DESC LIMIT 1').get(job) as any;
+   const fix=latest&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===`adlc-fix-${job.slice(0,12)}-${latest.attempt}`);
+   if(fix&&(!cont||entry)&&e.transcript.entries.indexOf(fix)>e.transcript.entries.indexOf(entry))entry=fix;
+  }
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{
    if(!persist)return {...result,session:d.session_id};
-   if(cont&&turn){
+   if(cont&&turn&&entry?.clientMessageId===cont.client_id){
     if(['failed','cancelled','interrupted'].includes(turn.state))this.s.db.query("UPDATE continuations SET state='failed',reason=? WHERE id=?").run('Continuation turn failed or was cancelled',cont.id);
     else if(turn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state!='failed'").run(cont.id);
    }
@@ -343,22 +350,28 @@ export class Workflow{
  private completedOutcome(job:string,d:any,e:any,entry:any,graceMs:number,now:number){
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   if(prs.length>1)return {state:'blocked',outcome:'failed',reason:'Multiple open PRs require reconciliation',questions:[],dependencies:[],source:'session',confidence:'high'};
-  if(prs.length===1)return {state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'session',confidence:'high',pr:prs[0]};
+  const linked=this.s.db.query("SELECT name FROM sqlite_master WHERE name='remediation_continuations'").get()?this.s.db.query('SELECT handle FROM remediation_continuations WHERE client_id=? AND job=?').get(entry.clientMessageId??'',job) as any:null;
+  const remediationHandle=linked?.handle??(typeof entry.clientMessageId==='string'&&entry.clientMessageId.startsWith(`adlc-fix-${job.slice(0,12)}-`)?entry.clientMessageId:null);
+  const remediation=!!remediationHandle;
+  if(prs.length===1&&!remediation)return {state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'session',confidence:'high',pr:prs[0]};
   const entries=e.transcript?.entries??[],turns=new Map((e.transcript?.turns??[]).map((t:any)=>[t.id,t]));
   let receipt:any=null,source='transcript',confidence='low',discovery:any=null;
   for(const item of [...entries].reverse()){
    if(item.kind!=='message'||item.role!=='assistant'||item.origin!=='provider'||item.streaming)continue;
    if(typeof item.sequence==='number'&&typeof entry.sequence==='number'&&item.sequence<=entry.sequence)continue;
    if(turns.get(item.turnId)?.state!=='completed')continue;
+   if(remediation&&item.turnId!==entry.turnId)continue;
    const assessed=assessWorkerReceipt(item.text??'');
    if(assessed.valid){receipt=assessed.receipt;discovery=clarificationDiscovery(item.text??'');source='receipt';confidence='high';break;}
   }
+  if(remediation)source=`remediation:${remediationHandle}`;
   if(receipt){
    if(receipt.outcome==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:receipt.reason||'Worker requested input',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
    if(receipt.outcome==='blocked-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:receipt.reason||'Worker is blocked by a dependency',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
    if(receipt.outcome==='failed')return {state:'failed',outcome:'failed',reason:receipt.reason||'Worker reported failure',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
    if(receipt.outcome==='uncertain')return {state:'uncertain',outcome:'uncertain',reason:receipt.reason||'Worker reported an uncertain outcome',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
   }
+  if(prs.length===1)return {state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'session',confidence:'high',pr:prs[0]};
   let readiness=readinessFor(this.s,job);
   if(!readiness){
    const current=this.s.get(job);
@@ -425,7 +438,14 @@ export class Workflow{
   if(e.transcript?.controller!=='ready')throw Error('Worker is not idle; wait before resuming');
   if(run.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(run.state))throw Error('Existing orchestrator-owned run required');
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
-  if(prs.length)throw Error(prs.length===1?'A PR already exists; use its handoff instead of resuming':'Multiple PRs require reconciliation');
+  let remediationTarget:any=null;
+  if(prs.length){
+   const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
+   const fix=typeof outcome.source==='string'&&outcome.source.startsWith('remediation:adlc-fix-')?outcome.source.slice('remediation:'.length):null;
+   const attempt=fix&&this.s.db.query("SELECT r.state,c.kind FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.attempt=?").get(job,Number(fix.split('-').at(-1))) as any;
+   if(prs.length!==1||!target||target.repo!==c.githubRepo||prs[0].number!==target.pr||prs[0].url!==`https://github.com/${target.repo}/pull/${target.pr}`||!attempt||attempt.state!=='completed')throw Error('A PR already exists; only its reconciled owned remediation blocker can resume');
+   remediationTarget={...target,kind:attempt.kind};
+  }
   const unresolved=this.unresolvedContinuation(job,j.plan_hash);
   if(unresolved){
    if(unresolved.state==='delivery_uncertain'||unresolved.state==='reserved')throw Error('Continuation delivery is uncertain; never resend. Reconcile the existing session first');
@@ -443,15 +463,24 @@ export class Workflow{
     `A named human (${resolution.actor}) resolved the blocker via ${resolution.source}: ${resolution.detail}`,
     `Previously outstanding questions: ${JSON.stringify(JSON.parse(outcome.questions))}`,
     `Previously referenced dependencies: ${JSON.stringify(JSON.parse(outcome.dependencies))}`,
+    remediationTarget?`This continues remediation on https://github.com/${remediationTarget.repo}/pull/${remediationTarget.pr}, not a fresh implementation. Inspect its current head and prior remediation artifacts first. Attempt scope: ${remediationTarget.kind}. ${remediationTarget.kind==='pr_description'?'Description and verification only: do not edit application files, commit or push.':''} Do not replay completed checks or edits. Stop if the answer does not resolve the exact blocker within existing authorization. ${verificationInstructions(c.verification,c.verificationContext,r.worktree)}`:'',
     'The existing plan, approved repository scope and feature-branch Git permissions remain in force and are not expanded. If requirements or scope changed, stop and request replanning. Never merge a PR, enable auto-merge, deploy, weaken protection, or invoke ADLC/ALDC skills.',
     WORKER_STATUS_INSTRUCTION
   ].join('\n\n');
   let claim:any;
+  this.s.db.exec('CREATE TABLE IF NOT EXISTS remediation_continuations(client_id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),handle TEXT NOT NULL);');
   await guard?.();
   const local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));
   if(local.branch!==deliveryBranch(this.s,job,e.session))throw Error('Worktree branch changed; reconcile before continuation');
   const fresh=await this.t.evidence(d.session_id);
-  if(fresh.session?.id!==d.session_id||fresh.session?.projectId!==r.project||fresh.session?.branch!==r.branch||fresh.session?.isTerminated||fresh.transcript?.controller!=='ready'||!Array.isArray(fresh.transcript?.turns)||fresh.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))||(fresh.session.prs??[]).some((p:any)=>p.state==='open'))throw Error('Worker changed or has active/queued work before resume reservation');
+  const freshPRs=(fresh.session.prs??[]).filter((p:any)=>p.state==='open');
+  const expectedPR=remediationTarget&&freshPRs.length===1&&freshPRs[0].number===remediationTarget.pr&&freshPRs[0].url===`https://github.com/${remediationTarget.repo}/pull/${remediationTarget.pr}`;
+  if(fresh.session?.id!==d.session_id||fresh.session?.projectId!==r.project||fresh.session?.branch!==r.branch||fresh.session?.isTerminated||fresh.transcript?.controller!=='ready'||!Array.isArray(fresh.transcript?.turns)||fresh.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))||(remediationTarget?!expectedPR:freshPRs.length>0))throw Error('Worker changed or has active/queued work before resume reservation');
+  if(remediationTarget){
+   const b=await (this.t.branchSnapshot?this.t.branchSnapshot(remediationTarget.repo,remediationTarget.pr):readBranchSnapshot(remediationTarget.repo,remediationTarget.pr));
+   assertDeliveryTarget(this.s,job,fresh.session,remediationTarget.repo,remediationTarget.pr,b);
+   if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before remediation continuation');
+  }
   try{
     claim=this.s.db.transaction(()=>{
      assertWorktreeAvailable(this.s,job);
@@ -466,7 +495,9 @@ export class Workflow{
     if(currentRun?.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(currentRun.state)||currentRun.session_id!==run.session_id||currentRun.worktree!==run.worktree||currentRun.plan_hash!==j.plan_hash)throw Error('Worker ownership changed during resume');
     if(resolutionBinding(this.s,job)!==resolution.binding||applicableResolution(this.s,job)?.detail!==resolution.detail)throw Error('Resolution changed before continuation');
     if(this.unresolvedContinuation(job,j.plan_hash))throw Error('A continuation is already reserved or in flight; never duplicate a resume delivery');
-    return this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,j.plan_hash,digest(j.spec),binding,clientId,d.session_id);
+    const inserted=this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,j.plan_hash,digest(j.spec),binding,clientId,d.session_id);
+    if(remediationTarget)this.s.db.query('INSERT INTO remediation_continuations VALUES (?,?,?)').run(clientId,job,outcome.source.slice('remediation:'.length));
+    return inserted;
    }).immediate();
   }catch(error){
    if(error instanceof Error&&/UNIQUE/i.test(error.message))throw Error('A continuation is already reserved for this resolution; duplicate resume refused');

@@ -8,6 +8,8 @@ import {LinearBlockers} from '../src/linear-blockers';
 import {LinearClarifications,validateClarifications} from '../src/linear-clarifications';
 import {LinearApprovals} from '../src/linear-approvals';
 import {ApprovalPolicyStore} from '../src/approval-policy';
+import {ReviewLoop} from '../src/review-loop';
+import {Lifecycle} from '../src/lifecycle';
 const human='11111111-1111-1111-1111-111111111111',label='22222222-2222-2222-2222-222222222222';
 const config:any={repo:'/repo',requiredChecks:['CI'],linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},blockerSync:{enabled:true,labelId:label},clarifications:{enabled:true,humanIds:[human]}};
 const discovery='<!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Inspected ticket, linked copy ticket and src/a.ts; approved display wording is unchanged","necessity":"The exact listing identifier is absent and required to address the correct listing"} -->';
@@ -56,6 +58,24 @@ test('discovery occurs before exact question publication; configured label is ad
   const body=f.comments[0].body;expect(body).toContain('1. **q1** (requirement): What is the exact listing ID?');expect(body).toContain('Why this answer is necessary');expect(body).toContain('Reply on this same Linear issue');expect(body).toContain('```text');expect(body).toContain(f.reference());expect(body).toContain(f.id);expect(body).toContain('Never post secrets');
   expect(f.labels).toEqual(['ready','human-label',label]);await f.adapter().sync(config);expect(f.comments.length).toBe(1);
   await f.blockers.sync(config);expect(f.comments.length).toBe(1);expect(f.labels).toContain(label);
+ }finally{f.s.close();}
+});
+test('verification remediation on an existing PR publishes exact prerequisites and resumes once through clarification',async()=>{
+ const f=await fixture();try{
+  const c={...config,githubRepo:'owner/repo'},loop=new ReviewLoop(f.s);loop.register(f.id,'owner/repo',1,['CI'],['src/**'],true);
+  const attempt=new Lifecycle(f.s).reserveRemediation(f.id,'a'.repeat(40),'verification evidence') as any;
+  f.s.db.query("UPDATE remediation SET state='completed' WHERE job=?").run(f.id);
+  f.s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(f.id,attempt.attempt,'pr_description','original-description');
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  f.t.branchSnapshot=async()=>({branch:f.e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'});
+  const handle=`adlc-fix-${f.id.slice(0,12)}-${attempt.attempt}`;
+  f.e.transcript.entries.push({sequence:4,clientMessageId:handle,turnId:'verify'});f.e.transcript.turns.push({id:'verify',state:'completed'});
+  f.e.transcript.entries.push({sequence:5,kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'verify',text:`${discovery}\n<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"needs-input","reason":"Validated verification runtime reference is unavailable","questions":[{"id":"runtime","kind":"requirement","question":"Which already validated runtime reference should the configured runner use?"}],"dependencies":[]} -->`});
+  await f.w.executionStatus(f.id,f.e,c);expect(f.w.outcomes(f.id).source).toBe(`remediation:${handle}`);
+  await f.adapter().sync(c);expect(f.comments[0].body).toContain('Which already validated runtime reference');
+  f.reply('The existing validated runtime reference');f.confirm();await f.adapter().sync(c);await f.adapter().sync(c);
+  expect(f.sends).toHaveLength(2);expect(f.sends[1].id).toBe('session');expect(f.sends[1].prompt).toContain('Description and verification only');
+  expect(f.s.get(f.id).attempts).toBe(1);expect(f.e.session.prs).toHaveLength(1);
  }finally{f.s.close();}
 });
 test('missing discovery and incomplete linked inventories never ask',async()=>{

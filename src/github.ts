@@ -3,6 +3,7 @@ import {templateLogReader} from './gh-logs';
 import {templateCIFindings,templateSignature,metadataCheckEvidence,metadataBodyCovered} from './pr-template-ci';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
+import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
 
 async function gh(args: string[]): Promise<any> {
   const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});
@@ -71,15 +72,7 @@ export function reviewThreadFindings(summary:ReviewThreadSummary,head:string){
 export function coderabbitRateLimited(checks:any[],head:string){
  return checks.some((c:any)=>c?.app?.slug==='coderabbitai'&&c.head_sha===head&&/rate[\s_-]?limit/i.test(`${c.output?.title??''} ${c.output?.summary??''} ${c.output?.text??''}`));
 }
-export function metadataFindings(review:any,head:string,comments:any[]){
- if(review?.commit_id!==head||review?.state!=='CHANGES_REQUESTED'||!review.body?.includes('Pre-merge checks failed'))return [];
- const bot=comments.filter(c=>c.user?.login==='coderabbitai[bot]').sort((a,b)=>Date.parse(a.updated_at)-Date.parse(b.updated_at)).at(-1);
- const body=bot?.body??'';
- if(!/\|\s*Verification Evidence\s*\|[^\n]*!\[Error\]/i.test(body))return [];
- const match=body.match(/<summary><strong>Full details: Verification Evidence<\/strong><\/summary>([\s\S]*?)<\/details>/i);
- if(!match)return [];
- return [{kind:'pr_description',path:null,sha:head,body:match[1].replace(/<[^>]*>/g,'').trim().slice(0,10000)}];
-}
+export function metadataFindings(...args:Parameters<typeof customCheckEvidence>){return customCheckEvidence(...args).findings;}
 export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[]) {
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1)throw Error('Valid owner/repository and PR number required');
   required=[...new Set([...required,...metadataChecks])];
@@ -124,9 +117,11 @@ export async function readiness(repo:string, number:number, required:string[],me
   // A later COMMENTED review does not revoke an earlier approval. A real
   // change request or dismissal does; approval still must match the PR head.
   const latest=effectiveBotReview(reviews);
-  if(latest?.state==='CHANGES_REQUESTED'&&latest.commit_id===first.head.sha){
-    const comments=await pages(`${base}/issues/${number}/comments?per_page=100`);
-    findings.push(...metadataFindings(latest,first.head.sha,comments));
+  const comments=await pages(`${base}/issues/${number}/comments?per_page=100`);
+  let version:any;
+  if(comments.some(c=>c.user?.login==='coderabbitai[bot]'&&(c.body??'').includes('<!-- pre_merge_checks_walkthrough_start -->'))){
+   const result=await gh(['api','graphql','-f',`query=${BODY_VERSION_QUERY}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`]);
+   if(!result.errors)version=result.data?.repository?.pullRequest;
   }
   const currentBase=await baseTip(repo,first.base.ref);
   const comparison=await gh(['api',`${base}/compare/${currentBase}...${first.head.sha}`]);
@@ -137,6 +132,10 @@ export async function readiness(repo:string, number:number, required:string[],me
     review:latest?{sha:latest.commit_id,author:latest.user.login,state:latest.state}:null,
     unresolved,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
+  const custom=customCheckEvidence(latest,first.head.sha,comments,{repo,pr:number,body:final.body??'',version,checks});
+  if(first.body!==final.body||first.head.sha!==final.head.sha){custom.findings=[];custom.bodyReviewed=false;custom.blocker='PR head or description changed during custom-check collection';}
+  findings.push(...custom.findings);
+  if(custom.blocker||custom.findings.length){gate.clear=false;gate.reasons.push(custom.blocker??'Actionable CodeRabbit Verification Evidence failure');}
   if(comparison.behind_by>0){gate.clear=false;gate.reasons.push('Feature branch is behind base');}
   if(final.base.ref!==first.base.ref||await baseTip(repo,final.base.ref)!==currentBase){gate.clear=false;gate.reasons.push('Base branch changed during review collection');}
   if(final.state!=='open' || final.draft || final.mergeable!==true){gate.clear=false;gate.reasons.push('PR closed, draft, conflicted or mergeability unknown');}
@@ -153,7 +152,8 @@ export async function readiness(repo:string, number:number, required:string[],me
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
-    reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
+    descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
+    coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
     metadataCheckEvidence:bodyEvidence,
      botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }

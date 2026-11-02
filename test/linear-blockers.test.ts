@@ -4,6 +4,7 @@ import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
 import {ConflictRecovery} from '../src/conflict-recovery';
+import {ReviewLoop} from '../src/review-loop';
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};
@@ -75,11 +76,19 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
  }finally{f.s.close();}
 });
+test('ambiguous custom-check provenance publishes a concrete deduplicated blocker instead of approval timeout',async()=>{
+ const f=fixture();try{
+  new ReviewLoop(f.s);f.running();
+  f.s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head,state,reason,head_since) VALUES (?,?,?,?,?,?,?,?,?,?)").run(f.id,'owner/repo',1,'["CI"]','["src/**"]',1,'a'.repeat(40),'blocked','CodeRabbit custom-check failure: full Verification Evidence explanation/resolution is missing or truncated',Date.now());
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.comments[0].body).toContain('explanation/resolution is missing or truncated');expect(f.comments[0].body).toContain('Do not post secrets');expect(f.labels).toContain(labelId);
+ }finally{f.s.close();}
+});
 test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
  const f=fixture();try{
   f.running();new ConflictRecovery(f.s).install();
-  f.s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,state TEXT,required_checks TEXT)");
-  f.s.db.query('INSERT INTO review_targets VALUES (?,?,?,?)').run(f.id,'new-sha','waiting_for_ci','["latest-SHA CI","CodeRabbit"]');
+  f.s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,state TEXT,required_checks TEXT,reason TEXT)");
+  f.s.db.query('INSERT INTO review_targets(job,head,state,required_checks) VALUES (?,?,?,?)').run(f.id,'new-sha','waiting_for_ci','["latest-SHA CI","CodeRabbit"]');
   const review=f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id);
   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);

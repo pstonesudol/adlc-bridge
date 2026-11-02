@@ -141,6 +141,17 @@ export class LinearBlockers{
     const notice=stopped?`Conflict recovery ${recovery.id} has an independent reconciliation gate at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
     rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:stopped?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(stopped?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
    }
+  // A provenance gap is not an approval timeout or permission to fabricate an
+  // attestation. Reuse the existing publisher/receipts for the concrete blocker.
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()){
+   const reviews=this.s.db.query("SELECT t.job,t.reason,j.plan_hash FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=? AND t.state='blocked' AND t.reason LIKE 'CodeRabbit custom-check%' AND j.state!='done'").all(c.linear.projectId) as any[];
+   for(const review of reviews){
+    const prior=rows.findIndex(r=>r.job===review.job);
+    if(prior>=0&&blockerOutcome(rows[prior].outcome))continue;
+    if(prior>=0)rows.splice(prior,1);
+    rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason:review.reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
+   }
+  }
   for(const outcome of rows){
    handled.add(outcome.job);
    try{
