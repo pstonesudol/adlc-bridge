@@ -80,6 +80,24 @@ export class LinearClarifications{
  }
  private row(job:string,binding:string):any{return this.s.db.query('SELECT * FROM clarification_receipts WHERE job=? AND binding=?').get(job,binding);}
  private command(reference:string){return `Confirm clarification ${reference}: all answers resolve the questions within the existing approved scope; no new permissions.`;}
+ /** Publication and approval replies are control data, including approval
+  * commands not consumed yet by the later plan-approval stage of this poll. */
+ private controlComment(job:string){
+  const ids=new Set((this.s.db.query('SELECT comment_id FROM blocker_notices WHERE job=?').all(job) as any[]).map(x=>x.comment_id)),commands=new Set<string>();
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='plan_approval_notices'").get())for(const n of this.s.db.query('SELECT comment_id,approval_comment,token FROM plan_approval_notices WHERE job=?').all(job) as any[]){
+   ids.add(n.comment_id);if(n.approval_comment)ids.add(n.approval_comment);commands.add(`Approve ADLC plan ${n.token}`);
+  }
+  return (x:any)=>ids.has(x.id)||typeof x.body==='string'&&commands.has(x.body.trim());
+ }
+ /** Both admission and pre-dispatch validation must parse the same reply body.
+  * Reject quotation before stripping the exact current confirmation command. */
+ private normalizeReply(raw:any,reference:string,multipleRounds:boolean){
+  if(typeof raw.body!=='string'||raw.body.length>4000||/^\s*>/m.test(raw.body)||/```|~~~|<!--|-->/.test(raw.body))return null;
+  if(raw.body.trim()===`Replan clarification ${reference}`)return {body:'',confirmation:false,replan:true};
+  const lines=raw.body.trim().split(/\r?\n/),confirmation=lines.includes(this.command(reference)),body=lines.filter(l=>l!==this.command(reference)).join('\n');
+  if(multipleRounds&&!body.startsWith(`Clarification ${reference}\n`)&&body.trim()!==`Clarification ${reference}`&&!confirmation)return null;
+  return {body,confirmation,replan:false};
+ }
  private async inspectLinked(issue:any,outcome:any){
   const refs=new Set<string>();
   for(const m of (issue.description??'').matchAll(/https:\/\/linear\.app\/[^\s)]+\/issue\/([A-Za-z]+-\d+)/g))refs.add((m as RegExpMatchArray)[1]);
@@ -139,9 +157,8 @@ export class LinearClarifications{
   if(!posted||posted.body!==notice.body)throw Error('Clarification notice changed or disappeared');
   const issue=await readLinearIssue(context.issue,this.blockers.api);this.guard(job,c,snapshot.binding,issue);
   const humans=c.clarifications!.humanIds;
-  const self=new Set((this.s.db.query('SELECT comment_id FROM blocker_notices WHERE job=?').all(job) as any[]).map(x=>x.comment_id));
-  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='plan_approval_notices'").get())for(const row of this.s.db.query('SELECT comment_id FROM plan_approval_notices WHERE job=?').all(job) as any[])self.add(row.comment_id);
-  const authorized=(x:any)=>x.user?.app===false&&x.botActor===null&&humans.includes(x.user.id)&&!self.has(x.id)&&x.editedAt===null&&Number.isFinite(Date.parse(x.createdAt))&&Date.parse(x.createdAt)>Date.parse(notice.created);
+  const control=this.controlComment(job);
+  const authorized=(x:any)=>x.user?.app===false&&x.botActor===null&&humans.includes(x.user.id)&&!control(x)&&x.editedAt===null&&Number.isFinite(Date.parse(x.createdAt))&&Date.parse(x.createdAt)>Date.parse(notice.created);
   const fingerprint=(x:any)=>digest(JSON.stringify([x.id,x.body,x.createdAt,x.editedAt,x.user,x.botActor]));
   const prior=JSON.parse(row.consumed);
   if(Object.entries(prior).some(([id,hash])=>!comments.some(x=>x.id===id&&fingerprint(x)===hash))){
@@ -157,12 +174,10 @@ export class LinearClarifications{
   // Concurrent polls re-read the durable answers, never overwrite partial work.
   const parsed:any[]=[];
   for(const raw of [...comments].sort((a,b)=>Date.parse(a.createdAt)-Date.parse(b.createdAt))){
-   if(!authorized(raw)||prior[raw.id]||typeof raw.body!=='string')continue;
-   if(raw.body.length>4000||/^\s*>/m.test(raw.body)||/```|~~~|<!--|-->/.test(raw.body))continue;
-   if(raw.body.trim()===`Replan clarification ${context.reference}`){parsed.push({raw,replan:true});continue;}
-   const lines=raw.body.trim().split(/\r?\n/),confirmation=lines.includes(this.command(context.reference));
-   const body=lines.filter(l=>l!==this.command(context.reference)).join('\n');
-   if(multipleRounds&&!body.startsWith(`Clarification ${context.reference}\n`)&&body.trim()!==`Clarification ${context.reference}`&&!confirmation)continue;
+   if(!authorized(raw)||prior[raw.id])continue;
+   const normalized=this.normalizeReply(raw,context.reference,multipleRounds);if(!normalized)continue;
+   if(normalized.replan){parsed.push({raw,replan:true});continue;}
+   const {body,confirmation}=normalized;
    const result=await inspectHumanAnswer({current:async()=>context,authorizedHumanIds:async()=>humans,consumed:async()=>false},context,{...raw,issue:context.issue,body} as HumanComment);
    if(result.state!=='ignored'||confirmation)parsed.push({raw,answers:result.answers,confirmation});
   }
@@ -262,7 +277,7 @@ export class LinearClarifications{
   * between plan approval on one poll and execution on the next. */
  async preflight(c:ClarificationConfig){
   validateClarifications(c);if(c.clarifications?.enabled!==true)return;
-  const rows=this.s.db.query("SELECT r.* FROM clarification_receipts r JOIN jobs j ON j.id=r.job WHERE j.project=? AND j.state IN ('approved','awaiting_approval') AND r.state='resolved'").all(c.linear.projectId) as any[];
+  const rows=this.s.db.query("SELECT r.* FROM clarification_receipts r JOIN jobs j ON j.id=r.job LEFT JOIN implementation_dispatch d ON d.job=r.job WHERE j.project=? AND j.state IN ('approved','awaiting_approval') AND r.state='resolved' AND (d.job IS NULL OR d.state='approved_pending')").all(c.linear.projectId) as any[];
   for(const row of rows){
    const j=this.s.get(row.job),context=JSON.parse(row.context);
    if(context.planHash!==j.plan_hash||context.specHash!==digest(j.spec))continue;
@@ -271,16 +286,18 @@ export class LinearClarifications{
    const comments=await this.blockers.comments(j.issue),consumed=JSON.parse(row.consumed);
    let valid=context.policyHash===digest(JSON.stringify([c.clarifications,c.blockerSync]))&&Object.entries(consumed).every(([id,hash])=>comments.some(x=>x.id===id&&x.user?.app===false&&x.botActor===null&&c.clarifications!.humanIds.includes(x.user.id)&&x.editedAt===null&&digest(JSON.stringify([x.id,x.body,x.createdAt,x.editedAt,x.user,x.botActor]))===hash));
    const notice=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(row.job,row.binding) as any;
-   const self=new Set((this.s.db.query('SELECT comment_id FROM blocker_notices WHERE job=?').all(row.job) as any[]).map(x=>x.comment_id));
-   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='plan_approval_notices'").get())for(const n of this.s.db.query('SELECT comment_id,approval_comment FROM plan_approval_notices WHERE job=?').all(row.job) as any[]){self.add(n.comment_id);if(n.approval_comment)self.add(n.approval_comment);}
+   const control=this.controlComment(row.job);
+   const multipleRounds=(this.s.db.query('SELECT count(*) AS n FROM clarification_receipts WHERE job=?').get(row.job) as any).n>1;
    if(!notice)valid=false;
    else for(const raw of comments){
-    if(consumed[raw.id]||self.has(raw.id)||raw.user?.app!==false||raw.botActor!==null||!c.clarifications!.humanIds.includes(raw.user.id)||raw.editedAt!==null||!Number.isFinite(Date.parse(raw.createdAt))||Date.parse(raw.createdAt)<=Date.parse(notice.created))continue;
-    if(raw.body?.trim()===`Replan clarification ${context.reference}`){valid=false;break;}
+    if(consumed[raw.id]||control(raw)||raw.user?.app!==false||raw.botActor!==null||!c.clarifications!.humanIds.includes(raw.user.id)||raw.editedAt!==null||!Number.isFinite(Date.parse(raw.createdAt))||Date.parse(raw.createdAt)<=Date.parse(notice.created))continue;
+    const normalized=this.normalizeReply(raw,context.reference,multipleRounds);if(!normalized)continue;
+    if(normalized.replan){valid=false;break;}
+    if(!normalized.body.trim())continue;
     const request={...context,noticeId:notice.comment_id,publishedAt:notice.created};
-    const result=await inspectHumanAnswer({current:async()=>request,authorizedHumanIds:async()=>c.clarifications!.humanIds,consumed:async()=>false},request,{...raw,issue:j.issue});
+    const result=await inspectHumanAnswer({current:async()=>request,authorizedHumanIds:async()=>c.clarifications!.humanIds,consumed:async()=>false},request,{...raw,issue:j.issue,body:normalized.body});
     const answers=JSON.parse(row.answers);
-    if(result.answers.some(a=>answers[a.question]?.text!==a.text)){valid=false;break;}
+    if(result.answers.some(a=>permissionSensitive(a.text)||answers[a.question]?.text!==a.text)){valid=false;break;}
    }
    if(!valid)this.s.db.transaction(()=>{
     const active=activeResolution(this.s,row.job);

@@ -6,6 +6,8 @@ import {Planning} from '../src/planning';
 import {recordReadiness,activeResolution,clarificationDiscovery} from '../src/readiness';
 import {LinearBlockers} from '../src/linear-blockers';
 import {LinearClarifications,validateClarifications} from '../src/linear-clarifications';
+import {LinearApprovals} from '../src/linear-approvals';
+import {ApprovalPolicyStore} from '../src/approval-policy';
 const human='11111111-1111-1111-1111-111111111111',label='22222222-2222-2222-2222-222222222222';
 const config:any={repo:'/repo',requiredChecks:['CI'],linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},blockerSync:{enabled:true,labelId:label},clarifications:{enabled:true,humanIds:[human]}};
 const discovery='<!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Inspected ticket, linked copy ticket and src/a.ts; approved display wording is unchanged","necessity":"The exact listing identifier is absent and required to address the correct listing"} -->';
@@ -214,5 +216,60 @@ test('an explicit replan after plan approval still blocks the initial dispatch',
   await f.adapter().sync(config);f.reply('listing-42');f.confirm();await f.adapter().sync(config);
   f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
   f.reply(`Replan clarification ${f.reference()}`);await f.adapter().preflight(config);await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}
+});
+test('preflight rejects corrected answers with confirmation before initial dispatch',async()=>{
+ for(const withReference of [false,true]){const f=await fixture(':memory:',true);try{
+  await f.adapter().sync(config);f.reply('listing-42');const confirmation=f.confirm().body;await f.adapter().sync(config);
+  f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+  f.reply(`${withReference?`Clarification ${f.reference()}\n`:''}q1: listing-99\n${confirmation}`);
+  await f.adapter().preflight(config);expect(activeResolution(f.s,f.id)).toBeNull();expect(f.adapter().status()[0].state).toBe('needs_review');
+  await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}}
+});
+test('shared normalization preserves confirmation-only and quote gates and escalates sensitive corrections',async()=>{
+ const f=await fixture(':memory:',true);try{
+  await f.adapter().sync(config);f.reply('listing-42');const confirmation=f.confirm().body;await f.adapter().sync(config);
+  f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+  f.reply(confirmation);f.reply(`\`\`\`text\nq1: listing-99\n${confirmation}\n\`\`\``);f.reply(`> q1: listing-99\n${confirmation}`);
+  await f.adapter().preflight(config);expect(activeResolution(f.s,f.id)).toBeTruthy();expect(f.adapter().status()[0].state).toBe('resolved');
+  f.reply(`q1: deploy production\n${confirmation}`);await f.adapter().preflight(config);expect(activeResolution(f.s,f.id)).toBeNull();
+  await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}
+});
+test('clarification and Linear plan approval stay separate regardless of reply order',async()=>{
+ for(const approvalFirst of [false,true]){const f=await fixture(':memory:',true);try{
+  const c={...config,planApproval:{enabled:true,approverIds:[human],scope:['src/**']}};
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']));
+  const approvals=new LinearApprovals(f.s,f.w,f.api);
+  await f.adapter().sync(c);expect((await approvals.sync(c))[0].state).toBe('awaiting_human_approval');
+  const notice=f.s.db.query('SELECT * FROM plan_approval_notices WHERE job=?').get(f.id) as any,command=`Approve ADLC plan ${notice.token}`;
+  if(approvalFirst){
+   f.reply(command);await f.adapter().preflight(c);await f.adapter().sync(c);
+   expect(JSON.parse((f.s.db.query('SELECT answers FROM clarification_receipts WHERE job=?').get(f.id) as any).answers)).toEqual({});
+   expect((await approvals.sync(c))[0].state).toBe('approval_blocked');expect(f.s.get(f.id).state).toBe('awaiting_approval');expect(f.sends).toHaveLength(0);
+  }
+  f.reply('listing-42');f.confirm();await f.adapter().sync(c);expect(activeResolution(f.s,f.id)).toBeTruthy();
+  if(!approvalFirst)f.reply(command);
+  // Match poll ordering: clarification preflight/sync precede approval handling.
+  await f.adapter().preflight(c);await f.adapter().sync(c);expect(activeResolution(f.s,f.id)).toBeTruthy();
+  expect((await approvals.sync(c))[0].state).toBe('approved');expect(f.s.get(f.id).actor).toBe(`Linear user ${human}`);
+  expect(JSON.parse(f.w.implementation(f.id).paths)).toEqual(['src/**']);
+  // Both the consumed approval ID and duplicate command bodies are control data.
+  f.reply(command);await f.adapter().preflight(c);expect(activeResolution(f.s,f.id)).toBeTruthy();
+  await f.w.executeApproved(f.id);expect(f.sends).toHaveLength(1);expect(f.sends[0].prompt).toContain('listing-42');expect(f.sends[0].prompt).not.toContain(command);
+ }finally{f.s.close();}}
+});
+test('preflight stops reading a planning resolution once the initial send is no longer pending',async()=>{
+ const f=await fixture(':memory:',true);try{
+  await f.adapter().sync(config);const answer=f.reply('listing-42');f.confirm();await f.adapter().sync(config);
+  f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+  await f.w.executeApproved(f.id);answer.editedAt='2026-11-02T12:00:00Z';f.reply('Unrelated later discussion');
+  f.blockers.api=async()=>{throw Error('Completed initial sends must not make preflight API calls');};
+  for(const state of ['delivery_accepted','delivery_uncertain','implementation_running','pr_handoff']){
+   f.s.db.query('UPDATE implementation_dispatch SET state=? WHERE job=?').run(state,f.id);
+   await f.adapter().preflight(config);expect(f.adapter().status()[0].state).toBe('resolved');
+  }
+  expect(f.sends).toHaveLength(1);
  }finally{f.s.close();}
 });
