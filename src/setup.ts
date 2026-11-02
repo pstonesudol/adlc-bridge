@@ -1,0 +1,106 @@
+import {existsSync,readFileSync,realpathSync,writeFileSync,lstatSync,statSync} from 'node:fs';
+import {isAbsolute,dirname,resolve,basename} from 'node:path';
+import {installedCLI} from './install-state';
+import {Store} from './core';
+import {ProjectServices,projectServiceLabel,legacyLabel,registryPath} from './project-services';
+import {validate} from './linear';
+import {validateVerification,verificationInstructions,type VerificationContext} from './verification';
+
+export type RuntimeConfig={version:1;platform:'launchd';projectConfig:string;controller:string;workingDirectory:string;tools:Record<string,{path:string;version:string}>;service:{label:string;path:string;interval:number;runAtLoad:boolean;stdout:string;stderr:string}};
+function exact(v:any,keys:string[]){if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).some(k=>!keys.includes(k)))throw Error('Unknown runtime configuration field');}
+function path(p:any){if(typeof p!=='string'||!isAbsolute(p)||/[\x00-\x1f]/.test(p))throw Error('Absolute runtime path required');}
+export function validateRuntime(r:any):asserts r is RuntimeConfig{
+ exact(r,['version','platform','projectConfig','controller','workingDirectory','tools','service']);
+ if(r.version!==1||r.platform!=='launchd')throw Error('Unsupported runtime version/platform');
+ for(const k of ['projectConfig','controller','workingDirectory'])path(r[k]);
+ exact(r.tools,['bun','ao','git','gh','docker']);
+ for(const name of ['bun','ao','git','gh'])if(!r.tools[name])throw Error('Pinned bun, ao, git and gh required');
+ for(const t of Object.values(r.tools) as any[]){exact(t,['path','version']);path(t.path);if(typeof t.version!=='string'||!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(t.version))throw Error('Exact tool version required');}
+ const s=r.service;exact(s,['label','path','interval','runAtLoad','stdout','stderr']);
+ for(const k of ['path','stdout','stderr'])path(s[k]);
+ if(!/^[a-zA-Z0-9][\w.-]{0,180}$/.test(s.label)||!Number.isSafeInteger(s.interval)||s.interval<10||s.interval>86400||typeof s.runAtLoad!=='boolean')throw Error('Invalid service settings');
+}
+// Only the host CLI option/service environment supplies this reference, never ticket text.
+// Ignore any serialized context in project JSON and copy only validated path fields.
+export function withVerificationContext(c:any,projectPath:string,runtimePath?:string){
+ validate(c);const result={...c,verificationContext:undefined as VerificationContext|undefined};
+ if(!runtimePath)return result;
+ const runtimeConfig=realpathSync(runtimePath),r=JSON.parse(readFileSync(runtimeConfig,'utf8'));validateRuntime(r);
+ if(realpathSync(r.projectConfig)!==realpathSync(projectPath))throw Error('Runtime configuration belongs to a different project config');
+ // The currently executing, owner-pinned snapshot is authoritative after an
+ // operator installation/rollback. Runtime JSON remains unchanged and recoverable.
+ const pin=installedCLI(),executing=realpathSync(resolve(import.meta.dir,'cli.ts'));
+ const controller=pin&&existsSync(pin)&&realpathSync(pin)===executing?executing:r.controller;
+ result.verificationContext={projectConfig:realpathSync(projectPath),runtimeConfig,bun:r.tools.bun.path,cli:controller};
+ return result;
+}
+const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
+const runtimePATH=(r:RuntimeConfig)=>[...new Set(Object.values(r.tools).map(t=>dirname(t.path))),'/usr/bin','/bin'].join(':');
+export function runtimeServiceDefinition(r:RuntimeConfig,runtimePath?:string){
+ validateRuntime(r);const s=r.service;
+ if(runtimePath)path(runtimePath);
+ return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>
+<key>Label</key><string>${xml(s.label)}</string>
+<key>ProgramArguments</key><array>${[r.tools.bun.path,r.controller,'poll',r.projectConfig].map(a=>`<string>${xml(a)}</string>`).join('')}</array>
+<key>WorkingDirectory</key><string>${xml(r.workingDirectory)}</string>
+<key>EnvironmentVariables</key><dict><key>ADLC_AO_PATH</key><string>${xml(r.tools.ao.path)}</string>${runtimePath?`<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key><string>${xml(runtimePath)}</string>`:''}<key>PATH</key><string>${xml(runtimePATH(r))}</string></dict>
+<key>StartInterval</key><integer>${s.interval}</integer><key>RunAtLoad</key><${s.runAtLoad?'true':'false'}/>
+<key>StandardOutPath</key><string>${xml(s.stdout)}</string><key>StandardErrorPath</key><string>${xml(s.stderr)}</string>
+</dict></plist>\n`;
+}
+// No provider calls, credentials, project-setting changes or launchctl.
+const liveProbe=(name:string,t:{path:string;version:string})=>{
+ if(!existsSync(t.path))return false;
+ const p=Bun.spawnSync([t.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
+ return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===t.version||x===`v${t.version}`);
+};
+function matchesServiceIdentity(c:any,r:RuntimeConfig,projectPath:string|undefined,registry:string){
+ try{
+  const project=c.automation?.orchestratorProject,generated=projectServiceLabel(project),config=realpathSync(projectPath!);
+  let expected=generated;
+  if(existsSync(registry)){
+   const s=Store.readonly(registry);try{
+    const entry=new ProjectServices(s,false).list().find(p=>p.project===project||p.config===config||p.repo===realpathSync(c.repo)||p.linear_project===c.linear.projectId);
+    if(entry){
+     if(entry.project!==project||entry.config!==config||entry.repo!==realpathSync(c.repo)||entry.linear_project!==c.linear.projectId||![generated,legacyLabel].includes(entry.label))return false;
+     expected=entry.label;
+    }
+   }finally{s.close();}
+  }
+  return r.service.label===expected;
+ }catch{return false;}
+}
+export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string,projectPath?:string,registry=registryPath()){
+ validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
+ if(c.verification?.mode==='container'&&!r.tools.docker)throw Error('Pinned Docker executable required');
+ const definition=runtimeServiceDefinition(r,runtimePath);
+ const existing=existsSync(r.service.path)?readFileSync(r.service.path,'utf8'):undefined;
+ const checks=Object.entries(r.tools).map(([name,t])=>({name,passed:probe(name,t),kind:probe===liveProbe?'live-executable-version':'injected-probe-not-live'}));
+ for(const name of ['git','gh',...(r.tools.docker?['docker']:[])]){
+  let passed=false;try{const selected=Bun.which(name,{PATH:runtimePATH(r)});passed=!!selected&&realpathSync(selected)===realpathSync(r.tools[name].path);}catch{}
+  checks.push({name:`${name}-path`,passed,kind:'live-path-resolution'});
+ }
+ checks.push({name:'service-label',passed:matchesServiceIdentity(c,r,projectPath,registry),kind:'read-only-service-identity'});
+ let sameProject=false;try{sameProject=!!projectPath&&realpathSync(projectPath)===realpathSync(r.projectConfig);}catch{}checks.push({name:'project-config-path',passed:sameProject,kind:'live-file-identity'});
+ for(const [name,p] of Object.entries({repo:c.repo,projectConfig:r.projectConfig,controller:r.controller,workingDirectory:r.workingDirectory})){
+  let passed=false;try{passed=name==='projectConfig'?existsSync(p as string):['repo','workingDirectory'].includes(name)?statSync(p as string).isDirectory():basename(p as string)==='cli.ts'&&statSync(p as string).isFile();}catch{}
+  checks.push({name,passed,kind:'live-path'});
+ }
+ if(existsSync(r.projectConfig)){let matches=false;try{matches=JSON.stringify(JSON.parse(readFileSync(r.projectConfig,'utf8')))===JSON.stringify(c);}catch{}checks.push({name:'project-config-content',passed:matches,kind:'live-file'});}
+ const conflict=existing!==undefined&&existing!==definition;
+ return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict,checks,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['Existing local service registration is checked read-only; absent registration permits only the generated project label. No live provider, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
+}
+export function writeSetupService(c:any,r:RuntimeConfig,runtimePath?:string,projectPath?:string){
+ const preview=setupPreview(c,r,liveProbe,runtimePath,projectPath);if(!preview.passed)throw Error('Setup validation failed; existing configuration preserved');
+ if(preview.service==='unchanged')return {written:false,activation:false};
+ // Render to a staging file only. Never install into a login-loaded service directory.
+ if(r.service.path.includes('/Library/LaunchAgents/')||r.service.path.includes('/Library/LaunchDaemons/'))throw Error('Use a staging service.path; installation/activation requires separate human action');
+ if(lstatSync(dirname(r.service.path)).isSymbolicLink()||realpathSync(dirname(r.service.path)).includes('/Library/LaunchAgents'))throw Error('Unsafe service staging directory');
+ writeFileSync(r.service.path,preview.definition,{flag:'wx',mode:0o600});return {written:true,activation:false};
+}
+// Intentionally emit a portable template, not a dump of local configuration.
+// Commands/identities/paths may themselves contain private data, so do not copy them.
+export function sanitizedSetup(c:any,r:RuntimeConfig){
+ validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
+  return {version:1,kind:'sanitized-setup-template',project:{version:1,name:'YOUR_PROJECT',repo:'/REPLACE/repository',githubRepo:'OWNER/REPOSITORY',requiredChecks:['REPLACE_REQUIRED_CHECK_NAME'],prMetadataChecks:[],automation:{planningEnabled:false,orchestratorProject:'REPLACE_PROJECT'},linear:Object.fromEntries(['projectId','teamId','readyStateId','readyLabelId'].map(k=>[k,'REPLACE_UUID'])),approval:{mode:'manual'},verification:c.verification?{version:1,mode:c.verification.mode,steps:[{cwd:'.',argv:['REPLACE_VERIFICATION_COMMAND']}],...(c.verification.mode==='container'?{container:{image:'sha256:REPLACE_DIGEST',inputs:['REPLACE_INPUT']}}:{})}:undefined},runtime:{version:1,platform:r.platform,projectConfig:'/REPLACE/project.json',controller:'/REPLACE/stable-install/src/cli.ts',workingDirectory:'/REPLACE/stable-install',tools:Object.fromEntries(Object.entries(r.tools).map(([k,t])=>[k,{path:`/REPLACE/bin/${k}`,version:t.version}])),service:{label:'local.adlc.REPLACE',path:'/REPLACE/staging/service.plist',interval:r.service.interval,runAtLoad:false,stdout:'/REPLACE/state/stdout.log',stderr:'/REPLACE/state/stderr.log'}},instructions:'Template only: restore local mappings, policies and verification from original files. Never transfer standing authorization. Existing credential mechanisms must be configured separately.'};
+}

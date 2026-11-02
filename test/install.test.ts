@@ -1,12 +1,15 @@
-import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
-import {installBridge} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
+import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join,dirname,relative,resolve} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
+import {installBridge,rotatedServiceDefinition} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
 import {turnBarrier} from '../src/turn-submission';import {serviceControl} from '../src/service-control';
+import {Store} from '../src/core';
+import {assertDefinition} from '../src/project-services';
+const fixtureDefinition=()=>({Label:'local.adlc.fixture',ProgramArguments:[process.execPath,'/old/src/cli.ts','poll','/project.json']});
 function controlFixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-install-control-'))),source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json'),plist=join(home,'Library/LaunchAgents/local.adlc.project.plist');
  for(const dir of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(dir,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');writeFileSync(plist,'old plist');
  let loaded=true,failStart=false,starts=0;const calls:string[]=[],original=Error('activation restart receipt lost');
  const projects=[{project:'project',label:'local.adlc.project',config:'/project.json'}];
- const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},
+ const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},
   serviceControl:(action:string,id:string)=>serviceControl(action,id,turnBarrier(state),async action=>{
    calls.push(action);expect(existsSync(join(state,'turn-submission.lock'))).toBe(true);await expect(turnBarrier(state).submit(async()=>{})).rejects.toThrow('in progress');
    if(action==='stop')loaded=false;if(action==='start'){loaded=true;if(++starts===1&&failStart)throw original;}return {loaded};
@@ -32,7 +35,7 @@ test('installer migrates projects without plists and rolls back gates, record, l
   for(const p of projects.slice(0,2))writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old '+p.project);
   writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher',{mode:0o755});
   const calls:string[]=[],hooks:string[]=[],restored:{path:string;config:any}[]=[];
-  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({Label:'old'}),assertDefinition:()=>{},
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},
    serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:id==='loaded'};},
    localAO:async(path:string,method?:string,body?:any)=>{if(method==='PUT'){restored.push({path,config:body.config});return {};}return {status:'ok',project:{config:{original:path.split('/')[1]}}};},
    installWorkflowHook:async(path:string)=>{hooks.push(path);if(path==='/no-plist.json')throw Error('hook failed');}};
@@ -63,13 +66,88 @@ test('install uses read-only project discovery for preview and writable discover
   await installBridge(false,source,join(root,'adlc'),io);expect(existsSync(join(state,'installation.json'))).toBe(false);await installBridge(true,source,join(root,'adlc'),io);expect(modes).toEqual([true,false]);expect(existsSync(join(state,'installation.json'))).toBe(true);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('snapshot service migration retains the host verification runtime reference (fixture-only installation)',async()=>{
+ const f=controlFixture();try{
+  const runtime=join(f.root,"runtime owner's & config.json");f.io.readDefinition=()=>({...fixtureDefinition(),EnvironmentVariables:{ADLC_VERIFICATION_RUNTIME_CONFIG:runtime}});f.unload();
+  await installBridge(true,f.source,f.launcher,f.io);
+  const parsed=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',f.plist]);expect(parsed.exitCode).toBe(0);expect(JSON.parse(parsed.stdout.toString()).EnvironmentVariables.ADLC_VERIFICATION_RUNTIME_CONFIG).toBe(runtime);
+ }finally{f.close();}
+});
+test('snapshot rotation preserves every configured service setting except the controller argument',async()=>{
+ const f=controlFixture();try{
+  const def={Label:'local.adlc.project',ProgramArguments:['/pinned/bun','/prior/src/cli.ts','poll','/project.json'],WorkingDirectory:'/custom/working-directory',EnvironmentVariables:{ADLC_AO_PATH:'/pinned/ao',PATH:'/pinned/tools:/usr/bin',ADLC_VERIFICATION_RUNTIME_CONFIG:'/private/runtime.json'},StartInterval:123,RunAtLoad:false,StandardOutPath:'/custom/out.log',StandardErrorPath:'/custom/err.log',ProcessType:'Background'};
+  f.io.readDefinition=()=>structuredClone(def);f.unload();const result=await installBridge(true,f.source,f.launcher,f.io);
+  const parsed=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',f.plist]);expect(parsed.exitCode).toBe(0);
+  expect(JSON.parse(parsed.stdout.toString())).toEqual({...def,ProgramArguments:[def.ProgramArguments[0],result.cli,'poll','/project.json']});
+  expect(rotatedServiceDefinition(def,result.cli)).not.toBe(def);expect(def.ProgramArguments[1]).toBe('/prior/src/cli.ts');
+ }finally{f.close();}
+});
+test('rotation moves only a controller-derived working directory and remains usable after old snapshot removal',async()=>{
+ const f=controlFixture();try{
+  const old=join(f.root,'old-snapshot'),controller=join(old,'src/cli.ts');mkdirSync(dirname(controller),{recursive:true});writeFileSync(controller,'old cli');
+  const def={...fixtureDefinition(),ProgramArguments:[process.execPath,controller,'poll','/project.json'],WorkingDirectory:dirname(controller)};
+  f.io.readDefinition=()=>structuredClone(def);f.unload();const result=await installBridge(true,f.source,f.launcher,f.io);
+  const parsed=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',f.plist]);expect(parsed.exitCode).toBe(0);const next=JSON.parse(parsed.stdout.toString());
+  rmSync(old,{recursive:true,force:true});expect(next.WorkingDirectory).toBe(dirname(result.cli));expect(existsSync(next.WorkingDirectory)).toBe(true);expect(def.WorkingDirectory).toBe(dirname(controller));
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},result.cli).WorkingDirectory).toBe('/operator/custom');
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:undefined},result.cli).WorkingDirectory).toBeUndefined();
+ }finally{f.close();}
+});
+test('relative state paths refuse directory rotation before writes and preserve existing jobs/approvals',async()=>{
+ const f=controlFixture();try{
+  const controller=join(f.root,'old-snapshot/src/cli.ts'),next=join(f.root,'new-snapshot/src/cli.ts'),database=join(dirname(controller),'state.sqlite');
+  mkdirSync(dirname(controller),{recursive:true});writeFileSync(controller,'old cli');mkdirSync(dirname(next),{recursive:true});
+  const s=new Store(database),job=s.enqueue('project','issue','spec'),hash=s.propose(job,'approved implementation plan');s.approve(job,hash,'human');s.close();const bytes=readFileSync(database);
+  const def={...fixtureDefinition(),ProgramArguments:[process.execPath,controller,'poll','/project.json'],WorkingDirectory:dirname(controller),EnvironmentVariables:{ADLC_DB:'state.sqlite'}};
+  const before=structuredClone(def),artifacts=[f.plist,f.record,f.launcher].map(path=>readFileSync(path));f.io.readDefinition=()=>structuredClone(def);
+  expect(()=>rotatedServiceDefinition(def,next)).toThrow('requires absolute ADLC_DB');expect(def).toEqual(before);
+  for(const apply of [false,true]){
+   await expect(installBridge(apply,f.source,f.launcher,f.io)).rejects.toThrow('requires absolute ADLC_DB');
+   expect(f.calls).toEqual([]);expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+   expect([f.plist,f.record,f.launcher].map(path=>readFileSync(path))).toEqual(artifacts);expect(readFileSync(database)).toEqual(bytes);expect(existsSync(join(dirname(next),'state.sqlite'))).toBe(false);
+  }
+  const absolute=rotatedServiceDefinition({...def,EnvironmentVariables:{ADLC_DB:database}},next);expect(absolute.WorkingDirectory).toBe(dirname(next));expect(absolute.EnvironmentVariables.ADLC_DB).toBe(database);
+  const read=Store.readonly(absolute.EnvironmentVariables.ADLC_DB);try{expect(read.get(job)).toMatchObject({state:'approved',approved_hash:hash,attempts:0});expect(read.list()).toHaveLength(1);}finally{read.close();}
+  const custom=rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},next);expect(custom.WorkingDirectory).toBe('/operator/custom');expect(custom.EnvironmentVariables.ADLC_DB).toBe('state.sqlite');
+  expect(rotatedServiceDefinition(def,controller).WorkingDirectory).toBe(dirname(controller));
+  const runtime={...def,EnvironmentVariables:{ADLC_DB:database,ADLC_VERIFICATION_RUNTIME_CONFIG:'runtime.json'}};expect(()=>rotatedServiceDefinition(runtime,next)).toThrow('requires absolute ADLC_VERIFICATION_RUNTIME_CONFIG');
+ }finally{f.close();}
+});
+test('relative project config that passes current identity checks refuses directory rotation before writes',async()=>{
+ const f=controlFixture();try{
+  const controller=join(f.root,'old-snapshot/src/cli.ts'),next=join(f.root,'new-snapshot/src/cli.ts'),config=join(f.root,'project.json');
+  for(const cli of [controller,next]){mkdirSync(dirname(cli),{recursive:true});writeFileSync(cli,'fixture cli');}
+  const uuid='00000000-0000-0000-0000-000000000001';writeFileSync(config,JSON.stringify({version:1,name:'Existing project',repo:f.source,requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid}}));
+  const relativeConfig=relative(process.cwd(),config),def={Label:f.projects[0].label,ProgramArguments:[process.execPath,controller,'poll',relativeConfig],WorkingDirectory:dirname(controller)};
+  expect(()=>assertDefinition(def,def.Label,config,controller)).not.toThrow();expect(resolve(dirname(next),relativeConfig)).not.toBe(config);
+  const before=structuredClone(def),files=[f.plist,f.record,f.launcher,config],bytes=files.map(path=>readFileSync(path));let verified=0;
+  f.projects[0].config=config;f.io.readDefinition=()=>structuredClone(def);f.io.assertDefinition=(candidate:any,label:string,path:string)=>{assertDefinition(candidate,label,path,controller);verified++;};
+  expect(()=>rotatedServiceDefinition(def,next)).toThrow('Controller-directory rotation requires absolute project config');expect(def).toEqual(before);
+  for(const apply of [false,true]){
+   await expect(installBridge(apply,f.source,f.launcher,f.io)).rejects.toThrow('Controller-directory rotation requires absolute project config');
+   expect(files.map(path=>readFileSync(path))).toEqual(bytes);expect(f.calls).toEqual([]);expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+  }
+  expect(verified).toBe(2);
+  const absolute={...def,ProgramArguments:[process.execPath,controller,'poll',config]},rotated=rotatedServiceDefinition(absolute,next);
+  expect(rotated.WorkingDirectory).toBe(dirname(next));expect(rotated.ProgramArguments[3]).toBe(config);expect(readFileSync(rotated.ProgramArguments[3])).toEqual(bytes[3]);expect(()=>assertDefinition(rotated,def.Label,config,next)).not.toThrow();
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},next).WorkingDirectory).toBe('/operator/custom');expect(rotatedServiceDefinition(def,controller).WorkingDirectory).toBe(dirname(controller));
+ }finally{f.close();}
+});
+test('rotation rejects malformed arguments, wrong command and relative controller without changing input',()=>{
+ const valid=fixtureDefinition();
+ for(const args of [undefined,[],valid.ProgramArguments.slice(0,3),[...valid.ProgramArguments,'extra'],[42,...valid.ProgramArguments.slice(1)],[process.execPath,'/old/src/cli.ts','serve','/project.json']]){
+  const def={...valid,ProgramArguments:args},before=structuredClone(def);
+  expect(()=>rotatedServiceDefinition(def,'/new/src/cli.ts')).toThrow('Verified service definition and absolute controller required');expect(def).toEqual(before);
+ }
+ expect(()=>rotatedServiceDefinition(valid,'relative/cli.ts')).toThrow('Verified service definition and absolute controller required');
+});
 test('incomplete installation rollback reports every failure and continues restoration without restarting intake',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-rollback-errors-'));try{
   const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json');
   for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');
   const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`})),plists=projects.map(p=>join(home,'Library/LaunchAgents',p.label+'.plist'));for(const path of plists)writeFileSync(path,'old plist');
   const original=Error('activation failed'),settings=Error('settings restore failed'),restart=Error('restart failed'),calls:string[]=[];let starts=0;
-  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{},
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},installWorkflowHook:async()=>{},
    localAO:async(path:string,method?:string)=>{calls.push(`${method??'GET'}:${path}`);if(method==='PUT'&&path.includes('/first/'))throw settings;return {status:'ok',project:{config:{old:true}}};},
    serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {loaded:true};if(action==='start'&&id==='first'){
     if(++starts===1){for(const path of [record,plists[0],launcher]){rmSync(path);mkdirSync(path);}throw original;}throw restart;
@@ -87,7 +165,7 @@ test('failed rollback pauses preserve activated artifacts and settings without r
   for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(record,'old record');writeFileSync(launcher,'old src/cli.ts launcher');
   const projects=['first','second','third'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`})),plists=projects.map(p=>join(home,'Library/LaunchAgents',p.label+'.plist'));for(const path of plists)writeFileSync(path,'old plist');
   const original=Error('second start uncertain'),pauses=[Error('first pause failed'),Error('second pause failed')],calls:string[]=[];let rollback=false,activated:Buffer[]=[];
-  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{},localAO:async(path:string,method?:string)=>{calls.push(`${method??'GET'}:${path}`);return {status:'ok',project:{config:{old:true}}};},
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},installWorkflowHook:async()=>{},localAO:async(path:string,method?:string)=>{calls.push(`${method??'GET'}:${path}`);return {status:'ok',project:{config:{old:true}}};},
    serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {loaded:true};if(action==='start'&&id==='second'){activated=[record,launcher,...plists].map(path=>readFileSync(path));rollback=true;throw original;}if(action==='stop'&&rollback)throw pauses[id==='first'?0:1];return {};}};
   const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors[0]).toBe(original);expect(error.errors.map((e:any)=>e.cause).slice(1)).toEqual(pauses);expect(error.message).toContain('artifacts preserved');
   expect(calls.slice(-2)).toEqual(['stop:first','stop:second']);expect(calls.filter(call=>call.startsWith('start:'))).toEqual(['start:first','start:second']);expect(calls.some(call=>call.startsWith('PUT:'))).toBe(false);
@@ -107,7 +185,7 @@ test('rollback settings restoration failure alone leaves every intake stopped',a
   for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher');
   const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));for(const p of projects)writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old plist');
   const original=Error('hook failed'),settings=Error('settings PUT failed'),calls:string[]=[];
-  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:true};},localAO:async(path:string,method?:string)=>{if(method==='PUT'){calls.push(`restore:${path}`);if(path.includes('/first/'))throw settings;}return {status:'ok',project:{config:{old:true}}};}};
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);return {loaded:true};},localAO:async(path:string,method?:string)=>{if(method==='PUT'){calls.push(`restore:${path}`);if(path.includes('/first/'))throw settings;}return {status:'ok',project:{config:{old:true}}};}};
   const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors[0]).toBe(original);expect(error.errors[1].cause).toBe(settings);expect(error.errors).toHaveLength(2);
   expect(calls).toContain('restore:projects/second/config');expect(calls.filter(call=>call.startsWith('start:'))).toEqual([]);expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');
   for(const p of projects)expect(readFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'utf8')).toBe('old plist');
@@ -119,7 +197,7 @@ test('successful restoration still attempts intake restarts and aggregates resta
   for(const path of [join(source,'src'),state,join(home,'Library/LaunchAgents')])mkdirSync(path,{recursive:true});writeFileSync(join(source,'src/cli.ts'),'new cli');writeFileSync(join(state,'installation.json'),'old record');writeFileSync(launcher,'old src/cli.ts launcher');
   const projects=['first','second'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));for(const p of projects)writeFileSync(join(home,'Library/LaunchAgents',p.label+'.plist'),'old plist');
   const original=Error('hook failed'),restart=Error('first restart failed'),calls:string[]=[];
-  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:()=>({}),assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},localAO:async()=>({status:'ok',project:{config:{old:true}}}),serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='start'){
+  const io:any={state:()=>state,home:()=>home,registeredProjects:async()=>projects,readDefinition:fixtureDefinition,assertDefinition:()=>{},installWorkflowHook:async()=>{throw original;},localAO:async()=>({status:'ok',project:{config:{old:true}}}),serviceControl:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='start'){
    expect(readFileSync(join(state,'installation.json'),'utf8')).toBe('old record');expect(readFileSync(launcher,'utf8')).toBe('old src/cli.ts launcher');if(id==='first')throw restart;
   }return {loaded:true};}};
   const error=await installBridge(true,source,launcher,io).catch(error=>error);expect(error).toBeInstanceOf(AggregateError);expect(error.errors).toHaveLength(2);expect(error.errors[0]).toBe(original);expect(error.errors[1].cause).toBe(restart);expect(calls.slice(-2)).toEqual(['start:first','start:second']);
