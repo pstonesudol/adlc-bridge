@@ -6,6 +6,7 @@ import {Lifecycle} from '../src/lifecycle';
 import {sendPilotRemediation} from '../src/pilot';
 import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
+import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -65,6 +66,25 @@ function templateFixture(){
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+test('scoped remediation combines persisted project verification with current delivery and budget safeguards',async()=>{
+ const f=templateFixture();try{
+  f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','commit','push-feature'],'human');
+  f.e.failedChecks=[];f.e.findings=[{path:'src/fix.ts',body:'Fix the scoped defect',sha:f.head}];
+  let prompt='';const original=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return original(args);};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(prompt).toContain('execution mode: host');expect(prompt).toContain('["bun","test"]');expect(prompt).toContain('Budget:');expect(f.s.get(f.id).attempts).toBe(1);expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('container remediation receives persisted host runtime paths and clears them when withdrawn',async()=>{
+ const f=templateFixture();try{
+  const v:any={version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}},context={projectConfig:'/trusted/project.json',runtimeConfig:'/trusted/runtime.json',bun:'/trusted/bun',cli:'/trusted/installed/src/cli.ts'};
+  f.loop.setVerification(f.id,v,context);new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','commit','push-feature'],'human');f.e.failedChecks=[];f.e.findings=[{path:'src/fix.ts',body:'Fix scoped code',sha:f.head}];
+  let prompt='';const original=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return original(args);};
+  await f.loop.tick(f.id);expect(prompt).toContain(JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,'/worktree','--run','--runtime',context.runtimeConfig]));expect(prompt).not.toContain('STOP before container verification');
+  f.loop.setVerification(f.id,v);expect(f.s.db.query('SELECT * FROM review_verification_runtime WHERE job=?').all(f.id)).toEqual([]);
+ }finally{f.s.close();}
+});
 function failureEvidence(e:any){return e.findings.map((f:any)=>({name:f.check,checkId:f.checkId,sha:f.sha,status:'completed',conclusion:'failure',descriptionHash:f.descriptionHash}));}
 test('initial clear metadata checks cannot bypass body evidence without a preexisting wait',async()=>{
  const f=templateFixture();try{
@@ -404,6 +424,42 @@ test('carried-forward review thread dispatches exactly one provenance-bound reme
   // Dispositions are durable: a restarted loop reads the same identity.
   const restarted=new ReviewLoop(f.s,async()=>{},f.loop.io as any);
   expect((await restarted.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+for(const missing of ['initial','withdrawn','invalid'])test(`container remediation validates context before reservation/feedback claim: ${missing}`,async()=>{
+ const f=threadFixture();try{
+  const verification:any={version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}};
+  const context={projectConfig:'/trusted/project.json',runtimeConfig:'/trusted/runtime.json',bun:'/trusted/bun',cli:'/trusted/installed/src/cli.ts'};
+  f.loop.setVerification(f.id,verification,missing==='initial'?undefined:context);
+  new Lifecycle(f.s).recordRemediationPolicy(f.id,DEFAULT_REMEDIATION_POLICY);
+  const budget=()=>f.s.db.query('SELECT consumed,extensions,no_progress,last_head,last_findings_hash,last_attempt,stop_reason FROM remediation_budget').all(),before=budget();
+  const submit=f.io.submit;f.io.submit=async(operation:any)=>{
+   if(missing==='withdrawn')f.loop.setVerification(f.id,verification);
+   if(missing==='invalid')f.s.db.query('UPDATE review_verification_runtime SET context=? WHERE job=?').run(JSON.stringify({...context,cli:'relative/cli.ts'}),f.id);
+   return submit(operation);
+  };
+  if(missing==='invalid')await expect(f.loop.tick(f.id)).rejects.toThrow('Validated absolute verification context paths required');
+  else expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:expect.stringContaining('requires validated runtime context')});
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM review_feedback').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM remediation_context').all()).toEqual([]);
+  expect(budget()).toEqual(before);
+  // The same unchanged head/findings can be retried after supplying context.
+  f.io.submit=submit;f.loop.setVerification(f.id,verification,context);let prompt='';const spawn=f.io.spawn;
+  f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return spawn(args);};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  expect(f.s.db.query('SELECT state FROM remediation').all()).toEqual([{state:'delivery_uncertain'}]);
+  expect(f.s.db.query('SELECT thread_id,attempt FROM review_feedback').all()).toEqual([{thread_id:'T1',attempt:1}]);
+  expect(prompt).toContain(JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,'/worktree','--run','--runtime',context.runtimeConfig]));
+ }finally{f.s.close();}
+});
+test('metadata-only remediation does not require container runtime context',async()=>{
+ const f=templateFixture();try{
+  f.loop.setVerification(f.id,{version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
  }finally{f.s.close();}
 });
 test('a duplicate remediation reservation never spawns a second worker for the same feedback',async()=>{

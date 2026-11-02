@@ -1,7 +1,7 @@
 import {installedCLI} from './install-state';
 import {Store,digest} from './core';
 import {existsSync,readFileSync,realpathSync} from 'node:fs';
-import {join,resolve} from 'node:path';
+import {join,isAbsolute,basename} from 'node:path';
 import {homedir} from 'node:os';
 import {validate} from './linear';
 export const legacyLabel='local.adlc.linear-intake';
@@ -19,12 +19,42 @@ export function definitionXML(def:unknown){
  const r=Bun.spawnSync(['/usr/bin/plutil','-convert','xml1','-o','-','-'],{stdin:Buffer.from(JSON.stringify(def)),stdout:'pipe',stderr:'pipe'});
  if(r.exitCode!==0)throw Error('Unable to encode service definition');return r.stdout.toString();
 }
-export function assertDefinition(def:any,label:string,config:string){
+export function assertDefinition(def:any,label:string,config:string,controller=join(import.meta.dir,'cli.ts')){
  const a=def.ProgramArguments;
- if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||![join(import.meta.dir,'cli.ts'),installedCLI()].filter(Boolean).some(x=>realpathSync(a[1])===realpathSync(x!)))throw Error('Service definition does not match this project; existing service preserved');
+ try{if(def.Label===label&&Array.isArray(a)&&a.length===4&&a.every(x=>typeof x==='string')&&a[2]==='poll'&&realpathSync(a[3])===realpathSync(config)&&isAbsolute(a[1])&&basename(a[1])==='cli.ts'){
+  const installed=installedCLI();
+  if(existsSync(controller)&&realpathSync(a[1])===realpathSync(controller))return;
+  if(installed&&realpathSync(a[1])===realpathSync(installed))return;
+ }}catch{}
+ throw Error('Service definition does not match this project; existing service preserved');
 }
 export class ProjectServices{
- constructor(public s:Store,initialize=true){if(initialize)s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);`);}
+ constructor(public s:Store,initialize=true){if(initialize)s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);
+ CREATE TABLE IF NOT EXISTS project_service_controllers(config TEXT PRIMARY KEY,controller TEXT NOT NULL);`);}
+ assertInstalled(def:any,label:string,config:string,persist=true){
+  return this.verifyInstalled(def,label,config,persist,false);
+ }
+ // Explicit setup input, not inferred from a mutable installed plist.
+ registerController(config:string,controller:string){
+  const path=realpathSync(config);
+  if(!this.list().some(p=>p.config===path)||!isAbsolute(controller)||basename(controller)!=='cli.ts')throw Error('Registered project and explicit controller path required');
+  const canonical=realpathSync(controller),old=this.s.db.query('SELECT controller FROM project_service_controllers WHERE config=?').get(path) as any;
+  if(old&&old.controller!==canonical)throw Error('Controller identity changed; explicit migration required');
+  this.s.db.query('INSERT OR IGNORE INTO project_service_controllers VALUES (?,?)').run(path,canonical);
+ }
+ private verifyInstalled(def:any,label:string,config:string,persist:boolean,discovery:boolean){
+  const path=realpathSync(config);
+  const entry=this.list().find(p=>p.config===path);
+  if((persist&&!entry)||(entry&&entry.label!==label))throw Error('Registered project service required; existing service preserved');
+  const hasControllers=this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_service_controllers'").get();
+  const registered=hasControllers?this.s.db.query('SELECT controller FROM project_service_controllers WHERE config=?').get(path) as any:undefined;
+  if(!registered&&!discovery)throw Error('Registered controller identity missing; explicit migration required');
+  // Only legacy discovery may adopt an existing user-installed plist identity.
+  const controller=registered?.controller??def.ProgramArguments?.[1];
+  if(typeof controller!=='string'||!isAbsolute(controller))throw Error('Installed controller identity required; existing service preserved');
+  assertDefinition(def,label,path,controller);
+  if(persist)this.s.db.query('INSERT INTO project_service_controllers VALUES (?,?) ON CONFLICT(config) DO UPDATE SET controller=excluded.controller').run(path,realpathSync(def.ProgramArguments[1]));
+ }
  list():ProjectService[]{if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").get())return [];return this.s.db.query('SELECT * FROM project_services ORDER BY project').all() as ProjectService[];}
  register(configPath:string,label?:string,persist=true){
   const config=realpathSync(configPath),c=JSON.parse(readFileSync(config,'utf8'));validate(c);
@@ -44,7 +74,8 @@ export class ProjectServices{
   if(!existsSync(path))return;
   const b=read(path),config=b.ProgramArguments?.[3];
   if(typeof config!=='string')throw Error('Existing legacy service configuration is unknown');
-  assertDefinition(b,legacyLabel,config);return this.register(config,legacyLabel,persist);
+  if(!persist){const entry=this.register(config,legacyLabel,false);this.verifyInstalled(b,legacyLabel,config,false,true);return entry;}
+  return this.s.db.transaction(()=>{const entry=this.register(config,legacyLabel);this.verifyInstalled(b,legacyLabel,config,true,true);return entry;})();
  }
  select(project?:string,extra:ProjectService[]=[]){
   const stored=this.list(),entries=[...stored,...extra.filter(p=>!stored.some(old=>old.project===p.project))];

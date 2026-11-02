@@ -11,6 +11,8 @@ import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
 import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
+import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime,withVerificationContext} from './setup';
+import {verificationInstructions,runVerification} from './verification';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -34,10 +36,12 @@ import {readinessFor,recordResolution,assertApprovalReadiness} from './readiness
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
+import {withTurnSubmission} from './turn-submission';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
 import {recoveryRows} from './worktree-reservation';
+import {migrateController} from './controller-migration';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -47,9 +51,31 @@ export function authorizeBaseMerge(lifecycle:Pick<Lifecycle,'grantBaseMerge'>,ar
  return lifecycle.grantBaseMerge(args[0],args[1],args[2]);
 }
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
-export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
- const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
+function projectConfiguration(path:string){
+ const i=a.indexOf('--runtime'),runtime=i>=0?req(a[i+1],'Runtime config'):process.env.ADLC_VERIFICATION_RUNTIME_CONFIG;
+ if(runtime?.startsWith('--'))throw Error('--runtime requires a runtime configuration path');
+ return withVerificationContext(JSON.parse(readFileSync(path,'utf8')),path,runtime);
+}
+export async function runCLIReviewTick<T>(operation:()=>Promise<T>):Promise<T>{
+ let interrupted:'SIGINT'|'SIGTERM'|undefined;
+ const defer=(signal:'SIGINT'|'SIGTERM')=>{interrupted??=signal;console.error(`${signal}: waiting for the in-flight review tick to settle before releasing the submission fence`);};
+ const onINT=()=>defer('SIGINT'),onTERM=()=>defer('SIGTERM');
+ process.on('SIGINT',onINT);process.on('SIGTERM',onTERM);
+ try{return await withTurnSubmission(operation);}
+ finally{
+  // Never cancel delivery, clear uncertainty, or unlock before the operation's
+  // normal receipt/error handling and the submission fence's finally settle.
+  process.off('SIGINT',onINT);process.off('SIGTERM',onTERM);
+  if(interrupted)process.exitCode=interrupted==='SIGINT'?130:143;
+ }
+}
+export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+ const {config:startup,loadConfig,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
+ const identity=(c:any)=>JSON.stringify([realpathSync(c.repo),c.linear.projectId,c.linear.teamId,c.automation?.orchestratorProject,c.githubRepo]);
+ const initialIdentity=loadConfig?identity(startup):undefined;
  return async()=>runPollTick(async()=>{
+  const c=loadConfig?loadConfig():startup;
+  if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
   io.out(await io.poll(c,s,io.linearToken()));
@@ -62,19 +88,23 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
     const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
     if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
     const delivery=workflow.implementation(stage.job);
-    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
+    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true,c.verification,c.verificationContext);
    }
   }
   const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
   const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+   reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
    if(target.state==='completed')continue;
    try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
   }
  });
 }
 async function main(){
+  if(command==='bind-controller'){
+   const i=a.indexOf('--confirm');return out(await migrateController(req(a[0],'Project'),req(a[1],'Controller'),a.includes('--apply'),i>=0?req(a[i+1],'Confirmation hash'):undefined));
+  }
   if(['recover','cleanup'].includes(command)){const s=new Store(db);try{return out(await maintenance(s,command as 'recover'|'cleanup',req(a[0],'Job'),a.includes('--apply'),a.includes('--confirm')?req(a[a.indexOf('--confirm')+1],'Confirmation hash'):undefined));}finally{s.close();}}
   if(command==='install'){
     const bin=a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined;
@@ -84,6 +114,25 @@ async function main(){
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
   if(['start','stop','status'].includes(command)&&a.includes('--all')){if(a.length!==1)throw Error('Use --all without a project ID or other options');return out(await stackControl(command as 'start'|'stop'|'status'));}
+  if(command==='setup'){
+    const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
+    if(a.includes('--export'))return out(sanitizedSetup(c,r));
+    if(a.includes('--write-service'))return out(writeSetupService(c,r,realpathSync(a[1]),realpathSync(a[0])));
+    const preview=setupPreview(c,r,undefined,realpathSync(a[1]),realpathSync(a[0]));out(preview);if(!preview.passed)process.exitCode=1;return;
+  }
+  if(command==='verification'){
+    const c=projectConfiguration(req(a[0],'Config'));validate(c);
+    if(!a.includes('--run'))return console.log(verificationInstructions(c.verification,c.verificationContext));
+    if(!c.verification)throw Error('Project verification is not configured');
+    let docker;
+    if(c.verification.mode==='container'){
+      if(!c.verificationContext)throw Error('Container verification requires --runtime RUNTIME_JSON');
+      const runtime=JSON.parse(readFileSync(c.verificationContext.runtimeConfig,'utf8'));validateRuntime(runtime);
+      if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
+      docker=runtime.tools.docker;
+    }
+    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker,projectRepo:c.repo});out(result);if(!result.passed)process.exitCode=1;return;
+  }
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
@@ -96,6 +145,15 @@ async function main(){
   start --all | stop --all | status --all
                                        full background stack; stop requires idle workers
   projects                             list registered project services
+  bind-controller PROJECT CONTROLLER   preview verified missing-identity migration
+    [--apply --confirm HASH]            bind only the currently inspected identity; no activation
+  setup PROJECT_JSON RUNTIME_JSON       read-only prerequisite/service preview
+    [--write-service]                   create staged definition only; no activation
+    [--export]                          print sanitized, disabled setup template
+  verification CONFIG [WORKTREE]        instructions; --run requires worktree
+    --runtime RUNTIME_JSON              required for container execution; pins Docker
+  poll/serve/tick-review/register-review also accept --runtime RUNTIME_JSON
+                                       trusted reference supplied to verification workers
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
@@ -185,7 +243,7 @@ Registered approved review targets can request bounded in-scope fixes from their
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
    if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
-  const c=['poll','serve','reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[['poll','serve','reconcile-preview'].includes(command)?0:1],'Config'),'utf8')):null;if(c)validate(c);
+  const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-conflict'){
      if(a.length!==2&&!(a.length===6&&a[2]==='--confirm'&&a[4]==='--human'))throw Error('Use reconcile-conflict JOB CONFIG [--confirm HASH --human NAME]');
      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
@@ -254,19 +312,22 @@ Registered approved review targets can request bounded in-scope fixes from their
       return out(result);
     }
     if(command==='register-review'){
-      const job=req(a[0],'Job'),config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));
+      const job=req(a[0],'Job'),config=projectConfiguration(req(a[3],'Config'));
       const run=lifecycle.run(job);if(!run)throw Error('Existing approved run required');
       await disableNativeFeedback(run.session_id);
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
-      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true));
+      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification,config.verificationContext));
     }
     if(command==='tick-review'){
-      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
-      const job=req(a[0],'Job'),target=reviewLoop.get(job);
-      if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
-      new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
-      reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]},config));
+       return out(await runCLIReviewTick(async()=>{
+       const config=projectConfiguration(req(a[1],'Config'));validate(config);
+       const job=req(a[0],'Job'),target=reviewLoop.get(job);
+       if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+       new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
+       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
+       reviewLoop.setVerification(job,config.verification,config.verificationContext);
+        return reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]},config);
+      }));
     }
     if(command==='extend-budget'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
@@ -288,7 +349,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
+    const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();
@@ -297,4 +358,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
+if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=process.exitCode||1;});

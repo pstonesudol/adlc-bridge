@@ -2,7 +2,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { Store, digest } from './core';
 
-export const AO = '/Applications/Agent Orchestrator.app/Contents/Resources/daemon/ao';
+export const AO = process.env.ADLC_AO_PATH || '/Applications/Agent Orchestrator.app/Contents/Resources/daemon/ao';
 // Deliberately read-only adapter. No merge, send, spawn, resume or publish path.
 export async function inspectAO(kind: 'status' | 'projects' | 'agents' | 'sessions') {
   if (!existsSync(AO)) throw Error('Agent Orchestrator desktop app is not installed');
