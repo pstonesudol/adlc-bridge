@@ -1,3 +1,4 @@
+import {installedCLI} from './install-state';
 import {Store,digest} from './core';
 import {existsSync,readFileSync,realpathSync} from 'node:fs';
 import {join,resolve} from 'node:path';
@@ -14,13 +15,17 @@ export function readDefinition(path:string){
  const r=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',path],{stdout:'pipe',stderr:'pipe'});
  if(r.exitCode!==0)throw Error('Unable to read installed service definition');return JSON.parse(r.stdout.toString());
 }
+export function definitionXML(def:unknown){
+ const r=Bun.spawnSync(['/usr/bin/plutil','-convert','xml1','-o','-','-'],{stdin:Buffer.from(JSON.stringify(def)),stdout:'pipe',stderr:'pipe'});
+ if(r.exitCode!==0)throw Error('Unable to encode service definition');return r.stdout.toString();
+}
 export function assertDefinition(def:any,label:string,config:string){
  const a=def.ProgramArguments;
- if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||realpathSync(a[1])!==realpathSync(join(import.meta.dir,'cli.ts')))throw Error('Service definition does not match this project; existing service preserved');
+ if(def.Label!==label||!Array.isArray(a)||a.length!==4||a[2]!=='poll'||resolve(a[3])!==resolve(config)||![join(import.meta.dir,'cli.ts'),installedCLI()].filter(Boolean).some(x=>realpathSync(a[1])===realpathSync(x!)))throw Error('Service definition does not match this project; existing service preserved');
 }
 export class ProjectServices{
- constructor(public s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);`);}
- list():ProjectService[]{return this.s.db.query('SELECT * FROM project_services ORDER BY project').all() as ProjectService[];}
+ constructor(public s:Store,initialize=true){if(initialize)s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);`);}
+ list():ProjectService[]{if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").get())return [];return this.s.db.query('SELECT * FROM project_services ORDER BY project').all() as ProjectService[];}
  register(configPath:string,label?:string,persist=true){
   const config=realpathSync(configPath),c=JSON.parse(readFileSync(config,'utf8'));validate(c);
   const project=c.automation?.orchestratorProject,generated=projectServiceLabel(project),repo=realpathSync(c.repo);
@@ -34,15 +39,15 @@ export class ProjectServices{
   this.s.db.query('INSERT INTO project_services VALUES (?,?,?,?,?,?)').run(project,c.name,repo,c.linear.projectId,config,selected);
   return entry;
  }
- discoverLegacy(home=homedir(),read=readDefinition){
+ discoverLegacy(home=homedir(),read=readDefinition,persist=true){
   const path=join(home,'Library/LaunchAgents',`${legacyLabel}.plist`);
   if(!existsSync(path))return;
   const b=read(path),config=b.ProgramArguments?.[3];
   if(typeof config!=='string')throw Error('Existing legacy service configuration is unknown');
-  assertDefinition(b,legacyLabel,config);return this.register(config,legacyLabel);
+  assertDefinition(b,legacyLabel,config);return this.register(config,legacyLabel,persist);
  }
- select(project?:string){
-  const entries=this.list();
+ select(project?:string,extra:ProjectService[]=[]){
+  const stored=this.list(),entries=[...stored,...extra.filter(p=>!stored.some(old=>old.project===p.project))];
   if(project){const p=entries.find(p=>p.project===project);if(!p)throw Error(`Unknown project ${project}; use adlc projects`);return p;}
   if(entries.length!==1)throw Error(entries.length?'Multiple projects registered; specify a project ID from adlc projects':'No projects registered; use adlc init');
   return entries[0];

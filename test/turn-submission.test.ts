@@ -1,0 +1,129 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,realpathSync,existsSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {turnBarrier,TurnSubmissionBlocked} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';import {createWorkflowTransport} from '../src/workflow-transport';import {createFeatureAgents} from '../src/feature-transport';
+import {Store} from '../src/core';import {Workflow} from '../src/workflow';import {featureFixture,featureConfig,requirements} from './feature-fixture';
+import {serviceControl} from '../src/service-control';
+const receipt=(exited=Promise.resolve(0))=>({stdout:new Response('{}').body,stderr:new Response('').body,exited});
+function fixture(){
+ const state=realpathSync(mkdtempSync(join(tmpdir(),'adlc-turns-'))),turns=turnBarrier(state),calls:string[]=[];let on=true;
+ const ops:StackOps={turns,projects:async()=>[],project:async()=>({}),backend:async()=>({ready:on,loaded:on,managed:true}),backendStart:async()=>{calls.push('start');on=true;},backendStop:async()=>{calls.push('stop');on=false;},blockers:async()=>{calls.push('scan');return [];}};
+ return {state,turns,ops,calls,close:()=>rmSync(state,{recursive:true,force:true})};
+}
+test('an in-flight implementation send retains the shared barrier until the delivery receipt settles',async()=>{
+ const f=fixture();let finish!:(value:number)=>void;const exited=new Promise<number>(resolve=>finish=resolve);let sends=0;
+ try{
+  f.ops.projects=async()=>[{project:'intake'}];f.ops.project=async action=>{f.calls.push(`${action}:intake`);return {};};
+  const transport=createWorkflowTransport(f.turns.submit,(()=>{sends++;return receipt(exited);}) as any),delivery=transport.sendImplementation('worker','prompt','key');
+  await expect(controlStack('stop',f.ops)).rejects.toThrow('submission or shutdown is in progress');expect(f.calls).toEqual([]);expect(sends).toBe(1);
+  finish(0);await delivery;f.ops.blockers=async()=>[{session:'worker',reason:'queued turn'}];await expect(controlStack('stop',f.ops)).rejects.toThrow('queued turn');expect(f.calls).not.toContain('stop');
+  await expect(transport.sendImplementation('worker','later','key2')).rejects.toThrow('paused');expect(sends).toBe(1);
+ }finally{finish?.(0);f.close();}
+});
+test('shutdown fences every bridge turn transport during its final scan, backend stop and afterward until start',async()=>{
+ const f=fixture();let sends=0,creates=0;try{
+  const spawn=(()=>{sends++;return receipt();}) as any,workflow=createWorkflowTransport(f.turns.submit,spawn,async()=>{creates++;return {};});const feature=createFeatureAgents(f.turns.submit,spawn);
+  const rejected=async()=>{
+   await expect(workflow.sendImplementation('worker','prompt','key')).rejects.toThrow();await expect(feature.send('worker','prompt','key')).rejects.toThrow();
+   await expect(workflow.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow();await expect(feature.start({route:{},name:'feature',key:'key'} as any)).rejects.toBeInstanceOf(TurnSubmissionBlocked);
+  };
+  f.ops.blockers=async()=>{await rejected();return [];};const stop=f.ops.backendStop;f.ops.backendStop=async()=>{await rejected();await stop();};
+  await controlStack('stop',f.ops);await rejected();expect(sends).toBe(0);expect(creates).toBe(0);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);
+  await controlStack('start',f.ops);await workflow.sendImplementation('worker','prompt','key');await feature.send('worker','prompt','key');expect(sends).toBe(2);
+ }finally{f.close();}
+});
+test('the turn barrier coordinates independent processes and never steals an active lock',async()=>{
+ const f=fixture();let child:any;try{
+  const module=join(import.meta.dir,'../src/turn-submission.ts'),script=`import {turnBarrier} from ${JSON.stringify(module)};await turnBarrier(${JSON.stringify(f.state)}).submit(async()=>{console.log('held');await new Response(Bun.stdin.stream()).text();});`;
+  child=Bun.spawn([process.execPath,'-e',script],{stdin:'pipe',stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.state}});
+  const reader=child.stdout.getReader();const first=await reader.read();expect(new TextDecoder().decode(first.value)).toContain('held');
+  await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(true);
+  child.stdin.end();expect(await child.exited).toBe(0);reader.releaseLock();await f.turns.run(async()=>{});expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+ }finally{if(child&&child.exitCode===null){child.stdin.end();await child.exited;}f.close();}
+});
+test('failed backend startup never removes a persisted submission pause',async()=>{
+ const f=fixture();try{await controlStack('stop',f.ops);f.ops.backendStart=async()=>{throw Error('startup failed');};await expect(controlStack('start',f.ops)).rejects.toThrow('startup failed');await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);}finally{f.close();}
+});
+test('planning setup retains the barrier through receipt validation and native feedback setup',async()=>{
+ const f=fixture();let release!:()=>void;let entered!:()=>void;const setupEntered=new Promise<void>(resolve=>entered=resolve),setupGate=new Promise<void>(resolve=>release=resolve);
+ try{
+  const transport=createWorkflowTransport(f.turns.submit,undefined,async()=>({session:{id:'worker',projectId:'p',branch:'feature'}}),async()=>{entered();await setupGate;return {};});
+  const setup=transport.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'});await setupEntered;
+  await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');release();expect(await setup).toEqual({id:'worker'});await f.turns.run(async()=>{});
+  let disabled=false;const invalid=createWorkflowTransport(f.turns.submit,undefined,async()=>({session:{id:'worker',projectId:'foreign',branch:'feature'}}),async()=>{disabled=true;return {};});
+  await expect(invalid.startPlan({project:'p',branch:'feature',name:'plan',prompt:'prompt',clientId:'key'})).rejects.toThrow('Invalid planning spawn receipt');expect(disabled).toBe(false);await f.turns.run(async()=>{});
+ }finally{release?.();f.close();}
+});
+test('planning and feature reservations made during project shutdown are refused before becoming uncertain',async()=>{
+ const f=fixture(),s=new Store(':memory:'),feature=featureFixture();let creates=0;
+ try{
+  const transport=createWorkflowTransport(f.turns.submit,undefined,async(_path,_method,body:any)=>{creates++;return {session:{id:'worker',projectId:body.projectId,branch:body.branch}};},async()=>({}));
+  const workflow=new Workflow(s,transport),job=s.enqueue('p','issue','spec'),config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project'}};
+  Object.assign(feature.agents,{submit:createFeatureAgents(f.turns.submit).submit});const plan=await feature.planner.create(featureConfig,JSON.stringify(requirements),'Test');
+  f.ops.projects=async()=>[{project:'intake'}];f.ops.project=async action=>{
+   if(action==='stop'){
+    await expect(workflow.startPlanning(job,config)).rejects.toThrow('in progress');expect(workflow.planning(job)).toBeNull();expect(s.db.query('SELECT * FROM planning_runs').all()).toEqual([]);
+    expect((await feature.planner.tick(plan.id)).state).toBe('planning');expect(feature.s.db.query('SELECT state,started FROM feature_agents').all()).toEqual(Array.from({length:3},()=>({state:'reserved',started:null})));
+   }return {};
+  };
+  await controlStack('stop',f.ops);expect(creates).toBe(0);expect(feature.agents.starts).toEqual([]);
+  await controlStack('start',f.ops);expect((await workflow.startPlanning(job,config))?.state).toBe('planning');await feature.planner.advance(plan.id,'architecture');expect(creates).toBe(1);expect(feature.agents.starts).toHaveLength(1);expect(feature.agents.messages).toHaveLength(1);
+ }finally{s.close();feature.s.close();f.close();}
+});
+test('nested submissions reuse only their own active submission scope, never a shutdown fence',async()=>{
+ const f=fixture();try{
+  await f.turns.submit(async()=>{await turnBarrier(f.state).submit(async()=>{});await expect(f.turns.run(async()=>{})).rejects.toThrow('in progress');});
+  await f.turns.run(async()=>{await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');});
+ }finally{f.close();}
+});
+test('direct project stops are fenced and nested stack stops reuse only the control scope',async()=>{
+ const f=fixture();try{
+  const calls:string[]=[],operate=async(action:string)=>{calls.push(action);return {};};
+  await f.turns.submit(async()=>{
+   await expect(serviceControl('stop','project',f.turns,operate)).rejects.toThrow('in progress');expect(calls).toEqual([]);
+   await serviceControl('service-status','project',f.turns,operate);await expect(serviceControl('start','project',f.turns,operate)).rejects.toThrow('in progress');expect(calls).toEqual(['service-status']);
+  });
+  calls.length=0;await f.turns.run(async()=>{
+   await serviceControl('stop','project',turnBarrier(f.state),async action=>{calls.push(action);await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');return {};});
+  });expect(calls).toEqual(['stop']);
+ }finally{f.close();}
+});
+test('direct starts reject the durable pause while stack starts can confirm services before resuming',async()=>{
+ const f=fixture();try{
+  f.turns.pause();const starts:string[]=[];
+  const operate=async(action:string,id?:string)=>{starts.push(`${action}:${id}`);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);return {loaded:true,running:true,startupAcknowledged:true};};
+  await expect(serviceControl('start','one',turnBarrier(f.state),operate)).rejects.toThrow('use start --all');expect(starts).toEqual([]);expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+  f.ops.projects=async()=>[{project:'one'},{project:'two'}];f.ops.project=(action,id)=>serviceControl(action,id,turnBarrier(f.state),operate);
+  await controlStack('start',f.ops);expect(starts).toEqual(['start:one','start:two']);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(false);await f.turns.submit(async()=>{});
+  // An independent direct start still works when the stack is unpaused.
+  let direct=0;await serviceControl('start','one',f.turns,async()=>{direct++;await expect(turnBarrier(f.state).submit(async()=>{})).rejects.toThrow('in progress');return {};});expect(direct).toBe(1);
+ }finally{f.close();}
+});
+test('partial stack startup failure cannot be bypassed by a subsequent direct project start',async()=>{
+ const f=fixture();try{
+  let starts=0;f.ops.projects=async()=>[{project:'one'},{project:'two'}];f.ops.project=(action,id)=>serviceControl(action,id,turnBarrier(f.state),async()=>{starts++;if(id==='two')throw Error('second acknowledgement failed');return {loaded:true,running:true};});
+  await expect(controlStack('start',f.ops)).rejects.toThrow('second acknowledgement failed');expect(starts).toBe(2);
+  await expect(serviceControl('start','one',f.turns,async()=>{starts++;return {};})).rejects.toThrow('use start --all');expect(starts).toBe(2);await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');
+ }finally{f.close();}
+});
+test('production project-stop wiring refuses an active submission before touching launchd',()=>{
+ const f=fixture();try{
+  const service=join(import.meta.dir,'../src/service-control.ts'),barrier=join(import.meta.dir,'../src/turn-submission.ts');
+  const script=`import {serviceControl} from ${JSON.stringify(service)};import {turnBarrier} from ${JSON.stringify(barrier)};let reason='';await turnBarrier().submit(async()=>{try{await serviceControl('stop','project');}catch(e){reason=e.message;}});console.log(JSON.stringify({reason}));`;
+  const child=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.state,ADLC_DB:join(f.state,'unused.sqlite')}});
+  expect(child.exitCode).toBe(0);expect(JSON.parse(child.stdout.toString()).reason).toContain('in progress');
+ }finally{f.close();}
+});
+test('start keeps submissions paused through every project start and retains the pause on partial failure',async()=>{
+ const f=fixture();try{
+  f.ops.projects=async()=>[{project:'one'},{project:'two'}];let fail=true;const started:string[]=[];
+  f.ops.project=async(action,id)=>{expect(action).toBe('start');expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(true);await expect(f.turns.submit(async()=>{})).rejects.toThrow('in progress');started.push(id);if(id==='two'&&fail)throw Error('second intake failed');return {};};
+  await expect(controlStack('start',f.ops)).rejects.toThrow('second intake failed');await expect(f.turns.submit(async()=>{})).rejects.toThrow('paused');expect(started).toEqual(['one','two']);
+  fail=false;await controlStack('start',f.ops);expect(existsSync(join(f.state,'turn-submissions.paused'))).toBe(false);await f.turns.submit(async()=>{});
+ }finally{f.close();}
+});
+test('a failed intake stop retains the durable pause and never proceeds to the worker scan or backend stop',async()=>{
+ const f=fixture();try{f.ops.projects=async()=>[{project:'one'},{project:'two'}];f.ops.project=async(action,id)=>{f.calls.push(`${action}:${id}`);if(id==='two')throw Error('intake unload failed');return {loaded:false};};await expect(controlStack('stop',f.ops)).rejects.toThrow('intake unload failed');expect(f.calls).toEqual(['stop:one','stop:two']);expect(f.calls).not.toContain('scan');expect(f.calls).not.toContain('stop');await expect(turnBarrier(f.state).submit(async()=>{})).rejects.toThrow('paused');expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+  const module=join(import.meta.dir,'../src/turn-submission.ts'),script=`import {turnBarrier} from ${JSON.stringify(module)};let delivered=false,error='';try{await turnBarrier(${JSON.stringify(f.state)}).submit(async()=>{delivered=true;});}catch(e){error=e.message;}console.log(JSON.stringify({delivered,error}));`;
+  const child=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.state}});expect(child.exitCode).toBe(0);const proof=JSON.parse(child.stdout.toString());expect(proof.error).toContain('paused');expect(proof.delivered).toBe(false);
+ }finally{f.close();}
+});

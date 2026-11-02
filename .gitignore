@@ -19,3 +19,7 @@ COORDINATION-MILESTONE.md
 DEV-8-*.md
 IMPLEMENTATION-STATUS.md
 PR-REVIEW-COORDINATOR.md
+
+# Python build products
+__pycache__/
+*.pyc

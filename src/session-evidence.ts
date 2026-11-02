@@ -1,9 +1,9 @@
 import {AO} from './orchestrator';
 import {Store,digest} from './core';
 
-export async function sessionEvidence(session:string){
+export async function sessionEvidence(session:string,spawn=Bun.spawn){
  if(!/^[a-zA-Z0-9_-]+$/.test(session))throw Error('Session ID required');
- const p=Bun.spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0'],{stdout:'pipe',stderr:'pipe'});
+ const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0'],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(code!==0)throw Error('Orchestrator session inspection failed');
  const r=JSON.parse(text);
