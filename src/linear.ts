@@ -6,6 +6,7 @@ import {validateConflictPolicy,type ConflictPolicy} from './conflict-policy';
 import {validateClarifications} from './linear-clarifications';
 import {validateVerification,type Verification} from './verification';
 import {effectiveSettings} from './project-settings';
+import {validateDependencies,type DependencyPolicy} from './dependency-policy';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -18,6 +19,7 @@ export type ProjectConfig = {
   prMetadataChecks?:string[];
   branchUpdate?:{enabled:boolean;authorizedBy:string;maxUpdates:number|null};
   conflictRecovery?:ConflictPolicy;
+  dependencyRecovery?:DependencyPolicy;
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
   blockerSync?:{enabled:boolean;labelId?:string};
   clarifications?:{enabled:boolean;humanIds:string[]};
@@ -41,7 +43,8 @@ export function validate(c: any): asserts c is ProjectConfig {
   requiredCheckNames(c.requiredChecks);
   validateClarifications(c);
   metadataCheckNames(c.prMetadataChecks);
-  validateConflictPolicy(c.conflictRecovery);
+   validateConflictPolicy(c.conflictRecovery);
+   validateDependencies(c);
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||c.branchUpdate.maxUpdates!==null&&(!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
   if(c.blockerSync!==undefined&&(c.blockerSync===null||typeof c.blockerSync!=='object'||typeof c.blockerSync.enabled!=='boolean'))throw Error('blockerSync.enabled must be a boolean');
@@ -104,8 +107,12 @@ export async function poll(c: ProjectConfig, store: Store, token: string) {
   const dependencyBlocked=new Map<string,string>();
   if(store.db.query("SELECT name FROM sqlite_master WHERE name='feature_dependencies'").get()){
     for(const issue of candidates){
-      const deps=store.db.query('SELECT prerequisite FROM feature_dependencies WHERE issue=?').all(issue.id) as any[];
-      if(!deps.length)continue;
+       const deps=store.db.query('SELECT prerequisite FROM feature_dependencies WHERE issue=?').all(issue.id) as any[];
+       if(!deps.length)continue;
+       // Existing approved sessions retain eligibility while the dependency
+       // coordinator waits for verified source capabilities. Initial intake is
+       // unchanged; Linear Done alone never authorizes an existing continuation.
+       if(c.dependencyRecovery?.enabled&&store.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()&&store.db.query("SELECT 1 FROM implementation_dispatch d JOIN jobs j ON j.id=d.job WHERE j.issue=? AND j.project=? AND d.state IN ('delivery_uncertain','delivery_accepted','implementation_running','blocked_dependency','needs_input','awaiting_pr','pr_handoff','failed','uncertain','needs_reconciliation','blocked')").get(issue.id,c.linear.projectId))continue;
       const response=await fetch('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},signal:AbortSignal.timeout(20000),body:JSON.stringify({query:`query($ids:[ID!]!){issues(first:100,filter:{id:{in:$ids}}){nodes{id state{type} project{id} team{id}}pageInfo{hasNextPage}}}`,variables:{ids:deps.map(d=>d.prerequisite)}})});
       const body:any=await response.json();if(!response.ok||body.errors||!Array.isArray(body.data?.issues?.nodes)||body.data.issues.pageInfo?.hasNextPage!==false)throw Error('Incomplete dependency state snapshot');
       if(deps.some(d=>!body.data.issues.nodes.some((n:any)=>n.id===d.prerequisite&&n.state?.type==='completed'&&n.project?.id===c.linear.projectId&&n.team?.id===c.linear.teamId&&(!(store.db.query('SELECT state FROM jobs WHERE issue=? AND project=?').get(d.prerequisite,c.linear.projectId) as any)||(store.db.query('SELECT state FROM jobs WHERE issue=? AND project=?').get(d.prerequisite,c.linear.projectId) as any).state==='done'))))dependencyBlocked.set(issue.id,'Feature prerequisites must be completed before this ticket is picked up');

@@ -84,6 +84,14 @@ test('ambiguous custom-check provenance publishes a concrete deduplicated blocke
   expect(f.creates).toBe(1);expect(f.comments[0].body).toContain('explanation/resolution is missing or truncated');expect(f.comments[0].body).toContain('Do not post secrets');expect(f.labels).toContain(labelId);
  }finally{f.s.close();}
 });
+for(const outcome of ['failed','uncertain','needs_reconciliation','needs_input'])test(`post-dependency ${outcome} is still published`,async()=>{
+ const f=fixture();try{
+  f.s.db.exec('CREATE TABLE dependency_waits(job TEXT,plan TEXT,state TEXT)');
+  f.s.db.query('INSERT INTO dependency_waits VALUES (?,?,?)').run(f.id,f.s.get(f.id).plan_hash,'resumed');
+  f.s.db.query('UPDATE worker_outcomes SET outcome=? WHERE job=?').run(outcome,f.id);
+  await f.blockers().sync(f.config);expect(f.creates).toBe(1);expect(f.comments[0].body).toContain(outcome.replaceAll('_',' '));
+ }finally{f.s.close();}
+});
 test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
  const f=fixture();try{
   f.running();new ConflictRecovery(f.s).install();
