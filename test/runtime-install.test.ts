@@ -4,7 +4,8 @@ import {installRuntime} from '../src/runtime-install';import {trustedDaemon} fro
 import {stackControl,type StackOps} from '../src/stack-control';import {turnBarrier} from '../src/turn-submission';
 function fixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-runtime-install-'))),state=join(root,'state'),home=join(root,'home'),binary=join(root,'build-ao');mkdirSync(state);mkdirSync(home);writeFileSync(binary,'original binary');
- const pin=join(state,'orchestrator-runtime.json'),plist=join(home,'Library/LaunchAgents/local.adlc.orchestrator.plist');let status='stopped',failTrust=false;
+  const pin=join(state,'orchestrator-runtime.json'),plist=join(home,'Library/LaunchAgents/local.adlc.orchestrator.plist');let status='stopped',failTrust=false;
+  const launcher=join(root,'versions/version/src/serve-orchestrator.py');mkdirSync(join(root,'versions/version/src'),{recursive:true});writeFileSync(launcher,'test launcher');
  const io:any={state:()=>state,home:()=>home,installedCLI:()=>join(root,'versions/version/src/cli.ts'),command:(args:string[])=>{
   if(args[1]==='status'){writeFileSync(binary,'source replaced after initial hash');return {stdout:Buffer.from(JSON.stringify({state:status})),exitCode:0};}
    return {exitCode:113,stdout:Buffer.from(''),stderr:Buffer.from('Could not find service "local.adlc.orchestrator"')};
@@ -19,6 +20,13 @@ test('runtime registration restores both prior files if the post-install trust c
 });
 test('runtime status failures are rejected before creating registrations',async()=>{
  for(const result of [{stdout:Buffer.from('malformed'),exitCode:0},{stdout:Buffer.from('{"state":"stopped"}'),exitCode:1}]){const f=fixture();try{f.io.command=()=>result;await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow();expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);}finally{f.close();}}
+});
+test('missing runtime launcher rejects apply before service probes, backups or writes while preview stays read-only',async()=>{
+ const f=fixture();try{
+  rmSync(join(f.root,'versions/version/src/serve-orchestrator.py'));mkdirSync(join(f.io.home(),'Library/LaunchAgents'),{recursive:true});writeFileSync(f.pin,'{"serviceLabel":"local.adlc.orchestrator"}',{mode:0o600});writeFileSync(f.plist,'prior plist');const before=[readFileSync(f.pin),readFileSync(f.plist)];let probes=0;
+  f.io.command=()=>{probes++;throw Error('Must not probe without launcher');};expect((await installRuntime(f.binary,false,f.io)).preview).toBe(true);
+  await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow('Runtime launcher missing');expect(probes).toBe(0);expect([readFileSync(f.pin),readFileSync(f.plist)]).toEqual(before);expect(existsSync(join(f.io.state(),'backups'))).toBe(false);expect(existsSync(join(f.io.state(),'runtimes'))).toBe(false);expect(existsSync(join(f.io.state(),'turn-submission.lock'))).toBe(false);
+ }finally{f.close();}
 });
 test('runtime registration rejects unknown launchd state and preserves every prior artifact',async()=>{
  const missing='Could not find service "local.adlc.orchestrator"';

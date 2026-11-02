@@ -11,7 +11,7 @@ export function assertCleanup(j:any,run:any,target:any,e:any,pr:any,branch:strin
  if(e.session.id!==run.session_id||branch!==pr.head?.ref||!e.session.prs?.some((p:any)=>p.number===target.pr&&p.url===`https://github.com/${target.repo}/pull/${target.pr}`)||!pr.merged||pr.head?.repo?.full_name!==target.repo)throw Error('Merged PR and owned session must match');
  assertIdle(e);
 }
-function registrations(){const r=new Store(registryPath());try{return new ProjectServices(r).list();}finally{r.close();}}
+export function registrations(path=registryPath()){const r=Store.readonly(path);try{return new ProjectServices(r,false).list();}finally{r.close();}}
 export function configFor(s:Store,job:string,projects=registrations()){
  const p=projects.find(x=>x.linear_project===s.get(job).project);if(!p)throw Error('Registered project required');
  const c=JSON.parse(readFileSync(p.config,'utf8'));

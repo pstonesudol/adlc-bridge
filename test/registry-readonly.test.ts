@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,readdirSync,statSync,rmSync,realpathSync} from 'node:fs';import {join,dirname,resolve} from 'node:path';import {tmpdir} from 'node:os';
 import {registeredProjects} from '../src/service-control';import {Store} from '../src/core';import {ProjectServices,legacyLabel} from '../src/project-services';import {serviceDefinition} from '../src/init';
 import {installBridge} from '../src/install';import {readDefinition,assertDefinition} from '../src/project-services';
+import {registrations} from '../src/maintenance';
 function fixture(){
  const home=realpathSync(mkdtempSync(join(tmpdir(),'adlc-readonly-registry-'))),repo=join(home,'repo'),config=join(home,'project.json'),path=join(home,'state/state.sqlite'),plist=join(home,'Library/LaunchAgents',legacyLabel+'.plist');mkdirSync(repo);mkdirSync(dirname(plist),{recursive:true});
  writeFileSync(config,JSON.stringify({version:1,name:'Legacy',repo,requiredChecks:['CI'],automation:{orchestratorProject:'legacy'},linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'}}));
@@ -19,6 +20,14 @@ test('read-only discovery never inserts legacy registry rows or changes existing
 });
 test('read-only discovery does not initialize a project-services table in an older database',async()=>{
  const f=fixture();try{const s=new Store(f.path);s.close();await registeredProjects(true,f.home,f.path);const inspect=Store.readonly(f.path);try{expect(inspect.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").all()).toEqual([]);}finally{inspect.close();}}finally{f.close();}
+});
+test('maintenance registration reads do not initialize tables, change bytes or modes, or create a missing registry',()=>{
+ for(const initialized of [false,true]){const f=fixture();try{
+  const s=new Store(f.path);if(initialized)new ProjectServices(s);s.close();const before=readFileSync(f.path),mode=statSync(f.path).mode,files=readdirSync(dirname(f.path));
+  expect(registrations(f.path)).toEqual([]);expect(readFileSync(f.path)).toEqual(before);expect(statSync(f.path).mode).toBe(mode);expect(readdirSync(dirname(f.path))).toEqual(files);
+  const inspect=Store.readonly(f.path);try{expect(inspect.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").all()).toHaveLength(initialized?1:0);}finally{inspect.close();}
+ }finally{f.close();}}
+ const f=fixture();try{expect(()=>registrations(f.path)).toThrow();expect(existsSync(f.path)).toBe(false);expect(existsSync(dirname(f.path))).toBe(false);}finally{f.close();}
 });
 test('install preview discovers legacy projects without creating or changing the registry',async()=>{
  for(const existing of [false,true]){const f=fixture();try{

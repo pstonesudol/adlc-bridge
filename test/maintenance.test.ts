@@ -15,7 +15,7 @@ function fixture(){
  const writes:string[]=[],comparisons:Record<string,string>={[`repos/owner/repo/compare/base...${head}`]:'ahead',[`repos/owner/repo/compare/old...${head}`]:'ahead'};
  const io:any={registrations:()=>[{project:'ao',linear_project:uuid(1),repo,config}],sessionEvidence:async()=>evidence,gh:async(path:string)=>{if(path in comparisons)return {status:comparisons[path]};if(path==='repos/owner/repo/pulls/1')return pr;throw Error('Unexpected GitHub read: '+path);},
   localAO:async()=>{writes.push('kill');return {};},poll:async()=>{writes.push('poll');},linearToken:()=>'',review:()=>({configureMetadataChecks:()=>writes.push('policy'),tick:async()=>{writes.push('tick');return {};}})};
- return {s,id,tree,root,config,c,pr,evidence,io,writes,unproven:(side:string)=>comparisons[`repos/owner/repo/compare/${side}...${head}`]='diverged',done:()=>{s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';UPDATE review_targets SET state='completed';");pr.merged=true;pr.state='closed';},close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
+  return {s,id,tree,root,config,c,pr,evidence,io,writes,git,unproven:(side:string)=>comparisons[`repos/owner/repo/compare/${side}...${head}`]='diverged',done:()=>{s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';UPDATE review_targets SET state='completed';");pr.merged=true;pr.state='closed';},close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
 }
 test('maintenance preview and stale confirmation never perform external or durable writes',async()=>{
  const f=fixture();try{
@@ -28,6 +28,19 @@ test('maintenance preview and stale confirmation never perform external or durab
 },15000);
 test('cleanup rejects dirty and ignored files even with a previously valid confirmation',async()=>{
  for(const file of ['dirty','ignored']){const f=fixture();try{f.done();const preview=await maintenance(f.s,'cleanup',f.id,false,undefined,f.io);writeFileSync(join(f.tree,file),'preserve');await expect(maintenance(f.s,'cleanup',f.id,true,preview.confirmation,f.io)).rejects.toThrow('preserved');expect(f.writes).toEqual([]);expect(readFileSync(join(f.tree,file),'utf8')).toBe('preserve');}finally{f.close();}}
+});
+test('cleanup rejects a clean worktree at a different HEAD without changing user content or writing externally',async()=>{
+ const f=fixture();try{
+  f.done();const preview=await maintenance(f.s,'cleanup',f.id,false,undefined,f.io),file=join(f.tree,'user.txt');writeFileSync(file,'preserve committed user content');f.git('add','user.txt');f.git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','user change');const head=f.git('rev-parse','HEAD'),events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(f.git('status','--porcelain')).toBe('');expect(head).not.toBe(f.pr.head.sha);
+  await expect(maintenance(f.s,'cleanup',f.id,true,preview.confirmation,f.io)).rejects.toThrow('differs from merged PR head; preserved');expect(f.writes).toEqual([]);expect(readFileSync(file,'utf8')).toBe('preserve committed user content');expect(f.git('rev-parse','HEAD')).toBe(head);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ }finally{f.close();}
+});
+test('cleanup rejects the repository checkout and worktrees that differ from the recorded run without changing user files',async()=>{
+ for(const main of [false,true]){const f=fixture();try{
+  f.done();const preview=await maintenance(f.s,'cleanup',f.id,false,undefined,f.io),tree=main?f.c.repo:join(f.root,'other-tree');if(!main)mkdirSync(tree);const file=join(tree,'user.txt');writeFileSync(file,'preserve user changes');writeFileSync(join(f.tree,'original-user.txt'),'preserve original worktree');f.evidence.session.worktree=tree;
+  if(main)f.s.db.query('UPDATE runs SET worktree=? WHERE job=?').run(tree,f.id);
+  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();await expect(maintenance(f.s,'cleanup',f.id,true,preview.confirmation,f.io)).rejects.toThrow('Verified isolated worktree required');expect(f.writes).toEqual([]);expect(readFileSync(file,'utf8')).toBe('preserve user changes');expect(readFileSync(join(f.tree,'original-user.txt'),'utf8')).toBe('preserve original worktree');expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ }finally{f.close();}}
 });
 test('recovery refuses changed Linear, repository or Orchestrator registration before reading providers',async()=>{
  for(const change of [{linear:{projectId:'other'}},{repo:'/'},{automation:{orchestratorProject:'other'}}]){const f=fixture();try{writeFileSync(f.config,JSON.stringify({...f.c,...change}));f.io.gh=async()=>{throw Error('provider must not be read');};await expect(maintenance(f.s,'recover',f.id,true,'any',f.io)).rejects.toThrow('identity changed');expect(f.writes).toEqual([]);}finally{f.close();}}
