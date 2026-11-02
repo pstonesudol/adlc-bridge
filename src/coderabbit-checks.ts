@@ -21,7 +21,9 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  if(!section)return {...empty,blocker:'CodeRabbit custom-check section is incomplete'};
  // Inspect the check table, not examples/commands in the full-details prose.
  // Unknown status formats cannot be mistaken for an informational pass.
- const table=section.split(/<summary>\s*<strong>Full details:/i)[0];
+ const detailsAt=section.search(/<summary>\s*<strong>Full details:/i);
+ const table=detailsAt<0?section:section.slice(0,detailsAt);
+ if(detailsAt>=0&&/^\s*\|.*\|\s*$/m.test(section.slice(detailsAt)))return {...empty,blocker:'CodeRabbit custom-check table continues after full details; obtain the complete supported bot summary'};
  const rows=table.split('\n').filter(l=>l.includes('|'));
  const errors:string[]=[];let unclassified=false,dataRows=0;
  for(const row of rows){

@@ -13,6 +13,16 @@ test('PR108 regression: green run plus custom Verification Evidence error is sco
 test('warnings and old walkthrough NEEDS_EVIDENCE prose do not become failing custom checks',()=>{
  for(const status of ['Warning','Passed']){const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]','!['+status+']');f.review.state='APPROVED';expect(f.evidence()).toMatchObject({blocker:null,findings:[],bodyReviewed:true});}
 });
+for(const status of ['Error','Warning','Passed'])test(`table rows after full details fail closed: ${status}`,()=>{
+ const f=customFixture();
+ f.comments[0].body=f.comments[0].body.replace('<!-- pre_merge_checks_walkthrough_end -->',`| Unsupported check | ![${status}](status.svg) | Extra result after details |\n<!-- pre_merge_checks_walkthrough_end -->`);
+ const e=f.evidence();expect(e.findings).toEqual([]);expect(e.bodyReviewed).toBe(false);expect(e.blocker).toContain('table continues after full details');
+ expect(decision({...e,customCheckBlocker:e.blocker,clear:false,failedChecks:[],findings:[{path:'src/fix.ts',body:'unrelated'}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
+});
+test('table rows nested inside full details also remain ambiguous instead of being dropped',()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.','Never invent results.\n| Another check | ![Error](error.svg) | Unsupported error |');
+ expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toContain('table continues after full details');
+});
 for(const status of ['![Failed](error.svg)','Error','![Error]()','![Error](error.svg) ![Passed](passed.svg)',''])test(`unclassifiable custom status blocks unrelated remediation: ${status}`,()=>{
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error](error.svg)',status);
  const e=f.evidence();expect(e.findings).toEqual([]);expect(e.bodyReviewed).toBe(false);expect(e.blocker).toContain('unclassifiable');
