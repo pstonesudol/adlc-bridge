@@ -18,3 +18,13 @@ export function verifiedCoordinator(db:Database,project:string,source:string,cwd
  const sessions=db.query("SELECT workspace_path FROM sessions WHERE project_id=? AND kind='orchestrator' AND is_terminated=0").all(project) as any[];
  return sessions.length===1&&(!sessions[0].workspace_path||realpathSync(sessions[0].workspace_path)===cwd);
 }
+
+// A missing default data directory, an unreadable database or an unsupported
+// native schema closes coordinator admission, but it must not abort setup for a
+// reserved ticket worker. Any registry failure falls through to the reservation gate.
+export function tryVerifiedCoordinator(project:string,source:string,cwd:string,dataRoot:string){
+ try{
+  const registry=new Database(join(dataRoot,'ao.db'),{readonly:true});
+  try{return verifiedCoordinator(registry,project,source,cwd,dataRoot);}finally{registry.close();}
+ }catch{return false;}
+}

@@ -962,7 +962,9 @@ This integration currently reads the default local AO registry at `~/.ao/data/ao
 in read-only mode and recognizes AO's managed coordinator layout
 `worktrees/<project>/orchestrator/<sessionPrefix>-orchestrator` (the prefix defaults
 to the first 12 characters of the project ID). A custom AO data directory or a
-changed native schema/layout is unsupported and fails closed. The registry must
+changed native schema/layout is unsupported: it never admits a coordinator, and a
+registry that is absent, unreadable or unsupported falls through to the reservation
+gate so a reserved ticket worker is still evaluated. The registry must
 contain exactly one non-terminated coordinator for the project. During initial
 setup its stored workspace may be empty, so the native coordinator-only layout
 and shared Git directory establish workspace identity. This admits coordinator
