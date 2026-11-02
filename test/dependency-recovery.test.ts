@@ -166,9 +166,11 @@ test('resumed dependency wait retains blocked label for a later worker blocker',
   f.s.db.query("UPDATE dependency_waits SET state='resumed' WHERE job=?").run(f.job);
   f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency' WHERE job=?").run(f.job);
   const before=labelWrites;
-  await f.r.notices(f.c,blockers);await blockers.sync(f.c);
+  await f.r.notices(f.c,blockers);const beforeSyncComments=comments.length;
+  await blockers.sync(f.c);
   expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(true);
   expect(labelWrites).toBe(before);
+  expect(comments).toHaveLength(beforeSyncComments);
  }finally{f.s.close();}
 });
 test('explicit confirmation reconciles interrupted pre-update Git stage, automatic poll does not',async()=>{
