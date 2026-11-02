@@ -1,13 +1,13 @@
 import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {Lifecycle} from '../src/lifecycle';
-import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from '../src/approval-policy';import {scopeAllows} from '../src/file-scope';
+import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from '../src/approval-policy';import {scopeAllows} from '../src/file-scope';import {recordReadiness} from '../src/readiness';
 const policy:ApprovalPolicy={mode:'ready-queue',id:'test-queue-policy',authorizedBy:'test human',scope:['**'],gitScope:'feature-pr'};
 const config={repo:'/repo',linear:{projectId:'project'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:policy};
 function fixture(){
  const s=new Store(':memory:'),messages:any[]=[],session={session:{id:'worker',projectId:'ao',branch:'',isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
  const w=new Workflow(s,{startPlan:async()=>{throw Error('No new worker expected');},findPlans:async()=>[],evidence:async()=>session,disableFeedback:async()=>{},sendImplementation:async(id,prompt,clientId)=>{messages.push({id,prompt,clientId});session.transcript.controller='busy';(session.transcript.entries as any[]).push({clientMessageId:clientId,turnId:'implementation'});(session.transcript.turns as any[]).push({id:'implementation',state:'running'});}});
  const id=s.enqueue('project','issue','User queued task'),p=new Planning(s);p.reserve(id,'ao');const r=p.get(id);session.session.branch=r.branch;p.gate(id,'ao','worker',r.branch,'/worktree');
- const hash=s.propose(id,'Captured plan');s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest('User queued task'),'awaiting_approval','worker','planning-id');
+ const hash=s.propose(id,'Captured plan');recordReadiness(s,id,'Captured plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->',hash,digest('User queued task'));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest('User queued task'),'awaiting_approval','worker','planning-id');
  return {s,w,id,hash,messages,policyStore:new ApprovalPolicyStore(s)};
 }
 test('complete trusted queue snapshot plus standing user policy authorizes one implementation delivery',async()=>{
@@ -34,6 +34,16 @@ test('standing grant revokes on policy changes and cannot support stale remediat
  policyStore.snapshot('project',new Set(['issue']));await w.tick(config);expect(messages.length).toBe(1);
  policyStore.snapshot('project',new Set(['issue']),Date.now()-121000);expect(()=>new Lifecycle(s).current(id)).toThrow('eligibility');
  policyStore.snapshot('project',new Set(['issue']));await w.tick({...config,approval:{mode:'manual'}});expect(s.get(id).state).toBe('blocked');expect(s.get(id).approved_hash).toBeNull();expect(messages.length).toBe(1);
+ }finally{s.close();}
+});
+test('existing standing authorization remains executable without a retroactive readiness row',async()=>{
+ const {s,w,id,messages,policyStore}=fixture();try{
+  policyStore.snapshot('project',new Set(['issue']));await w.tick(config);expect(s.get(id).state).toBe('approved');
+  s.db.query('DELETE FROM plan_readiness WHERE job=?').run(id);
+  expect(policyStore.evaluate(id,'project',policy).allowed).toBe(false);
+  expect(()=>policyStore.verify(id,'project',policy)).not.toThrow();
+  await expect(w.executeApproved(id,config)).resolves.toBeDefined();
+  expect(messages.length).toBe(1);
  }finally{s.close();}
 });
 test('wildcard repository scope still rejects traversal, secrets, Git metadata and policies',()=>{

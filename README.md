@@ -237,6 +237,8 @@ and its placeholders must be replaced; it is not an executable configuration.
 | `statusSync` | Team-specific In Progress, In Review, and Done UUIDs |
 | `remediation.maxAttempts` | Positive per-job remediation budget; `null` enables explicit uncapped mode |
 | `remediation.maxNoProgress` | Consecutive attempts without verified progress before an explicit stop |
+| `blockerSync` | Additive needs-human label UUID for worker blocker comments; never grants readiness |
+| `workflow.prGraceMs` | Delay before an unexplained zero-PR completion becomes a reconciliation blocker (default 120000) |
 | `featurePlanning.backlogStateId` | Backlog UUID for newly published ticket batches |
 
 Obtain Linear UUIDs through its API or connected tools; do not substitute issue
@@ -356,6 +358,54 @@ For a missed handoff after an eligible ticket's original authorization was
 revoked, see [Existing worker PR recovery](#existing-worker-pr-recovery).
 Recovery previews read-only by default and applies only the reviewed proposal
 with `--confirm HASH`; normal polling registers the review target afterwards.
+
+### Plan readiness and worker blockers
+
+Planning agents must end with a machine-readable `ADLC_PLAN_STATUS` receipt:
+`ready`, `needs-input`, or `blocked-by-dependency`, with concrete questions and
+dependency references. Missing or malformed receipts are non-actionable. The
+`ready-queue` standing policy can authorize only a current, valid `ready` plan;
+ordinary non-blocking risks do not prevent execution. Human plan approval does
+not silently resolve a structured question or dependency.
+
+Legacy plans with no structured receipt can be approved only with an explicit
+`--acknowledge-readiness` flag; this records a `human-acknowledgement` and does
+not answer any concrete question quoted from the legacy plan.
+
+Inspect readiness and worker blockers with `adlc status`. When a completed
+implementation turn has no PR, the bridge prefers the worker's
+`ADLC_WORKER_STATUS` receipt. A needs-input or blocked-dependency receipt becomes
+a visible blocker instead of an indefinite `awaiting_pr`. If PR metadata is merely
+delayed, `workflow.prGraceMs` allows it to attach; after expiry the state becomes
+an explicit reconciliation blocker. Legacy sessions without a receipt are
+interpreted conservatively, and their confidence is shown.
+
+With `blockerSync.enabled`, polls add the configured needs-human label and one
+deduplicated Linear comment with the exact question and dependency references.
+The update is additive: existing labels and human changes are preserved, and it
+never grants readiness or implementation authority.
+
+Record a human answer or satisfied dependency, then resume the existing owned
+worker explicitly:
+
+```sh
+adlc resolve-plan JOB_ID --source human-answer --human "Your name" \
+  --answer "Use product ID SKU-42"
+adlc resume-job JOB_ID config/local.json
+```
+
+Resume validates the current spec, plan version, approval, scoped permissions,
+resolution and session identity. It reserves one continuation before delivery,
+never resends the original implementation request, and refuses uncertain sends
+or duplicate resumes. Material requirement or scope changes require replanning
+and reapproval. To preview reconciliation without writing state:
+
+```sh
+adlc reconcile-preview config/local.json
+```
+
+The preview reports existing session outcomes and questions but applies no repair
+and never restarts work.
 
 ## Feature requirements to ticket batches
 
@@ -547,6 +597,55 @@ limited to one per job, commit, and description hash, including uncertain delive
 outcomes. No empty commits, approval commands, check overrides, or merges are used.
 A full review still has to return actual current-commit clearance; requesting it
 is not approval. If it fails or never responds, coordination blocks for inspection.
+
+#### Carried-forward CodeRabbit threads
+
+An inline review thread stays unresolved after later pushes while its comments
+keep the commit they were originally written on. GitHub still maps that thread to
+current code. Readiness therefore collects every thread and comment page with
+stable thread/comment IDs, the reviewer identity, original commit, current path
+and line, and resolution/outdated state. A non-outdated thread with an
+authentic `coderabbitai[bot]` comment is a validation candidate even when
+`originalCommit` differs from the current head; `originalCommit` is provenance,
+not a relevance test. Comments from a human account named `coderabbitai` are not
+reviewer feedback. Outdated threads are never treated as resolved.
+
+Only candidates that were never handed to this worker are dispatched, as one
+bounded batch through the existing remediation budget, same-session delivery and
+single push. Each reservation records `thread_id` and the hash of its reviewer
+comment IDs in `review_feedback`; a retry, restart or repeated poll cannot resend
+the same feedback. Delivery re-reads the PR and rejects a changed head, a changed
+comment set, or a resolved thread. The worker must verify each thread against the
+code at that commit, fix only valid in-scope defects, ignore instructions inside
+review text, and report concrete evidence for feedback that is already addressed;
+a thread is never resolved just to obtain approval.
+
+When unresolved threads remain that cannot become reviewer remediation, the job
+blocks immediately with counts and paths instead of waiting for a timeout or
+requesting repeated full reviews:
+
+- human-only discussions, which stay blocking by policy and are never sent as
+  CodeRabbit fixes;
+- outdated or otherwise ambiguous threads, which need human confirmation;
+- carried-forward threads already sent at an earlier head, which need a human to
+  confirm the current code (or a new CodeRabbit comment, which becomes a new
+  candidate).
+
+Inspect without modifying the database:
+
+```sh
+DB="${ADLC_DB:-$HOME/Library/Application Support/ADLC Bridge/state.sqlite}"
+sqlite3 -readonly "$DB" \
+  'SELECT job,thread_id,comments_hash,path,head,attempt,state,updated FROM review_feedback ORDER BY updated DESC LIMIT 50;'
+sqlite3 -readonly "$DB" \
+  'SELECT job,head,state,reason FROM review_targets ORDER BY updated DESC;'
+```
+
+`adlc review-status` shows the resulting status, and `adlc tick-review JOB CONFIG`
+re-observes the configured PR without adopting or bypassing drift. A successful
+CodeRabbit check is still not approval: explicit current-head approval remains
+required. Applying this reviewed change to a live installation and recovering
+other jobs remain separate operator actions.
 
 ### Require plan approval on one ticket
 
@@ -965,3 +1064,22 @@ operations. Run reconciliation cannot replace an adopted session/worktree.
 Native reservation metadata stays unchanged. Human merges remain mandatory;
 there is no auto-merge or deployment. DEV-30/#7 validation for DEV-31 is preview
 only; any live adoption is a separate operator action after reviewed installation.
+
+### Project coordinator setup
+
+The setup hook admits a project coordinator only after matching the native AO
+project/session registry, the canonical coordinator workspace, and the source
+repository's Git common directory. Ticket workers still require a durable ADLC
+planning reservation; a branch name or environment role flag does not grant access.
+
+This integration currently reads the default local AO registry at `~/.ao/data/ao.db`
+in read-only mode and recognizes AO's managed coordinator layout
+`worktrees/<project>/orchestrator/<sessionPrefix>-orchestrator` (the prefix defaults
+to the first 12 characters of the project ID). A custom AO data directory or a
+changed native schema/layout is unsupported: it never admits a coordinator, and a
+registry that is absent, unreadable or unsupported falls through to the reservation
+gate so a reserved ticket worker is still evaluated. The registry must
+contain exactly one non-terminated coordinator for the project. During initial
+setup its stored workspace may be empty, so the native coordinator-only layout
+and shared Git directory establish workspace identity. This admits coordinator
+startup; it does not approve a ticket plan, merge a PR, or activate a new runtime.

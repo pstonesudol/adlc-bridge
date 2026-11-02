@@ -19,6 +19,58 @@ export function effectiveBotReview(reviews:any[]) {
   return reviews.filter(r=>r.user?.login==='coderabbitai[bot]'&&['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state))
     .sort((a,b)=>Date.parse(a.submitted_at)-Date.parse(b.submitted_at)).at(-1);
 }
+const REVIEW_COMMENT_FIELDS='id body author{login __typename} originalCommit{oid}';
+const REVIEW_THREAD_FIELDS=`id isResolved isOutdated path line startLine comments(first:100){nodes{${REVIEW_COMMENT_FIELDS}}pageInfo{hasNextPage endCursor}}`;
+export const REVIEW_THREADS_QUERY=`query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{${REVIEW_THREAD_FIELDS}}pageInfo{hasNextPage endCursor}}}}}`;
+export const REVIEW_THREAD_COMMENTS_QUERY=`query($id:ID!,$after:String){node(id:$id){... on ReviewThread{comments(first:100,after:$after){nodes{${REVIEW_COMMENT_FIELDS}}pageInfo{hasNextPage endCursor}}}}}`;
+export type ReviewComment={id:string;login:string;bot:boolean;originalCommit:string|null;body:string};
+export type ReviewThread={id:string;path:string;line:number|null;startLine:number|null;isResolved:boolean;isOutdated:boolean;comments:ReviewComment[]};
+export type ReviewFeedbackCandidate={threadId:string;path:string;line:number|null;commentIds:string[];commentsHash:string;body:string;originalCommit:string|null;outdated:false};
+export type ReviewThreadSummary={unresolved:number;resolved:number;candidates:ReviewFeedbackCandidate[];stale:{threadId:string;path:string;commentIds:string[]}[];humanOnly:{threadId:string;path:string}[]};
+// GitHub reserves the [bot] login suffix for app installations; a human
+// account named "coderabbitai" is not the reviewer. Accept the legacy bot login
+// only when GitHub itself reports the author as a Bot.
+function reviewComment(node:any):ReviewComment{
+ if(typeof node?.id!=='string'||!node.id)throw Error('Invalid review comment');
+ // GitHub retains comments from deleted accounts with an explicit null author.
+ const login=node.author===null?'':node.author?.login;
+ if(typeof login!=='string'||(node.author!==null&&!login))throw Error('Invalid review comment author');
+ const body=typeof node.body==='string'?node.body:'';
+ return {id:node.id,login,bot:login==='coderabbitai[bot]'||login==='coderabbitai'&&node.author?.__typename==='Bot',originalCommit:typeof node.originalCommit?.oid==='string'?node.originalCommit.oid:null,body};
+}
+export function normalizeReviewThread(node:any,extra:any[]=[]):ReviewThread{
+ if(typeof node?.id!=='string'||!node.id||typeof node.isResolved!=='boolean'||typeof node.isOutdated!=='boolean'||typeof node.path!=='string'||!node.path)throw Error('Invalid review thread');
+ if(!Array.isArray(node.comments?.nodes)||!node.comments.pageInfo)throw Error('Incomplete thread comments');
+ const seen=new Set<string>();const comments:ReviewComment[]=[];
+ for(const raw of [...node.comments.nodes,...extra]){const c=reviewComment(raw);if(seen.has(c.id))continue;seen.add(c.id);comments.push(c);}
+ return {id:node.id,path:node.path,line:Number.isSafeInteger(node.line)?node.line:null,startLine:Number.isSafeInteger(node.startLine)?node.startLine:null,isResolved:node.isResolved,isOutdated:node.isOutdated,comments};
+}
+// Resolution and outdated state are independent. An unresolved thread mapped to
+// current code is a validation candidate even when its comments keep an older
+// originalCommit; only an explicitly outdated thread is excluded as ambiguous.
+export function reviewThreadEvidence(threads:ReviewThread[]):ReviewThreadSummary{
+ const candidates:ReviewFeedbackCandidate[]=[],stale:ReviewThreadSummary['stale']=[],humanOnly:ReviewThreadSummary['humanOnly']=[];
+ const resolved=threads.filter(t=>t.isResolved).length;
+ const unresolved=threads.filter(t=>!t.isResolved);
+ for(const t of unresolved){
+  const bot=t.comments.filter(c=>c.bot);
+  if(!bot.length){humanOnly.push({threadId:t.id,path:t.path});continue;}
+  const commentIds=[...new Set(bot.map(c=>c.id))].sort();
+  if(t.isOutdated){stale.push({threadId:t.id,path:t.path,commentIds});continue;}
+  const commits=[...new Set(bot.map(c=>c.originalCommit).filter((x):x is string=>!!x))].sort();
+  candidates.push({threadId:t.id,path:t.path,line:t.line,commentIds,commentsHash:digest(commentIds.join(',')),body:bot.map(c=>c.body).join('\n\n').slice(0,10000),originalCommit:commits.length===1?commits[0]:commits.length?commits.join(','):null,outdated:false});
+ }
+ candidates.sort((a,b)=>a.path===b.path?a.threadId.localeCompare(b.threadId):a.path.localeCompare(b.path));
+ stale.sort((a,b)=>a.path===b.path?a.threadId.localeCompare(b.threadId):a.path.localeCompare(b.path));
+ humanOnly.sort((a,b)=>a.path===b.path?a.threadId.localeCompare(b.threadId):a.path.localeCompare(b.path));
+ return {unresolved:unresolved.length,resolved,candidates,stale,humanOnly};
+}
+export function reviewThreadFindings(summary:ReviewThreadSummary,head:string){
+ return summary.candidates.map(c=>({source:'github-review',kind:'review_thread',threadId:c.threadId,path:c.path,line:c.line,body:c.body,sha:head,originalCommit:c.originalCommit,commentIds:c.commentIds,commentsHash:c.commentsHash,outdated:false}));
+}
+export function coderabbitRateLimited(checks:any[],head:string){
+ return checks.some((c:any)=>c?.app?.slug==='coderabbitai'&&c.head_sha===head&&/rate[\s_-]?limit/i.test(`${c.output?.title??''} ${c.output?.summary??''} ${c.output?.text??''}`));
+}
 export function metadataFindings(review:any,head:string,comments:any[]){
  if(review?.commit_id!==head||review?.state!=='CHANGES_REQUESTED'||!review.body?.includes('Pre-merge checks failed'))return [];
  const bot=comments.filter(c=>c.user?.login==='coderabbitai[bot]').sort((a,b)=>Date.parse(a.updated_at)-Date.parse(b.updated_at)).at(-1);
@@ -36,29 +88,39 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(first.state!=='open')throw Error('PR is not open');
   const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
    const checks=latestWorkflowChecks(rawChecks);
-  const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();let unresolved=0;
+  const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();
+  const threads:ReviewThread[]=[];
   const findings:any[]=[];
   do {
-    const query=`query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{isResolved isOutdated path comments(first:100){nodes{body author{login} originalCommit{oid}} pageInfo{hasNextPage}}}pageInfo{hasNextPage endCursor}}}}}`;
-    const args=['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`];
+    const args=['api','graphql','-f',`query=${REVIEW_THREADS_QUERY}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`];
     if(after)args.push('-f',`after=${after}`);
     const result=await gh(args);
-    const threads=result.data?.repository?.pullRequest?.reviewThreads;
-    if(result.errors || !threads?.pageInfo || !Array.isArray(threads.nodes))throw Error('Incomplete review threads');
-    for(const t of threads.nodes){
-      if(typeof t.isResolved!=='boolean')throw Error('Invalid review thread');
-      if(!t.isResolved){
-        unresolved++;
-        if(!Array.isArray(t.comments?.nodes)||t.comments.pageInfo?.hasNextPage!==false)throw Error('Incomplete thread comments');
-        for(const c of t.comments.nodes)if(c.author?.login==='coderabbitai' || c.author?.login==='coderabbitai[bot]'){
-          if(!t.isOutdated&&c.originalCommit?.oid===first.head.sha)findings.push({path:t.path,body:c.body,sha:first.head.sha});
-        }
+    const page=result.data?.repository?.pullRequest?.reviewThreads;
+    if(result.errors || !page?.pageInfo || !Array.isArray(page.nodes))throw Error('Incomplete review threads');
+    for(const node of page.nodes){
+      if(!Array.isArray(node?.comments?.nodes)||!node.comments.pageInfo)throw Error('Incomplete thread comments');
+      const extra:any[]=[];let commentAfter:string|null=node.comments.pageInfo.endCursor??null;const commentCursors=new Set<string>();
+      while(node.comments.pageInfo.hasNextPage){
+        if(!commentAfter||commentCursors.has(commentAfter))throw Error('Invalid thread cursor');
+        commentCursors.add(commentAfter);
+        // Nested comment pagination is authoritative too: a truncated thread
+        // can hide the reviewer comment that makes a carried thread actionable.
+        const pageResult=await gh(['api','graphql','-f',`query=${REVIEW_THREAD_COMMENTS_QUERY}`,'-f',`id=${node.id}`,'-f',`after=${commentAfter}`]);
+        const comments=pageResult.data?.node?.comments;
+        if(pageResult.errors||!comments?.pageInfo||!Array.isArray(comments.nodes))throw Error('Incomplete thread comments');
+        extra.push(...comments.nodes);
+        node.comments.pageInfo=comments.pageInfo;
+        commentAfter=comments.pageInfo.endCursor??null;
       }
+      threads.push(normalizeReviewThread(node,extra));
     }
-    if(!threads.pageInfo.hasNextPage)break;
-    after=threads.pageInfo.endCursor;
+    if(!page.pageInfo.hasNextPage)break;
+    after=page.pageInfo.endCursor;
     if(!after || cursors.has(after))throw Error('Invalid thread cursor');cursors.add(after);
   }while(true);
+  const reviewThreadSummary=reviewThreadEvidence(threads);
+  const unresolved=reviewThreadSummary.unresolved;
+  findings.push(...reviewThreadFindings(reviewThreadSummary,first.head.sha));
   // A later COMMENTED review does not revoke an earlier approval. A real
   // change request or dismissal does; approval still must match the PR head.
   const latest=effectiveBotReview(reviews);
@@ -91,6 +153,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
+    reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
     metadataCheckEvidence:bodyEvidence,
      botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }
