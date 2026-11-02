@@ -143,23 +143,32 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
-  // Missing worktree identity and a moved remote head fail closed.
+  expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
+  // Missing worktree identity, remote-only divergence and wrong attachment URLs
+  // fail closed without regressing the settled state.
   const worktree=(f as any).worktree.bind(f),snapshot=f.branchSnapshot.bind(f);
   (f as any).worktree=async()=>({branch:r.branch,head:'a'.repeat(40)});
-  expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+  expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
   (f as any).worktree=worktree;
   (f as any).branchSnapshot=async()=>({...await snapshot(),head:'c'.repeat(40)});
-  expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+  expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
   (f as any).branchSnapshot=snapshot;
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
-  // A same-number PR attached from another repository/host is not this target.
   for(const url of ['https://github.com/other/repo/pull/1','https://example.com/owner/repo/pull/1',undefined]){
    e.session.prs[0].url=url;
-   expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+   expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
    expect(w.implementation(id).state).not.toBe('pr_handoff');
   }
   e.session.prs[0].url='https://github.com/owner/repo/pull/1';
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  // A legitimate new head after settlement stays settled; only current
+  // local/remote identity must agree, not the original adopted head.
+  (f as any).worktree=async()=>({branch:r.branch,head:'c'.repeat(40),tree:'/worktrees/session-1'});
+  (f as any).branchSnapshot=async()=>({...await snapshot(),head:'c'.repeat(40)});
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
+  (f as any).worktree=worktree;
+  (f as any).branchSnapshot=snapshot;
  }finally{s.close();}
 });
 test('recovery for an earlier continuation cannot authorize a newer failed continuation',async()=>{

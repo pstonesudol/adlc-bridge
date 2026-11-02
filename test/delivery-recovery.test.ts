@@ -89,6 +89,12 @@ test('explicit confirmation binds recovery to the failed continuation and repair
   f.s.db.query("UPDATE implementation_dispatch SET state='failed',reason='Worker-reported failure, not a continuation turn' WHERE job=?").run(f.id);
   await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('Delivery dispatch is failed');
   expect((f.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(f.id) as any)).toEqual({state:'failed',reason:'Worker-reported failure, not a continuation turn'});
+  // A fresh continuation-bound confirmation can repair needs_reconciliation.
+  const third=Number(f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(f.id,f.s.get(f.id).plan_hash,f.r.spec_hash,'failure-three','continue-three','worker','failed',Date.now()).lastInsertRowid);
+  f.s.db.query("UPDATE implementation_dispatch SET state='needs_reconciliation',reason='Newer remediation masked the continuation failure' WHERE job=?").run(f.id);
+  expect((await f.recovery.confirm(f.id,f.c,p.hash)).continuationRecovery).toBe(third);
+  expect((f.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(f.id) as any).state).toBe('pr_handoff');
+  expect((f.s.db.query('SELECT state FROM continuations WHERE id=?').get(third) as any).state).toBe('recovered');
  }finally{f.s.close();}
 });
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});

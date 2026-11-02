@@ -293,8 +293,12 @@ export class Workflow{
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
    const contTurn=contEntry&&e.transcript?.turns?.find((t:any)=>t.id===contEntry.turnId);
    if(cont&&contTurn){
-    if(['failed','cancelled','interrupted'].includes(contTurn.state))this.s.db.query("UPDATE continuations SET state='failed',failed_at=COALESCE(failed_at,?),reason=? WHERE id=?").run(Date.now(),'Continuation turn failed or was cancelled',cont.id);
-    else if(contTurn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state!='failed'").run(cont.id);
+    if(['failed','cancelled','interrupted'].includes(contTurn.state)){
+     // A verified recovery settles the failure; the historical failed turn no
+     // longer forces later polls back into the recovery gate.
+     if(result.state==='pr_handoff'&&String(result.source??'').startsWith('delivery-recovery'))this.s.db.query("UPDATE continuations SET state='recovered',reason=NULL WHERE id=? AND state!='recovered'").run(cont.id);
+     else this.s.db.query("UPDATE continuations SET state='failed',failed_at=COALESCE(failed_at,?),reason=? WHERE id=? AND state!='recovered'").run(Date.now(),'Continuation turn failed or was cancelled',cont.id);
+    }else if(contTurn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state NOT IN ('failed','recovered')").run(cont.id);
    }
    this.s.db.query('UPDATE implementation_dispatch SET state=?,reason=? WHERE job=?').run(result.state,result.reason??null,job);
    return {...this.saveOutcome(job,d,result,graceMs,now,this.outcomes(job)),session:d.session_id};
@@ -315,6 +319,7 @@ export class Workflow{
    // here as well as after the later completed-turn path.
    const recovered=await this.recoveredDelivery(job,c,e,prs,d,cont?.id);
    if(turn.id===contTurn?.id&&recovered)return finish({state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'delivery-recovery',confidence:'high'});
+   if(turn.id===contTurn?.id&&cont?.state==='recovered')return finish({state:'needs_reconciliation',outcome:'failed',reason:'Settled continuation recovery no longer matches current delivery identity; inspect before handoff',questions:[],dependencies:[],source:'delivery-recovery',confidence:'high'});
    return finish({state:'failed',outcome:'failed',reason:'Implementation turn failed or cancelled; explicit recovery required',questions:[],dependencies:[],source:'receipt',confidence:'high'});
   }
   if(turn.state!=='completed')return finish({state:'implementation_running',outcome:'running',reason:null,questions:[],dependencies:[],source:'receipt',confidence:'high'});
@@ -337,7 +342,7 @@ export class Workflow{
   // Existing delivery adoption can establish recovery only when its reviewed
   // proposal binds this job, session, repository, PR, head, plan and worktree.
   const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any:null;
-  const ownTurnFailed=['failed','cancelled','interrupted'].includes(contTurn?.state);
+  const ownTurnFailed=cont?.state!=='recovered'&&['failed','cancelled','interrupted'].includes(contTurn?.state);
   const continuationFailed=!!failed||ownTurnFailed;
   if(continuationFailed&&!(await this.recoveredDelivery(job,c,e,prs,d,ownTurnFailed?cont?.id:failed?.id))){
    return finish({state:'needs_reconciliation',outcome:'failed',reason:'Previous guarded continuation failed and has no exact reviewed delivery recovery; inspect recovery evidence and never infer handoff',questions:[],dependencies:[],source:'continuation',confidence:'high'});
@@ -355,21 +360,25 @@ export class Workflow{
   try{local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));}catch{return false;}
   const localTree=(local as any)?.tree??(local as any)?.worktree;
   if(typeof localTree!=='string'||!localTree)return false;
-  const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=? AND head=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec),local.head) as any;
-  if(!adopted||local.head!==adopted.head||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
   // Recovery must belong to the specific failed continuation, not an adoption
-  // that existed before a later continuation failed.
+  // that existed before a later continuation failed. A recovered continuation
+  // remains settled across legitimate future head changes.
   const failed=continuationId
    ?this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE id=? AND job=?").get(continuationId,job) as any
-   :this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any;
-  if(!failed||failed.state!=='failed')return false;
+   :this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE job=? AND plan_hash=? AND state IN ('failed','recovered') ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any;
+  if(!failed||!['failed','recovered'].includes(failed.state))return false;
+  const settled=failed.state==='recovered';
+  const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec)) as any;
+  if(!adopted||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
+  if(!settled&&local.head!==adopted.head)return false;
   if(!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head))return false;
   // A recovered handoff is still a handoff: the open PR must remain the exact
-  // adopted target at the adopted head.
+  // adopted target. Before settlement the head is bound to the adoption; after
+  // settlement the current local and remote heads must agree.
   try{
    const remote=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
    assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,remote);
-   return remote.head===adopted.head;
+   return settled?remote.head===local.head:remote.head===adopted.head;
   }catch{return false;}
  }
  continuation(job:string):any{

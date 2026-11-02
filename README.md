@@ -1290,7 +1290,10 @@ records recovery against that specific continuation, and only an `adopted` recor
 matching the same job, plan, requirements, session, repository, PR, worktree
 branch and exact current head settles it. An adoption that predates a later
 failure has no such record and cannot recover it; that dispatch repairs only the
-guarded `failed` to handoff transition. Until then, workflow handoff and review
+guarded `failed` or masked `needs_reconciliation` state to handoff. Once settled,
+the continuation remains recovered across later legitimate head changes, while
+handoff still requires the exact attached PR and current local/remote head
+agreement. Until then, workflow handoff and review
 dispatch remain blocked with a concrete reconciliation reason; review settlement
 re-reads the adopted evidence and never repairs or fabricates it. Tests cover the real merged foundation with
 fake provider/session evidence; they do not exercise live Linear, install code or

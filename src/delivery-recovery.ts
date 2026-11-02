@@ -83,7 +83,7 @@ export class DeliveryRecovery{
    // A stale row must not re-open a later failure reached for another reason.
    const recorded=failed?this.s.db.query("INSERT OR IGNORE INTO continuation_recoveries(continuation,job,proposal,head,at) VALUES (?,?,?,?,?)").run(failed.id,job,adopted.proposal,adopted.head,Date.now()).changes>0:false;
    const recovery=failed&&this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head);
-   const repair=changed.changes?['approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr',...(recorded?['failed']:[])]:recorded?['failed']:[];
+   const repair=changed.changes?['approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr',...(recorded?['failed']:[])]:recorded?['failed','needs_reconciliation']:[];
    if(repair.length){
     // Only dispatch states written before handoff may be repaired. A later
     // blocker is not overwritten, and handoff is an idempotent no-op.
@@ -98,6 +98,9 @@ export class DeliveryRecovery{
     const current=this.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(job) as any;
     if(current?.state!=='pr_handoff')throw Error(`Delivery dispatch is ${current?.state??'missing'}; reconciliation required${current?.reason?`: ${current.reason}`:''}`);
    }
+   // Only a fresh, continuation-bound confirmation settles that failure. The
+   // continuation then remains recovered across later legitimate head changes.
+   if(recorded)this.s.db.query("UPDATE continuations SET state='recovered',reason=NULL WHERE id=? AND state='failed'").run(failed.id);
    // Adoption makes the verified delivery branch authoritative, so any older
    // review-stage branch-mismatch reason refers to the superseded reservation.
    if(changed.changes&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get())this.s.db.query("UPDATE review_targets SET reason=NULL WHERE job=? AND reason LIKE 'Blocked — branch mismatch%'").run(job);

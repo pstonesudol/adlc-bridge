@@ -104,6 +104,17 @@ test('custom finding is rejected at dispatch when the description changes after 
   expect(f.s.db.query('SELECT * FROM custom_description_obligations').all()).toEqual([]);
  }finally{f.s.close();}
 });
+test('receipt-sourced failure is blocked while an unrecovered continuation exists',async()=>{
+ const f=templateFixture();try{
+  f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT); CREATE TABLE IF NOT EXISTS continuations(id INTEGER PRIMARY KEY,job TEXT,plan_hash TEXT,state TEXT)');
+  const hash=f.s.get(f.id).plan_hash;
+  f.s.db.query('INSERT INTO continuations VALUES (?,?,?,?)').run(1,f.id,hash,'failed');
+  f.s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,hash,'session','failed','Continuation failed','[]','[]','receipt','high',Date.now(),null,Date.now(),null);
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE continuations SET state='recovered' WHERE job=?").run(f.id);
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 test('failed continuation outcome blocks review dispatch until workflow republishes a recovered handoff',async()=>{
  const f=templateFixture();try{
   f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT)');
