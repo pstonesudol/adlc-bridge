@@ -21,7 +21,7 @@ const activePlanning="(d.state IN ('dispatch_uncertain','needs_reconciliation') 
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
- findPlans(project:string,branch:string):Promise<any[]>;
+ findPlans(project:string,branch:string,includeTerminated?:boolean):Promise<any[]>;
  evidence(session:string):Promise<any>;
  sendImplementation(session:string,prompt:string,clientId:string):Promise<void>;
  disableFeedback(session:string):Promise<void>;
@@ -104,9 +104,9 @@ export class Workflow{
  async reconcileBlockedPlanning(job:string){
   const dispatch=this.planning(job),r=new Planning(this.s).get(job);
   if(!['planning','dispatch_uncertain','needs_reconciliation'].includes(dispatch.state))return {state:dispatch.state};
-  let session=dispatch.session_id;
+  let session=dispatch.session_id??r.session_id;
   if(!session){
-   const matches=await this.t.findPlans(r.project,r.branch);
+   const matches=await this.t.findPlans(r.project,r.branch,true);
    if(matches.length!==1)return {state:'needs_reconciliation',reason:'Blocked planning outcome remains uncertain'};
    session=matches[0].id;
   }

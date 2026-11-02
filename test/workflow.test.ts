@@ -619,6 +619,7 @@ test('blocked uncertain reservations persist across restart until unique matchin
  const dir=mkdtempSync(join(tmpdir(),'adlc-blocked-plan-'));let s=new Store(join(dir,'db'));const f=new Fake(s);f.loseSpawn=true;
  try{
   let w=new Workflow(s,f);const id=s.enqueue('p','first','spec');s.enqueue('p','next','spec');await w.startPlanning(id,config);
+  s.db.query('UPDATE planning_runs SET session_id=NULL WHERE job=?').run(id);
   s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(id);s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
   const find=f.findPlans.bind(f),e=f.sessions.get('session-1');f.completePlan();
   for(const matches of [[],[e.session,e.session]]){
@@ -677,4 +678,47 @@ test('blocked captured plans retain their dispatch and can be recaptured after e
   expect(reads).toBe(1);expect(w.planning(id).state).toBe('awaiting_approval');expect(s.get(id).state).toBe('awaiting_approval');
   expect(s.get(id).plan_hash).toBe(hash);expect(s.get(id).approved_hash).toBeNull();expect(f.starts.length).toBe(1);expect(f.sends).toEqual([]);
  }finally{s.close();}
+});
+
+// Real inventory transport path, but no host AO command or provider request.
+function inventoryTransport(sessions:any[]){
+ const calls:string[][]=[];
+ const spawn=((args:string[])=>{
+  calls.push(args);
+  const data=args[2]==='ls'?{data:sessions.map(s=>({id:s.id,projectId:s.projectId,isTerminated:s.isTerminated}))}:{session:sessions.find(s=>s.id===args[3])};
+  return {stdout:new Blob([JSON.stringify(data)]).stream(),stderr:new Blob([]).stream(),exited:Promise.resolve(0)};
+ }) as any;
+ return {calls,transport:createWorkflowTransport(async operation=>operation(),spawn)};
+}
+
+test('inventory transport includes terminated matches only when explicitly requested and retains ambiguity',async()=>{
+ const ended={id:'ended',projectId:'project',branch:'branch',isTerminated:true};
+ const rows=[ended,{id:'other-project',projectId:'elsewhere',branch:'branch',isTerminated:true},{id:'other-branch',projectId:'project',branch:'elsewhere',isTerminated:true}];
+ const {calls,transport}=inventoryTransport(rows);
+ expect(await transport.findPlans('project','branch')).toEqual([]);
+ expect(await transport.findPlans('project','branch',true)).toEqual([ended]);
+ expect(calls.filter(a=>a[2]==='ls').every(a=>a.includes('--include-terminated'))).toBe(true);
+ rows.push({...ended,id:'another-ended'});
+ expect((await transport.findPlans('project','branch',true)).length).toBe(2);
+});
+
+test('lost spawn reply then termination releases blocked capacity using recorded run or terminated inventory',async()=>{
+ for(const recorded of [true,false]){
+  const dir=mkdtempSync(join(tmpdir(),'adlc-terminated-spawn-'));let s=new Store(join(dir,'db'));const f=new Fake(s);f.loseSpawn=true;
+  try{
+   let w=new Workflow(s,f);const id=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   await w.startPlanning(id,config);expect(w.planning(id).session_id).toBeNull();
+   if(!recorded)s.db.query('UPDATE planning_runs SET session_id=NULL WHERE job=?').run(id);
+   s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(id);
+   const ended=f.sessions.get('session-1').session;ended.isTerminated=true;
+   const {calls,transport}=inventoryTransport([ended]);
+   f.findPlans=recorded?async()=>{throw Error('Recorded planning-run identity must avoid inventory');}:transport.findPlans;
+   s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+   await w.tick(config);
+   expect(w.planning(id).state).toBe('planning_finished');expect(w.planning(id).session_id).toBe('session-1');
+   expect(w.planning(next).state).toBe('dispatch_uncertain');expect(f.starts.length).toBe(2);
+   expect(s.get(id).state).toBe('blocked');expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+   expect(calls.length>0).toBe(!recorded);
+  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+ }
 });
