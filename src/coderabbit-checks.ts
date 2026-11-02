@@ -22,6 +22,9 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  const errors=section.split('\n').filter(l=>/^\s*\|/.test(l)&&/!\[Error\]/i.test(l));
  const blocked=(reason:string)=>({...empty,blocker:errors.length?`CodeRabbit custom-check failure: ${reason}`:null});
  if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
+ // A known older bot review is waiting evidence, not a current custom-check
+ // failure. Missing/malformed provenance must still take the fail-closed path.
+ if(context&&bot(review?.user)&&review.user.id===summary.user.id&&typeof review.commit_id==='string'&&/^[a-f0-9]{40,64}$/.test(review.commit_id)&&review.commit_id!==head)return empty;
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
  if(version?.headRefOid!==head||version.body!==body||!Number.isFinite(time(version.createdAt))||!(version.lastEditedAt===null||Number.isFinite(time(version.lastEditedAt))))return blocked('current description version is unavailable');

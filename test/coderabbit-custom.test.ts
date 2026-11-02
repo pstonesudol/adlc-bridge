@@ -13,9 +13,10 @@ test('PR108 regression: green run plus custom Verification Evidence error is sco
 test('warnings and old walkthrough NEEDS_EVIDENCE prose do not become failing custom checks',()=>{
  for(const status of ['Warning','Passed']){const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]','!['+status+']');f.review.state='APPROVED';expect(f.evidence()).toMatchObject({blocker:null,findings:[],bodyReviewed:true});}
 });
-for(const change of ['stale-head','edited-summary','edited-body','unknown-body','spoof-review','spoof-comment','wrong-pr','missing-details','truncated-details','duplicate-summary','ambiguous-run','stale-section','pending-run'])test(`custom evidence fails closed: ${change}`,()=>{
+for(const change of ['missing-commit','malformed-commit','edited-summary','edited-body','unknown-body','spoof-review','spoof-comment','wrong-pr','missing-details','truncated-details','duplicate-summary','ambiguous-run','stale-section','pending-run'])test(`custom evidence fails closed: ${change}`,()=>{
  const f=customFixture();
- if(change==='stale-head')f.review.commit_id='b'.repeat(40);
+ if(change==='missing-commit')delete (f.review as any).commit_id;
+ if(change==='malformed-commit')f.review.commit_id='';
  if(change==='edited-summary')f.comments[0].updated_at='2026-11-01T01:03:00Z';
  if(change==='edited-body')f.context.version.lastEditedAt='2026-11-01T01:01:00Z';
  if(change==='unknown-body')(f.context as any).version=undefined;
@@ -29,6 +30,12 @@ for(const change of ['stale-head','edited-summary','edited-body','unknown-body',
  if(change==='stale-section')f.comments[0].body=f.comments[0].body.replace('<!-- pre_merge_checks_walkthrough_end -->','');
  if(change==='pending-run')f.context.checks[0].status='in_progress';
  expect(f.evidence().findings).toEqual([]);if(change==='pending-run')expect(f.evidence().blocker).toBeNull();else expect(f.evidence().blocker).toBeTruthy();
+});
+test('a known stale-head bot review waits for the current-head run rather than becoming a custom blocker',()=>{
+ const f=customFixture();f.review.commit_id='b'.repeat(40);f.context.checks=[];
+ const e=f.evidence();expect(e).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],failedChecks:[],pendingChecks:[],missingChecks:[]},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+ expect(customCheckEvidence(f.review,f.head,f.comments).blocker).toBeTruthy();
 });
 test('unrelated newer bot command replies never replace the summary; edits change evidence identity',()=>{
  const f=customFixture(),original=f.evidence().findings[0];
