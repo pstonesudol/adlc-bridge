@@ -599,3 +599,38 @@ test('preview reconciliation exposes the three reported blockers without applyin
  expect(s.db.query('SELECT job,state FROM implementation_dispatch ORDER BY job').all()).toEqual(before);
  s.close();
 });
+
+test('blocked planning releases capacity only after authoritative completion without restoring eligibility',async()=>{
+ for(const terminated of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const id=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');await w.startPlanning(id,config);
+   s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+   await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('planning');
+   if(terminated)f.sessions.get('session-1').session.isTerminated=true;else f.completePlan();
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(w.planning(next).state).toBe('planning');
+   expect(s.get(id).state).toBe('blocked');expect(s.get(id).plan_hash).toBeNull();expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+   await w.tick(config);expect(f.starts.length).toBe(2);
+  }finally{s.close();}
+ }
+});
+
+test('blocked uncertain reservations persist across restart until unique matching ended-session evidence',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-blocked-plan-'));let s=new Store(join(dir,'db'));const f=new Fake(s);f.loseSpawn=true;
+ try{
+  let w=new Workflow(s,f);const id=s.enqueue('p','first','spec');s.enqueue('p','next','spec');await w.startPlanning(id,config);
+  s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(id);s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+  const find=f.findPlans.bind(f),e=f.sessions.get('session-1');f.completePlan();
+  for(const matches of [[],[e.session,e.session]]){
+   f.findPlans=async()=>matches;await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');
+  }
+  f.findPlans=find;
+  for(const key of ['id','projectId','branch']){
+   const original=e.session[key];e.session[key]='wrong';await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');e.session[key]=original;
+  }
+  e.transcript.controller='busy';await w.tick(config);expect(f.starts.length).toBe(1);
+  e.transcript.controller='ready';e.transcript.turns.push({id:'live',state:'running'});await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.turns.pop();
+  const text=e.transcript.entries[0].text;e.transcript.entries[0].text='Uncorrelated plan';await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.entries[0].text=text;
+  await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(f.starts.length).toBe(2);expect(f.sends).toEqual([]);expect(s.get(id).state).toBe('blocked');
+ }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});

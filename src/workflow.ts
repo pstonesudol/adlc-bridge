@@ -17,7 +17,7 @@ import {effectiveSettings} from './project-settings';
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
 // Completed planning dispatches release their slot even if manually proposed.
-const activePlanning="(d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state!='awaiting_approval' AND j.state NOT IN ('awaiting_approval','approved','done')))";
+const activePlanning="(d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
@@ -101,9 +101,34 @@ export class Workflow{
    return {state:'dispatch_uncertain'};
   }
  }
+ async reconcileBlockedPlanning(job:string){
+  const dispatch=this.planning(job),r=new Planning(this.s).get(job);
+  if(dispatch.state==='planning_finished')return {state:'planning_finished'};
+  let session=dispatch.session_id;
+  if(!session){
+   const matches=await this.t.findPlans(r.project,r.branch);
+   if(matches.length!==1)return {state:'needs_reconciliation',reason:'Blocked planning outcome remains uncertain'};
+   session=matches[0].id;
+  }
+  const e=await this.t.evidence(session);
+  if(!session||e.session?.id!==session||e.session.projectId!==r.project||e.session.branch!==r.branch||r.session_id&&r.session_id!==session)return {state:'needs_reconciliation',reason:'Blocked planning session identity mismatch'};
+  const turns=e.transcript?.turns,marker=`<!-- ADLC_PLAN_READY:${r.correlation} -->`;
+  const terminal=Array.isArray(turns)&&turns.length>0&&turns.every((t:any)=>['completed','failed','cancelled','interrupted'].includes(t.state));
+  const complete=new Set((turns??[]).filter((t:any)=>t.state==='completed').map((t:any)=>t.id));
+  const ended=e.session.isTerminated===true||e.transcript?.controller==='ready'&&terminal&&e.transcript.entries?.some((x:any)=>x.kind==='message'&&x.role==='assistant'&&x.origin==='provider'&&!x.streaming&&complete.has(x.turnId)&&x.text?.includes(marker));
+  if(!ended)return {state:'needs_reconciliation',reason:'No authoritative end of blocked planning'};
+  return this.s.db.transaction(()=>{
+   const latest=this.planning(job);
+   if(this.s.get(job).state!=='blocked'||latest.client_id!==dispatch.client_id||latest.session_id!==dispatch.session_id)return {state:'needs_reconciliation'};
+   this.s.db.query("UPDATE planning_dispatch SET state='planning_finished',session_id=?,reason='Planning ended while job remained blocked; no plan captured or approval granted' WHERE job=?").run(session,job);
+   this.s.event(job,'blocked_planning_finished',session);
+   return {state:'planning_finished',session};
+  }).immediate();
+ }
  async reconcilePlanning(job:string,c:WorkflowConfig){
   const dispatch=this.planning(job);if(!dispatch)return;
   const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
+  if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');
   if(j.state==='awaiting_approval'){await this.prepareImplementationRoute(job,c);return {state:j.state};}
   if(j.state!=='awaiting_plan')return {state:j.state};
@@ -459,7 +484,7 @@ export class Workflow{
   new ApprovalPolicyStore(this.s).revokeChanged(c.linear.projectId,c.approval);
   this.s.db.query('INSERT INTO project_execution_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET runtime=excluded.runtime').run(c.linear.projectId,'supervised-host');
   // Recover existing planning/delivery first. One uncertain session consumes a slot.
-  const planning=this.s.db.query('SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND j.state IN (?,?)').all(c.linear.projectId,'awaiting_plan','awaiting_approval') as any[];
+  const planning=this.s.db.query("SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND (j.state IN ('awaiting_plan','awaiting_approval') OR (j.state='blocked' AND d.state!='planning_finished'))").all(c.linear.projectId) as any[];
   for(const d of planning)try{results.push({job:d.job,...await this.reconcilePlanning(d.job,c)});}catch(e){results.push({job:d.job,error:e instanceof Error?e.message:'Planning reconcile failed'});}
   if(c.approval?.mode==='ready-queue'){
    const waiting=this.s.db.query("SELECT id FROM jobs WHERE project=? AND state='awaiting_approval'").all(c.linear.projectId) as any[];
