@@ -349,6 +349,7 @@ export class Workflow{
  // publishes, adopts, or repairs delivery evidence.
  async recoveredDelivery(job:string,c:WorkflowConfig|undefined,e:any,prs:any[],d:any,continuationId?:number){
   if(prs.length!==1||!c?.githubRepo||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_adoptions'").get()||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuation_recoveries'").get())return false;
+  if(prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)return false;
   if(!(this.s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))return false;
   let local;
   try{local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));}catch{return false;}

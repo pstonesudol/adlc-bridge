@@ -152,6 +152,14 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   expect((await w.executionStatus(id,e,config)).state).toBe('failed');
   (f as any).branchSnapshot=snapshot;
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  // A same-number PR attached from another repository/host is not this target.
+  for(const url of ['https://github.com/other/repo/pull/1','https://example.com/owner/repo/pull/1',undefined]){
+   e.session.prs[0].url=url;
+   expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+   expect(w.implementation(id).state).not.toBe('pr_handoff');
+  }
+  e.session.prs[0].url='https://github.com/owner/repo/pull/1';
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
  }finally{s.close();}
 });
 test('recovery for an earlier continuation cannot authorize a newer failed continuation',async()=>{
