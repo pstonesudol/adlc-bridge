@@ -69,6 +69,24 @@ for(const [name,change] of Object.entries({
  fork:(f:DeliveryFacts)=>f.candidates[0].fork=true,similar:(f:DeliveryFacts)=>f.candidates[0].repo='owner/repo-evil',diverged:(f:DeliveryFacts)=>f.candidates[0].head='c'.repeat(40),default:(f:DeliveryFacts)=>f.candidates[0].defaultBranch=f.branch,
  session:(f:DeliveryFacts)=>f.session='imposter',branch:(f:DeliveryFacts)=>f.candidates[0].branch='similar',closed:(f:DeliveryFacts)=>f.candidates[0].state='closed'
 }))test(`recovery fails closed: ${name}`,async()=>{const f=fixture();const expected:Record<string,string>={lineage:'Reserved branch lineage',dirty:'Clean registered isolated worktree',shared:'Clean registered isolated worktree',queued:'Idle controller',receipt:'Completed original implementation',owner:'Another active session',duplicate:'Exactly one unambiguous',missing:'Exactly one unambiguous',fork:'Existing PR repository',similar:'Existing PR repository',diverged:'Existing PR repository',default:'Existing PR repository',branch:'Existing PR repository',closed:'Existing PR repository',session:'identity mismatch'};try{change(f.facts);await expect(f.recovery.preview(f.id,f.c)).rejects.toThrow(expected[name]);expect(f.calls()).toBe(0);}finally{f.s.close();}});
+test('explicit confirmation binds recovery to the failed continuation and repairs only that failed dispatch',async()=>{
+ const f=fixture();try{
+  const p=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,p.hash);
+  const cont=Number(f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(f.id,f.s.get(f.id).plan_hash,f.r.spec_hash,'failure-one','continue-one','worker','failed',Date.now()).lastInsertRowid);
+  f.s.db.query("UPDATE implementation_dispatch SET state='failed',reason='Continuation failed' WHERE job=?").run(f.id);
+  // The earlier adoption predates this failure and cannot recover it.
+  expect(f.s.db.query('SELECT * FROM continuation_recoveries').all()).toHaveLength(0);
+  const first=await f.recovery.confirm(f.id,f.c,p.hash);
+  expect(first.continuationRecovery).toBe(cont);
+  expect(f.s.db.query('SELECT job,proposal,head FROM continuation_recoveries WHERE continuation=?').get(cont)).toEqual({job:f.id,proposal:p.hash,head:f.facts.head});
+  expect((f.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(f.id) as any).state).toBe('pr_handoff');
+  const later=Number(f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(f.id,f.s.get(f.id).plan_hash,f.r.spec_hash,'failure-two','continue-two','worker','failed',Date.now()).lastInsertRowid);
+  f.s.db.query("UPDATE implementation_dispatch SET state='failed',reason='Later continuation failed' WHERE job=?").run(f.id);
+  expect((f.s.db.query('SELECT count(*) AS n FROM continuation_recoveries').get() as any).n).toBe(1);
+  expect((await f.recovery.confirm(f.id,f.c,p.hash)).continuationRecovery).toBe(later);
+  expect((f.s.db.query('SELECT count(*) AS n FROM continuation_recoveries').get() as any).n).toBe(2);
+ }finally{f.s.close();}
+});
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('lost claim receipt reconciles attachment without another claim; concurrent confirms are bounded',async()=>{const f=fixture();try{f.lose();const p=await f.recovery.preview(f.id,f.c);await Promise.allSettled([f.recovery.confirm(f.id,f.c,p.hash),f.recovery.confirm(f.id,f.c,p.hash)]);await f.recovery.confirm(f.id,f.c,p.hash);expect(f.calls()).toBe(1);}finally{f.s.close();}});
 test('uncertain unattached claim is durable and never replayed',async()=>{const f=fixture();try{f.t.claim=async()=>{throw Error('unknown');};const p=await f.recovery.preview(f.id,f.c);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');let calls=0;f.t.claim=async()=>{calls++;};await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('uncertain');expect(calls).toBe(0);}finally{f.s.close();}});

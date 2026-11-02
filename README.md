@@ -1285,11 +1285,14 @@ continuation. A continuation whose own transcript turn failed, was cancelled or
 was interrupted remains a durable failed state. A later completed remediation
 turn cannot turn that failure into a PR handoff, and another clarification answer
 cannot resume it. Recovery requires the existing explicit `recover-handoff`
-delivery adoption, and only an `adopted` record matching the same job, plan,
-requirements, session, repository, PR, worktree branch and exact current head
-settles it. Until then, workflow handoff and review dispatch remain blocked with
-a concrete reconciliation reason; review settlement re-reads the adopted evidence
-and never repairs or fabricates it. Tests cover the real merged foundation with
+delivery adoption plus a confirmation made after that failure. Confirmation
+records recovery against that specific continuation, and only an `adopted` record
+matching the same job, plan, requirements, session, repository, PR, worktree
+branch and exact current head settles it. An adoption that predates a later
+failure has no such record and cannot recover it; that dispatch repairs only the
+guarded `failed` to handoff transition. Until then, workflow handoff and review
+dispatch remain blocked with a concrete reconciliation reason; review settlement
+re-reads the adopted evidence and never repairs or fabricates it. Tests cover the real merged foundation with
 fake provider/session evidence; they do not exercise live Linear, install code or
 activate services.
 

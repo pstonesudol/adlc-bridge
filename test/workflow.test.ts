@@ -102,18 +102,47 @@ for(const [continuationTurn,selectedTurn,priorState,expected,state] of [
 test('a failed continuation hands off only with exact adopted-delivery recovery evidence',async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
-  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','failed');
+  const failedAt=Date.now()-1000,cont=Number(s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','failed',failedAt).lastInsertRowid);
   const e=f.sessions.get('session-1'),r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any;
   e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'});
   e.transcript.turns.push({id:'continue-turn',state:'completed'});
-  s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL)');
+  s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL); CREATE TABLE continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL,proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL)');
   const adopt=(over:any={})=>s.db.query('INSERT OR REPLACE INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal',over.state??'adopted',over.session??'session-1',over.worktree??'/worktrees/session-1',r.branch,over.branch??r.branch,'owner/repo',1,over.head??'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
   expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
   adopt({state:'reserved'});expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
   adopt({head:'c'.repeat(40)});expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
   adopt({worktree:'/other'});expect((await w.executionStatus(id,e,config)).state).toBe('blocked');
-  adopt();const recovered=await w.executionStatus(id,e,config);
+  // An adoption that predates the failure has no continuation-bound recovery.
+  adopt();expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(cont,id,'other-proposal','a'.repeat(40),Date.now());
+  expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  s.db.query('UPDATE continuation_recoveries SET proposal=? WHERE continuation=?').run('proposal',cont);
+  const recovered=await w.executionStatus(id,e,config);
   expect(recovered.state).toBe('pr_handoff');expect(w.outcomes(id).outcome).toBe('pr_handoff');
+  // The same adoption predates a later continuation failure and cannot recover it.
+  const later=Number(s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'later','continue-later','session-1','failed',Date.now()).lastInsertRowid);
+  e.transcript.entries.push({sequence:6,clientMessageId:'continue-later',turnId:'later-turn'});
+  e.transcript.turns.push({id:'later-turn',state:'completed'});
+  expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(later,id,'proposal','a'.repeat(40),Date.now());
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+ }finally{s.close();}
+});
+test('an actually failed continuation turn is recovered before the failed-turn early return',async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
+  const r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any,e=f.sessions.get('session-1');
+  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','delivery_accepted');
+  e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'});
+  e.transcript.turns.push({id:'continue-turn',state:'failed'});
+  expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+  const failed=s.db.query("SELECT * FROM continuations WHERE client_id='continue-owned'").get() as any;
+  expect(failed.state).toBe('failed');expect(Number.isSafeInteger(failed.failed_at)).toBe(true);
+  s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL); CREATE TABLE continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL,proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL)');
+  s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal','adopted','session-1','/worktrees/session-1',r.branch,r.branch,'owner/repo',1,'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
+  s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
  }finally{s.close();}
 });
 test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{

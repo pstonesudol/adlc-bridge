@@ -57,6 +57,7 @@ export class Workflow{
     client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,paths TEXT NOT NULL,runtime TEXT NOT NULL,
     actor TEXT NOT NULL,reason TEXT);`);
   if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
+  if(!(s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))s.db.exec('ALTER TABLE continuations ADD COLUMN failed_at INTEGER');
  }
  planning(job:string):any{return this.s.db.query('SELECT * FROM planning_dispatch WHERE job=?').get(job);}
  implementation(job:string):any{return this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job);}
@@ -292,12 +293,15 @@ export class Workflow{
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
    const contTurn=contEntry&&e.transcript?.turns?.find((t:any)=>t.id===contEntry.turnId);
    if(cont&&contTurn){
-    if(['failed','cancelled','interrupted'].includes(contTurn.state))this.s.db.query("UPDATE continuations SET state='failed',reason=? WHERE id=?").run('Continuation turn failed or was cancelled',cont.id);
+    if(['failed','cancelled','interrupted'].includes(contTurn.state))this.s.db.query("UPDATE continuations SET state='failed',failed_at=COALESCE(failed_at,?),reason=? WHERE id=?").run(Date.now(),'Continuation turn failed or was cancelled',cont.id);
     else if(contTurn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state!='failed'").run(cont.id);
    }
    this.s.db.query('UPDATE implementation_dispatch SET state=?,reason=? WHERE job=?').run(result.state,result.reason??null,job);
    return {...this.saveOutcome(job,d,result,graceMs,now,this.outcomes(job)),session:d.session_id};
   };
+  const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
+  const contEntry=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()&&cont?e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id):null;
+  const contTurn=contEntry&&e.transcript?.turns?.find((t:any)=>t.id===contEntry.turnId);
   if(!entry||!turn){
    if(cont&&!entry){
     if(cont.state==='delivery_accepted')return finish({state:'implementation_running',outcome:'running',reason:'Continuation accepted; awaiting its transcript receipt',questions:[],dependencies:[],source:'receipt',confidence:'medium'});
@@ -305,9 +309,15 @@ export class Workflow{
    }
    return finish({state:'needs_reconciliation',outcome:'uncertain',reason:'No authoritative delivery receipt; never resend',questions:[],dependencies:[],source:'receipt',confidence:'low'});
   }
-  if(['failed','cancelled','interrupted'].includes(turn.state))return finish({state:'failed',outcome:'failed',reason:'Implementation turn failed or cancelled; explicit recovery required',questions:[],dependencies:[],source:'receipt',confidence:'high'});
+  if(['failed','cancelled','interrupted'].includes(turn.state)){
+   // A failed continuation's own turn is the selected receipt when no newer
+   // remediation exists. Verified, continuation-bound recovery must be reached
+   // here as well as after the later completed-turn path.
+   const recovered=await this.recoveredDelivery(job,c,e,prs,d,cont?.id);
+   if(turn.id===contTurn?.id&&recovered)return finish({state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'delivery-recovery',confidence:'high'});
+   return finish({state:'failed',outcome:'failed',reason:'Implementation turn failed or cancelled; explicit recovery required',questions:[],dependencies:[],source:'receipt',confidence:'high'});
+  }
   if(turn.state!=='completed')return finish({state:'implementation_running',outcome:'running',reason:null,questions:[],dependencies:[],source:'receipt',confidence:'high'});
-  const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   try{
    const local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));
    const expected=deliveryBranch(this.s,job,e.session);
@@ -327,10 +337,8 @@ export class Workflow{
   // Existing delivery adoption can establish recovery only when its reviewed
   // proposal binds this job, session, repository, PR, head, plan and worktree.
   const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any:null;
-  const contEntry=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()&&cont?e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id):null;
-  const contTurn=contEntry&&e.transcript?.turns?.find((t:any)=>t.id===contEntry.turnId);
   const continuationFailed=!!failed||['failed','cancelled','interrupted'].includes(contTurn?.state);
-  if(continuationFailed&&!(await this.recoveredDelivery(job,c,e,prs,d))){
+  if(continuationFailed&&!(await this.recoveredDelivery(job,c,e,prs,d,failed?.id??cont?.id))){
    return finish({state:'needs_reconciliation',outcome:'failed',reason:'Previous guarded continuation failed and has no exact reviewed delivery recovery; inspect recovery evidence and never infer handoff',questions:[],dependencies:[],source:'continuation',confidence:'high'});
   }
   if(contTurn&&!['completed','failed','cancelled','interrupted'].includes(contTurn.state))return finish({state:'implementation_running',outcome:'running',reason:'Guarded continuation is still active; do not infer handoff',questions:[],dependencies:[],source:'continuation',confidence:'high'});
@@ -338,12 +346,20 @@ export class Workflow{
  }
  // Read-only recovery assertion shared by handoff and the review loop. It never
  // publishes, adopts, or repairs delivery evidence.
- async recoveredDelivery(job:string,c:WorkflowConfig|undefined,e:any,prs:any[],d:any){
-  if(prs.length!==1||!c?.githubRepo||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_adoptions'").get())return false;
+ async recoveredDelivery(job:string,c:WorkflowConfig|undefined,e:any,prs:any[],d:any,continuationId?:number){
+  if(prs.length!==1||!c?.githubRepo||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_adoptions'").get()||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuation_recoveries'").get())return false;
+  if(!(this.s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))return false;
   let local;
   try{local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));}catch{return false;}
   const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=? AND head=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec),local.head) as any;
-  return !!adopted&&local.head===adopted.head&&(local as any).branch===adopted.branch&&canonicalWorktree(adopted.worktree)===canonicalWorktree((local as any).tree??(local as any).worktree);
+  if(!adopted||local.head!==adopted.head||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree((local as any).tree??(local as any).worktree))return false;
+  // Recovery must belong to the specific failed continuation, not an adoption
+  // that existed before a later continuation failed.
+  const failed=continuationId
+   ?this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE id=? AND job=?").get(continuationId,job) as any
+   :this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any;
+  if(!failed||failed.state!=='failed')return false;
+  return !!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head);
  }
  continuation(job:string):any{
   if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get())return null;
@@ -471,7 +487,7 @@ export class Workflow{
    remediationTarget={...target,kind:attempt.kind};
   }
   const failedContinuation=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,j.plan_hash) as any:null;
-  if(failedContinuation&&!(await this.recoveredDelivery(job,c,e,prs,d)))throw Error('Previous guarded continuation failed; exact reviewed delivery recovery required before resuming');
+  if(failedContinuation&&!(await this.recoveredDelivery(job,c,e,prs,d,failedContinuation.id)))throw Error('Previous guarded continuation failed; exact reviewed delivery recovery required before resuming');
   const unresolved=this.unresolvedContinuation(job,j.plan_hash);
   if(unresolved){
    if(unresolved.state==='delivery_uncertain'||unresolved.state==='reserved')throw Error('Continuation delivery is uncertain; never resend. Reconcile the existing session first');
