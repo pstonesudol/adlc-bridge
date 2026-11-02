@@ -1,4 +1,6 @@
 import {Store} from './core';
+import {Database} from 'bun:sqlite';
+import {verifiedCoordinator} from './coordinator-gate';
 import {Planning} from './planning';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
@@ -17,6 +19,19 @@ async function gate(){
     const p=Bun.spawn(['/usr/bin/git','branch','--show-current'],{cwd,stdout:'pipe',stderr:'pipe'});
     const [branch,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
     if(code!==0)throw Error('Cannot verify branch');
+    const dataRoot=join(homedir(),'.ao','data');
+    const registry=new Database(join(dataRoot,'ao.db'),{readonly:true});
+    try{
+      if(verifiedCoordinator(registry,project,source,cwd,dataRoot)){
+        const common=async(path:string)=>{
+          const p=Bun.spawn(['/usr/bin/git','rev-parse','--path-format=absolute','--git-common-dir'],{cwd:path,stdout:'pipe',stderr:'pipe'});
+          const [out,code]=await Promise.all([new Response(p.stdout).text(),p.exited]);
+          if(code!==0)throw Error('Cannot verify coordinator repository');return realpath(out.trim());
+        };
+        if(await common(cwd)!==await common(source))throw Error('Coordinator repository mismatch');
+        console.log('ADLC: verified project coordinator admitted; ticket workers retain their planning and implementation gates');return;
+      }
+    }finally{registry.close();}
     const s=new Store(join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite'));
     try{
       new Planning(s);

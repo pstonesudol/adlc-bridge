@@ -950,3 +950,20 @@ operations. Run reconciliation cannot replace an adopted session/worktree.
 Native reservation metadata stays unchanged. Human merges remain mandatory;
 there is no auto-merge or deployment. DEV-30/#7 validation for DEV-31 is preview
 only; any live adoption is a separate operator action after reviewed installation.
+
+### Project coordinator setup
+
+The setup hook admits a project coordinator only after matching the native AO
+project/session registry, the canonical coordinator workspace, and the source
+repository's Git common directory. Ticket workers still require a durable ADLC
+planning reservation; a branch name or environment role flag does not grant access.
+
+This integration currently reads the default local AO registry at `~/.ao/data/ao.db`
+in read-only mode and recognizes AO's managed coordinator layout
+`worktrees/<project>/orchestrator/<sessionPrefix>-orchestrator` (the prefix defaults
+to the first 12 characters of the project ID). A custom AO data directory or a
+changed native schema/layout is unsupported and fails closed. The registry must
+contain exactly one non-terminated coordinator for the project. During initial
+setup its stored workspace may be empty, so the native coordinator-only layout
+and shared Git directory establish workspace identity. This admits coordinator
+startup; it does not approve a ticket plan, merge a PR, or activate a new runtime.
