@@ -42,3 +42,11 @@ test('full nested resolution details are retained rather than silently cut at an
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.','<details><summary>Commands</summary>Exact commands required.</details> Preserve historical checks and report runtime limitations.');
  expect(f.evidence().findings[0].body).toContain('Preserve historical checks and report runtime limitations.');
 });
+for(const text of ['Run `go test ./...` and record the result.','The log output was truncated; inspect the complete artifact before reporting.','Compare old...new results, then record current-head verification.'])test(`complete details allow ordinary text: ${text}`,()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',text);
+ const result=f.evidence();expect(result.blocker).toBeNull();expect(result.findings).toHaveLength(1);expect(result.findings[0].body).toContain(text);
+});
+for(const ending of ['Incomplete…','Incomplete...','<dl><dd>Incomplete… </dd> </dl>','<p>Incomplete... </p>'])test(`trailing ellipsis still fails closed: ${ending}`,()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',ending);
+ expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toContain('missing or truncated');
+});

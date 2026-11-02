@@ -46,7 +46,7 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
   else depth++;
  }
  const details=endDetails<0?'':tail.slice(0,endDetails).trim();
- if(!details||details.length>60000||/\u2026|\.\.\.|truncated/i.test(details)||!details.replace(/<[^>]*>/g,'').trim()||! /\*\*Explanation\*\*/i.test(details)||! /\*\*Resolution\*\*/i.test(details))return blocked('full Verification Evidence explanation/resolution is missing or truncated');
+ if(!details||details.length>60000||/(\u2026|\.\.\.)\s*(<\/[^>]+>\s*)*$/.test(details)||!details.replace(/<[^>]*>/g,'').trim()||! /\*\*Explanation\*\*/i.test(details)||! /\*\*Resolution\*\*/i.test(details))return blocked('full Verification Evidence explanation/resolution is missing or truncated');
  const descriptionHash=digest(body),evidenceHash=digest(JSON.stringify([review.id,summary.id,summary.updated_at,summary.body,run.id,head,descriptionHash]));
  return {blocker:null,bodyReviewed:true,findings:[{source:'coderabbit-custom',kind:'pr_description',path:null,sha:head,descriptionHash,reviewId:review.id,commentId:summary.id,checkId:run.id,evidenceHash,body:`${errors[0]}\n\n${details}`} ]};
 }

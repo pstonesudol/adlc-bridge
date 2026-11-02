@@ -74,6 +74,31 @@ test('an existing PR does not hide a delivered remediation blocker; only the rec
   expect(f.sends.at(-1).prompt).toContain('Description and verification only');expect(f.sends).toHaveLength(2);expect(s.get(id).attempts).toBe(1);
  }finally{s.close();}
 });
+for(const [continuationTurn,selectedTurn,priorState,expected] of [
+ ['completed','running','delivery_accepted','completed'],
+ ['completed','completed','delivery_accepted','completed'],
+ ['failed','completed','delivery_accepted','failed'],
+ ['cancelled','completed','delivery_accepted','failed'],
+ ['interrupted','completed','delivery_accepted','failed'],
+ ['running','completed','delivery_accepted','delivery_accepted'],
+ ['completed','completed','failed','failed'],
+])test(`continuation receipt ${continuationTurn} settles independently of newer remediation ${selectedTurn} (${priorState})`,async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
+  const loop=new ReviewLoop(s);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
+  const attempt=new Lifecycle(s).reserveRemediation(id,'a'.repeat(40),'newer remediation') as any;
+  s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(id,attempt.attempt,'pr_description','old-body');
+  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1',priorState);
+  const e=f.sessions.get('session-1');
+  e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'},{sequence:5,clientMessageId:`adlc-fix-${id.slice(0,12)}-${attempt.attempt}`,turnId:'newer-fix'});
+  e.transcript.turns.push({id:'continue-turn',state:continuationTurn},{id:'newer-fix',state:selectedTurn});
+  await w.executionStatus(id,e,config,Date.now(),false);expect(w.continuation(id).state).toBe(priorState);
+  const result=await w.executionStatus(id,e,config);
+  expect(result.state).toBe(selectedTurn==='running'?'implementation_running':'pr_handoff');
+  expect(w.continuation(id).state).toBe(expected);
+  if(expected==='completed')expect(w.unresolvedContinuation(id,hash)).toBeNull();
+ }finally{s.close();}
+});
 test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{
  const {s,f,w,id,hash}=await planned();
  try{

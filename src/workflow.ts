@@ -287,9 +287,13 @@ export class Workflow{
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{
    if(!persist)return {...result,session:d.session_id};
-   if(cont&&turn&&entry?.clientMessageId===cont.client_id){
-    if(['failed','cancelled','interrupted'].includes(turn.state))this.s.db.query("UPDATE continuations SET state='failed',reason=? WHERE id=?").run('Continuation turn failed or was cancelled',cont.id);
-    else if(turn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state!='failed'").run(cont.id);
+   // A later remediation may be selected for the workflow outcome, but only
+   // the continuation's own receipt can settle its durable delivery state.
+   const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
+   const contTurn=contEntry&&e.transcript?.turns?.find((t:any)=>t.id===contEntry.turnId);
+   if(cont&&contTurn){
+    if(['failed','cancelled','interrupted'].includes(contTurn.state))this.s.db.query("UPDATE continuations SET state='failed',reason=? WHERE id=?").run('Continuation turn failed or was cancelled',cont.id);
+    else if(contTurn.state==='completed')this.s.db.query("UPDATE continuations SET state='completed',reason=NULL WHERE id=? AND state!='failed'").run(cont.id);
    }
    this.s.db.query('UPDATE implementation_dispatch SET state=?,reason=? WHERE job=?').run(result.state,result.reason??null,job);
    return {...this.saveOutcome(job,d,result,graceMs,now,this.outcomes(job)),session:d.session_id};
