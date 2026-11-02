@@ -398,6 +398,28 @@ test('resume rejects a busy worker and a different configured project',async()=>
  await expect(w.resume(id,config)).rejects.toThrow('Worker is not idle');
  expect(f.sends.length).toBe(1);s.close();
 });
+test('dependency-only plans cannot mask worker requirement or security questions',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(config);
+ f.completePlan('session-1',JSON.stringify({version:1,readiness:'blocked-by-dependency',questions:[],dependencies:[{ref:'DEV-9',reason:'Upstream wording'}],risks:[]}));
+ await w.tick(config);recordResolution(s,id,'dependency-satisfied','Alice','DEV-9 complete');
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(`<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome:'needs-input',reason:'Security decision needed',questions:[{id:'w1',question:'May we change access?',kind:'security-scope'}],dependencies:[]})} -->`);
+ await w.tick(config);recordResolution(s,id,'dependency-satisfied','Alice','DEV-9 complete again');
+ await expect(w.resume(id,config)).rejects.toThrow('human answer');
+ recordResolution(s,id,'human-answer','Alice','Access scope approved');
+ expect((await w.resume(id,config)).state).toBe('continuation_delivery_accepted');s.close();
+});
+test('blocked-dependency worker outcomes still require answers for non-dependency questions',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
+ w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(workerBlock('blocked-dependency','Which requirement applies?','DEV-9'));await w.tick(config);
+ recordResolution(s,id,'dependency-satisfied','Alice','DEV-9 complete');
+ await expect(w.resume(id,config)).rejects.toThrow('human answer');
+ recordResolution(s,id,'human-answer','Alice','Requirement chosen');
+ expect((await w.resume(id,config)).state).toBe('continuation_delivery_accepted');s.close();
+});
 test('worker outcome questions require the same applicable resolution sources as plans',async()=>{
  const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);

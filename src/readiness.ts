@@ -173,7 +173,15 @@ export function activeResolution(s:Store,job:string):any{
  * readiness evidence. Acknowledgement never answers a concrete question. */
 export function applicableResolution(s:Store,job:string):any{
   const resolution=activeResolution(s,job);if(!resolution)return null;
-  const readiness=readinessFor(s,job),j=s.get(job);
+  const j=s.get(job);
+  const outcome=hasTable(s,'worker_outcomes')?s.db.query('SELECT plan_hash,outcome,questions FROM worker_outcomes WHERE job=?').get(job) as any:null;
+  if(outcome&&outcome.plan_hash===j.plan_hash&&['needs_input','blocked_dependency'].includes(outcome.outcome)){
+   if(resolution.source!=='human-answer'){
+    const questions=JSON.parse(outcome.questions||'[]') as any[];
+    if(resolution.source!=='dependency-satisfied'||!questions.every((q:any)=>q.kind==='dependency'))return null;
+   }
+  }
+  const readiness=readinessFor(s,job);
   if(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))return resolution;
   if(readiness.valid&&readiness.state==='needs-input'){
    if(resolution.source==='human-answer')return resolution;
@@ -182,12 +190,6 @@ export function applicableResolution(s:Store,job:string):any{
   }
   if(readiness.valid&&readiness.state==='blocked-by-dependency')return ['human-answer','dependency-satisfied'].includes(resolution.source)?resolution:null;
   if(!readiness.valid&&readiness.source==='plan-text'&&readiness.questions.length)return resolution.source==='human-answer'?resolution:null;
-  const outcome=hasTable(s,'worker_outcomes')?s.db.query('SELECT plan_hash,outcome,questions FROM worker_outcomes WHERE job=?').get(job) as any:null;
-  if(outcome&&outcome.plan_hash===j.plan_hash&&['needs_input','blocked_dependency'].includes(outcome.outcome)){
-   if(resolution.source==='human-answer')return resolution;
-   const dependencyOnly=outcome.outcome==='blocked_dependency'||(JSON.parse(outcome.questions) as any[]).every((q:any)=>q.kind==='dependency');
-   return resolution.source==='dependency-satisfied'&&dependencyOnly?resolution:null;
-  }
   return resolution;
 }
 export function recordResolution(s:Store,job:string,source:string,actor:string,detail:string){
