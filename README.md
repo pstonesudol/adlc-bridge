@@ -897,6 +897,90 @@ session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
 
+## Clarification questions and replies in Linear (DEV-18)
+
+Clarifications reuse the merged DEV-17 readiness/resolution bindings, blocker
+publication receipts and guarded same-session continuation. Enable explicitly in
+the project configuration after reviewing the exact human account IDs:
+
+```json
+"blockerSync": {
+  "enabled": true,
+  "labelId": "YOUR_NEEDS_HUMAN_LABEL_UUID"
+},
+"clarifications": {
+  "enabled": true,
+  "humanIds": ["YOUR_AUTHORIZED_LINEAR_HUMAN_UUID"]
+}
+```
+
+The needs-human label must differ from `agent-ready`. Enabling replies does not
+grant plan approval, Git scope, merge/deployment permissions, or readiness. It
+does not install/activate this source version. Live installation and configuration
+remain explicit operator actions.
+
+Before asking, the worker must inspect the original ticket, linked issues and
+dependencies, and accessible repository context. Its `ADLC_DISCOVERY` receipt
+records the specific context checked and why the missing information is essential.
+Ordinary implementation choices, facts already supplied and authorized work are
+not blockers. The bridge refreshes the ticket/comments, linked-issue inventory and
+referenced context, and hashes bounded repository files before publication. Missing
+discovery evidence or incomplete API context fails closed without publishing a new
+question. Older workers without discovery receipts require inspection, not a blind
+restart or another implementation request.
+
+One deduplicated comment on the original issue lists the exact numbered questions,
+reason, checked context and issue/job/requirements/plan/round-bound clarification
+reference. Reply there, not in Terminal or worker chat. For a single question in
+the first round, an ordinary answer is accepted. Multiple questions, dependency
+answers and later rounds use the exact IDs and reference shown in the comment:
+
+```text
+Clarification DEV-18-REFERENCE_FROM_NOTICE
+q1: exact listing identifier
+q2: final approved display wording
+```
+
+Partial answers are retained durably; acknowledgments list only what remains.
+Once all questions and dependencies have answers, a configured human must attest
+that the answers resolve them within existing scope by posting the **exact**
+confirmation printed in the notice. This can accompany the answers or be a later
+comment. Structural parsing is not a semantic oracle: this explicit human
+completeness/scope attestation is required before resolution activation. Generic
+assent to a factual question and placeholders are not answers. Permission-sensitive
+answer text escalates conservatively, even when accompanied by confirmation.
+
+For a material requirement/scope change, use the exact `Replan clarification …`
+line shown in the notice. Security decisions and changed dependencies never
+silently authorize production exposure, credentials, merge/deployment or expanded
+scope. Replanning and applicable human approval are required. Never post secrets.
+
+Bot/app/self-authored, unauthorized, quoted, duplicate, stale and edited comments
+cannot release the gate. Edits/removals of accepted evidence before continuation
+invalidate the adapter's resolution and require review. Ambiguous or conflicting
+answers remain blocked; no answer is guessed. Bounded resolution detail is never
+silently truncated.
+
+`adlc status` includes **Waiting for clarification**, partial/confirmed evidence
+state and reconciliation reasons. All answer provenance and resolution activation
+commit atomically under the current binding, without rewriting the resolution
+timestamp on retries. Planning answers still await the existing plan-approval gate.
+Their bound resolution is included as untrusted task context in the first approved
+implementation prompt. A preflight check before workflow dispatch invalidates
+edited or superseded evidence even if plan approval occurred on an earlier poll.
+Implementation answers reserve only the existing foundation continuation, after
+fresh ticket eligibility, exact approval/scope, branch, ownership and idle/queued
+work checks. An answer arriving while a worker is active is retained and waits for
+idle; it is not steered into competing work.
+
+Requests and acknowledgments use `LinearBlockers`' existing publication receipts.
+Only a tracked bridge-applied needs-human label is removed, with additive/removal
+label mutations preserving unrelated human labels and other unresolved blockers.
+Uncertain sends or comments reconcile their existing receipts and never replay the
+original implementation request, spawn another worker, or resend an uncertain
+continuation. Tests cover the real merged foundation with fake provider/session
+evidence; they do not exercise live Linear, install code or activate services.
+
 ### Legacy exhausted jobs from pre-budget databases
 
 Databases created before per-project remediation budgets have no

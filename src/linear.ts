@@ -3,6 +3,7 @@ import {validScopes} from './file-scope';
 import { Store } from './core';
 import {remediationPolicy,type RemediationConfig} from './remediation';
 import {validateConflictPolicy,type ConflictPolicy} from './conflict-policy';
+import {validateClarifications} from './linear-clarifications';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -14,6 +15,7 @@ export type ProjectConfig = {
   conflictRecovery?:ConflictPolicy;
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
   blockerSync?:{enabled:boolean;labelId?:string};
+  clarifications?:{enabled:boolean;humanIds:string[]};
   workflow?:{prGraceMs?:number};
   featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number};
   remediation?:RemediationConfig;
@@ -30,8 +32,9 @@ export function metadataCheckNames(value:unknown):string[]{
 export function validate(c: any): asserts c is ProjectConfig {
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   requiredCheckNames(c.requiredChecks);
-   metadataCheckNames(c.prMetadataChecks);
-   validateConflictPolicy(c.conflictRecovery);
+  validateClarifications(c);
+  metadataCheckNames(c.prMetadataChecks);
+  validateConflictPolicy(c.conflictRecovery);
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||c.branchUpdate.maxUpdates!==null&&(!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
   if(c.blockerSync!==undefined&&(c.blockerSync===null||typeof c.blockerSync!=='object'||typeof c.blockerSync.enabled!=='boolean'))throw Error('blockerSync.enabled must be a boolean');
