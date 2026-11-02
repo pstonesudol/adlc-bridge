@@ -1331,7 +1331,10 @@ latest-SHA CI/CodeRabbit gates; earlier clearance is not reused.
 
 The durable reservation is honored by bridge planning delivery, implementation,
 continuations, review remediation, branch updates, delivery adoption and lifecycle
-reconciliation. It is not a native AO lock: **arbitrary human/native AO writers
+reconciliation. The disconnected lifecycle dispatch contract requires a verified
+worktree before starting transport, persists that binding, and rejects a receipt
+for a different tree. Reservation checks include planning and active-run paths.
+It is not a native AO lock: **arbitrary human/native AO writers
 can still race the bridge**. Activity and ownership are rechecked, but this is
 not atomic native exclusivity. Operators must not concurrently edit/send into a
 reserved worktree. Unexpected activity or changed evidence fails closed. The
@@ -1370,7 +1373,9 @@ If that proof cannot be obtained, preserve the reservation and request explicit
 operator reconciliation/replanning; do not edit SQLite or rewrite history to
 satisfy the check. DEV-18 answer intake is not required or assumed: a human answer
 alone does not resume a conflict worker. DEV-17 blocker notices are deduplicated;
-completion notices report the new SHA but do not grant readiness or merge approval.
+they identify the recovery and stage without publishing raw Git/hook diagnostics.
+Detailed failure text remains local in `recovery-status`.
+Completion notices report the new SHA but do not grant readiness or merge approval.
 
 Installation/activation is a separate reviewed operator step. Human-only PR
 merging remains mandatory.

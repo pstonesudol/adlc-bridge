@@ -160,7 +160,7 @@ export class ConflictRecovery{
   if(x.auth.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy||JSON.stringify(JSON.parse(x.auth.paths))!==JSON.stringify(JSON.parse(r.detail).paths)||x.b.head!==expectedRemote||x.b.base!==r.base||x.b.branch!==r.branch||x.b.baseBranch!==r.base_branch)throw Error('Approval, policy, scope, remote head/base or ownership changed; preserve recovery evidence');
   await this.noOperation(r.worktree,true);return x;
  }
- async index(r:any){return (await this.git(r.worktree,'ls-files','--stage')).split('\n').filter(Boolean);}
+ async index(r:any){return (await this.git(r.worktree,'ls-files','--stage','-z')).split('\0').filter(Boolean);}
  async assertResolved(r:any,d:any){
   if(await this.git(r.worktree,'diff','--name-only','--diff-filter=U'))throw Error('Unresolved index entries remain');
   // Base-side whitespace is already committed and must not block recovery.

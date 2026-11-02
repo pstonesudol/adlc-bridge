@@ -83,7 +83,10 @@ test('conflict recovery blockers and completion reuse dedupe without granting re
   const review=f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id);
   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
-  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('app.txt');
+  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('Conflict recovery recovery stopped at stage resolving');
+  expect(f.comments[0].body).not.toContain('app.txt');
+  expect(f.comments[0].body).not.toContain('security decision');
+  expect((f.s.db.query('SELECT reason FROM conflict_recoveries').get() as any).reason).toBe('app.txt requires a security decision');
   f.s.db.query("UPDATE conflict_recoveries SET state='completed',reason=NULL,detail=?").run(JSON.stringify({result:'new-sha'}));
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
   expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.comments[1].body).toContain('new-sha');expect(f.comments[1].body).toContain('not readiness');
