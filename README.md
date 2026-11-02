@@ -838,10 +838,13 @@ policy has a higher limit or is uncapped, the legacy five-attempt stop no longer
 applies: preview returns `action: "resume_legacy_stop"` with zero additional
 budget, and the exact confirmation clears only that legacy job/run stop so the
 next poll reevaluates current evidence. A lowered limit still uses the exhausted
-path. In every outcome, `jobs.attempts`, consumed counts, prior remediation
-deliveries, Git grants, plan bindings and original audit events are preserved;
-the migration row and audit event are written once even across repeated or
-overlapping previews.
+path. If policy changes after an exhausted preview, that same migration is
+re-evaluated: the provenance row keeps its single identity but its outcome is
+updated and a `legacy_remediation_budget_reassessed` event records the prior and
+current outcome. In every outcome, `jobs.attempts`, consumed counts, prior
+remediation deliveries, Git grants, plan bindings and original audit events are
+preserved; the migration row and its initial audit event are created once even
+across repeated or overlapping previews.
 
 After confirmation, verify recovery without starting replacement work:
 

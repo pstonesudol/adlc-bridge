@@ -70,11 +70,11 @@ export class Lifecycle {
   }
 
   /** Lazily mirror legacy exhaustion into the budget table. The migration row is
-   * written once per job. It never grants an extension or dispatches work. */
+   * written once per job; a later policy change updates that same row so the
+   * stored outcome follows the policy currently being applied. It never grants
+   * an extension or dispatches work. */
   private reconcileLegacyBudget(job:string,policy:RemediationPolicy){
-    const row=this.budgetRow(job),migration=this.migrationRow(job);
-    if(migration?.outcome==='exhausted')return row;
-    const legacy=this.legacyBudget(job);
+    const row=this.budgetRow(job),migration=this.migrationRow(job),legacy=this.legacyBudget(job);
     if(!legacy)return row;
     const extensions=row?.extensions??0;
     const effective=policy.maxAttempts===null?null:policy.maxAttempts+extensions;
@@ -91,10 +91,24 @@ export class Lifecycle {
         last_attempt=COALESCE(last_attempt,?),stop_reason=?,configured_max_attempts=?,configured_max_no_progress=?,window=?,updated=CURRENT_TIMESTAMP WHERE job=?`)
         .run(consumed,legacy.lastHead,legacy.lastFindingsHash,legacy.attempts,stopReason,policy.maxAttempts,policy.maxNoProgress,policy.window,job);
     }
-    const inserted=this.s.db.query(`INSERT OR IGNORE INTO remediation_budget_migrations(job,version,legacy_reason,attempts,outcome,policy,detail)
-      VALUES (?,?,?,?,?,?,?)`).run(job,1,LEGACY_EXHAUSTION_REASON,legacy.attempts,outcome,JSON.stringify(policy),
-      JSON.stringify({effective,historicalLimit:LEGACY_MAX_ATTEMPTS,jobReason:LEGACY_EXHAUSTION_REASON,runReason:LEGACY_EXHAUSTION_REASON}));
-    if(inserted.changes)this.s.event(job,'legacy_remediation_budget_reconciled',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective}));
+    const detail=JSON.stringify({effective,historicalLimit:LEGACY_MAX_ATTEMPTS,jobReason:LEGACY_EXHAUSTION_REASON,runReason:LEGACY_EXHAUSTION_REASON,reassessedFrom:migration?.outcome??null});
+    if(migration){
+      if(migration.outcome!==outcome){
+        this.s.db.query('UPDATE remediation_budget_migrations SET outcome=?,policy=?,detail=? WHERE job=?').run(outcome,JSON.stringify(policy),detail,job);
+        this.s.event(job,'legacy_remediation_budget_reassessed',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective,previousOutcome:migration.outcome}));
+      }
+    }else{
+      const inserted=this.s.db.query(`INSERT OR IGNORE INTO remediation_budget_migrations(job,version,legacy_reason,attempts,outcome,policy,detail)
+        VALUES (?,?,?,?,?,?,?)`).run(job,1,LEGACY_EXHAUSTION_REASON,legacy.attempts,outcome,JSON.stringify(policy),detail);
+      if(inserted.changes)this.s.event(job,'legacy_remediation_budget_reconciled',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective}));
+      else{
+        const concurrent=this.migrationRow(job);
+        if(concurrent&&concurrent.outcome!==outcome){
+          this.s.db.query('UPDATE remediation_budget_migrations SET outcome=?,policy=?,detail=? WHERE job=?').run(outcome,JSON.stringify(policy),detail,job);
+          this.s.event(job,'legacy_remediation_budget_reassessed',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective,previousOutcome:concurrent.outcome}));
+        }
+      }
+    }
     return this.budgetRow(job);
   }
 
@@ -144,7 +158,7 @@ export class Lifecycle {
         .run(policy.maxAttempts,policy.maxNoProgress,policy.window,job);
       this.s.event(job,'remediation_policy_observed',JSON.stringify(policy));
       return this.summarizeBudget(job,this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any,policy);
-    })();
+    }).immediate();
   }
 
   private stopBudget(job:string,row:any,reason:string,total:number,policy:RemediationPolicy){
@@ -299,9 +313,9 @@ export class Lifecycle {
       // It never grants an extension, clears a stop, or dispatches a worker.
       const budget=this.reconcileLegacyBudget(job,policy)??this.budgetRow(job),migration=this.migrationRow(job);
       if(!budget)throw Error('Remediation budget is not exhausted; extension refused');
-      if(!budget.stop_reason&&migration&&migration.outcome!=='exhausted'){
+      const alreadyApplied=j.state==='approved'&&run.state==='running';
+      if(!budget.stop_reason&&migration&&(migration.outcome!=='exhausted'||this.legacyBudget(job))){
         const action='resume_legacy_stop';
-        const alreadyApplied=j.state==='approved'&&run.state==='running';
         if(!alreadyApplied&&!this.legacyBudget(job))throw Error('Legacy budget stop changed; preview the current state before resuming');
         const previewHash=digest(JSON.stringify([action,job,j.plan_hash,head,target.repo,target.pr,actor,budget.consumed,budget.extensions,budget.no_progress,migration.outcome,policy]));
         const summary=this.summarizeBudget(job,budget,policy);

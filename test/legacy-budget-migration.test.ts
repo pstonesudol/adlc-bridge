@@ -145,6 +145,54 @@ test('lowered policy still treats the legacy five-attempt stop as exhausted',()=
   }finally{f.s.close();}
 });
 
+test('an exhausted legacy migration follows a later raised or uncapped policy without a budget extension',()=>{
+  for(const [name,current] of [['raised',{maxAttempts:8,maxNoProgress:5,window:'job' as const}],['uncapped',{maxAttempts:null,maxNoProgress:5,window:'job' as const}]] as const){
+    const f=legacyFixture();
+    try{
+      const exhausted=f.l.extendRemediationBudget(f.id,options(f)) as any;
+      expect(exhausted.budget.stopReason).toBe('budget_exhausted');
+      const preview=f.l.extendRemediationBudget(f.id,{...options(f),policy:current}) as any;
+      expect(preview.action,name).toBe('resume_legacy_stop');expect(preview.preview).toBe(true);expect(preview.additional).toBe(0);
+      expect(f.l.budgetSummary(f.id,current).stopReason).toBeNull();
+      expect((f.s.db.query('SELECT outcome FROM remediation_budget_migrations WHERE job=?').get(f.id) as any).outcome).toBe(name==='raised'?'raised_current_policy':'uncapped_current_policy');
+      const applied=f.l.extendRemediationBudget(f.id,{...options(f),policy:current,confirm:preview.confirmHash}) as any;
+      expect(applied.preview).toBe(false);expect(applied.budget.extensions).toBe(0);
+      expect(f.s.get(f.id).state).toBe('approved');expect(f.s.get(f.id).attempts).toBe(5);expect(f.l.run(f.id).state).toBe('running');
+      expect((f.s.db.query('SELECT count(*) AS n FROM remediation_budget_extensions').get() as any).n).toBe(0);
+    }finally{f.s.close();}
+  }
+});
+
+test('resume confirmation is evidence-guarded, transactional and replay-safe',()=>{
+  const f=legacyFixture(),raised={maxAttempts:8,maxNoProgress:5,window:'job' as const};
+  try{
+    const preview=f.l.extendRemediationBudget(f.id,{...options(f),policy:raised}) as any;
+    expect(preview.action).toBe('resume_legacy_stop');
+    // Evidence can change between preview and confirmation.
+    f.s.db.query('UPDATE runs SET reason=? WHERE job=?').run('manual review',f.id);
+    expect(()=>f.l.extendRemediationBudget(f.id,{...options(f),policy:raised,confirm:preview.confirmHash})).toThrow('Legacy budget stop changed');
+    f.s.db.query('UPDATE runs SET reason=? WHERE job=?').run(REASON,f.id);
+    // A transaction failure after clearing the stop must roll back every change.
+    f.s.db.exec("CREATE TRIGGER fail_resume BEFORE UPDATE ON review_targets BEGIN SELECT RAISE(ABORT,'resume blocked'); END");
+    expect(()=>f.l.extendRemediationBudget(f.id,{...options(f),policy:raised,confirm:preview.confirmHash})).toThrow('resume blocked');
+    f.s.db.exec('DROP TRIGGER fail_resume');
+    expect(f.s.get(f.id).state).toBe('blocked');expect(f.l.run(f.id).state).toBe('blocked');
+    expect((f.s.db.query('SELECT state,reason FROM review_targets WHERE job=?').get(f.id) as any)).toMatchObject({state:'remediation_pending',reason:'Actionable latest-SHA CodeRabbit findings'});
+    expect((f.s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='legacy_remediation_budget_resumed'").get(f.id) as any).n).toBe(0);
+    const applied=f.l.extendRemediationBudget(f.id,{...options(f),policy:raised,confirm:preview.confirmHash}) as any;
+    expect(applied).toMatchObject({preview:false,action:'resume_legacy_stop',alreadyApplied:false});
+    expect((f.s.db.query('SELECT state,reason FROM review_targets WHERE job=?').get(f.id) as any)).toMatchObject({state:'remediation_pending',reason:'Legacy budget stop cleared under current policy; next poll reevaluates current evidence'});
+    expect((f.s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='legacy_remediation_budget_resumed'").get(f.id) as any).n).toBe(1);
+    const target=f.s.db.query('SELECT state,reason,updated FROM review_targets WHERE job=?').get(f.id) as any;
+    const replay=f.l.extendRemediationBudget(f.id,{...options(f),policy:raised,confirm:preview.confirmHash}) as any;
+    expect(replay).toMatchObject({preview:false,action:'resume_legacy_stop',alreadyApplied:true});
+    expect((f.s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='legacy_remediation_budget_resumed'").get(f.id) as any).n).toBe(1);
+    expect(f.s.db.query('SELECT state,reason,updated FROM review_targets WHERE job=?').get(f.id)).toEqual(target);
+    expect(f.s.get(f.id).state).toBe('approved');expect(f.s.get(f.id).attempts).toBe(5);
+  }finally{f.s.close();}
+});
+
+
 test('legacy migration refuses uncertainty, stale approval, wrong owner, changed head or scope before writing',()=>{
   const cases:[string,(f:ReturnType<typeof legacyFixture>)=>void,string][]=[
     ['uncertain delivery',f=>{f.s.db.query("UPDATE remediation SET state='delivery_uncertain' WHERE job=? AND attempt=5").run(f.id)},'Prior delivery uncertainty'],
@@ -181,7 +229,7 @@ test('review-status and status report the legacy stop as blocked while keeping r
   const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-status-')),path=join(dir,'state.db');
   try{
     const f=legacyFixture(path);f.s.close();
-    const env={...process.env,ADLC_DB:path,PATH:process.env.PATH??'/usr/bin:/bin'};
+    const env={ADLC_DB:path,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
     for(const command of ['review-status','status']){
       const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),command],{env});
       expect(result.exitCode).toBe(0);
@@ -189,5 +237,20 @@ test('review-status and status report the legacy stop as blocked while keeping r
       expect(row).toMatchObject({state:'blocked',displayStatus:'Blocked',reviewState:'remediation_pending',blockedReason:REASON});
       expect(row.remediation).toMatchObject({consumed:5,remaining:0,stopReason:'budget_exhausted'});
     }
+  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+test('review-status preserves a needs_reconciliation display when the job is blocked',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-status-')),path=join(dir,'state.db');
+  try{
+    const f=legacyFixture(path);
+    f.s.db.query("UPDATE review_targets SET state='needs_reconciliation',reason='Previous remediation delivery is uncertain; never resend' WHERE job=?").run(f.id);
+    f.s.close();
+    const env={ADLC_DB:path,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
+    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'review-status'],{env});
+    expect(result.exitCode).toBe(0);
+    const row=JSON.parse(result.stdout.toString())[0];
+    expect(row).toMatchObject({state:'needs_reconciliation',displayStatus:'Blocked — delivery needs reconciliation',reviewState:'needs_reconciliation',jobState:'blocked'});
+    expect(row.remediation).toMatchObject({consumed:5,remaining:0,stopReason:'budget_exhausted'});
   }finally{rmSync(dir,{recursive:true,force:true});}
 });

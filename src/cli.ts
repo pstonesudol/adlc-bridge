@@ -174,7 +174,7 @@ Registered approved review targets can request bounded in-scope fixes from their
    }
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
-    const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked';
+    const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
   });
   try{
