@@ -112,7 +112,12 @@ export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir
   if(x.includes('ADLC execution disabled pending host approval gate'))return false;
   const suffix=` # ${planningGateMarker}`,trimmed=x.trimEnd(),marked=trimmed.endsWith(suffix);
   const words=literalCommandWords(marked?trimmed.slice(0,-suffix.length):x);
-  const gateInvocation=words?.length===2&&words[0]!=='echo'&&isAbsolute(words[1])&&basename(dirname(words[1]))==='src'&&basename(words[1])==='planning-gate.ts';
+  const gatePath=(word:string)=>isAbsolute(word)&&basename(dirname(word))==='src'&&basename(word)==='planning-gate.ts';
+  const gateInvocation=words?.length===2&&words[0]!=='echo'&&gatePath(words[1]);
+  // Prefixes/extra arguments are not proven equivalent to the owned two-word
+  // invocation, even with an installation record. Never retain a possible
+  // existing gate while adding a second one.
+  if(words&&words[0]!=='echo'&&!gateInvocation&&words.some(gatePath))throw Error('Ambiguous legacy planning gate; reconcile postCreate ownership before setup');
   const bunInvocation=words&&(basename(words[0]??'')==='bun'||(isAbsolute(words[0]??'')&&resolve(words[0])===resolve(process.execPath)));
   if(gateInvocation&&(marked||(bunInvocation&&resolve(words![1])===resolve(gate))))return false;
   // An owner-validated installation record supplies the source and snapshot namespace.

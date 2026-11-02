@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join,dirname} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
 import {installBridge,rotatedServiceDefinition} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
 import {turnBarrier} from '../src/turn-submission';import {serviceControl} from '../src/service-control';
+import {Store} from '../src/core';
 const fixtureDefinition=()=>({Label:'local.adlc.fixture',ProgramArguments:[process.execPath,'/old/src/cli.ts','poll','/project.json']});
 function controlFixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-install-control-'))),source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json'),plist=join(home,'Library/LaunchAgents/local.adlc.project.plist');
@@ -89,6 +90,26 @@ test('rotation moves only a controller-derived working directory and remains usa
   rmSync(old,{recursive:true,force:true});expect(next.WorkingDirectory).toBe(dirname(result.cli));expect(existsSync(next.WorkingDirectory)).toBe(true);expect(def.WorkingDirectory).toBe(dirname(controller));
   expect(rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},result.cli).WorkingDirectory).toBe('/operator/custom');
   expect(rotatedServiceDefinition({...def,WorkingDirectory:undefined},result.cli).WorkingDirectory).toBeUndefined();
+ }finally{f.close();}
+});
+test('relative state paths refuse directory rotation before writes and preserve existing jobs/approvals',async()=>{
+ const f=controlFixture();try{
+  const controller=join(f.root,'old-snapshot/src/cli.ts'),next=join(f.root,'new-snapshot/src/cli.ts'),database=join(dirname(controller),'state.sqlite');
+  mkdirSync(dirname(controller),{recursive:true});writeFileSync(controller,'old cli');mkdirSync(dirname(next),{recursive:true});
+  const s=new Store(database),job=s.enqueue('project','issue','spec'),hash=s.propose(job,'approved implementation plan');s.approve(job,hash,'human');s.close();const bytes=readFileSync(database);
+  const def={...fixtureDefinition(),ProgramArguments:[process.execPath,controller,'poll','/project.json'],WorkingDirectory:dirname(controller),EnvironmentVariables:{ADLC_DB:'state.sqlite'}};
+  const before=structuredClone(def),artifacts=[f.plist,f.record,f.launcher].map(path=>readFileSync(path));f.io.readDefinition=()=>structuredClone(def);
+  expect(()=>rotatedServiceDefinition(def,next)).toThrow('requires absolute ADLC_DB');expect(def).toEqual(before);
+  for(const apply of [false,true]){
+   await expect(installBridge(apply,f.source,f.launcher,f.io)).rejects.toThrow('requires absolute ADLC_DB');
+   expect(f.calls).toEqual([]);expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+   expect([f.plist,f.record,f.launcher].map(path=>readFileSync(path))).toEqual(artifacts);expect(readFileSync(database)).toEqual(bytes);expect(existsSync(join(dirname(next),'state.sqlite'))).toBe(false);
+  }
+  const absolute=rotatedServiceDefinition({...def,EnvironmentVariables:{ADLC_DB:database}},next);expect(absolute.WorkingDirectory).toBe(dirname(next));expect(absolute.EnvironmentVariables.ADLC_DB).toBe(database);
+  const read=Store.readonly(absolute.EnvironmentVariables.ADLC_DB);try{expect(read.get(job)).toMatchObject({state:'approved',approved_hash:hash,attempts:0});expect(read.list()).toHaveLength(1);}finally{read.close();}
+  const custom=rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},next);expect(custom.WorkingDirectory).toBe('/operator/custom');expect(custom.EnvironmentVariables.ADLC_DB).toBe('state.sqlite');
+  expect(rotatedServiceDefinition(def,controller).WorkingDirectory).toBe(dirname(controller));
+  const runtime={...def,EnvironmentVariables:{ADLC_DB:database,ADLC_VERIFICATION_RUNTIME_CONFIG:'runtime.json'}};expect(()=>rotatedServiceDefinition(runtime,next)).toThrow('requires absolute ADLC_VERIFICATION_RUNTIME_CONFIG');
  }finally{f.close();}
 });
 test('rotation rejects malformed arguments, wrong command and relative controller without changing input',()=>{

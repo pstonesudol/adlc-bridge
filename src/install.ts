@@ -3,12 +3,20 @@ import {atomicFile as atomic} from './atomic-file';
 import {trustedDaemon} from './daemon-runtime';
 import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {definitionXML} from './project-services';
-import {join,resolve,dirname} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
+import {join,resolve,dirname,isAbsolute} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
 import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
+function assertMovableStatePaths(def:any){
+ const controller=def.ProgramArguments?.[1];
+ if(typeof controller!=='string'||def.WorkingDirectory!==dirname(controller))return;
+ for(const name of ['ADLC_DB','ADLC_VERIFICATION_RUNTIME_CONFIG']){
+  const path=def.EnvironmentVariables?.[name];
+  if(path!==undefined&&(typeof path!=='string'||!isAbsolute(path)))throw Error(`Controller-directory rotation requires absolute ${name}; reconcile the existing path before installation; existing service preserved`);
+ }
+}
 export function rotatedServiceDefinition(def:any,controller:string){
  if(!Array.isArray(def.ProgramArguments)||def.ProgramArguments.length!==4||def.ProgramArguments.some((v:any)=>typeof v!=='string')||def.ProgramArguments[2]!=='poll'||!controller.startsWith('/'))throw Error('Verified service definition and absolute controller required');
  const next=structuredClone(def);
- if(def.WorkingDirectory===dirname(def.ProgramArguments[1]))next.WorkingDirectory=dirname(controller);
+ if(def.WorkingDirectory===dirname(def.ProgramArguments[1])&&def.WorkingDirectory!==dirname(controller)){assertMovableStatePaths(def);next.WorkingDirectory=dirname(controller);}
  next.ProgramArguments[1]=controller;return next;
 }
 export function distributionFiles(root:string){
@@ -52,7 +60,7 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
  const projects=await io.registeredProjects(!apply);
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}
- const definitions=projects.map(p=>{const path=join(io.home(),'Library/LaunchAgents',p.label+'.plist');if(!existsSync(path))return {p,path,def:null,original:null};const def=io.readDefinition(path);io.assertDefinition(def,p.label,p.config);return {p,path,def,original:readFileSync(path)};});
+ const definitions=projects.map(p=>{const path=join(io.home(),'Library/LaunchAgents',p.label+'.plist');if(!existsSync(path))return {p,path,def:null,original:null};const def=io.readDefinition(path);io.assertDefinition(def,p.label,p.config);assertMovableStatePaths(def);return {p,path,def,original:readFileSync(path)};});
  const runtime=runtimeMigration(io.state(),io.home(),io);
   if(!apply)return {preview:true,source:root,launcher,projects:projects.map(p=>p.project),files:distributionFiles(root),runtimeLauncherMigration:!!runtime,verificationRunnerMigration:'The verified executing installed snapshot supplies the runner after activation/rollback; runtime JSON is not rewritten.',note:'Apply creates a pinned runtime snapshot, pauses intake during activation, migrates gates/services and restores prior intake state. No workers are stopped. Runtime launcher changes take effect at the next guarded stop/start.'};
   // The default state is appState(), matching independently constructed service

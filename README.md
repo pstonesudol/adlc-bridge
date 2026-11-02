@@ -105,6 +105,11 @@ Managed snapshot rotation preserves the entire existing plist (tool/PATH/AO
 settings, interval, RunAtLoad, logs and other keys), changing the controller
 argument and a working directory only when it exactly equals the prior
 controller's directory. Custom working directories are preserved.
+Installation preview/apply refuses controller-derived directories with relative
+`ADLC_DB` or `ADLC_VERIFICATION_RUNTIME_CONFIG` values before creating snapshots,
+backups or changing services/settings. Reconcile those references to their
+existing absolute locations explicitly; installation never moves state or guesses
+that a fresh database is safe.
 The active verification runner follows the currently executing snapshot only
 when it matches the owner-validated installation record. Thus `install --apply`
 and its existing rollback atomically select the effective runner through the
