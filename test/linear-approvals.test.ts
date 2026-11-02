@@ -9,7 +9,7 @@ function fixture(){
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
  const issue:any={id:'issue',identifier:'DEV-12',title:'Task',description:'Requirement',team:{id:'t'},project:{id:'p'},state:{id:'todo'},labels:{nodes:[{id:'ready'},{id:'gate',name:'plan-approval-required'}],pageInfo:{hasNextPage:false}}};
  const spec=JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description});
- const w=new Workflow(s,{startPlan:async()=>{throw Error('Unexpected start');},findPlans:async()=>[],disableFeedback:async()=>{},sendImplementation:async()=>{sends++;},evidence:async()=>({session:{id:'worker',projectId:'ao',branch:p.get(id).branch},transcript:{controller:'ready',entries:[],turns:[]}})});
+ const w=new Workflow(s,{startPlan:async()=>{throw Error('Unexpected start');},findPlans:async()=>[],disableFeedback:async()=>{},sendImplementation:async()=>{sends++;},evidence:async()=>({session:{id:'worker',projectId:'ao',branch:p.get(id).branch,isTerminated:false},transcript:{controller:'ready',entries:[],turns:[]}})});
  const id=s.enqueue('p','issue',spec),p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');
  s.propose(id,'Plan: edit src/a.ts and run checks');s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(id,digest(spec),'awaiting_approval','worker',null,'plan');
  new ApprovalPolicyStore(s).snapshot('p',new Set(['issue']),Date.now(),new Set(['issue']));

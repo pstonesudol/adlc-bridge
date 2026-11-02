@@ -1,12 +1,16 @@
 #!/usr/bin/env bun
+import {installBridge} from './install';
+import {maintenance} from './maintenance';
+import {installRuntime} from './runtime-install';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
-import {join} from 'node:path';
+import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {Store} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
+import {stackControl} from './stack-control';
 import {initWizard} from './init';
-import {poll,validate} from './linear';
+import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -15,7 +19,7 @@ import {runtimeCheck} from './runtime';
 import {containerCheck} from './container-check';
 import {sessionEvidence,capturePlan} from './session-evidence';
 import {adoptPilot,observePilot} from './pilot';
-import {ReviewLoop} from './review-loop';
+import {ReviewLoop,reviewDisplay} from './review-loop';
 import {disableNativeFeedback} from './ao-policy';
 import {TaskRouting,loadOpenChamber,selectRoute} from './task-routing';
 import {FeaturePlanning} from './feature-planning';
@@ -26,15 +30,59 @@ import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
+import {acknowledgePoll,runPollTick} from './poll-process';
+import {DeliveryRecovery} from './delivery-recovery';
+import {recoveryTransport} from './delivery-evidence';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
+export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+ const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,io={poll,linearToken,out}}=context;
+ return async()=>runPollTick(async()=>{
+  reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
+  const remediation=remediationPolicy(c.remediation);
+  io.out(await io.poll(c,s,io.linearToken()));
+  const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
+  for(const stage of stages){
+   if(stage.state==='pr_handoff'&&stage.pr){
+    const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
+    if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
+    const delivery=workflow.implementation(stage.job);
+    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
+   }
+  }
+  const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
+  const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
+  for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+   if(target.state==='completed')continue;
+   try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
+  }
+ });
+}
 async function main(){
+  if(['recover','cleanup'].includes(command)){const s=new Store(db);try{return out(await maintenance(s,command as 'recover'|'cleanup',req(a[0],'Job'),a.includes('--apply'),a.includes('--confirm')?req(a[a.indexOf('--confirm')+1],'Confirmation hash'):undefined));}finally{s.close();}}
+  if(command==='install'){
+    const bin=a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined;
+    if(bin?.startsWith('-'))throw Error('--bin requires a launcher path, not an option');
+    if(bin!==undefined&&!isAbsolute(bin))throw Error('--bin requires an absolute launcher path');
+    return out(await installBridge(a.includes('--apply'),undefined,bin));
+  }
+  if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
+  if(['start','stop','status'].includes(command)&&a.includes('--all')){if(a.length!==1)throw Error('Use --all without a project ID or other options');return out(await stackControl(command as 'start'|'stop'|'status'));}
   if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
   if(command==='projects')return out(await registeredProjects());
-  if(command==='help')return console.log(`ADLC Bridge 0.5 — Agent Orchestrator + OpenChamber
+  if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
+  recover JOB                         inspect guarded recovery
+    [--apply --confirm HASH]           apply only the exact inspected state
+  cleanup JOB                         inspect completed cleanup (preview-only)
+  install [--apply] [--bin PATH]        preview or install stable bridge snapshot
+  install-runtime --binary PATH [--apply]
+                                       register reproducibly built Orchestrator daemon
+  start --all | stop --all | status --all
+                                       full background stack; stop requires idle workers
   projects                             list registered project services
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
@@ -64,10 +112,10 @@ async function main(){
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
   adopt-pilot JOB SESSION               reconcile existing supervised worker only
   observe-pilot JOB OWNER/REPO PR CONFIG persist latest-SHA review evidence
-  recover-handoff JOB CONFIG           reconnect an existing authorized worker PR
+  recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
   register-review JOB REPO PR CONFIG    register bounded review target
   review-status                        show CI/review waits, blockers and remediation budget
-  tick-review JOB                      check CI/review; send bounded in-scope fixes
+  tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
                                        preview or apply an audited exhausted-budget extension
   approve-plan JOB HASH HUMAN           record current plan approval
@@ -95,7 +143,7 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(command==='doctor')return out({bun:Bun.version,aoInstalled:existsSync('/Applications/Agent Orchestrator.app'),codex:!!Bun.which('codex'),opencode:!!Bun.which('opencode'),gh:!!Bun.which('gh'),linearTokenConfigured:!!process.env.ADLC_LINEAR_TOKEN||existsSync(tokenPath),executionEnabled:false});
   if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository'));return out({repo,mode:'preview_only',existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
   if(command==='handoff')return out(handoffChecklist(req(a[0],'Worktree')));
-  if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8'));if(!Array.isArray(c.requiredChecks)||c.requiredChecks.some((x:any)=>typeof x!=='string'))throw Error('requiredChecks required');return out(await readiness(req(a[0],'Repository'),Number(a[1]),c.requiredChecks));}
+  if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out(await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata));}
   if(command.startsWith('feature-')){
     const s=new Store(db),features=new FeaturePlanning(s,featureAgents);try{
       if(command==='feature-start'){
@@ -117,19 +165,22 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
   if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?JSON.parse(readFileSync(req(a[0],'Config'),'utf8')):null;if(c)validate(c);
-  const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
+   if(command==='recover-handoff'){
+    const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+    if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
+    if(!existsSync(db))throw Error('Existing state database required');
+    const store=new Store(db,a.length===2);
+    try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
+   }
+   const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
+  const reviewStatus=()=>reviewLoop.list().map(t=>{
+    const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
+    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
+  });
   try{
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
-    if(command==='review-status')return out(reviewLoop.list().map(t=>({...t,remediation:lifecycle.budgetSummary(t.job)})));
-    if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewLoop.list(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
-    if(command==='recover-handoff'){
-      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
-      await poll(config,s,linearToken());
-      const stage=await workflow.recoverHandoff(req(a[0],'Job'),config);
-      await disableNativeFeedback(stage.session);
-      reviewLoop.register(stage.job,config.githubRepo,stage.pr.number,config.requiredChecks,JSON.parse(workflow.implementation(stage.job).paths),true);
-      return out(stage);
-    }
+    if(command==='review-status')return out(reviewStatus());
+    if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewStatus(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
     if(command==='show-plan'){const j=s.get(req(a[0],'Job'));return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),routing:new TaskRouting(s).list(j.id)});}
     if(command==='approve-job'){
       const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
@@ -143,11 +194,14 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
       return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true));
     }
-    if(command==='tick-review'&&a[1]){
+    if(command==='tick-review'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
-      return out(await reviewLoop.tick(req(a[0],'Job'),config.branchUpdate,remediationPolicy(config.remediation)));
+      const job=req(a[0],'Job'),target=reviewLoop.get(job);
+      if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+      new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
+      reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
+      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
     }
-    if(command==='tick-review'){const job=req(a[0],'Job');return out(await reviewLoop.tick(job,undefined,lifecycle.budgetPolicy(job)));}
     if(command==='extend-budget'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       const flag=(name:string)=>{const i=a.indexOf(name);return i<0?undefined:req(a[i+1],name);};
@@ -157,34 +211,19 @@ Registered approved review targets can request bounded in-scope fixes from their
       }));
     }
     if(command==='adopt-pilot')return out(await adoptPilot(s,req(a[0],'Job'),req(a[1],'Session')));
-    if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks));}
+    if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));validate(config);return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.prMetadataChecks??[]));}
     if(command==='capture-plan')return out(capturePlan(s,req(a[0],'Job'),await sessionEvidence(req(a[1],'Session')),Number(a[2])));
     if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
     if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
     if(command==='approve-plan'){s.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'));return out({approved:true,executionEnabled:false});}
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=async()=>{
-      const remediation=remediationPolicy(c!.remediation);
-      out(await poll(c,s,linearToken()));
-      const stages=await workflow.tick(c);if(stages.length)out({workflow:stages});
-      const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)out({planApprovals});
-      for(const stage of stages){
-        if(stage.state==='pr_handoff'&&stage.pr){
-          const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
-          if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
-          const delivery=workflow.implementation(stage.job);
-          reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
-        }
-      }
-      const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)out({linearStatuses:linearUpdates});
-      const featureUpdates=await features.tickProject(c);if(featureUpdates.length)out({features:featureUpdates});
-      for(const target of reviewLoop.list(c.linear.projectId) as any[]){
-        if(target.state==='completed')continue;
-        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
-      }
-    };if(command==='poll')return await tick();
+    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features});
+    const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
+    try{
+    if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);
     while(!stop){try{await tick();}catch(e){console.error(e instanceof Error?e.message:'Poll failed');}for(let i=0;i<60&&!stop;i++)await Bun.sleep(1000);}
+    }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
+if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});

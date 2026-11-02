@@ -1,0 +1,41 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+concurrency:
+  # PR results validate their own base/merge context, not a main push context.
+  # Never let a push or another PR cancel that required validation.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}-{1}', github.event.pull_request.base.ref, github.event.pull_request.number) || format('push-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  bun-test:
+    # The full suite exercises the supported macOS runtime and native plutil.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.4.2
+      - name: Check commit whitespace
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            git diff --check "FETCH_HEAD...HEAD"
+          elif [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$BEFORE_SHA..$HEAD_SHA"
+          fi
+      - run: bun test

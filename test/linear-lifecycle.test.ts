@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';
+import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';import {DeliveryRecovery} from '../src/delivery-recovery';
 const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
 function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false,noticeFailure=false,noticeCalls=0;const posted:any[]=[],issueChanges:any={};let beforeAPI:(q:string)=>void=()=>{};
  const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}},...issueChanges});
@@ -14,7 +14,7 @@ function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new R
  return {s,id,sync,issueChanges,intercept(callback:(q:string)=>void){beforeAPI=callback;},get noticeCalls(){return noticeCalls;},failNotice(){noticeFailure=true;},get state(){return state;},get updates(){return updates;},get posted(){return posted;},merge(){merged=true;},lost(){lost=true;},manual(value:string){state=value;}};
 }
 test('owned ticket moves In Progress → In Review → Done only after observed merge',async()=>{
- const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
+ const f=fixture();try{await f.sync.sync(c);expect(f.state).toBe('progress');f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','pr_handoff','["**"]','supervised-host','human',null);f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',1,'["CI"]','["**"]',Date.now());
  await f.sync.sync(c);expect(f.state).toBe('review');expect(f.s.get(f.id).state).not.toBe('done');f.merge();await f.sync.sync(c);expect(f.state).toBe('done');expect(f.s.get(f.id).state).toBe('done');expect(f.updates).toBe(3);
  }finally{f.s.close();}
 });
@@ -31,6 +31,52 @@ test('lost status reply reconciles without replay; subsequent manual change is p
  const f=fixture();try{f.lost();await f.sync.sync(c);expect(f.updates).toBe(1);await f.sync.sync(c);expect(f.updates).toBe(1);f.manual('todo');const result=await f.sync.sync(c);expect(result[0].state).toBe('needs_reconciliation');expect(f.state).toBe('todo');expect(f.updates).toBe(1);}finally{f.s.close();}
 });
 
+test('review-stage branch drift posts one notice and blocks in-review',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; preview recover-handoff';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const first=await f.sync.sync(c);expect(first[0]).toEqual({job:f.id,state:'blocked',reason});
+  await f.sync.sync(c);
+  expect(f.s.db.query('SELECT count(*) AS n FROM branch_drift_notices').get()).toEqual({n:1});
+  expect(f.posted.length).toBe(1);expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
+test('another blocked review identity failure stays out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked','Target is not the owned open feature PR');
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
+test('post-adoption review branch mismatch remains a blocker',async()=>{
+ const f=fixture();try{
+  const p=f.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(f.id) as any;
+  new DeliveryRecovery(f.s,{} as any).install();
+  f.s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,'hash','adopted','worker','/worktree',p.branch,'adlc/existing','owner/repo',7,'a'.repeat(40),'b'.repeat(40),'h'.repeat(64),'s'.repeat(64),'{}');
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; preview recover-handoff';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now(),'blocked',reason);
+  const result=await f.sync.sync(c);
+  expect(result[0]).toEqual({job:f.id,state:'blocked',reason});
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);expect(f.posted.length).toBe(1);
+  expect((f.s.db.query('SELECT reason FROM review_targets WHERE job=?').get(f.id) as any).reason).toBe(reason);
+ }finally{f.s.close();}
+});
+test('missing delivery receipt keeps review status out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','needs_reconciliation','["src/**"]','supervised-host','human','No authoritative delivery receipt; never resend');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
+test('blocked dispatch identity failure stays out of in-review',async()=>{
+ const f=fixture();try{
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'h'.repeat(64),'worker','client','blocked','["src/**"]','supervised-host','human','Worktree and remote PR HEAD differ; reconcile before handoff');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+  expect(await f.sync.sync(c)).toEqual([]);
+  expect(f.state).toBe('todo');expect(f.updates).toBe(0);
+ }finally{f.s.close();}
+});
 function budgetBlocked(){
  const f=fixture();f.s.db.query('INSERT INTO remediation_budget(job,consumed,stop_reason,configured_max_attempts,configured_max_no_progress) VALUES (?,?,?,?,?)').run(f.id,5,'budget_exhausted',5,5);
  f.s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(f.id);return f;
@@ -152,4 +198,78 @@ test('requirements binding is rechecked inside terminal completion transaction',
   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe('blocked');
   expect((f.s.db.query('SELECT state FROM review_targets WHERE job=?').get(f.id) as any).state).not.toBe('completed');
  }finally{f.s.close();}
+});
+
+test('branch mismatch sync posts one notice and confirms uncertain delivery by comment ID',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'a'.repeat(64),'worker','client','blocked','["**"]','supervised-host','human',reason);
+  const comments:any[]=[];let calls=0;const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){calls++;expect(v.input.id).toMatch(/^[0-9a-f-]{36}$/);expect(v.input.body).toContain('reserved old; actual new');expect(v.input.body).toContain('--confirm HASH');comments.push({id:v.input.id,body:v.input.body});throw Error('Lost receipt');}
+   if(q.includes('comments('))return {issue:{comments:{nodes:comments.slice(),pageInfo:{hasNextPage:false,endCursor:null}}}};
+   return original(q,v);
+  };
+  const first=await f.sync.sync(c);expect(first[0].error).toBe('Lost receipt');expect(calls).toBe(1);expect(f.updates).toBe(0);
+  const second=await f.sync.sync(c);expect(second[0]).toEqual({job:f.id,state:'blocked',reason});expect(calls).toBe(1);expect(comments.length).toBe(1);expect(f.updates).toBe(0);
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices').all()).toEqual([{state:'confirmed'}]);
+ }finally{f.s.close();}
+});
+
+test('uncertain drift notice stays fail-closed without an exact comment',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  let comments:any[]=[],creates=0,body='';const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){creates++;body=v.input.body;comments=[{id:v.input.id,body:v.input.body}];throw Error('Lost receipt');}
+   if(q.includes('comments('))return {issue:{comments:{nodes:comments,pageInfo:{hasNextPage:false,endCursor:null}}}};
+   return original(q,v);
+  };
+  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');
+  const commentId=(f.s.db.query('SELECT comment_id FROM branch_drift_notices WHERE job=?').get(f.id) as any).comment_id;
+  comments=[];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  comments=[{id:commentId,body:'different body'}];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  comments=[{id:'00000000-0000-4000-8000-000000000000',body}];await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('no blind replay');
+  expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('delivery_uncertain');
+  expect(creates).toBe(1);
+ }finally{f.s.close();}
+});
+test('drift notice confirms a matching comment on a later page',async()=>{
+ const f=fixture();try{
+  const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7; run recover-handoff';
+  let commentId='',body='',pages=0;const original=f.sync.api;
+  f.sync.api=async(q,v)=>{
+   if(q.includes('commentCreate')){commentId=v.input.id;body=v.input.body;throw Error('Lost receipt');}
+   if(q.includes('comments(')){
+    pages++;
+    if(pages===1)return {issue:{comments:{nodes:[{id:'unrelated',body:'other'}],pageInfo:{hasNextPage:true,endCursor:'cursor-1'}}}};
+    expect(v.after).toBe('cursor-1');
+    return {issue:{comments:{nodes:[{id:commentId,body}],pageInfo:{hasNextPage:false,endCursor:null}}}};
+   }
+   return original(q,v);
+  };
+  await expect(f.sync.driftNotice(f.id,reason,c)).rejects.toThrow('Lost receipt');
+  await f.sync.driftNotice(f.id,reason,c);
+  expect(pages).toBe(2);expect(f.s.db.query('SELECT state FROM branch_drift_notices WHERE job=?').get(f.id).state).toBe('confirmed');
+ }finally{f.s.close();}
+});
+
+test('combined budget and branch blockers preserve observed merge completion and requirements checks',async()=>{
+ for(const noticeFails of [false,true])for(const merged of [false,true])for(const changed of [false,true]){
+  const f=budgetBlocked();try{
+   const reason='Blocked — branch mismatch: reserved old; actual new; candidate https://github.com/owner/repo/pull/7';
+   f.s.db.query('INSERT INTO implementation_dispatch(job,plan_hash,session_id,client_id,state,paths,runtime,actor,reason) VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,'hash','worker','client','blocked','["src/**"]','supervised-host','human',reason);
+   f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,?,?,?,?)').run(f.id,'owner/repo',7,'["CI"]','["src/**"]',Date.now());
+   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(f.id,'correlation','hash','blocked');
+   f.sync.driftNotice=async()=>{if(noticeFails)throw Error('Drift notice unavailable');};
+   if(merged)f.merge();if(changed)f.issueChanges.description='changed';
+   const result=await f.sync.sync(c),done=merged&&!changed;
+   expect(f.s.get(f.id).state).toBe(done?'done':'blocked');
+   expect(f.state).toBe(done?'done':'todo');expect(f.updates).toBe(done?1:0);
+   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.id) as any).state).toBe(done?'completed':'blocked');
+   if(noticeFails)expect(result.some((x:any)=>x.phase==='branch-drift'&&x.error==='Drift notice unavailable')).toBe(true);
+  }finally{f.s.close();}
+ }
 });
