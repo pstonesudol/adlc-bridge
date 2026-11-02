@@ -87,6 +87,7 @@ export class LinearBlockers{
  }
  async retract(job:string,c:BlockerConfig){
   if(c.blockerSync?.enabled!==true)return {state:'disabled'};
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state!='resumed'").get(job))return {state:'retained',reason:'Dependency evidence or delivery remains unresolved'};
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&this.s.db.query("SELECT job FROM clarification_receipts WHERE job=? AND state IN ('waiting','partial','confirmed','replan','needs_review')").get(job))return {state:'retained',reason:'Another unresolved clarification remains'};
   const rows=this.s.db.query("SELECT * FROM blocker_notices WHERE job=? AND state='posted' AND label_applied=1").all(job) as any[];
   if(!rows.length)return {state:'none'};
@@ -141,9 +142,10 @@ export class LinearBlockers{
     const notice=stopped?`Conflict recovery ${recovery.id} has an independent reconciliation gate at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
     rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:stopped?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(stopped?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
    }
-  for(const outcome of rows){
-   handled.add(outcome.job);
-   try{
+   for(const outcome of rows){
+    handled.add(outcome.job);
+    try{
+    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query('SELECT 1 FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash))continue;
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.
     if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;
