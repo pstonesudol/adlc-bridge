@@ -118,21 +118,27 @@ export class LinearBlockers{
   const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
    const results:any[]=[];
-   const recoveries=recoveryRows(this.s);
+    const recoveries=recoveryRows(this.s);
+    const handled=new Set<string>();
    for(const recovery of recoveries.filter(r=>r.state==='completed'&&!recoveries.some(later=>later.job===r.job&&later.created>r.created))){
     const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId||j.plan_hash!==recovery.plan)continue;
     const detail=JSON.parse(recovery.detail);
-    try{results.push(await this.leave(recovery.job,{plan_hash:recovery.plan,outcome:'recovery_completed',reason:`Recovery ${recovery.id} published ${detail.result}; fresh latest-SHA CI and CodeRabbit are required. This is not readiness or merge approval.`,questions:'[]',dependencies:'[]'},c));}
+    const outcome={plan_hash:recovery.plan,outcome:'recovery_completed',reason:`Recovery ${recovery.id} published ${detail.result}; fresh latest-SHA CI and CodeRabbit are required. This is not readiness or merge approval.`,questions:'[]',dependencies:'[]'};
+    const binding=this.binding(recovery.job,outcome,c.blockerSync.labelId);
+    const notice=this.s.db.query('SELECT state FROM blocker_notices WHERE job=? AND binding=?').get(recovery.job,binding) as any;
+    if(notice?.state==='posted')continue;
+    try{results.push(await this.leave(recovery.job,outcome,c));}
     catch(error){results.push({job:recovery.job,state:'blocked',reason:error instanceof Error?error.message:'Recovery outcome synchronization failed'});}
    }
    // Reuse the same dedupe/label ownership contract without overwriting the
    // original implementation receipt or inventing another approval engine.
    for(const recovery of recoveryRows(this.s).filter(r=>r.state!=='completed')){
-    const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId||j.plan_hash!==recovery.plan)continue;
+    const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId)continue;
+    handled.add(recovery.job);
     const prior=rows.findIndex(r=>r.job===recovery.job);if(prior>=0)rows.splice(prior,1);
+    if(j.plan_hash!==recovery.plan)continue;
     rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:recovery.reason?'needs_reconciliation':'running',reason:recovery.reason,questions:JSON.stringify(recovery.reason?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
    }
-  const handled=new Set<string>();
   for(const outcome of rows){
    handled.add(outcome.job);
    try{

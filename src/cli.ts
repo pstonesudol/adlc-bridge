@@ -42,6 +42,10 @@ import {recoveryRows} from './worktree-reservation';
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
+export function authorizeBaseMerge(lifecycle:Pick<Lifecycle,'grantBaseMerge'>,args:string[]){
+ if(args.length!==3||args.some(v=>!v.trim()||v.trim().startsWith('-')))throw Error('Use authorize-base-merge JOB HASH HUMAN with exactly three positional arguments');
+ return lifecycle.grantBaseMerge(args[0],args[1],args[2]);
+}
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
 export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
@@ -218,8 +222,7 @@ Registered approved review targets can request bounded in-scope fixes from their
   });
    try{
     if(command==='authorize-base-merge'){
-     const job=req(a[0],'Job'),hash=req(a[1],'Plan hash'),human=req(a[2],'Human');
-     return out(lifecycle.grantBaseMerge(job,hash,human));
+     return out(authorizeBaseMerge(lifecycle,a));
     }
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
     if(command==='review-status')return out(reviewStatus());

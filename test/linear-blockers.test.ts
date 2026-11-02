@@ -100,6 +100,33 @@ test('label verification failure after a successful write is retractable',async(
   expect(f.labels).toEqual(['ready','team']);
  }finally{f.s.close();}
 });
+test('stale-plan recovery retains its blocker after a spec change and a newer running outcome',async()=>{
+ const f=fixture();try{
+  new ConflictRecovery(f.s).install();
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt needs reconciliation',1);
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
+  f.s.enqueue('p','issue',spec+' changed');
+  const before=f.calls;await f.blockers().sync(f.config);
+  expect(f.labels).toContain(labelId);expect(f.calls).toBe(before);
+  f.s.db.query("UPDATE jobs SET plan_hash='new-plan',state='approved' WHERE id=?").run(f.id);
+  f.s.db.query("UPDATE worker_outcomes SET plan_hash='new-plan',outcome='running' WHERE job=?").run(f.id);
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);expect(f.calls).toBe(before);
+ }finally{f.s.close();}
+});
+test('confirmed completion notices skip provider reads for done jobs, uncertain notices still reconcile',async()=>{
+ for(const uncertain of [false,true]){
+  const f=fixture();try{
+   new ConflictRecovery(f.s).install();f.s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(f.id);
+   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','completed','client',1,JSON.stringify({result:'new-sha'}),null,1);
+   if(uncertain)f.loseReplyAfterCreate();
+   await f.blockers().sync(f.config);expect(f.creates).toBe(1);
+   const calls=f.calls;
+   await f.blockers().sync(f.config);
+   if(uncertain)expect(f.calls).toBeGreaterThan(calls);else expect(f.calls).toBe(calls);
+   const confirmed=f.calls;await f.blockers().sync(f.config);expect(f.calls).toBe(confirmed);expect(f.creates).toBe(1);
+  }finally{f.s.close();}
+ }
+});
 test('a comment that lands before its reply is lost is adopted without reposting',async()=>{
  const f=fixture();try{
   f.loseReplyAfterCreate();const first=await f.blockers().sync(f.config);
