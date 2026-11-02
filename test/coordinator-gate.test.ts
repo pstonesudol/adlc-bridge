@@ -24,6 +24,22 @@ test('only the registered coordinator workspace is admitted; worker and forged r
   expect(verifiedCoordinator(db,'demo',source,cwd,root)).toBe(false);
  }finally{db.close();rmSync(root,{recursive:true,force:true});}
 });
+test('a different existing project path or session workspace closes coordinator admission',()=>{
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'coordinator-mismatch-'))),db=new Database(':memory:');
+ try{
+  const source=join(root,'repo'),other=join(root,'other'),cwd=join(root,'worktrees','demo','orchestrator','demo-orchestrator');
+  mkdirSync(source);mkdirSync(other);mkdirSync(cwd,{recursive:true});
+  db.exec('CREATE TABLE projects(id TEXT,path TEXT,config TEXT,archived_at TEXT); CREATE TABLE sessions(project_id TEXT,kind TEXT,is_terminated INTEGER,workspace_path TEXT)');
+  db.query('INSERT INTO projects VALUES(?,?,?,NULL)').run('demo',other,'{}');
+  db.query('INSERT INTO sessions VALUES(?,?,0,?)').run('demo','orchestrator','');
+  expect(verifiedCoordinator(db,'demo',source,cwd,root)).toBe(false);
+  db.query('UPDATE projects SET path=?').run(source);
+  db.query('UPDATE sessions SET workspace_path=?').run(other);
+  expect(verifiedCoordinator(db,'demo',source,cwd,root)).toBe(false);
+  db.query('UPDATE sessions SET workspace_path=?').run(cwd);
+  expect(verifiedCoordinator(db,'demo',source,cwd,root)).toBe(true);
+ }finally{db.close();rmSync(root,{recursive:true,force:true});}
+});
 test('a missing, corrupt or unsupported AO registry closes coordinator admission without throwing',()=>{
  const root=realpathSync(mkdtempSync(join(tmpdir(),'coordinator-registry-')));
  try{

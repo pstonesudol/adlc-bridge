@@ -44,15 +44,21 @@ function workerFixture(){
 }
 
 // Registers the native coordinator workspace in AO's read-only project/session registry.
-function coordinatorFixture(shared:boolean){
+// Mismatch options exist so a removed registry comparison cannot pass unnoticed.
+function coordinatorFixture(options:{shared?:boolean;projectPath?:'source'|'other';workspace?:'empty'|'other'}={}){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-coordinator-admission-'))),home=join(root,'home'),source=join(root,'repo'),dataRoot=join(home,'.ao','data'),cwd=join(dataRoot,'worktrees','demo','orchestrator','demo-orchestrator');
  mkdirSync(source);mkdirSync(dataRoot,{recursive:true});repository(source);
- if(shared)git(['worktree','add','-q','-b','ao/demo-orchestrator',cwd],source);
+ const state=new Store(join(home,'Library','Application Support','ADLC Bridge','state.sqlite'));
+ state.db.exec('CREATE TABLE planning_dispatch (job TEXT PRIMARY KEY REFERENCES jobs(id),spec_hash TEXT NOT NULL,state TEXT NOT NULL,session_id TEXT,reason TEXT,client_id TEXT NOT NULL UNIQUE)');
+ state.close();
+ const other=join(root,'other');
+ if(options.projectPath==='other'||options.workspace==='other'){mkdirSync(other);repository(other,'other repository');}
+ if(options.shared??true)git(['worktree','add','-q','-b','ao/demo-orchestrator',cwd],source);
  else{mkdirSync(cwd,{recursive:true});repository(cwd,'unrelated repository');}
  const db=new Database(join(dataRoot,'ao.db'));
  db.exec('CREATE TABLE projects(id TEXT,path TEXT,config TEXT,archived_at TEXT); CREATE TABLE sessions(project_id TEXT,kind TEXT,is_terminated INTEGER,workspace_path TEXT)');
- db.query('INSERT INTO projects VALUES(?,?,?,NULL)').run('demo',source,'{}');
- db.query('INSERT INTO sessions VALUES(?,?,0,?)').run('demo','orchestrator','');
+ db.query('INSERT INTO projects VALUES(?,?,?,NULL)').run('demo',options.projectPath==='other'?other:source,'{}');
+ db.query('INSERT INTO sessions VALUES(?,?,0,?)').run('demo','orchestrator',options.workspace==='other'?other:'');
  db.close();
  return {root,run:()=>runGate(home,source,cwd,configured(root,source))};
 }
@@ -75,7 +81,7 @@ test('an unreserved worker still fails setup when the AO registry is absent',()=
 });
 
 test('the configured gate admits a registered coordinator sharing the source repository',()=>{
- const f=coordinatorFixture(true);try{
+ const f=coordinatorFixture({shared:true});try{
   const r=f.run();
   if(r.code!==0)throw Error(r.err);
   expect(r.code).toBe(0);
@@ -84,9 +90,25 @@ test('the configured gate admits a registered coordinator sharing the source rep
 });
 
 test('the configured gate rejects a registered coordinator in a different repository',()=>{
- const f=coordinatorFixture(false);try{
+ const f=coordinatorFixture({shared:false});try{
   const r=f.run();
   expect(r.code).toBe(78);
   expect(r.err).toContain('Coordinator repository mismatch');
+ }finally{rmSync(f.root,{recursive:true,force:true});}
+});
+
+test('the configured gate rejects a registry project path outside the source repository',()=>{
+ const f=coordinatorFixture({projectPath:'other'});try{
+  const r=f.run();
+  expect(r.code).toBe(78);
+  expect(r.err).toContain('No durable planning dispatch authorizes this branch');
+ }finally{rmSync(f.root,{recursive:true,force:true});}
+});
+
+test('the configured gate rejects a coordinator session workspace outside the managed path',()=>{
+ const f=coordinatorFixture({workspace:'other'});try{
+  const r=f.run();
+  expect(r.code).toBe(78);
+  expect(r.err).toContain('No durable planning dispatch authorizes this branch');
  }finally{rmSync(f.root,{recursive:true,force:true});}
 });
