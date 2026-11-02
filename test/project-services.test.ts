@@ -172,7 +172,8 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
   writeFileSync(plist,serviceDefinition(path,process.execPath,cli,f.dir,entry.label));
   const config=JSON.parse(readFileSync(path,'utf8'));config.pollingIntervalSeconds=15;writeFileSync(path,JSON.stringify(config));
   const calls:string[][]=[],turns=turnBarrier(join(f.dir,'fence')),pollState=join(f.dir,'receipts');
-  let loaded=true,failNextBootout=false;
+  let loaded=true,failNextBootout=false,staleStartup=false,pauses=0;
+  let finishStartup:undefined|(()=>void);
   const run=async(args:string[])=>{
    calls.push(args);
    if(args[0]==='print')return loaded?{code:0,stdout:`state = running\npid = ${process.pid}`,stderr:''}:{code:1,stdout:'',stderr:'Could not find service'};
@@ -180,13 +181,16 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
     if(failNextBootout){failNextBootout=false;return {code:1,stdout:'',stderr:'Simulated unload failure'};}
     loaded=false;return {code:0,stdout:'',stderr:''};
    }
-   if(args[0]==='bootstrap'||args[0]==='kickstart'){loaded=true;return {code:0,stdout:'',stderr:''};}
+   if(args[0]==='bootstrap'){loaded=true;return {code:0,stdout:'',stderr:''};}
+   if(args[0]==='kickstart'){
+    if(!staleStartup)finishStartup=await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());
+    return {code:0,stdout:'',stderr:''};
+   }
    throw Error('Unexpected service command');
   };
-  const options={home:f.dir,statePath,run,turns,pollState};
-  // Establish an idle receipt, then acknowledge a live non-idle intake for startup.
+  const options={home:f.dir,statePath,run,turns,pollState,startupWait:{attempts:2,pause:async()=>{pauses++;}}};
+  // Establish idle support. Only kickstart publishes the fresh running receipt.
   const idle=await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());idle();
-  await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());
   const applied=await serviceControl('service-config','one',true,options);
   const domain=`gui/${process.getuid!()}`,target=`${domain}/${entry.label}`;
   expect(applied).toMatchObject({changed:true,applied:true,reloaded:true,pollingIntervalSeconds:15});
@@ -203,6 +207,12 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
   expect(retried).toMatchObject({changed:false,applied:false,reloaded:true,pollingIntervalSeconds:18});
   expect(calls).toEqual([['print',target],['bootout',target],['bootstrap',domain,plist],['kickstart',target],['print',target]]);
   expect(readDefinition(plist).StartInterval).toBe(18);
+  // A stale idle receipt must not acknowledge the fake running PID after reload.
+  finishStartup!();staleStartup=true;pauses=0;calls.length=0;
+  config.pollingIntervalSeconds=19;writeFileSync(path,JSON.stringify(config));
+  await expect(serviceControl('service-config','one',true,options)).rejects.toThrow('intake startup not confirmed');
+  expect(calls).toEqual([['print',target],['bootout',target],['bootstrap',domain,plist],['kickstart',target],['print',target],['print',target]]);
+  expect(pauses).toBe(1);expect(readDefinition(plist).StartInterval).toBe(19);
   config.pollingIntervalSeconds=20;writeFileSync(path,JSON.stringify(config));calls.length=0;loaded=false;
   const stopped=await serviceControl('service-config','one',true,options);
   expect(stopped).toMatchObject({changed:true,applied:true,reloaded:false,pollingIntervalSeconds:20});

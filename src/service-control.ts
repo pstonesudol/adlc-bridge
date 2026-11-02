@@ -7,7 +7,8 @@ import {effectiveSettings} from './project-settings';
 import {serviceSettings} from './service-settings';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {assertPollQuiescent,assertPollStarted} from './poll-process';
-export async function waitForPollStartup<T extends {loaded:boolean;running?:boolean;pid?:number}>(status:()=>Promise<T>,verify:(current:T)=>void,kickstart:()=>Promise<void>,wait={attempts:100,pause:()=>Bun.sleep(100)}){
+type StartupWait={attempts:number;pause:()=>Promise<unknown>};
+export async function waitForPollStartup<T extends {loaded:boolean;running?:boolean;pid?:number}>(status:()=>Promise<T>,verify:(current:T)=>void,kickstart:()=>Promise<void>,wait:StartupWait={attempts:100,pause:()=>Bun.sleep(100)}){
  await kickstart();let last:unknown;
  for(let attempt=0;attempt<wait.attempts;attempt++){
   const current=await status();
@@ -36,7 +37,7 @@ export async function reloadService(apply:boolean,loaded:boolean,domain:string,t
  if((await run(['bootstrap',domain,plist])).code!==0)throw Error('Service reload failed; inspect service-status and use start PROJECT');
  return true;
 }
-type ServiceControlOptions={home?:string;statePath?:string;run?:typeof launch;turns?:TurnBarrier;pollState?:string};
+type ServiceControlOptions={home?:string;statePath?:string;run?:typeof launch;turns?:TurnBarrier;pollState?:string;startupWait?:StartupWait};
 export async function serviceControl(action:string,project?:string,applyOrTurns:boolean|TurnBarrier=false,optionsOrOperate:ServiceControlOptions|((action:string,project?:string)=>Promise<any>)={}){
  const apply=typeof applyOrTurns==='boolean'?applyOrTurns:false;
  const options=typeof optionsOrOperate==='function'?{}:optionsOrOperate;
@@ -74,7 +75,7 @@ async function controlProject(action:string,project:string|undefined,apply:boole
    if(apply&&current.loaded)verify();
    const update=serviceSettings(plist,label,entry.config,projectConfig,apply,def=>registry.assertInstalled(def,label,entry.config,!readOnly));
    const reloaded=await reloadService(apply,current.loaded,domain,target,plist,run,async()=>verify());
-   if(reloaded)await waitForPollStartup(status,observed=>assertPollStarted(observed,entry.config,def.ProgramArguments[1],options.pollState),async()=>{const r=await run(['kickstart',target]);if(r.code!==0)throw Error('Could not request poll startup');});
+   if(reloaded)await waitForPollStartup(status,observed=>assertPollStarted(observed,entry.config,def.ProgramArguments[1],options.pollState),async()=>{const r=await run(['kickstart',target]);if(r.code!==0)throw Error('Could not request poll startup');},options.startupWait);
    return {project:entry.project,...update,reloaded,workerSessionsStopped:false};
   }
   if(!['start','stop'].includes(action))throw Error('Unknown service action');
@@ -92,7 +93,7 @@ async function controlProject(action:string,project:string|undefined,apply:boole
    if(current.loaded!==(action==='start'))throw Error('Service state did not match requested action');
    if(action==='start'){
     const def=readDefinition(plist);
-    current=await waitForPollStartup(status,observed=>assertPollStarted(observed,entry.config,def.ProgramArguments[1],options.pollState),async()=>{const r=await run(['kickstart',target]);if(r.code!==0)throw Error('Could not request poll startup');});
+    current=await waitForPollStartup(status,observed=>assertPollStarted(observed,entry.config,def.ProgramArguments[1],options.pollState),async()=>{const r=await run(['kickstart',target]);if(r.code!==0)throw Error('Could not request poll startup');},options.startupWait);
    }
   return {project:entry.project,service:label,...current,...settings,settingsError,workerSessionsStopped:false,note:action==='stop'?'Background coordination stopped. Existing Orchestrator workers continue independently.':`Background coordination enabled; installed interval ${readDefinition(plist).StartInterval} seconds. Use service-config to preview/apply config changes.`};
  }finally{s.close();}
