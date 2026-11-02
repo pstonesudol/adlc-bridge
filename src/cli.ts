@@ -50,6 +50,19 @@ function projectConfiguration(path:string){
  if(runtime?.startsWith('--'))throw Error('--runtime requires a runtime configuration path');
  return withVerificationContext(JSON.parse(readFileSync(path,'utf8')),path,runtime);
 }
+export async function runCLIReviewTick<T>(operation:()=>Promise<T>):Promise<T>{
+ let interrupted:'SIGINT'|'SIGTERM'|undefined;
+ const defer=(signal:'SIGINT'|'SIGTERM')=>{interrupted??=signal;console.error(`${signal}: waiting for the in-flight review tick to settle before releasing the submission fence`);};
+ const onINT=()=>defer('SIGINT'),onTERM=()=>defer('SIGTERM');
+ process.on('SIGINT',onINT);process.on('SIGTERM',onTERM);
+ try{return await withTurnSubmission(operation);}
+ finally{
+  // Never cancel delivery, clear uncertainty, or unlock before the operation's
+  // normal receipt/error handling and the submission fence's finally settle.
+  process.off('SIGINT',onINT);process.off('SIGTERM',onTERM);
+  if(interrupted)process.exitCode=interrupted==='SIGINT'?130:143;
+ }
+}
 export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:startup,loadConfig,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  const identity=(c:any)=>JSON.stringify([realpathSync(c.repo),c.linear.projectId,c.linear.teamId,c.automation?.orchestratorProject,c.githubRepo]);
@@ -276,7 +289,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification,config.verificationContext));
     }
     if(command==='tick-review'){
-      return out(await withTurnSubmission(async()=>{
+      return out(await runCLIReviewTick(async()=>{
        const config=projectConfiguration(req(a[1],'Config'));validate(config);
        const job=req(a[0],'Job'),target=reviewLoop.get(job);
        if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
@@ -315,4 +328,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
+if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=process.exitCode||1;});
