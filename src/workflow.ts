@@ -127,6 +127,7 @@ export class Workflow{
  }
  async reconcilePlanning(job:string,c:WorkflowConfig){
   const dispatch=this.planning(job);if(!dispatch)return;
+  if(dispatch.state==='planning_finished')return {state:'planning_finished'};
   const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
   if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');

@@ -625,12 +625,39 @@ test('blocked uncertain reservations persist across restart until unique matchin
    f.findPlans=async()=>matches;await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');
   }
   f.findPlans=find;
+  const originalEvidence=f.evidence.bind(f);
   for(const key of ['id','projectId','branch']){
-   const original=e.session[key];e.session[key]='wrong';await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');e.session[key]=original;
+   f.evidence=async(sid:string)=>{const r=await originalEvidence(sid);return {...r,session:{...r.session,[key]:'wrong'}};};
+   const result=await w.tick(config);
+   expect(result.find(x=>x.job===id)).toMatchObject({state:'needs_reconciliation',reason:'Blocked planning session identity mismatch'});
+   expect(result.some(x=>x.error)).toBe(false);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');
   }
+  f.evidence=originalEvidence;
   e.transcript.controller='busy';await w.tick(config);expect(f.starts.length).toBe(1);
   e.transcript.controller='ready';e.transcript.turns.push({id:'live',state:'running'});await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.turns.pop();
   const text=e.transcript.entries[0].text;e.transcript.entries[0].text='Uncorrelated plan';await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.entries[0].text=text;
   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(f.starts.length).toBe(2);expect(f.sends).toEqual([]);expect(s.get(id).state).toBe('blocked');
  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('finished planning remains released after eligibility re-enqueue and waits for explicit recovery',async()=>{
+ for(const terminated of [false,true])for(const changed of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const id=s.enqueue('p','first','spec');await w.startPlanning(id,config);
+   s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+   if(terminated)f.sessions.get('session-1').session.isTerminated=true;else f.completePlan();
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');
+   s.enqueue('p','first',changed?'changed specification':'spec');expect(s.get(id).state).toBe('awaiting_plan');
+   const next=s.enqueue('p','next','spec');
+   f.evidence=async()=>{throw Error('Finished dispatch must not inspect its old session');};
+   const result=await w.tick(config);
+   expect(result.find(x=>x.job===id)).toMatchObject({state:'planning_finished'});
+   expect(result.some(x=>x.error)).toBe(false);expect(w.planning(id).state).toBe('planning_finished');
+   expect(w.planning(next).state).toBe('planning');expect(f.starts.length).toBe(2);
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(f.starts.length).toBe(2);
+   expect(s.get(id).state).toBe('awaiting_plan');expect(s.get(id).plan_hash).toBeNull();expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+  }finally{s.close();}
+ }
 });
