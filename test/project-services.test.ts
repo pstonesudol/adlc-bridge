@@ -107,7 +107,7 @@ test.skipIf(process.platform!=='darwin')('service-control recovery handles regis
  for(const registered of [false,true])for(const action of ['stop','service-status'])for(const setting of ['pollingIntervalSeconds','maxPlanning']){
   const f=fixture();try{
    const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
-   if(registered){const s=new Store(statePath);try{new ProjectServices(s).register(path,legacyLabel);}finally{s.close();}}
+   if(registered){const s=new Store(statePath);try{const registry=new ProjectServices(s);registry.register(path,legacyLabel);registry.registerController(path,resolve(import.meta.dir,'../src/cli.ts'));}finally{s.close();}}
    mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
    writeFileSync(join(f.dir,'Library/LaunchAgents',legacyLabel+'.plist'),serviceDefinition(path,process.execPath,resolve(import.meta.dir,'../src/cli.ts'),f.dir,legacyLabel));
    const config=JSON.parse(readFileSync(path,'utf8'));
@@ -146,7 +146,7 @@ test.skipIf(process.platform!=='darwin')('service-control recovery handles regis
 test.skipIf(process.platform!=='darwin')('service-config apply preserves fences and requires a verified idle receipt before definition changes',async()=>{
  const {serviceControl}=await import('../src/service-control');const f=fixture();try{
   const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
-  const s=new Store(statePath);let entry;try{entry=new ProjectServices(s).register(path);}finally{s.close();}
+  const s=new Store(statePath);let entry;try{const registry=new ProjectServices(s);entry=registry.register(path);registry.registerController(path,resolve(import.meta.dir,'../src/cli.ts'));}finally{s.close();}
   mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
   const plist=join(f.dir,'Library/LaunchAgents',entry.label+'.plist');
   writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'../src/cli.ts'),f.dir,entry.label));
@@ -166,7 +166,7 @@ test.skipIf(process.platform!=='darwin')('service-config apply preserves fences 
 test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded reload order and stopped updates without mutations',async()=>{
  const {serviceControl}=await import('../src/service-control');const f=fixture();try{
   const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
-  const s=new Store(statePath);let entry;try{entry=new ProjectServices(s).register(path);}finally{s.close();}
+  const s=new Store(statePath);let entry;try{const registry=new ProjectServices(s);entry=registry.register(path);registry.registerController(path,resolve(import.meta.dir,'../src/cli.ts'));}finally{s.close();}
   mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
   const plist=join(f.dir,'Library/LaunchAgents',entry.label+'.plist'),cli=resolve(import.meta.dir,'../src/cli.ts');
   writeFileSync(plist,serviceDefinition(path,process.execPath,cli,f.dir,entry.label));
@@ -217,5 +217,19 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
   const stopped=await serviceControl('service-config','one',true,options);
   expect(stopped).toMatchObject({changed:true,applied:true,reloaded:false,pollingIntervalSeconds:20});
   expect(calls).toEqual([['print',target]]);expect(readDefinition(plist).StartInterval).toBe(20);
+ }finally{f.close();}
+});
+
+test('read-only legacy discovery retains verified controller identity only in that registry instance',()=>{
+ const f=fixture();try{
+  const config=realpathSync(f.config('discovered','00000000-0000-0000-0000-000000000004'));
+  const controller=join(f.dir,'stable/cli.ts');mkdirSync(join(f.dir,'stable'));writeFileSync(controller,'fixture');
+  mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});writeFileSync(join(f.dir,'Library/LaunchAgents',legacyLabel+'.plist'),'fixture');
+  const def={Label:legacyLabel,ProgramArguments:['/bun',controller,'poll',config]};
+  f.registry.discoverLegacy(f.dir,()=>def,false);
+  expect(()=>f.registry.assertInstalled(def,legacyLabel,config,false)).not.toThrow();
+  expect(()=>f.registry.assertInstalled({...def,ProgramArguments:['/bun',resolve(import.meta.dir,'../src/cli.ts'),'poll',config]},legacyLabel,config,false)).toThrow('preserved');
+  expect(f.registry.list()).toEqual([]);expect(f.s.db.query('SELECT * FROM project_service_controllers').all()).toEqual([]);
+  expect(()=>new ProjectServices(f.s).assertInstalled(def,legacyLabel,config,false)).toThrow('controller identity missing');
  }finally{f.close();}
 });

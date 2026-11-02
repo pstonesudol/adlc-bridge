@@ -946,6 +946,11 @@ Omitted values retain defaults of 60 seconds and one planning stage. Polling mus
 be an integer from **5 to 86400 seconds**; maxPlanning must be an integer from
 **1 to 32**. Invalid values are rejected, never silently clamped. Setup prompts
 for both values; the static service example represents the default interval.
+Staged `setup` definitions also honor an explicit project polling interval. When
+it is omitted, staged setup retains the runtime configuration’s service interval;
+initial wizard generation and `serve` retain their 60-second default. Verification
+runtime references, pinned tools, controller bindings and unrelated service keys
+are preserved.
 
 Intake durably records all eligible tickets before dispatch, independently of
 available slots. Overflow stays queued. Reservations are made transactionally

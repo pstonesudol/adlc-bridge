@@ -35,6 +35,7 @@ function validateServiceConfig(c:any,validateRuntime:boolean){
  validate(validateRuntime?c:{...base,automation});
 }
 export class ProjectServices{
+ private discoveredControllers=new Map<string,string>();
  constructor(public s:Store,initialize=true){if(initialize)s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);
  CREATE TABLE IF NOT EXISTS project_service_controllers(config TEXT PRIMARY KEY,controller TEXT NOT NULL);`);}
  assertInstalled(def:any,label:string,config:string,persist=true){
@@ -54,11 +55,13 @@ export class ProjectServices{
   if((persist&&!entry)||(entry&&entry.label!==label))throw Error('Registered project service required; existing service preserved');
   const hasControllers=this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_service_controllers'").get();
   const registered=hasControllers?this.s.db.query('SELECT controller FROM project_service_controllers WHERE config=?').get(path) as any:undefined;
-  if(!registered&&!discovery)throw Error('Registered controller identity missing; explicit migration required');
+  const discovered=this.discoveredControllers.get(path);
+  if(!registered&&!discovered&&!discovery)throw Error('Registered controller identity missing; explicit migration required');
   // Only legacy discovery may adopt an existing user-installed plist identity.
-  const controller=registered?.controller??def.ProgramArguments?.[1];
+  const controller=registered?.controller??discovered??def.ProgramArguments?.[1];
   if(typeof controller!=='string'||!isAbsolute(controller))throw Error('Installed controller identity required; existing service preserved');
   assertDefinition(def,label,path,controller);
+  if(discovery)this.discoveredControllers.set(path,realpathSync(def.ProgramArguments[1]));
   if(persist)this.s.db.query('INSERT INTO project_service_controllers VALUES (?,?) ON CONFLICT(config) DO UPDATE SET controller=excluded.controller').run(path,realpathSync(def.ProgramArguments[1]));
  }
  list():ProjectService[]{if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").get())return [];return this.s.db.query('SELECT * FROM project_services ORDER BY project').all() as ProjectService[];}

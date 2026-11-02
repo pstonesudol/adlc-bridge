@@ -36,3 +36,12 @@ test('conflicting existing plist rejects recovery without binding or changing se
   expect(readFileSync(f.plist)).toEqual(before);const s=Store.readonly(f.db);try{expect(s.db.query('SELECT * FROM project_service_controllers').all()).toEqual([]);}finally{s.close();}
  }finally{f.close();}
 });
+
+test('initial service publication uses configured project polling without changing controller binding',()=>{
+ const f=fixture();try{
+  const c=JSON.parse(readFileSync(f.config,'utf8'));c.pollingIntervalSeconds=120;writeFileSync(f.config,JSON.stringify(c));
+  publishInitService(f.config,f.home,f.db,f.controller);
+  const xml=readFileSync(f.plist,'utf8');expect(xml).toContain('<integer>120</integer>');expect(xml).toContain(f.controller);
+  const s=Store.readonly(f.db);try{expect(s.db.query('SELECT controller FROM project_service_controllers').get()).toEqual({controller:f.controller});}finally{s.close();}
+ }finally{f.close();}
+});

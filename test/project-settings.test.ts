@@ -23,6 +23,19 @@ test('serve uses configured interval and omitted default without overlapping tic
  }
 });
 test('generated project services accept distinct validated intervals',()=>{
- for(const seconds of [5,120])expect(serviceDefinition('/config','/bun','/cli','/home','label',{pollingIntervalSeconds:seconds})).toContain(`<integer>${seconds}</integer>`);
- expect(()=>serviceDefinition('/config','/bun','/cli','/home','label',{pollingIntervalSeconds:0})).toThrow('pollingIntervalSeconds');
+ for(const seconds of [5,120])expect(serviceDefinition('/config','/bun','/cli','/home','label',undefined,{pollingIntervalSeconds:seconds})).toContain(`<integer>${seconds}</integer>`);
+ expect(()=>serviceDefinition('/config','/bun','/cli','/home','label',undefined,{pollingIntervalSeconds:0})).toThrow('pollingIntervalSeconds');
+});
+
+test('staged runtime generation honors project interval and preserves runtime metadata and legacy interval fallback',async()=>{
+ const {runtimeServiceDefinition}=await import('../src/setup');
+ const runtime=await Bun.file(new URL('../config/runtime.example.json',import.meta.url)).json();runtime.service.interval=90;
+ const before=JSON.stringify(runtime);
+ expect(runtimeServiceDefinition(runtime)).toContain('<integer>90</integer>');
+ const xml=runtimeServiceDefinition(runtime,'/trusted/runtime.json',{pollingIntervalSeconds:120});
+ expect(xml).toContain('<integer>120</integer>');expect(xml).toContain('/trusted/runtime.json');expect(xml).toContain('ADLC_AO_PATH');expect(xml).toContain(runtime.controller);
+ expect(JSON.stringify(runtime)).toBe(before);
+ expect(()=>runtimeServiceDefinition(runtime,undefined,{pollingIntervalSeconds:0})).toThrow('pollingIntervalSeconds');
+ expect(serviceDefinition('/config','/bun','/cli','/home','label','/trusted/runtime.json',{pollingIntervalSeconds:120})).toContain('<integer>120</integer>');
+ expect(serviceDefinition('/config','/bun','/cli','/home','label','/trusted/runtime.json',{pollingIntervalSeconds:120})).toContain('ADLC_VERIFICATION_RUNTIME_CONFIG');
 });
