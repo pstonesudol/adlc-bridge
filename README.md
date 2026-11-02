@@ -970,8 +970,11 @@ logs and unrelated keys; other projects are untouched. An already-loaded service
 requires verified intake quiescence under the submission fence before changing its
 definition or unloading. It is reloaded even if the definition already matches, allowing a failed unload to be
 retried (and can immediately pick up authorized work); a stopped service stays
-stopped. Existing worker sessions are not terminated. If reload fails, inspect
-service-status and use start PROJECT_ID after resolving the error. Status reports
+stopped. Existing worker sessions are not terminated. If `bootout` fails, inspect
+`service-status PROJECT_ID` and retry `service-config PROJECT_ID --apply` after
+resolving the error; the service can still be loaded with its previous interval.
+If `bootstrap` or poll startup fails after unload, inspect `service-status PROJECT_ID`
+and use `start PROJECT_ID` after resolving the error. Status reports
 effective configured settings and the installed definition interval; a loaded
 service needs apply/reload after interval changes. maxPlanning changes are read
 on the next launched poll, without service regeneration. `serve CONFIG` snapshots
