@@ -3,7 +3,8 @@ import os,subprocess,base64,hmac,hashlib,re,time,json,urllib.request,signal,shle
 root=Path.home()/'Library/Application Support/ADLC Bridge'
 manifest=json.loads((root/'orchestrator-runtime.json').read_text())
 exe=Path(manifest['executable'])
-assert hashlib.sha256(exe.read_bytes()).hexdigest()==manifest['sha256'],'Hotfix binary changed'
+if hashlib.sha256(exe.read_bytes()).hexdigest()!=manifest['sha256']:
+ raise SystemExit('Hotfix binary changed')
 data=Path.home()/'.ao/data'
 data.mkdir(parents=True,exist_ok=True,mode=0o700)
 keypath=data/'browser-runtime.key'
@@ -23,7 +24,8 @@ with os.fdopen(fd) as f:
 records=raw.split('\n')[:-1] if '\n' in raw else [raw]
 record=next(x.strip() for x in records if re.fullmatch(r'[A-Za-z0-9_-]{43}',x.strip()))
 key=base64.urlsafe_b64decode(record+'=')
-assert len(key)==32
+if len(key)!=32:
+ raise SystemExit('Browser runtime key must decode to exactly 32 bytes')
 token=base64.urlsafe_b64encode(hmac.new(key,b'ao-browser-runtime-token-v1',hashlib.sha256).digest()).decode().rstrip('=')
 resources=Path('/Applications/Agent Orchestrator.app/Contents/Resources')
 runid=manifest['appRunId']

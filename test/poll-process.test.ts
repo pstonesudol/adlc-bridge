@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';import {mkdtempSync,writeFileSync,readFileSync,readdirSync,chmodSync,rmSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {test,expect,spyOn} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,readdirSync,chmodSync,rmSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {acknowledgePoll,assertPollQuiescent,assertPollStarted} from '../src/poll-process';import {stopLoadedIntake,waitForPollStartup} from '../src/service-control';import {turnBarrier} from '../src/turn-submission';import {controlStack,type StackOps} from '../src/stack-control';
 import {TurnSubmissionBlocked} from '../src/turn-submission';import {PollProcessNotRunning} from '../src/poll-process';
 function fixture(){
@@ -42,6 +42,19 @@ test('startup preserves another live poll receipt and replaces only idle, dead o
   if(mode==='live'||mode==='unknown'){await expect(startup).rejects.toThrow(mode==='live'?'Another live poll':'inspection failed');expect(readFileSync(path)).toEqual(before);expect(submissions).toBe(0);}
   else{const finish=await startup;expect(JSON.parse(readFileSync(path,'utf8'))).toMatchObject({pid:process.pid,started:'current start',idle:false});expect(submissions).toBe(1);finish();}
  }finally{f.close();}}
+});
+test('receipt claim contention identifies its path and preserves the existing receipt and lock',async()=>{
+ const f=fixture();try{
+  const finish=await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit);finish();const path=f.receipt(),claim=path+'.lock',before=readFileSync(path);mkdirSync(claim);
+  await expect(acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit)).rejects.toThrow(`Poll receipt claim is held or abandoned; inspect before retrying: ${claim}`);expect(readFileSync(path)).toEqual(before);expect(readdirSync(claim)).toEqual([]);
+ }finally{f.close();}
+});
+test('receipt claim cleanup failure reports its path without replacing the startup error',async()=>{
+ const f=fixture();const log=spyOn(console,'error').mockImplementation(()=>{});try{
+  await acknowledgePoll(f.config,f.cli,f.state,f.started,f.turns.submit);const path=f.receipt(),claim=path+'.lock';const prior={...JSON.parse(readFileSync(path,'utf8')),pid:process.pid+1};writeFileSync(path,JSON.stringify(prior));const before=readFileSync(path),original=Error('Cannot inspect prior process');
+  const started=(pid:number)=>{if(pid===process.pid)return 'current start';writeFileSync(join(claim,'preserve'),'inspection required');throw original;};
+  expect(await acknowledgePoll(f.config,f.cli,f.state,started,f.turns.submit).catch(error=>error)).toBe(original);expect(readFileSync(path)).toEqual(before);expect(log).toHaveBeenCalledWith('Poll receipt claim cleanup needs inspection:',claim);expect(readFileSync(join(claim,'preserve'),'utf8')).toBe('inspection required');
+ }finally{log.mockRestore();f.close();}
 });
 test('a real live poll keeps its receipt when a second startup is rejected, and a dead owner can be replaced',async()=>{
  const f=fixture();let child:ReturnType<typeof Bun.spawn>|undefined;try{

@@ -21,7 +21,8 @@ export async function acknowledgePoll(config:string,cli:string,state=appState(),
   // until submit succeeds after the stack resumes and releases its fence.
   // Serialize receipt claims independently of the submission fence: a stack
   // start holds that fence while waiting for this acknowledgement.
-  mkdirSync(dirname(path),{recursive:true,mode:0o700});const claim=path+'.lock';mkdirSync(claim,{mode:0o700});
+  mkdirSync(dirname(path),{recursive:true,mode:0o700});const claim=path+'.lock';
+  try{mkdirSync(claim,{mode:0o700});}catch(error:any){if(error?.code==='EEXIST')throw Error(`Poll receipt claim is held or abandoned; inspect before retrying: ${claim}`,{cause:error});throw error;}
   try{
    if(existsSync(path)){
     const prior=readReceipt(path);
@@ -31,7 +32,7 @@ export async function acknowledgePoll(config:string,cli:string,state=appState(),
     }
    }
    atomicFile(path,JSON.stringify(record));
-  }finally{rmdirSync(claim);}
+  }finally{try{rmdirSync(claim);}catch{console.error('Poll receipt claim cleanup needs inspection:',claim);}}
   const finished=()=>{const current=readReceipt(path);if(current.pid===record.pid&&current.started===record.started)atomicFile(path,JSON.stringify({...record,idle:true}));};
   const deadline=Date.now()+wait.timeoutMs;let notified=false;
   try{for(;;){try{await submit(async()=>{});break;}catch(error){if(!(error instanceof TurnSubmissionBlocked)||Date.now()>=deadline)throw error;if(!notified){notified=true;wait.onBlocked?.();}await wait.pause();}}}

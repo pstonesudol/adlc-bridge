@@ -47,8 +47,12 @@ must have a clean completion receipt. Services without that proof are preserved:
 before upgrading a pre-barrier installation, an operator must establish
 quiescence and stop/unload its intake services manually. Never interrupt a
 submission or delete uncertain delivery records to force migration.
-Contention or an abandoned `turn-submission.lock` fails closed; inspect the stack
-and delivery receipts before removing an abandoned lock. This barrier cannot fence
+Contention or an abandoned `turn-submission.lock` fails closed. Before removing
+one, inspect the stack and delivery receipts and confirm that every possible lock
+holder has exited and cannot resume. An unresponsive holder may resume writing;
+unresponsiveness alone is not evidence that the lock is abandoned. Recovery must
+not interrupt an in-flight submission or discard uncertain delivery records.
+This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle
 during shutdown as well.
 
