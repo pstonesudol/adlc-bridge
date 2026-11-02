@@ -2,10 +2,11 @@ import {ApprovalPolicyStore} from './approval-policy';
 import {Store,digest} from './core';
 import {DEFAULT_REMEDIATION_POLICY,remediationPolicy,remediationSummary,type RemediationPolicy,type RemediationSummary} from './remediation';
 import {adoptedDelivery} from './delivery-identity';
+import {assertWorktreeAvailable} from './worktree-reservation';
 
 export type Session = {id:string;correlation:string;worktree:string;controller:'running'|'stopped'|'unknown'};
 export type Transport = {start(request:{correlation:string;spec:string;plan:string}):Promise<Session>};
-const allowedGit=new Set(['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+const allowedGit=new Set(['inspect','fetch','worktree','branch','commit','push-feature','open-pr','merge-base-feature']);
 // Pre-budget releases blocked a job after its fifth cumulative remediation
 // reservation with this exact structured reason on both the job and its run.
 // Compatibility migration only trusts that pair plus retained history; an
@@ -189,10 +190,12 @@ export class Lifecycle {
     return j;
   }
   async dispatch(job:string,transport:Transport,runtime:{isolated:boolean;hostVerified:boolean}) {
+    assertWorktreeAvailable(this.s,job);
     // Not exposed by the CLI. These booleans are a dependency contract, not
     // evidence of isolation; a production host verifier is still required.
     if(!runtime.isolated||!runtime.hostVerified)throw Error('Verified isolated worker runtime required');
     const request=this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);
       const j=this.current(job);
       const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
       const required=['inspect','fetch','worktree','branch'];
@@ -222,6 +225,7 @@ export class Lifecycle {
     }
   }
   adoptSupervised(job:string,session:Session) {
+    assertWorktreeAvailable(this.s,job);
     // Recovery/adoption of an already-running, human-supervised pilot only.
     // This does not satisfy the isolated-runtime contract for new dispatches.
     return this.s.db.transaction(()=>{
@@ -237,6 +241,7 @@ export class Lifecycle {
   }
   run(job:string):any{return this.s.db.query('SELECT * FROM runs WHERE job=?').get(job);}
   reconcile(job:string,sessions:Session[],complete:boolean) {
+    assertWorktreeAvailable(this.s,job);
     if(!complete)throw Error('Complete authoritative session inventory required');
     return this.s.db.transaction(()=>{
       const r=this.run(job);if(!r)throw Error('No run to reconcile');
@@ -260,6 +265,7 @@ export class Lifecycle {
     if(!/^[a-f0-9]{40,64}$/.test(head)||!findings.trim())throw Error('Current SHA and actionable findings required');
     const policy=remediationPolicy(policyInput);
     return this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);
       this.current(job);const r=this.run(job);
       if(!r||r.state!=='running'||r.owner!=='orchestrator')throw Error('Active agent-owned run required');
       const hash=digest(findings),budget=this.ensureBudget(job,policy);

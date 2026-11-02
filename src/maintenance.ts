@@ -1,5 +1,6 @@
 import {existsSync,realpathSync} from 'node:fs';
 import {Lifecycle} from './lifecycle';
+import {assertWorktreeAvailable} from './worktree-reservation';
 import {deliveryBranch} from './delivery-identity';
 import {remediationPolicy} from './remediation';
 import {metadataCheckNames,validate} from './linear';
@@ -21,6 +22,7 @@ export function configFor(s:Store,job:string,projects=registrations()){
 }
 const maintenanceIO={registrations,sessionEvidence,gh:maintenanceGitHub,localAO,poll,linearToken,review:(s:Store)=>new ReviewLoop(s)};
 export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,apply=false,confirmation?:string,io=maintenanceIO){
+  assertWorktreeAvailable(s,job);
  const j=s.get(job),run=s.db.query('SELECT * FROM runs WHERE job=?').get(job) as any,target=s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
  if(!run||!target)throw Error('Existing run and PR target required; use recover-handoff for a missed initial handoff');
  const c=configFor(s,job,io.registrations());if(target.repo!==c.githubRepo)throw Error('Registered repository mismatch');
@@ -66,5 +68,5 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
   for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
   s.event(job,'review_recovery_requested',JSON.stringify({...report,proven}));
  }).immediate();
- await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,metadataChecks);return {...report,result:await loop.tick(job,c.branchUpdate,budget,{project:c.linear.projectId,checks:metadataChecks})};
+  await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,metadataChecks);return {...report,result:await loop.tick(job,c.branchUpdate,budget,{project:c.linear.projectId,checks:metadataChecks},c)};
 }

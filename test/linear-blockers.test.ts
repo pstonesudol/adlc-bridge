@@ -3,6 +3,7 @@ import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
+import {ConflictRecovery} from '../src/conflict-recovery';
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};
@@ -72,6 +73,18 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   expect(f.comments[0].body).toContain('does not grant readiness');
   await f.blockers().sync(f.config);expect(f.creates).toBe(1);expect(f.updates).toBe(1);
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
+ }finally{f.s.close();}
+});
+test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
+ const f=fixture();try{
+  f.running();new ConflictRecovery(f.s).install();
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('app.txt');
+  f.s.db.query("UPDATE conflict_recoveries SET state='completed',reason=NULL,detail=?").run(JSON.stringify({result:'new-sha'}));
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);
+  expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.comments[1].body).toContain('new-sha');expect(f.comments[1].body).toContain('not readiness');
+  expect(f.s.get(f.id).state).toBe('approved');
  }finally{f.s.close();}
 });
 test('label verification failure after a successful write is retractable',async()=>{

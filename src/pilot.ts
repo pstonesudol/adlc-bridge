@@ -12,6 +12,7 @@ import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
 import {metadataFailureBodyCovered} from './pr-template-ci';
 import {recordDispatchedFeedback} from './review-feedback';
+import {assertWorktreeAvailable} from './worktree-reservation';
 
 export async function adoptPilot(s:Store,job:string,session:string){
  const evidence=await sessionEvidence(session),r=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
@@ -32,6 +33,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
 export async function sendPilotRemediation(s:Store,job:string,head:string,findings:string,repo:string,pr:number,required:string[],policy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,metadataChecks:string[]=[],overrides:Partial<typeof pilotIO>={}){
+  assertWorktreeAvailable(s,job);
  const io={...pilotIO,...overrides};
  const l=new Lifecycle(s),r=l.run(job);if(!r)throw Error('Existing pilot required');
  const parsed=JSON.parse(findings);

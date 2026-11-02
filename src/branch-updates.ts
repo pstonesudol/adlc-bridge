@@ -1,6 +1,7 @@
 import {Store} from './core';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
+import {assertWorktreeAvailable} from './worktree-reservation';
 export type BranchPolicy={enabled:boolean;authorizedBy:string;maxUpdates:number|null};
 export type BranchSnapshot={head:string;base:string;branch:string;baseBranch:string;defaultBranch:string;headRepo:string;baseRepo:string;state:string;draft:boolean;mergeable:boolean|null;behind:number};
 export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>};
@@ -25,7 +26,8 @@ export const branchTransport:BranchTransport={
 };
 export class BranchUpdates{
  constructor(public s:Store,public transport:BranchTransport=branchTransport){s.db.exec(`CREATE TABLE IF NOT EXISTS branch_updates(job TEXT NOT NULL REFERENCES jobs(id),head TEXT NOT NULL,base TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,reason TEXT,PRIMARY KEY(job,head,base));`);}
- async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
+  async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
+   assertWorktreeAvailable(this.s,job);
   if(policy?.enabled&&(!policy.authorizedBy?.trim()||policy.maxUpdates!==null&&(!Number.isSafeInteger(policy.maxUpdates)||policy.maxUpdates<1||policy.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1)throw Error('Valid PR required');
   const l=new Lifecycle(this.s),j=l.current(job),run=l.run(job),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
@@ -47,7 +49,8 @@ export class BranchUpdates{
   const fresh=await this.transport.read(repo,pr);
   if(JSON.stringify(fresh)!==JSON.stringify(b))return {state:'updating_branch',send:false,head:fresh.head,reason:'Branch changed during inspection; recheck next poll'};
   l.current(job);
-  const claim=this.s.db.transaction(()=>{
+   const claim=this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
    const count=(this.s.db.query('SELECT count(*) AS n FROM branch_updates WHERE job=?').get(job) as any).n;
    if(policy.maxUpdates!==null&&count>=policy.maxUpdates)return 'limit';
    return this.s.db.query('INSERT OR IGNORE INTO branch_updates VALUES (?,?,?,?,?,?)').run(job,b.head,b.base,'delivery_uncertain',Date.now(),null).changes?'claimed':'existing';

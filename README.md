@@ -964,6 +964,123 @@ explicit operator actions. No merge or deployment is automatic.
 
 ## Existing worker PR recovery
 
+### Opt-in base-conflict recovery (DEV-50)
+
+Conflict-free GitHub Update branch keeps its existing `branchUpdate` policy.
+Confirmed conflicts may instead use this **separate, disabled-by-default** policy:
+
+```json
+{
+  "conflictRecovery": {
+    "version": 1,
+    "enabled": true,
+    "authorizedBy": "named authorizing operator",
+    "baseBranch": "main",
+    "maxRecoveries": 3,
+    "verification": [["bun", "test"]]
+  }
+}
+```
+
+Verification is an explicit ordered list of argv arrays, not inferred shell
+commands. Each runs in the registered worktree with a ten-minute timeout; the
+first failure stops publication. Configure the project's approved Docker
+verification command here when appropriate. This bridge's full suite uses the
+supported macOS host runtime, as in its CI. Verification output tails and exit
+codes are retained with the recovery, so do not configure commands that print
+secrets. Configuration is operator-trusted execution input, not reviewer text.
+
+Policy alone grants **no Git authority**. Every attempt requires current unchanged
+job/plan approval, applicable scope, an existing registered delivery/run and PR
+handoff, and current grants for `inspect`, `fetch`, `branch`, `commit`,
+`push-feature`, `open-pr`, and **`merge-base-feature`**. Existing grants and standing
+policies are never migrated or expanded automatically. An operator can explicitly
+add the narrowly defined base-into-feature grant to a current approved job:
+
+```sh
+adlc authorize-base-merge JOB CURRENT_PLAN_HASH HUMAN
+adlc recovery-preview JOB CONFIG
+adlc recovery-status
+```
+
+The grant does not permit PR merges, default-branch pushes, rebases, force-pushes,
+resets, deployments or history rewrites. Normal polling and `tick-review` use the
+same policy. Preview uses a read-only database and neither reserves nor sends.
+Enabling policy or granting authority to live jobs is a separately authorized
+operator action; shipping this code does neither.
+
+Recovery requires the configured repository/base, a clean isolated registered
+worktree at the exact remote feature head, one verified owning AO session, idle
+activity/controller, no queued turns, and no uncertain branch update, remediation,
+implementation or continuation. Local divergence, pre-existing merge/rebase or
+sequencer operations, changed scope/approval/head/base, or ambiguous ownership
+block without discarding work. Standing approval freshness is checked again
+after verification; expired eligibility must be refreshed by normal coordination,
+never bypassed by recovery.
+
+The host reserves one durable intent bound to job, plan, PR and both input SHAs.
+It fetches exact refs, retains immutable `refs/adlc/conflict/<intent>/head` and
+`.../base` backups, and merges the base into the existing feature branch without
+committing. Only ordinary three-stage regular-text conflicts inside approved
+paths are sent to the **existing worker** through the existing turn-submission
+transport and stable client receipt. Binary, rename, add/delete, type/symlink,
+protected-path and out-of-scope conflicts require an operator. The worker must
+preserve both feature intent and base safeguards, and stop with exact files and
+questions for product/security/scope ambiguity; blindly selecting ours/theirs is
+not allowed. It edits only conflict files and does not stage, commit or push.
+
+After the completed receipt, the host rejects changes to non-conflict content,
+untracked/unstaged edits and conflict markers, stages only the approved conflict
+files, runs verification, checks the unchanged verified tree and exact merge
+parents, then normal-pushes only the owned feature ref after fresh ownership and
+remote head/base checks. No force option is used. The new SHA returns to fresh
+latest-SHA CI/CodeRabbit gates; earlier clearance is not reused.
+
+#### Reservation boundary and manual reconciliation
+
+The durable reservation is honored by bridge planning delivery, implementation,
+continuations, review remediation, branch updates, delivery adoption and lifecycle
+reconciliation. It is not a native AO lock: **arbitrary human/native AO writers
+can still race the bridge**. Activity and ownership are rechecked, but this is
+not atomic native exclusivity. Operators must not concurrently edit/send into a
+reserved worktree. Unexpected activity or changed evidence fails closed. The
+bridge does not claim protection against an external writer that evades those
+observations. Use native exclusive execution only if a separately verified
+native capability becomes available; none is assumed here.
+
+Reservations have no timeout/lease-stealing escape. Each recovery consumes one
+existing remediation-budget reservation, additionally bounded by `maxRecoveries`
+(1–10); waiting and receipt reconciliation consume none. Existing no-progress
+limits and audit history remain intact. Missing/uncertain resolution receipts
+never resend. A proven successful push with a lost reply is observed on the next
+tick without another push. Interrupted fetch/merge/stage/verification/commit,
+rejected push, decision blockers, and unprovable results preserve work and stop
+for operator reconciliation rather than replaying a mutation. These conservative
+stops are intentional, not automatic reset/retry opportunities.
+
+Inspect `recovery-status` for the exact stage, conflict paths, input SHAs,
+verification evidence and reason. After separately authorized manual repair and
+normal publication of the exact two-parent merge, an operator can preview and
+confirm its completion:
+
+```sh
+adlc reconcile-conflict JOB CONFIG
+adlc reconcile-conflict JOB CONFIG --confirm HASH --human NAME
+```
+
+Confirmation verifies the same approval/policy/scope/ownership, exact original
+parents, clean published tree, retained non-conflict content and a terminal
+worker receipt, then reruns configured verification and releases only that proven
+completed reservation. It never sends, commits, pushes, resets or expands scope.
+If that proof cannot be obtained, preserve the reservation and request explicit
+operator reconciliation/replanning; do not edit SQLite or rewrite history to
+satisfy the check. DEV-18 answer intake is not required or assumed: a human answer
+alone does not resume a conflict worker. DEV-17 blocker notices are deduplicated;
+completion notices report the new SHA but do not grant readiness or merge approval.
+
+Installation/activation is a separate reviewed operator step. Human-only PR
+merging remains mandatory.
+
 Workers must retain the reserved planning branch. At completed delivery, the
 bridge verifies the registered worktree branch/HEAD and PR identity. Drift is
 reported as **Blocked — branch mismatch**, with a deduplicated Linear comment

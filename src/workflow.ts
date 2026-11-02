@@ -10,6 +10,7 @@ import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
 import {PreSendFailure} from './pre-send';
+import {assertWorktreeAvailable,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number}};
@@ -55,13 +56,15 @@ export class Workflow{
  implementation(job:string):any{return this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job);}
  private submit<T>(operation:()=>Promise<T>){return this.t.submit?this.t.submit(operation):operation();}
  async startPlanning(job:string,c:WorkflowConfig){return this.submit(()=>this.startPlanningWithinBarrier(job,c));}
- private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
+  private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
+   assertWorktreeAvailable(this.s,job);
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
   if(this.planning(job))return this.reconcilePlanning(job,c);
   const specification=this.s.get(job).spec;
   const route=c.routing?.enabled?await this.router.choose(job,'planning',digest(specification),'Plan only: '+specification,c.routing,'planning'):undefined;
   if(route){if(!this.t.preflightRoute||!this.t.configureRoute)throw Error('Routed transport is unavailable');await this.t.preflightRoute(route);}
-  const row=this.s.db.transaction(()=>{
+   const row=this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
    const j=this.s.get(job);if(j.project!==c.linear.projectId||j.state!=='awaiting_plan')throw Error('Eligible project job required');
    if(this.planning(job))return null;
    if(route&&this.router.get(job,'planning')?.binding!==digest(j.spec))throw Error('Specification changed during route selection');
@@ -133,7 +136,8 @@ export class Workflow{
   await this.router.choose(job,'implementation',digest(JSON.stringify([j.spec,j.plan_hash])),`Implement the requested task (planning is complete; supporting checks are part of the change):\n${j.spec}`,c.routing);
  }
  async deliverPlanning(job:string,session:string,route:Route){return this.submit(()=>this.deliverPlanningWithinBarrier(job,session,route));}
- private async deliverPlanningWithinBarrier(job:string,session:string,route:Route){
+  private async deliverPlanningWithinBarrier(job:string,session:string,route:Route){
+   assertWorktreeAvailable(this.s,job);
   const r=new Planning(this.s).get(job),j=this.s.get(job);
   if(j.state!=='awaiting_plan'||r.spec_hash!==digest(j.spec))throw Error('Planning eligibility changed');
   const e=await this.t.evidence(session);
@@ -152,7 +156,8 @@ export class Workflow{
   await this.t.configureRoute(session,route);this.router.verified(job,'planning');
   const args=new Planning(this.s).request(job,true),prompt=args[args.indexOf('--prompt')+1];
   const clientId=`adlc-plan-message-${r.correlation}`;
-  const claim=this.s.db.transaction(()=>{
+   const claim=this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
    const latest=this.s.get(job);if(latest.state!=='awaiting_plan'||r.spec_hash!==digest(latest.spec))throw Error('Planning eligibility changed before delivery');
    return this.s.db.query('INSERT OR IGNORE INTO planning_delivery VALUES (?,?,?,?)').run(job,session,clientId,'delivery_uncertain').changes;
   }).immediate();
@@ -181,7 +186,9 @@ export class Workflow{
   })();
  }
  async executeApproved(job:string,c?:WorkflowConfig){return this.submit(()=>this.executeApprovedWithinBarrier(job,c));}
- private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
+  private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
+   const reservation=worktreeReservation(this.s,job);
+   if(reservation)return {state:'conflict_recovery',recovery:reservation.id,stage:reservation.state};
   const d=this.implementation(job);if(!d)return;
   const l=new Lifecycle(this.s),j=l.current(job),r=new Planning(this.s).get(job);
   if(j.plan_hash!==d.plan_hash||r?.session_id!==d.session_id)throw Error('Execution approval is stale');
@@ -200,7 +207,7 @@ export class Workflow{
   const route=this.router.approved(job,j.plan_hash);
   if(route){if(!this.t.configureRoute)throw Error('Routing controls are unavailable');await this.t.configureRoute(d.session_id,route);this.router.verified(job,'implementation');}
   l.current(job);
-  const claimed=this.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=? AND state='approved_pending'").run(job);
+   const claimed=this.s.db.transaction(()=>{assertWorktreeAvailable(this.s,job);return this.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=? AND state='approved_pending'").run(job);}).immediate();
   if(!claimed.changes)return {state:'delivery_uncertain'};
   await this.t.disableFeedback(d.session_id);
   l.adoptSupervised(job,{id:d.session_id,correlation:r.correlation,worktree:r.worktree,controller:'running'});
@@ -350,7 +357,8 @@ export class Workflow{
   }
   return {mode:'preview_only',applied:false,graceMs,results};
  }
- async resume(job:string,c:WorkflowConfig){
+  async resume(job:string,c:WorkflowConfig){
+   assertWorktreeAvailable(this.s,job);
   const j=this.s.get(job),d=this.implementation(job),r=new Planning(this.s).get(job),run=new Lifecycle(this.s).run(job),policy=new ApprovalPolicyStore(this.s),proof=policy.get(job);
   if(j.project!==c.linear.projectId)throw Error('Job project does not match configured project');
   if(!d||!r||!run)throw Error('Existing owned worker and delivery required');
@@ -398,7 +406,8 @@ export class Workflow{
   ].join('\n\n');
   let claim:any;
   try{
-   claim=this.s.db.transaction(()=>{
+    claim=this.s.db.transaction(()=>{
+     assertWorktreeAvailable(this.s,job);
     const current=this.s.get(job);
     if(current.plan_hash!==j.plan_hash||current.spec!==j.spec)throw Error('Plan changed during resume reservation');
     if(current.state!=='approved'||current.approved_hash!==j.plan_hash)throw Error('Plan approval revoked during resume reservation');

@@ -17,6 +17,8 @@ import {assertDeliveryTarget} from './delivery-identity';
 import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
 import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
+import {ConflictRecovery} from './conflict-recovery';
+import {worktreeReservation} from './worktree-reservation';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -125,7 +127,7 @@ export class ReviewLoop{
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({head,bodyHash}));
   return true;
  }
-  async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]}){
+  async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
    const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
@@ -133,7 +135,13 @@ export class ReviewLoop{
   const metadataChecks=[...metadataCheckNames(policy===undefined?this.metadataChecks(job):policy.checks)];
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
-  l.recordRemediationPolicy(job,remediationPolicy);
+   l.recordRemediationPolicy(job,remediationPolicy);
+   const recovery=worktreeReservation(this.s,job);
+   if(recovery){
+    if(recovery.job!==job||!config)return this.record(job,{state:'blocked',send:false,reason:'Worktree has a durable conflict reservation; inspect recovery-status with its original config'});
+    try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
+    catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
+   }
   let session;
   try{
    session=await this.io.sessionEvidence(run.session_id);
@@ -144,6 +152,13 @@ export class ReviewLoop{
   }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
    let branch;
+   if(config?.conflictRecovery?.enabled===true){
+    const snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);
+    if(snapshot.mergeable===false&&snapshot.behind>0){
+     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
+     catch(error){return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
+    }
+   }
    try{branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
    catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
    if(branch)return this.record(job,branch);

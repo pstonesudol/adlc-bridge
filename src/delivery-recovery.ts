@@ -1,6 +1,7 @@
 import {realpathSync} from 'node:fs';
 import {resolve} from 'node:path';
 import {Store,digest} from './core';
+import {assertWorktreeAvailable} from './worktree-reservation';
 
 // Evidence reports the resolved worktree root, while authorization keeps the
 // originally registered value. Compare canonical forms, but persist the raw
@@ -41,7 +42,8 @@ export class DeliveryRecovery{
   const hash=digest(JSON.stringify({...proposal,owners:[]}));
   return {state:'preview',hash,proposal,mergeEnabled:false};
  }
- async confirm(job:string,c:any,hash:string){
+  async confirm(job:string,c:any,hash:string){
+   assertWorktreeAvailable(this.s,job);
   const first=await this.preview(job,c);if(first.hash!==hash)throw Error('Proposal changed; preview again');
   this.install();
   const p=first.proposal;
@@ -50,7 +52,8 @@ export class DeliveryRecovery{
   // unattempted state, so a crash before the claim remains retryable.
   const pre=await this.preview(job,c);
   if(pre.hash!==hash)throw Error('Proposal changed before claim; explicit reconciliation required');
-  const reservation=this.s.db.transaction(()=>{
+   const reservation=this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
    this.authorization(job,c);
    const old=this.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(job) as any;
    if(old){if(old.proposal!==hash)throw Error('Existing adoption requires reconciliation; never overwrite');return old.state==='reserved'?'retry':false;}
@@ -63,8 +66,9 @@ export class DeliveryRecovery{
   }
   if(!await this.t.attached(p.session,p.candidate.url))throw Error('Claim receipt uncertain; no repeat claim, inspect ownership');
   if((await this.preview(job,c)).hash!==hash)throw Error('Proposal changed after claim; delivery remains blocked');
-  return this.s.db.transaction(()=>{
-   this.authorization(job,c);
+   return this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
+    this.authorization(job,c);
    const changed=this.s.db.query("UPDATE delivery_adoptions SET state='adopted' WHERE job=? AND proposal=? AND state='claim_uncertain'").run(job,hash);
    if(changed.changes){
     this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));

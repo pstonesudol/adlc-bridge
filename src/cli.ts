@@ -35,6 +35,8 @@ import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
+import {ConflictRecovery} from './conflict-recovery';
+import {recoveryRows} from './worktree-reservation';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -61,7 +63,7 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
    if(target.state==='completed')continue;
-   try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
+   try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
   }
  });
 }
@@ -119,7 +121,12 @@ async function main(){
   resume-job JOB CONFIG                 resume the existing needs-input worker after verified resolution
   adopt-pilot JOB SESSION               reconcile existing supervised worker only
   observe-pilot JOB OWNER/REPO PR CONFIG persist latest-SHA review evidence
-  recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
+   recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
+  recovery-status                      read-only conflict stages, evidence and blockers
+  recovery-preview JOB CONFIG          read-only conflict eligibility preview
+  reconcile-conflict JOB CONFIG        read-only published-merge reconciliation preview
+    [--confirm HASH --human NAME]      verify and release only proven completed recovery
+  authorize-base-merge JOB HASH HUMAN  explicitly add merge-base-feature to current job grant
   register-review JOB REPO PR CONFIG    register bounded review target
   review-status                        show CI/review waits, blockers and remediation budget
   tick-review JOB CONFIG               same identity and branch policy as periodic review
@@ -170,9 +177,25 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
-  if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve','reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[['poll','serve','reconcile-preview'].includes(command)?0:1],'Config'),'utf8')):null;if(c)validate(c);
-   if(command==='recover-handoff'){
+    if(command==='reconcile-conflict'){
+     if(a.length!==2&&!(a.length===6&&a[2]==='--confirm'&&a[4]==='--human'))throw Error('Use reconcile-conflict JOB CONFIG [--confirm HASH --human NAME]');
+     const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+     const store=new Store(db,a.length===2);
+     try{const recovery=new ConflictRecovery(store),job=req(a[0],'Job');return out(a.length===2?await recovery.manualPreview(job,config):await recovery.manualConfirm(job,config,req(a[3],'Hash'),req(a[5],'Human')));}finally{store.close();}
+    }
+    if(command==='recovery-status'||command==='recovery-preview'){
+     const store=new Store(db,true);
+     try{
+      if(command==='recovery-status')return out(recoveryRows(store));
+      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+      const job=req(a[0],'Job'),target=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
+      if(!target)throw Error('Existing review target required');
+      return out(await new ConflictRecovery(store).preview(job,config,target.repo,target.pr));
+     }finally{store.close();}
+    }
+    if(command==='recover-handoff'){
     const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
     if(!existsSync(db))throw Error('Existing state database required');
@@ -190,7 +213,14 @@ Registered approved review targets can request bounded in-scope fixes from their
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
   });
-  try{
+   try{
+    if(command==='authorize-base-merge'){
+     const job=req(a[0],'Job'),hash=req(a[1],'Plan hash'),human=req(a[2],'Human');
+     const grant=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+     if(!grant||grant.plan_hash!==hash)throw Error('Existing current scoped Git grant required');
+     lifecycle.grantGit(job,hash,[...JSON.parse(grant.operations),'merge-base-feature'],human);
+     return out({job,hash,grant:'merge-base-feature',policyStillRequired:true,mergePR:false});
+    }
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
     if(command==='review-status')return out(reviewStatus());
     if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewStatus(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
@@ -233,7 +263,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
       new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
+      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]},config));
     }
     if(command==='extend-budget'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);

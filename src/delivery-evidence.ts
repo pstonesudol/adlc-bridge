@@ -22,7 +22,7 @@ export async function worktreeIdentity(s:Store,job:string,run:ProcessRunner=comm
  if(!branch||!/^[a-f0-9]{40,64}$/.test(head))throw Error('Attached worktree branch and full HEAD required');
  return {tree,branch,head};
 }
-export function recoveryTransport(s:Store,run:ProcessRunner=command,evidence:typeof sessionEvidence=sessionEvidence):RecoveryTransport{return {
+export function recoveryTransport(s:Store,run:ProcessRunner=command,evidence:typeof sessionEvidence=sessionEvidence,allowLocalHeadDifference=false):RecoveryTransport{return {
  async inspect(job,c){
   if(!/^[\w.-]+\/[\w.-]+$/.test(c.githubRepo??''))throw Error('Exact configured GitHub repository required');
   const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
@@ -50,7 +50,7 @@ export function recoveryTransport(s:Store,run:ProcessRunner=command,evidence:typ
   const remote=(await git(run,w.tree,'ls-remote','--refs','origin',`refs/heads/${w.branch}`)).split(/\s+/);
   const open=e.session.prs.filter((p:any)=>p.state==='open');
   if(open.length>1||open.some((p:any)=>!candidates.some(x=>x.url===p.url&&x.pr===p.number)))throw Error('Conflicting or duplicate attached worker PRs');
-  if(remote.length!==2||remote[0]!==w.head||remote[1]!==`refs/heads/${w.branch}`)throw Error('Local HEAD differs from exact remote feature ref');
+   if(remote.length!==2||!allowLocalHeadDifference&&remote[0]!==w.head||remote[1]!==`refs/heads/${w.branch}`)throw Error('Local HEAD differs from exact remote feature ref');
   const inventory=await json(run,[AO,'session','ls','--all','--include-terminated','--json']);
   if(!Array.isArray(inventory.data))throw Error('Complete AO owner inventory unavailable');
   const owners:string[]=[];
