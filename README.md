@@ -40,6 +40,9 @@ A delivery already holding it refuses shutdown before unloading any intake
 service, instead of interrupting the send. Retry once that delivery settles.
 Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
 they cannot unload a poll process while it owns an in-flight submission.
+Each complete CLI poll tick also holds the fence through provider mutations and
+local receipt recording, including Linear status updates. A busy tick makes stop
+fail closed; retry after it drains rather than interrupting the process.
 Acquiring the lock is not proof that a legacy process participates. Loaded
 intake services must also have an owner-only process acknowledgement matching
 their CLI bytes and, while running, PID and process start time. An idle service

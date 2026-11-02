@@ -2,6 +2,9 @@ import {existsSync,lstatSync,readFileSync,realpathSync,mkdirSync,rmdirSync} from
 import {appState} from './install-state';import {atomicFile} from './atomic-file';import {withTurnSubmission,TurnSubmissionBlocked} from './turn-submission';
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const receiptPath=(state:string,config:string)=>join(state,'poll-processes',hash(config)+'.json');
+// Keep every provider mutation and its local receipt in the same scope as sends.
+// A matching running-process receipt is safe for stop only while this is idle.
+export const runPollTick=<T>(tick:()=>Promise<T>)=>withTurnSubmission(tick);
 export class PollProcessNotRunning extends Error{}
 export function processStarted(pid:number){
  if(!Number.isSafeInteger(pid)||pid<1)throw Error('Invalid intake PID');

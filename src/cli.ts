@@ -30,7 +30,7 @@ import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
-import {acknowledgePoll} from './poll-process';
+import {acknowledgePoll,runPollTick} from './poll-process';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 
@@ -189,7 +189,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
     if(command==='approve-plan'){s.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'));return out({approved:true,executionEnabled:false});}
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=async()=>{
+    const tick=async()=>runPollTick(async()=>{
       reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
       const remediation=remediationPolicy(c!.remediation);
       out(await poll(c,s,linearToken()));
@@ -209,7 +209,7 @@ Registered approved review targets can request bounded in-scope fixes from their
         if(target.state==='completed')continue;
         try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,{project:c!.linear.projectId,checks:c!.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
       }
-    };
+    });
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();

@@ -65,6 +65,24 @@ test('a real live poll keeps its receipt when a second startup is rejected, and 
   child.kill();await child.exited;const finish=await acknowledgePoll(f.config,f.cli,f.state,undefined,f.turns.submit);expect(JSON.parse(readFileSync(path,'utf8')).pid).toBe(process.pid);finish();assertPollQuiescent({running:false},f.config,f.cli,f.state);
  }finally{if(child&&child.exitCode===null){child.kill();await child.exited;}f.close();}
 },15000);
+test('production poll-tick fence prevents stop until provider mutation and receipt recording finish',async()=>{
+ const f=fixture();try{
+  const script=`
+import {runPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/poll-process.ts'))};
+import {turnBarrier,withTurnSubmission} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};
+import {serviceControl} from ${JSON.stringify(join(import.meta.dir,'../src/service-control.ts'))};
+let release;const gate=new Promise(resolve=>release=resolve);let entered;const started=new Promise(resolve=>entered=resolve);let recorded=false,stops=0,rejection='';
+const pending=runPollTick(async()=>{await withTurnSubmission(async()=>{});entered();await gate;recorded=true;});await started;
+try{await serviceControl('stop','project',undefined,async()=>{stops++;return {};});}catch(error){rejection=error.message;}
+const before={recorded,stops};release();await pending;
+await serviceControl('stop','project',undefined,async()=>{if(!recorded)throw Error('Receipt not recorded');stops++;return {};});
+let failure='';try{await runPollTick(async()=>{throw Error('Provider failure');});}catch(error){failure=error.message;}
+await turnBarrier().run(async()=>{});turnBarrier().pause();let writes=0,paused='';try{await runPollTick(async()=>{writes++;});}catch(error){paused=error.message;}
+console.log(JSON.stringify({before,recorded,stops,rejection,failure,writes,paused}));`;
+  const child=Bun.spawn([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe',env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},timeout:10000});const [out,err,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+  expect(code).toBe(0);expect(err).toBe('');expect(JSON.parse(out)).toEqual({before:{recorded:false,stops:0},recorded:true,stops:1,rejection:expect.stringContaining('in progress'),failure:'Provider failure',writes:0,paused:expect.stringContaining('paused')});
+ }finally{f.close();}
+},15000);
 test('loaded legacy intake is preserved even when the new barrier is available and launchd reports idle',async()=>{
  const f=fixture();try{let bootouts=0;for(const status of [{loaded:true,running:true,pid:process.pid},{loaded:true,running:false}])await f.turns.run(async()=>{await expect(stopLoadedIntake(status,f.config,f.cli,async()=>{bootouts++;},f.verify)).rejects.toThrow('barrier support is unverified');});expect(bootouts).toBe(0);
   await stopLoadedIntake({loaded:false},f.config,f.cli,async()=>{bootouts++;},()=>{throw Error('Unloaded legacy service needs no receipt');});expect(bootouts).toBe(0);
