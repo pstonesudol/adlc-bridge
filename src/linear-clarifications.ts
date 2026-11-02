@@ -55,7 +55,10 @@ export class LinearClarifications{
   const worker=outcome?.plan_hash===j.plan_hash&&['needs_input','blocked_dependency'].includes(outcome.outcome);
   if(!worker&&!(j.state==='awaiting_approval'&&r?.plan_hash===j.plan_hash&&['needs-input','blocked-by-dependency'].includes(r.state)))return null;
   const questions:ClarificationQuestion[]=worker?JSON.parse(outcome.questions):r.questions;
-  const deps=worker?JSON.parse(outcome.dependencies):r.dependencies;
+   const deps=worker?JSON.parse(outcome.dependencies):r.dependencies;
+   // The dependency coordinator verifies source/base evidence, not human prose.
+   // Mixed requirement questions still use this clarification adapter.
+   if(worker&&outcome.outcome==='blocked_dependency'&&!questions.length&&(c as any).dependencyRecovery?.enabled)return null;
   // Dependencies are explicit blocking questions too; do not silently resolve
   // them merely because the requirement questions have answers.
   const all=[...questions,...deps.map((d:any,i:number)=>({id:`dependency-${i+1}`,kind:'dependency' as const,question:`What evidence resolves ${d.ref}: ${d.reason}?`}))];

@@ -1552,3 +1552,125 @@ contain exactly one non-terminated coordinator for the project. During initial
 setup its stored workspace may be empty, so the native coordinator-only layout
 and shared Git directory establish workspace identity. This admits coordinator
 startup; it does not approve a ticket plan, merge a PR, or activate a new runtime.
+# Verified dependency resumption (DEV-47)
+
+`dependencyRecovery` is an opt-in adapter around the existing readiness,
+clarification publisher, `Workflow.resume`, submission fence and worktree
+reservation contracts. It never spawns a replacement session or creates a PR.
+The existing worker continues its approved implementation and owns its normal
+feature commit/push/PR workflow. Human-only PR merges remain mandatory.
+
+Configure this in the **operator-managed project configuration**, not in a worker
+message, ticket description or PR comment. Each job binding must match its
+current approved plan and specification SHA-256. Example shape (replace every
+placeholder with verified values before enabling):
+
+```json
+{
+  "dependencyRecovery": {
+    "enabled": true,
+    "baseBranch": "main",
+    "jobs": [{
+      "issue": "DEPENDENT_LINEAR_ISSUE_UUID",
+      "planHash": "CURRENT_APPROVED_PLAN_SHA256",
+      "specHash": "CURRENT_SPECIFICATION_SHA256",
+      "prerequisites": [{
+        "issue": "PREREQUISITE_LINEAR_ISSUE_UUID",
+        "ref": "DEV-15",
+        "repo": "OWNER/REPOSITORY",
+        "pr": 3,
+        "kind": "source",
+        "capabilities": [{
+          "path": "src/verification.ts",
+          "sha256": "REVIEWED_CONTRACT_FILE_UTF8_SHA256"
+        }]
+      }]
+    }]
+  }
+}
+```
+
+Prerequisites are the union of configured edges, structured plan/worker
+dependency references, authoritative Linear `blocks` relationships, and
+published feature-dependency edges. Worker references must have exact configured
+issue/PR/capability mappings; they supply no commands or authority. Linear edges
+are paginated and the combined graph is cycle checked with bounded traversal.
+Unknown references, incomplete inventories, excessive graphs and changed
+plan/spec bindings fail closed with an inspectable reason. Replaced PRs require
+explicit operator mapping reconciliation; closed-unmerged or reopened PRs are
+not considered satisfied. Linear Done is not capability evidence.
+
+For every prerequisite the observer verifies the exact GitHub repository/PR,
+provider-recorded merge, merge-commit ancestry in the configured current base, and configured
+capability file contents at that immutable base. Capability digests are exact
+UTF-8 file-content SHA-256. Merge evidence does not attest that a human manually
+performed the merge; human-only merging remains an operator policy, not a claim
+inferred from provider account type. Capability digests include trailing newlines:
+they are for operator-reviewed
+interface/contracts (bounded to 1 MB each). They are deliberately conservative:
+an interface file changed after merge needs a new reviewed digest rather than
+guessing compatibility. This is not arbitrary test execution or proof of
+installed-service behavior. `kind: "host-runtime"` always requires explicit
+operator reconciliation; workers never install or activate runtime changes.
+
+Automatic continuation requires a dependency-only structured worker receipt,
+current approval/scope, current Linear eligibility, supported runtime, the
+existing plan-bound `merge-base-feature` grant, no outstanding clarification,
+remediation or uncertain delivery, and a clean isolated singly-owned idle
+worktree with a completed delivery receipt. Missing discovery or human questions
+must be resolved through existing clarification/replanning interfaces, never
+fabricated attestations. This does not retroactively grant Git operations.
+
+Only a nondivergent **fast-forward** of the reserved feature branch is automatic.
+The adapter fetches and verifies the exact base, checks local capability bytes,
+and records an update reservation before changing the worktree. It does not
+push, switch branch, rebase, discard, resolve conflicts or overwrite local work.
+Dirty/shared/divergent work is an operator blocker, not permission to force it.
+Existing published feature refs must match the recorded pre-update head; an
+unpublished branch is allowed. Git conflicts and other recovery paths share the
+same worktree fence.
+
+```sh
+adlc dependency-status
+adlc dependency-preview JOB CONFIG
+adlc dependency-resume JOB CONFIG CONFIRMATION_HASH
+```
+
+Preview is read-only, including database schema. Confirmation rechecks the exact
+proposal and all guards; it cannot override missing capability, scope, ownership
+or approval evidence. After a known interrupted fetch/update, explicit fresh
+confirmation may retry only when clean original HEAD/ownership/base evidence
+still matches. Automatic polls never replay an uncertain Git stage. A crash
+after a failed pre-update fetch may leave an older-base reservation. A fresh
+confirmed `dependency-resume` can supersede that reserved/fetching row only when
+its recorded authorization, ownership, clean worktree and original HEAD still
+match current evidence. Superseded rows remain in the audit history; changed
+HEAD/ownership or a possibly attempted update retains its fence. A crash
+after a successful fast-forward can be reconciled from exact clean updated HEAD
+without repeating Git. Changed base/plan or unrelated reservations require
+operator reconciliation, not live SQL edits or reservation deletion.
+
+`Waiting for dependencies` is persisted separately from job approval and from
+delivery uncertainty, and exposed by `status` / `dependency-status`. With
+`blockerSync` enabled, Linear receives deduplicated waiting and resolution
+comments listing prerequisites, current plan and next action; existing board
+workflow states are not renamed or overwritten. Generic clarification notices
+do not compete with dependency-only notices. Mixed human questions still use
+clarification and cannot bypass dependency proof through `resume-job`.
+
+Continuation uses the existing durable `continuations` intent and sender, bound
+to job, plan/specification, dependency graph, base, scope and resolution evidence.
+Provider receipt loss never means unsent: the observer reconciles the existing
+intent and does not replay. Polling/waiting consumes no remediation attempts and
+does not reset prior budgets. Existing exhausted/no-progress budgets block
+continuation. If the worker blocks again after a completed continuation, further
+automatic resumption stops for no-progress reconciliation.
+
+Verification: `bun test test/dependency-recovery.test.ts`, then `bun test`.
+Fixtures exercise two prerequisites, provider/capability failures, conservative
+Git updates, concurrency, crashes, receipts and deduplicated notices without
+live PR merges or paid model calls. These fixtures are **not a live unattended
+recovery demonstration**. A separately authorized controlled run must verify
+the installed host version, real provider receipts and same-session behavior
+before claiming unattended recovery works. No such activation or end-to-end
+operation is performed by this coding change.

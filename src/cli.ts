@@ -44,6 +44,7 @@ import {ConflictRecovery} from './conflict-recovery';
 import {recoveryRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
+import {DependencyRecovery} from './dependency-recovery';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -83,6 +84,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   io.out(await io.poll(c,s,io.linearToken()));
   await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)io.out({dependencyNotices:await dependencies.notices(c,blockers as LinearBlockers)});}
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
   const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
   for(const stage of stages){
@@ -187,6 +189,9 @@ async function main(){
   plan JOB PLAN_FILE                    submit plan
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
   reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+  dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
+  dependency-resume JOB CONFIG HASH    confirm unchanged evidence using existing continuation
+  dependency-status                    durable waits, failed evidence and next action
   resolve-plan JOB --source SOURCE --human NAME --answer TEXT
                                        record a human answer or satisfied dependency; no resume
   resume-job JOB CONFIG                 resume the existing needs-input worker after verified resolution
@@ -251,6 +256,18 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
+   if(['dependency-preview','dependency-resume','dependency-status'].includes(command)){
+    if(!existsSync(db))throw Error('Existing database required');
+    const applying=command==='dependency-resume';
+    if(command==='dependency-status'&&a.length||command==='dependency-preview'&&a.length!==2||applying&&(a.length!==3||!/^[a-f0-9]{64}$/.test(a[2])))throw Error('Use dependency-status, dependency-preview JOB CONFIG, or dependency-resume JOB CONFIG HASH');
+    const store=new Store(db,!applying);
+    try{
+     const workflow=new Workflow(store,liveTransport,undefined,!applying),dependencies=new DependencyRecovery(store,workflow);
+     if(command==='dependency-status')return out(dependencies.status());
+     const config=projectConfiguration(req(a[1],'Config'));validate(config);
+     return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
+    }finally{store.close();}
+   }
    if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
