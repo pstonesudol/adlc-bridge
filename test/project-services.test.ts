@@ -162,3 +162,36 @@ test.skipIf(process.platform!=='darwin')('service-config apply preserves fences 
   expect(calls).toEqual([]);expect(readFileSync(plist,'utf8')).toBe(before);
  }finally{f.close();}
 });
+
+test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded reload order and stopped updates without mutations',async()=>{
+ const {serviceControl}=await import('../src/service-control');const f=fixture();try{
+  const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite');
+  const s=new Store(statePath);let entry;try{entry=new ProjectServices(s).register(path);}finally{s.close();}
+  mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
+  const plist=join(f.dir,'Library/LaunchAgents',entry.label+'.plist'),cli=resolve(import.meta.dir,'../src/cli.ts');
+  writeFileSync(plist,serviceDefinition(path,process.execPath,cli,f.dir,entry.label));
+  const config=JSON.parse(readFileSync(path,'utf8'));config.pollingIntervalSeconds=15;writeFileSync(path,JSON.stringify(config));
+  const calls:string[][]=[],turns=turnBarrier(join(f.dir,'fence')),pollState=join(f.dir,'receipts');
+  let loaded=true;
+  const run=async(args:string[])=>{
+   calls.push(args);
+   if(args[0]==='print')return loaded?{code:0,stdout:`state = running\npid = ${process.pid}`,stderr:''}:{code:1,stdout:'',stderr:'Could not find service'};
+   if(args[0]==='bootout'){loaded=false;return {code:0,stdout:'',stderr:''};}
+   if(args[0]==='bootstrap'||args[0]==='kickstart'){loaded=true;return {code:0,stdout:'',stderr:''};}
+   throw Error('Unexpected service command');
+  };
+  const options={home:f.dir,statePath,run,turns,pollState};
+  // Establish an idle receipt, then acknowledge a live non-idle intake for startup.
+  const idle=await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());idle();
+  await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());
+  const applied=await serviceControl('service-config','one',true,options);
+  const domain=`gui/${process.getuid!()}`,target=`${domain}/${entry.label}`;
+  expect(applied).toMatchObject({changed:true,applied:true,reloaded:true,pollingIntervalSeconds:15});
+  expect(calls).toEqual([['print',target],['bootout',target],['bootstrap',domain,plist],['kickstart',target],['print',target]]);
+  expect(readDefinition(plist).StartInterval).toBe(15);
+  config.pollingIntervalSeconds=20;writeFileSync(path,JSON.stringify(config));calls.length=0;loaded=false;
+  const stopped=await serviceControl('service-config','one',true,options);
+  expect(stopped).toMatchObject({changed:true,applied:true,reloaded:false,pollingIntervalSeconds:20});
+  expect(calls).toEqual([['print',target]]);expect(readDefinition(plist).StartInterval).toBe(20);
+ }finally{f.close();}
+});
