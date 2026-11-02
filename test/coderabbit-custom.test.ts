@@ -13,6 +13,21 @@ test('PR108 regression: green run plus custom Verification Evidence error is sco
 test('warnings and old walkthrough NEEDS_EVIDENCE prose do not become failing custom checks',()=>{
  for(const status of ['Warning','Passed']){const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]','!['+status+']');f.review.state='APPROVED';expect(f.evidence()).toMatchObject({blocker:null,findings:[],bodyReviewed:true});}
 });
+for(const status of ['![Failed](error.svg)','Error','![Error]()','![Error](error.svg) ![Passed](passed.svg)',''])test(`unclassifiable custom status blocks unrelated remediation: ${status}`,()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error](error.svg)',status);
+ const e=f.evidence();expect(e.findings).toEqual([]);expect(e.bodyReviewed).toBe(false);expect(e.blocker).toContain('unclassifiable');
+ expect(decision({...e,customCheckBlocker:e.blocker,clear:false,failedChecks:[],findings:[{path:'src/fix.ts',body:'unrelated'}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
+});
+test('malformed check row is blocked while recognized other-check errors retain their handling',()=>{
+ const malformed=customFixture();malformed.comments[0].body=malformed.comments[0].body.replace('| Verification Evidence |','Verification Evidence |');
+ expect(malformed.evidence().blocker).toContain('unclassifiable');
+ const other=customFixture();other.comments[0].body=other.comments[0].body.replace('| Verification Evidence |','| Migration Safety |');
+ expect(other.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(other.evidence().blocker).toContain('unsupported custom check');
+ for(const status of ['Warning','Passed']){
+  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('| Verification Evidence |','| Migration Safety |').replace('![Error]','!['+status+']');
+  expect(f.evidence()).toMatchObject({findings:[],blocker:null,bodyReviewed:true});
+ }
+});
 for(const change of ['missing-commit','malformed-commit','edited-summary','edited-body','unknown-body','spoof-review','spoof-comment','wrong-pr','missing-details','truncated-details','duplicate-summary','ambiguous-run','stale-section','pending-run'])test(`custom evidence fails closed: ${change}`,()=>{
  const f=customFixture();
  if(change==='missing-commit')delete (f.review as any).commit_id;

@@ -19,8 +19,24 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  if(summaries.length!==1)return {...empty,blocker:'CodeRabbit custom-check summary provenance is ambiguous'};
  const summary=summaries[0],section=customCheckSection(summary.body);
  if(!section)return {...empty,blocker:'CodeRabbit custom-check section is incomplete'};
- const errors=section.split('\n').filter(l=>/^\s*\|/.test(l)&&/!\[Error\]/i.test(l));
- const blocked=(reason:string)=>({...empty,blocker:errors.length?`CodeRabbit custom-check failure: ${reason}`:null});
+ // Inspect the check table, not examples/commands in the full-details prose.
+ // Unknown status formats cannot be mistaken for an informational pass.
+ const table=section.split(/<summary>\s*<strong>Full details:/i)[0];
+ const rows=table.split('\n').filter(l=>l.includes('|'));
+ const errors:string[]=[];let unclassified=false,dataRows=0;
+ for(const row of rows){
+  const cells=row.trim().split('|').map(c=>c.trim());
+  if(cells[0]!==''||cells.at(-1)!==''||cells.length<5){unclassified=true;continue;}
+  const name=cells[1],status=cells[2];
+  if(/^Check name$/i.test(name)&&/^Status$/i.test(status))continue;
+  if(cells.slice(1,-1).every(c=>/^:?-+:?$/.test(c)))continue;
+  dataRows++;
+  const classified=status.match(/^!\[(Error|Warning|Passed)\]\([^\s)]+\)$/i);
+  if(!name||!classified){unclassified=true;continue;}
+  if(classified[1].toLowerCase()==='error')errors.push(row);
+ }
+ if(!dataRows)unclassified=true;
+ const blocked=(reason:string)=>({...empty,blocker:errors.length||unclassified?`CodeRabbit custom-check failure: ${reason}`:null});
  const recentStart='<!-- recent_review_start -->',recentEnd='<!-- recent_review_end -->';
  const recent=summary.body.split(recentStart).length===2&&summary.body.split(recentEnd).length===2&&summary.body.indexOf(recentEnd)>summary.body.indexOf(recentStart)?summary.body.split(recentStart)[1].split(recentEnd)[0]:null;
  const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
@@ -32,6 +48,7 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
   if(staleSummary&&!currentRun)return empty;
   return {...empty,blocker:'CodeRabbit custom-check summary or run currency is ambiguous for the stale review; obtain current-head review evidence'};
  }
+ if(unclassified)return blocked('pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary');
  if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
