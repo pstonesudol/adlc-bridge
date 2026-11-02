@@ -16,6 +16,10 @@ function ambiguousDetailsTable(text:string){
    if(marker&&marker[1][0]===fence.character&&marker[1].length>=fence.length&&!marker[2].trim())fence=null;
    continue;
   }
+  // Fence-looking lines inside HTML comments are not Markdown fences. Rather
+  // than guess how mixed HTML/Markdown renders, reject comment markup outside
+  // complete fenced output so it cannot conceal unsupported check rows.
+  if(line.includes('<!--')||line.includes('-->'))return true;
   if(marker&&(marker[1][0]!=='`'||!marker[2].includes('`'))){fence={character:marker[1][0],length:marker[1].length};continue;}
   if(/^\s*\|.*\|\s*$/.test(line))return true;
  }
@@ -37,7 +41,7 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  // Unknown status formats cannot be mistaken for an informational pass.
  const detailsAt=section.search(/<summary>\s*<strong>Full details:/i);
  const table=detailsAt<0?section:section.slice(0,detailsAt);
- if(detailsAt>=0&&ambiguousDetailsTable(section.slice(detailsAt)))return {...empty,blocker:'CodeRabbit custom-check table continues after full details or fenced output is incomplete; obtain the complete supported bot summary'};
+ if(detailsAt>=0&&ambiguousDetailsTable(section.slice(detailsAt)))return {...empty,blocker:'CodeRabbit custom-check table continues after full details, fenced output is incomplete, or markup is ambiguous; obtain the complete supported bot summary'};
  const rows=table.split('\n').filter(l=>l.includes('|'));
  const errors:string[]=[];let unclassified=false,dataRows=0;
  for(const row of rows){

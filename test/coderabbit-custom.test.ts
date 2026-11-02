@@ -32,6 +32,17 @@ for(const close of ['```','~~~','``'])test(`table detection resumes after a fenc
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',`Observed output:\n\x60\x60\x60text\n| tests | passed |\n${close}\n| Unsupported check | ![Error](error.svg) | Outside or uncertain fence |`);
  expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toBeTruthy();
 });
+for(const marker of ['~~~','```'])test(`HTML comments cannot open fences that hide check rows: ${marker}`,()=>{
+ const f=customFixture(),payload=`<!--\n${marker}\n-->\n| Unsupported check | ![Error](error.svg) | Must not be hidden |\n<!--\n${marker}\n-->`;
+ f.comments[0].body=f.comments[0].body.replace('Never invent results.',payload);
+ const e=f.evidence();expect(e).toMatchObject({findings:[],bodyReviewed:false});expect(e.blocker).toContain('markup is ambiguous');
+ expect(decision({...e,customCheckBlocker:e.blocker,clear:false,failedChecks:[],findings:[{path:'src/fix.ts',body:'unrelated'}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
+});
+test('HTML comment text inside complete fenced output stays literal output',()=>{
+ const f=customFixture(),output='```text\n<!--\n~~~\n-->\n| tests | passed |\n```';
+ f.comments[0].body=f.comments[0].body.replace('Never invent results.',`Observed output:\n${output}\nNever invent results.`);
+ expect(f.evidence().blocker).toBeNull();expect(f.evidence().findings[0].body).toContain(output);
+});
 for(const status of ['![Failed](error.svg)','Error','![Error]()','![Error](error.svg) ![Passed](passed.svg)',''])test(`unclassifiable custom status blocks unrelated remediation: ${status}`,()=>{
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error](error.svg)',status);
  const e=f.evidence();expect(e.findings).toEqual([]);expect(e.bodyReviewed).toBe(false);expect(e.blocker).toContain('unclassifiable');
