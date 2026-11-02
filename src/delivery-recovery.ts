@@ -79,9 +79,11 @@ export class DeliveryRecovery{
    const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()
     ?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,adopted.plan_hash) as any
     :null;
-   if(failed)this.s.db.query("INSERT OR IGNORE INTO continuation_recoveries(continuation,job,proposal,head,at) VALUES (?,?,?,?,?)").run(failed.id,job,adopted.proposal,adopted.head,Date.now());
+   // Only a row created by this confirmation can repair a failed dispatch.
+   // A stale row must not re-open a later failure reached for another reason.
+   const recorded=failed?this.s.db.query("INSERT OR IGNORE INTO continuation_recoveries(continuation,job,proposal,head,at) VALUES (?,?,?,?,?)").run(failed.id,job,adopted.proposal,adopted.head,Date.now()).changes>0:false;
    const recovery=failed&&this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head);
-   const repair=changed.changes?['approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr',...(recovery?['failed']:[])]:recovery?['failed']:[];
+   const repair=changed.changes?['approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr',...(recorded?['failed']:[])]:recorded?['failed']:[];
    if(repair.length){
     // Only dispatch states written before handoff may be repaired. A later
     // blocker is not overwritten, and handoff is an idempotent no-op.

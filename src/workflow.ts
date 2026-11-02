@@ -28,7 +28,7 @@ export interface WorkflowTransport{
  disableFeedback(session:string):Promise<void>;
  preflightRoute?(route:Route):Promise<void>;
   configureRoute?(session:string,route:Route):Promise<unknown>;
-  worktree?(job:string):Promise<{branch:string;head:string}>;
+  worktree?(job:string):Promise<{branch:string;head:string;tree?:string;worktree?:string}>;
   branchSnapshot?(repo:string,pr:number):Promise<any>;
 }
 export class Workflow{
@@ -337,8 +337,9 @@ export class Workflow{
   // Existing delivery adoption can establish recovery only when its reviewed
   // proposal binds this job, session, repository, PR, head, plan and worktree.
   const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any:null;
-  const continuationFailed=!!failed||['failed','cancelled','interrupted'].includes(contTurn?.state);
-  if(continuationFailed&&!(await this.recoveredDelivery(job,c,e,prs,d,failed?.id??cont?.id))){
+  const ownTurnFailed=['failed','cancelled','interrupted'].includes(contTurn?.state);
+  const continuationFailed=!!failed||ownTurnFailed;
+  if(continuationFailed&&!(await this.recoveredDelivery(job,c,e,prs,d,ownTurnFailed?cont?.id:failed?.id))){
    return finish({state:'needs_reconciliation',outcome:'failed',reason:'Previous guarded continuation failed and has no exact reviewed delivery recovery; inspect recovery evidence and never infer handoff',questions:[],dependencies:[],source:'continuation',confidence:'high'});
   }
   if(contTurn&&!['completed','failed','cancelled','interrupted'].includes(contTurn.state))return finish({state:'implementation_running',outcome:'running',reason:'Guarded continuation is still active; do not infer handoff',questions:[],dependencies:[],source:'continuation',confidence:'high'});
@@ -351,15 +352,24 @@ export class Workflow{
   if(!(this.s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))return false;
   let local;
   try{local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));}catch{return false;}
+  const localTree=(local as any)?.tree??(local as any)?.worktree;
+  if(typeof localTree!=='string'||!localTree)return false;
   const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=? AND head=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec),local.head) as any;
-  if(!adopted||local.head!==adopted.head||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree((local as any).tree??(local as any).worktree))return false;
+  if(!adopted||local.head!==adopted.head||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
   // Recovery must belong to the specific failed continuation, not an adoption
   // that existed before a later continuation failed.
   const failed=continuationId
    ?this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE id=? AND job=?").get(continuationId,job) as any
    :this.s.db.query("SELECT id,state,failed_at FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,d.plan_hash) as any;
   if(!failed||failed.state!=='failed')return false;
-  return !!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head);
+  if(!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head))return false;
+  // A recovered handoff is still a handoff: the open PR must remain the exact
+  // adopted target at the adopted head.
+  try{
+   const remote=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
+   assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,remote);
+   return remote.head===adopted.head;
+  }catch{return false;}
  }
  continuation(job:string):any{
   if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get())return null;

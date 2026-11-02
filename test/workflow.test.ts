@@ -143,6 +143,35 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  // Missing worktree identity and a moved remote head fail closed.
+  const worktree=(f as any).worktree.bind(f),snapshot=f.branchSnapshot.bind(f);
+  (f as any).worktree=async()=>({branch:r.branch,head:'a'.repeat(40)});
+  expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+  (f as any).worktree=worktree;
+  (f as any).branchSnapshot=async()=>({...await snapshot(),head:'c'.repeat(40)});
+  expect((await w.executionStatus(id,e,config)).state).toBe('failed');
+  (f as any).branchSnapshot=snapshot;
+  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+ }finally{s.close();}
+});
+test('recovery for an earlier continuation cannot authorize a newer failed continuation',async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
+  const r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any,e=f.sessions.get('session-1');
+  s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL); CREATE TABLE continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL,proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL)');
+  s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal','adopted','session-1','/worktrees/session-1',r.branch,r.branch,'owner/repo',1,'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
+  const first=Number(s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state,failed_at) VALUES (?,?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'one','continue-one','session-1','failed',Date.now()).lastInsertRowid);
+  s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(first,id,'proposal','a'.repeat(40),Date.now());
+  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'two','continue-two','session-1','delivery_accepted');
+  new ReviewLoop(s);
+  const attempt=new Lifecycle(s).reserveRemediation(id,'a'.repeat(40),'newer remediation') as any;
+  s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(id,attempt.attempt,'pr_description','old-body');
+  e.transcript.entries.push({sequence:4,clientMessageId:'continue-two',turnId:'continue-two-turn'},{sequence:5,clientMessageId:`adlc-fix-${id.slice(0,12)}-${attempt.attempt}`,turnId:'newer-fix'});
+  e.transcript.turns.push({id:'continue-two-turn',state:'failed'},{id:'newer-fix',state:'completed'});
+  const result=await w.executionStatus(id,e,config);
+  expect(result).toMatchObject({state:'needs_reconciliation',outcome:'failed'});
+  expect(w.implementation(id).state).toBe('needs_reconciliation');
+  expect(w.continuation(id).state).toBe('failed');
  }finally{s.close();}
 });
 test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{

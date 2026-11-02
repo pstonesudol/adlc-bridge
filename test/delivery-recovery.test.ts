@@ -85,6 +85,10 @@ test('explicit confirmation binds recovery to the failed continuation and repair
   expect((f.s.db.query('SELECT count(*) AS n FROM continuation_recoveries').get() as any).n).toBe(1);
   expect((await f.recovery.confirm(f.id,f.c,p.hash)).continuationRecovery).toBe(later);
   expect((f.s.db.query('SELECT count(*) AS n FROM continuation_recoveries').get() as any).n).toBe(2);
+  // A stale recovery row cannot repair a failed dispatch reached for another reason.
+  f.s.db.query("UPDATE implementation_dispatch SET state='failed',reason='Worker-reported failure, not a continuation turn' WHERE job=?").run(f.id);
+  await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('Delivery dispatch is failed');
+  expect((f.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(f.id) as any)).toEqual({state:'failed',reason:'Worker-reported failure, not a continuation turn'});
  }finally{f.s.close();}
 });
 test('changed confirmation proposal never claims',async()=>{const f=fixture();try{const p=await f.recovery.preview(f.id,f.c);f.facts.head=f.facts.candidates[0].head='c'.repeat(40);await expect(f.recovery.confirm(f.id,f.c,p.hash)).rejects.toThrow('changed');expect(f.calls()).toBe(0);}finally{f.s.close();}});
