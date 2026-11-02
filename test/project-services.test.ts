@@ -172,11 +172,14 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
   writeFileSync(plist,serviceDefinition(path,process.execPath,cli,f.dir,entry.label));
   const config=JSON.parse(readFileSync(path,'utf8'));config.pollingIntervalSeconds=15;writeFileSync(path,JSON.stringify(config));
   const calls:string[][]=[],turns=turnBarrier(join(f.dir,'fence')),pollState=join(f.dir,'receipts');
-  let loaded=true;
+  let loaded=true,failNextBootout=false;
   const run=async(args:string[])=>{
    calls.push(args);
    if(args[0]==='print')return loaded?{code:0,stdout:`state = running\npid = ${process.pid}`,stderr:''}:{code:1,stdout:'',stderr:'Could not find service'};
-   if(args[0]==='bootout'){loaded=false;return {code:0,stdout:'',stderr:''};}
+   if(args[0]==='bootout'){
+    if(failNextBootout){failNextBootout=false;return {code:1,stdout:'',stderr:'Simulated unload failure'};}
+    loaded=false;return {code:0,stdout:'',stderr:''};
+   }
    if(args[0]==='bootstrap'||args[0]==='kickstart'){loaded=true;return {code:0,stdout:'',stderr:''};}
    throw Error('Unexpected service command');
   };
@@ -189,6 +192,17 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
   expect(applied).toMatchObject({changed:true,applied:true,reloaded:true,pollingIntervalSeconds:15});
   expect(calls).toEqual([['print',target],['bootout',target],['bootstrap',domain,plist],['kickstart',target],['print',target]]);
   expect(readDefinition(plist).StartInterval).toBe(15);
+  // Partial apply updates the definition before unload fails. A matching file
+  // on the next apply must not suppress the retry or startup acknowledgement.
+  config.pollingIntervalSeconds=18;writeFileSync(path,JSON.stringify(config));calls.length=0;failNextBootout=true;
+  await expect(serviceControl('service-config','one',true,options)).rejects.toThrow('Service unload failed');
+  expect(calls).toEqual([['print',target],['bootout',target]]);
+  expect(readDefinition(plist).StartInterval).toBe(18);expect(loaded).toBe(true);
+  calls.length=0;
+  const retried=await serviceControl('service-config','one',true,options);
+  expect(retried).toMatchObject({changed:false,applied:false,reloaded:true,pollingIntervalSeconds:18});
+  expect(calls).toEqual([['print',target],['bootout',target],['bootstrap',domain,plist],['kickstart',target],['print',target]]);
+  expect(readDefinition(plist).StartInterval).toBe(18);
   config.pollingIntervalSeconds=20;writeFileSync(path,JSON.stringify(config));calls.length=0;loaded=false;
   const stopped=await serviceControl('service-config','one',true,options);
   expect(stopped).toMatchObject({changed:true,applied:true,reloaded:false,pollingIntervalSeconds:20});
