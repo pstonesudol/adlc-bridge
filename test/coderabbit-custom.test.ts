@@ -33,9 +33,29 @@ for(const change of ['missing-commit','malformed-commit','edited-summary','edite
 });
 test('a known stale-head bot review waits for the current-head run rather than becoming a custom blocker',()=>{
  const f=customFixture();f.review.commit_id='b'.repeat(40);f.context.checks=[];
+ f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
  const e=f.evidence();expect(e).toEqual({findings:[],blocker:null,bodyReviewed:false});
  expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],failedChecks:[],pendingChecks:[],missingChecks:[]},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false});
  expect(customCheckEvidence(f.review,f.head,f.comments).blocker).toBeTruthy();
+});
+for(const length of [39,...Array.from({length:23},(_,i)=>i+41),64,65])test(`unsupported commit length ${length} fails closed rather than becoming stale evidence`,()=>{
+ const f=customFixture();f.review.commit_id='b'.repeat(length);f.context.checks=[];
+ expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toBeTruthy();
+});
+for(const state of ['current-summary','missing-summary-head','edited-old-summary','completed-current-run','pending-current-run'])test(`stale review cannot discard ambiguous/current evidence: ${state}`,()=>{
+ const f=customFixture();f.review.commit_id='b'.repeat(40);
+ if(state!=='completed-current-run'&&state!=='pending-current-run')f.context.checks=[];
+ if(state==='pending-current-run')f.context.checks[0].status='in_progress';
+ if(state==='missing-summary-head')f.comments[0].body=f.comments[0].body.replace('**Commit**','**Unknown**');
+ if(state==='edited-old-summary'){
+  f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
+  f.comments[0].updated_at='2026-11-01T01:03:00Z';
+ }
+ // Current summary contains an unsupported error: it must not be skipped just
+ // because the effective review still refers to the previous head.
+ f.comments[0].body=f.comments[0].body.replace('| Verification Evidence |','| Unsupported check |');
+ const e=f.evidence();expect(e.findings).toEqual([]);expect(e.blocker).toBeTruthy();
+ expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:[],failedChecks:[],findings:[{path:'src/fix.ts',body:'unrelated fix'}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
 });
 test('unrelated newer bot command replies never replace the summary; edits change evidence identity',()=>{
  const f=customFixture(),original=f.evidence().findings[0];

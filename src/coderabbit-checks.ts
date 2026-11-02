@@ -21,10 +21,18 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  if(!section)return {...empty,blocker:'CodeRabbit custom-check section is incomplete'};
  const errors=section.split('\n').filter(l=>/^\s*\|/.test(l)&&/!\[Error\]/i.test(l));
  const blocked=(reason:string)=>({...empty,blocker:errors.length?`CodeRabbit custom-check failure: ${reason}`:null});
- if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
+ const recentStart='<!-- recent_review_start -->',recentEnd='<!-- recent_review_end -->';
+ const recent=summary.body.split(recentStart).length===2&&summary.body.split(recentEnd).length===2&&summary.body.indexOf(recentEnd)>summary.body.indexOf(recentStart)?summary.body.split(recentStart)[1].split(recentEnd)[0]:null;
+ const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
  // A known older bot review is waiting evidence, not a current custom-check
  // failure. Missing/malformed provenance must still take the fail-closed path.
- if(context&&bot(review?.user)&&review.user.id===summary.user.id&&typeof review.commit_id==='string'&&/^[a-f0-9]{40,64}$/.test(review.commit_id)&&review.commit_id!==head)return empty;
+ if(context&&bot(review?.user)&&review.user.id===summary.user.id&&typeof review.commit_id==='string'&&/^[a-f0-9]{40}$/.test(review.commit_id)&&review.commit_id!==head){
+  const staleSummary=commits.length===1&&commits[0][1]===context.repo&&commits[0][2]===review.commit_id&&summary.issue_url===`https://api.github.com/repos/${context.repo}/issues/${context.pr}`&&Number.isFinite(time(summary.updated_at))&&Number.isFinite(time(review.submitted_at))&&time(summary.updated_at)<=time(review.submitted_at);
+  const currentRun=context.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head);
+  if(staleSummary&&!currentRun)return empty;
+  return {...empty,blocker:'CodeRabbit custom-check summary or run currency is ambiguous for the stale review; obtain current-head review evidence'};
+ }
+ if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
  if(version?.headRefOid!==head||version.body!==body||!Number.isFinite(time(version.createdAt))||!(version.lastEditedAt===null||Number.isFinite(time(version.lastEditedAt))))return blocked('current description version is unavailable');
@@ -32,9 +40,6 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  if(runs.length!==1)return blocked('review run is ambiguous');
  const run=runs[0],start=time(run.started_at),end=time(run.completed_at),submitted=time(review.submitted_at),edited=time(summary.updated_at);
  if(run.status!=='completed'||!Number.isSafeInteger(run.id)||![start,end,submitted,edited].every(Number.isFinite)||end<start||submitted<start||submitted>end||edited<start||edited>end||time(version.lastEditedAt??version.createdAt)>start)return blocked('summary or description changed outside the current completed review run');
- const recentStart='<!-- recent_review_start -->',recentEnd='<!-- recent_review_end -->';
- const recent=summary.body.split(recentStart).length===2&&summary.body.split(recentEnd).length===2&&summary.body.indexOf(recentEnd)>summary.body.indexOf(recentStart)?summary.body.split(recentStart)[1].split(recentEnd)[0]:null;
- const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
  if(commits.length!==1||commits[0][1]!==repo||commits[0][2]!==head||summary.issue_url!==`https://api.github.com/repos/${repo}/issues/${pr}`)return blocked('summary run does not identify this PR and head');
  if(!errors.length)return {...empty,bodyReviewed:true}; // Not approval: the explicit review gate still applies.
  if(review.state!=='CHANGES_REQUESTED'||!/Pre-merge checks failed/i.test(review.body??''))return blocked('custom errors contradict the current review');
