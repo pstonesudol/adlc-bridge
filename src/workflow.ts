@@ -10,7 +10,7 @@ import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
 import {PreSendFailure} from './pre-send';
-import {ensureReadinessStore,activeReadinessResolution,applicableResolution,readinessBinding,resolutionBinding,readinessFor,recordReadiness,recordResolution,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
+import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number}};
 export interface WorkflowTransport{
@@ -170,16 +170,7 @@ export class Workflow{
    const j=this.s.get(job),r=new Planning(this.s).get(job),d=this.planning(job);
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
    if(this.implementation(job)||new Lifecycle(this.s).run(job))throw Error('Existing execution requires reconciliation');
-   let readiness=readinessFor(this.s,job);
-   if(j.plan&&(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))){recordReadiness(this.s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(this.s,job);}
-   const resolved=applicableResolution(this.s,job);
-   if(standing&&(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash))throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
-   if(!standing&&readiness?.valid&&readiness.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
-   if(!standing&&(!readiness||!readiness.valid)&&!resolved){
-     if(!acknowledge?.readiness)throw Error('Structured plan readiness is missing or malformed; explicit human acknowledgement required');
-     recordResolution(this.s,job,'human-acknowledgement',actor,'Human explicitly acknowledged legacy or malformed plan readiness');
-     this.s.event(job,'plan_readiness_acknowledged',actor);
-   }
+   assertApprovalReadiness(this.s,job,actor,!!acknowledge?.readiness,!!standing);
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);

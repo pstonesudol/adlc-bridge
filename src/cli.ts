@@ -5,7 +5,7 @@ import {installRuntime} from './runtime-install';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
-import {Store,digest} from './core';
+import {Store} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
@@ -29,7 +29,7 @@ import {LinearLifecycle} from './linear-lifecycle';
 import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {LinearBlockers} from './linear-blockers';
-import {readinessFor,recordReadiness,recordResolution,applicableResolution} from './readiness';
+import {readinessFor,recordResolution,assertApprovalReadiness} from './readiness';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
@@ -251,12 +251,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='approve-plan'){
       const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
-      let r=readinessFor(s,job);
-      if(j.plan&&(!r||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));r=readinessFor(s,job);}
-      const resolved=applicableResolution(s,job);
-      if(r?.valid&&r.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
-      if((!r||!r.valid)&&!resolved&&!a.includes('--acknowledge-readiness'))throw Error('Structured plan readiness is missing or malformed; explicit --acknowledge-readiness required');
-      if((!r||!r.valid)&&!resolved)recordResolution(s,job,'human-acknowledgement',req(a[2],'Human'),'Human explicitly acknowledged legacy or malformed plan readiness');
+      assertApprovalReadiness(s,job,req(a[2],'Human'),a.includes('--acknowledge-readiness'));
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));

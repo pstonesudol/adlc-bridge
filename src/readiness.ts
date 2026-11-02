@@ -192,6 +192,23 @@ export function applicableResolution(s:Store,job:string):any{
   if(!readiness.valid&&readiness.source==='plan-text'&&readiness.questions.length)return resolution.source==='human-answer'?resolution:null;
   return resolution;
 }
+/** Shared readiness gate for both the workflow and CLI approval paths. */
+export function assertApprovalReadiness(s:Store,job:string,actor:string,acknowledge:boolean,standing=false){
+  const j=s.get(job);let readiness=readinessFor(s,job);
+  if(j.plan&&(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(s,job);}
+  if(standing){
+   if(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash)throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
+   return readiness;
+  }
+  const resolved=applicableResolution(s,job);
+  if(readiness?.valid&&readiness.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
+  if((!readiness||!readiness.valid)&&!resolved){
+   if(!acknowledge)throw Error('Structured plan readiness is missing or malformed; explicit human acknowledgement required');
+   recordResolution(s,job,'human-acknowledgement',actor,'Human explicitly acknowledged legacy or malformed plan readiness');
+   s.event(job,'plan_readiness_acknowledged',actor);
+  }
+  return readiness;
+}
 export function recordResolution(s:Store,job:string,source:string,actor:string,detail:string){
   ensureReadinessStore(s);
   if(!['human-answer','dependency-satisfied','human-acknowledgement'].includes(source))throw Error('Human answer or dependency evidence required');

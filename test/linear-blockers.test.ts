@@ -193,6 +193,16 @@ test('queue label cannot be configured as the blocker label',async()=>{
   await expect(f.blockers().sync({linear:{projectId:'p',teamId:'t',readyLabelId:labelId},blockerSync:{enabled:true,labelId}})).rejects.toThrow('queue label');
  }finally{f.s.close();}
 });
+test('a spec change retracts a stale bridge-applied blocker label',async()=>{
+ const f=fixture();try{
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
+  f.s.enqueue('p','issue','changed specification');
+  expect(f.s.get(f.id).state).toBe('awaiting_plan');
+  const result=await f.blockers().sync(f.config);
+  expect(result.some((row:any)=>row.state==='retracted')).toBe(true);
+  expect(f.labels).not.toContain(labelId);expect(f.comments.length).toBe(1);
+ }finally{f.s.close();}
+});
 test('disabled blocker sync and retraction perform no Linear work',async()=>{
  const f=fixture();try{
   await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);

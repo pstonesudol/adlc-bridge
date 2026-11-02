@@ -112,11 +112,20 @@ export class LinearBlockers{
   const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
   const results:any[]=[];
+  const handled=new Set<string>();
   for(const outcome of rows){
+   handled.add(outcome.job);
    try{
     if(blockerOutcome(outcome.outcome)){results.push(await this.leave(outcome.job,outcome,c));}
     else results.push(await this.retract(outcome.job,c));
    }catch(error){results.push({job:outcome.job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
+  }
+  const owned=this.s.db.query(`SELECT DISTINCT n.job FROM blocker_notices n JOIN jobs j ON j.id=n.job
+   WHERE j.project=? AND n.state='posted' AND n.label_applied=1`).all(c.linear.projectId) as any[];
+  for(const {job} of owned){
+   if(handled.has(job))continue;
+   try{results.push({job,...await this.retract(job,c)});}
+   catch(error){results.push({job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
   }
   return results;
  }

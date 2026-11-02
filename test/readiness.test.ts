@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
-import {assessPlan,assessWorkerReceipt,recordReadiness,readinessFor,recordResolution,activeResolution,readinessBinding} from '../src/readiness';
+import {assessPlan,assessWorkerReceipt,recordReadiness,readinessFor,recordResolution,activeResolution,readinessBinding,assertApprovalReadiness} from '../src/readiness';
 
 const receipt=(value:any)=>`Plan body.\n\n<!-- ADLC_PLAN_STATUS ${JSON.stringify(value)} -->`;
 
@@ -46,6 +46,16 @@ test('worker receipts require an outcome and concrete evidence',()=>{
  expect(assessWorkerReceipt('<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"needs-input","questions":[]} -->').valid).toBe(false);
  expect(assessWorkerReceipt('<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"pr-handoff"} -->').valid).toBe(true);
  expect(assessWorkerReceipt('No receipt').valid).toBe(false);
+});
+test('the shared approval gate refreshes stale evidence and records explicit acknowledgement',()=>{
+ const s=new Store(':memory:'),id=s.enqueue('p','i','spec');
+ const hash=s.propose(id,'Legacy plan without a receipt');
+ expect(()=>assertApprovalReadiness(s,id,'Alice',false)).toThrow('missing or malformed');
+ assertApprovalReadiness(s,id,'Alice',true);
+ expect(activeResolution(s,id).source).toBe('human-acknowledgement');
+ expect(s.db.query('SELECT kind FROM events WHERE job=? AND kind=?').get(id,'plan_readiness_acknowledged')).toBeTruthy();
+ expect(()=>assertApprovalReadiness(s,id,'Alice',true,true)).toThrow('Actionable plan required');
+ s.close();
 });
 test('resolutions are bound to the current plan, specification and readiness evidence',()=>{
  const s=new Store(':memory:'),id=s.enqueue('p','i','spec');
