@@ -71,6 +71,36 @@ for(const scenario of ['capability','provider','dirty','shared','divergent','cyc
   if(scenario==='grant')f.s.db.query('UPDATE git_grants SET operations=? WHERE job=?').run('[]',f.job);
   if(scenario==='base-change'){const update=f.r.io.update;f.r.io.update=async(...a)=>{await update(...a);f.r.io.provider=async()=>({repo:'owner/repo',baseBranch:'main',base:'e'.repeat(40),dependencies:[]});};}
   expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');expect(f.sends).toHaveLength(1);
+  expect(f.updates()).toBe(scenario==='base-change'?1:0);
+  const active=f.r.status().updates.filter((r:any)=>['reserved','fetching','updating'].includes(r.state));
+  expect(active.length).toBe(['capability','divergent','base-change'].includes(scenario)?1:0);
+ }finally{f.s.close();}
+});
+test('failed fetch stays fenced until confirmed changed-base supersession with identical owned HEAD',async()=>{
+ const f=await fixture();try{
+  f.setMerged(2);const fetch=f.r.io.fetch;f.r.io.fetch=async()=>{throw Error('fetch unavailable');};
+  await f.r.tick(f.job,f.c);expect(f.updates()).toBe(0);expect(()=>assertWorktreeAvailable(f.s,f.job)).toThrow('reserved');
+  const provider=f.r.io.provider;f.r.io.provider=async(...a)=>({...await provider(...a),base:'e'.repeat(40)});
+  await f.r.tick(f.job,f.c);expect(f.updates()).toBe(0);expect(f.r.status().updates[0].state).toBe('fetching');
+  f.r.io.fetch=fetch;f.r.io.update=async(_tree,base)=>{f.setHead(base);};
+  const p=await f.r.preview(f.job,f.c);expect((await f.r.tick(f.job,f.c,p.confirmation)).state).toBe('resumed');
+  expect(f.r.status().updates.some((r:any)=>r.state==='superseded')).toBe(true);expect(()=>assertWorktreeAvailable(f.s,f.job)).not.toThrow();
+ }finally{f.s.close();}
+});
+test('changed HEAD prevents supersession of an interrupted fetch',async()=>{
+ const f=await fixture();try{
+  f.setMerged(2);f.r.io.fetch=async()=>{throw Error('fetch failed');};await f.r.tick(f.job,f.c);
+  const provider=f.r.io.provider;f.r.io.provider=async(...a)=>({...await provider(...a),base:'e'.repeat(40)});f.setHead('f'.repeat(40));
+  const p=await f.r.preview(f.job,f.c);expect((await f.r.tick(f.job,f.c,p.confirmation)).reason).toContain('HEAD changed');expect(f.r.status().updates[0].state).toBe('fetching');expect(f.updates()).toBe(0);
+ }finally{f.s.close();}
+});
+test('one failed dependency notice does not prevent another job notice',async()=>{
+ const f=await fixture();try{
+  await f.r.tick(f.job,f.c);const other=f.s.enqueue('p','other','other');f.s.propose(other,'plan');
+  f.s.db.query('INSERT INTO dependency_waits VALUES (?,?,?,?,?)').run(other,f.s.get(other).plan_hash,'waiting_for_dependencies','wait','{}');
+  const calls:string[]=[];
+  const results=await f.r.notices({...f.c,blockerSync:{enabled:true}}, {leave:async(job:string)=>{calls.push(job);if(job===f.job)throw Error('uncertain notice');},retract:async()=>{}} as any);
+  expect(calls).toEqual([f.job,other]);expect(results[0].state).toBe('blocked');expect(results[1].state).toBe('posted');
  }finally{f.s.close();}
 });
 test('crash after Git update reconciles exact HEAD without repeating update',async()=>{

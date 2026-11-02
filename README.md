@@ -1601,9 +1601,12 @@ explicit operator mapping reconciliation; closed-unmerged or reopened PRs are
 not considered satisfied. Linear Done is not capability evidence.
 
 For every prerequisite the observer verifies the exact GitHub repository/PR,
-human merge, merge-commit ancestry in the configured current base, and configured
+provider-recorded merge, merge-commit ancestry in the configured current base, and configured
 capability file contents at that immutable base. Capability digests are exact
-UTF-8 file-content SHA-256, including trailing newlines, for operator-reviewed
+UTF-8 file-content SHA-256. Merge evidence does not attest that a human manually
+performed the merge; human-only merging remains an operator policy, not a claim
+inferred from provider account type. Capability digests include trailing newlines:
+they are for operator-reviewed
 interface/contracts (bounded to 1 MB each). They are deliberately conservative:
 an interface file changed after merge needs a new reviewed digest rather than
 guessing compatibility. This is not arbitrary test execution or proof of
@@ -1638,6 +1641,11 @@ proposal and all guards; it cannot override missing capability, scope, ownership
 or approval evidence. After a known interrupted fetch/update, explicit fresh
 confirmation may retry only when clean original HEAD/ownership/base evidence
 still matches. Automatic polls never replay an uncertain Git stage. A crash
+after a failed pre-update fetch may leave an older-base reservation. A fresh
+confirmed `dependency-resume` can supersede that reserved/fetching row only when
+its recorded authorization, ownership, clean worktree and original HEAD still
+match current evidence. Superseded rows remain in the audit history; changed
+HEAD/ownership or a possibly attempted update retains its fence. A crash
 after a successful fast-forward can be reconciled from exact clean updated HEAD
 without repeating Git. Changed base/plan or unrelated reservations require
 operator reconciliation, not live SQL edits or reservation deletion.

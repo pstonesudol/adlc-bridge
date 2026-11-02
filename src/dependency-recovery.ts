@@ -71,7 +71,8 @@ export class DependencyRecovery{
   const binding=resolutionBinding(this.s,job);
   const proof={job,auth,definition,graph,provider,binding,policy:c.dependencyRecovery};
   const id=digest(JSON.stringify(proof));
-  return {mode:'preview_only',id,confirmation:digest(JSON.stringify([proof,facts])),proof,facts,nextAction:'Verify/fetch exact base, fast-forward clean feature only, and use existing guarded continuation. Unsafe evidence requires operator reconciliation.'};
+  const retained=this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_updates'").get()?this.s.db.query("SELECT * FROM dependency_updates WHERE job=? AND state IN ('reserved','fetching','updating') ORDER BY id").all(job):[];
+  return {mode:'preview_only',id,confirmation:digest(JSON.stringify([proof,facts,retained])),proof,facts,retained,nextAction:'Verify/fetch exact base, fast-forward clean feature only, and use existing guarded continuation. Unsafe evidence requires operator reconciliation.'};
  }
  async tick(job:string,c:any,confirmation?:string){return this.submit(async()=>{
   this.install();
@@ -91,8 +92,21 @@ export class DependencyRecovery{
    if(confirmation&&confirmation!==preview.confirmation)throw Error('Dependency preview changed; inspect again');
    const {id,proof,facts}=preview;
    let row=this.s.db.query('SELECT * FROM dependency_updates WHERE id=?').get(id) as any;
-   if(!row){
-    assertWorktreeAvailable(this.s,job);
+    if(!row){
+     if(confirmation&&preview.retained.length){
+      this.s.db.transaction(()=>{
+       const current=this.s.db.query("SELECT * FROM dependency_updates WHERE job=? AND state IN ('reserved','fetching','updating') ORDER BY id").all(job);
+       if(JSON.stringify(current)!==JSON.stringify(preview.retained))throw Error('Retained dependency reservation changed; preview again');
+       for(const old of preview.retained){
+        const recorded=JSON.parse(old.detail);
+        if(!['reserved','fetching'].includes(old.state)||old.worktree!==facts.tree||JSON.stringify(recorded.proof.auth)!==JSON.stringify(proof.auth)||JSON.stringify(recorded.facts)!==JSON.stringify(facts))throw Error('Retained update ownership, worktree or HEAD changed; preserve reservation');
+        this.s.db.query("UPDATE dependency_updates SET state='superseded' WHERE id=?").run(old.id);
+        this.s.event(job,'dependency_preupdate_superseded',JSON.stringify({old:old.id,current:id,confirmation}));
+       }
+       assertWorktreeAvailable(this.s,job);
+      }).immediate();
+     }
+     assertWorktreeAvailable(this.s,job);
     row=this.s.db.transaction(()=>{
      if(JSON.stringify(this.authorization(job,c))!==JSON.stringify(proof.auth))throw Error('Approval changed before dependency reservation');
      assertWorktreeAvailable(this.s,job);
@@ -109,7 +123,7 @@ export class DependencyRecovery{
     await this.io.fetch(facts.tree,proof.provider.baseBranch);
     if(!await this.io.includes(facts.tree,facts.head,proof.provider.base))throw Error('Divergent feature work; only fast-forward is automatic, preserve history for operator merge');
     await this.io.capabilities(facts.tree,proof.provider.base,proof.definition);
-    const fresh=await this.preview(job,c);if(fresh.confirmation!==preview.confirmation)throw Error('Dependency/base/worktree changed before update');
+     const fresh=await this.preview(job,c);if(fresh.id!==id||JSON.stringify(fresh.facts)!==JSON.stringify(facts))throw Error('Dependency/base/worktree changed before update');
     this.s.db.query("UPDATE dependency_updates SET state='updating' WHERE id=? AND state='fetching'").run(id);
     await this.io.update(facts.tree,proof.provider.base);
    }
@@ -149,15 +163,20 @@ export class DependencyRecovery{
   for(const wait of this.rows())if(['ready','delivery_uncertain'].includes(wait.state)&&this.s.get(wait.job).project===c.linear.projectId&&!rows.some(r=>r.id===wait.job))rows.push({id:wait.job});
   const results=[];for(const r of rows)results.push(await this.tick(r.id,c));return results;
  }
- async notices(c:any,blockers:LinearBlockers){
-  if(!c.blockerSync?.enabled)return;
-  for(const row of this.rows()){
+  async notices(c:any,blockers:LinearBlockers){
+   const results:any[]=[];
+   if(!c.blockerSync?.enabled)return results;
+   for(const row of this.rows()){
+    try{
    const j=this.s.get(row.job);if(j.project!==c.linear.projectId||j.plan_hash!==row.plan)continue;
    const p=JSON.parse(row.evidence),definition=p.proof?.definition??p.definition;
    const outcome={plan_hash:row.plan,outcome:row.state,reason:row.reason,questions:'[]',dependencies:JSON.stringify((definition?.prerequisites??[]).map((d:any)=>({ref:d.ref,reason:`${d.repo}#${d.pr}; ${d.kind}; capabilities ${d.capabilities.map((x:any)=>x.path).join(', ')}`})))};
    const reason=row.state==='resumed'?`Verified dependency evidence ${p.id}; continuation accepted in the existing session. No new authorization or runtime activation.`:row.reason;
    await blockers.leave(row.job,outcome,c,{binding:digest(JSON.stringify([row.job,row.plan,row.state,reason,p.id??definition])),applyLabel:row.state!=='resumed',body:`## ADLC: ${row.state==='waiting_for_dependencies'?'Waiting for dependencies':row.state}\n\n${reason??''}\n\nPrerequisites: ${outcome.dependencies}\n\nPlan: ${row.plan}\nNext action: ${row.state==='resumed'?'Wait for the existing worker; do not resend.':'inspect dependency-preview; reconcile failed evidence before dependency-resume.'} No new authorization or runtime activation.`,guard:(issue)=>{if(issue.id!==j.issue||this.s.get(j.id).plan_hash!==row.plan)throw Error('Dependency notice identity changed');}});
-   if(row.state==='resumed')await blockers.retract(row.job,c);
-  }
+    if(row.state==='resumed')await blockers.retract(row.job,c);
+    results.push({job:row.job,state:'posted'});
+    }catch(error){results.push({job:row.job,state:'blocked',reason:error instanceof Error?error.message:'Dependency notice failed'});}
+   }
+   return results;
  }
 }

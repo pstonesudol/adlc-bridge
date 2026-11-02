@@ -84,7 +84,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   io.out(await io.poll(c,s,io.linearToken()));
   await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
-  if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)await dependencies.notices(c,blockers as LinearBlockers);}
+  if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)io.out({dependencyNotices:await dependencies.notices(c,blockers as LinearBlockers)});}
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
   const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
   for(const stage of stages){

@@ -75,6 +75,14 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
  }finally{f.s.close();}
 });
+for(const outcome of ['failed','uncertain','needs_reconciliation','needs_input'])test(`post-dependency ${outcome} is still published`,async()=>{
+ const f=fixture();try{
+  f.s.db.exec('CREATE TABLE dependency_waits(job TEXT,plan TEXT,state TEXT)');
+  f.s.db.query('INSERT INTO dependency_waits VALUES (?,?,?)').run(f.id,f.s.get(f.id).plan_hash,'resumed');
+  f.s.db.query('UPDATE worker_outcomes SET outcome=? WHERE job=?').run(outcome,f.id);
+  await f.blockers().sync(f.config);expect(f.creates).toBe(1);expect(f.comments[0].body).toContain(outcome.replaceAll('_',' '));
+ }finally{f.s.close();}
+});
 test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
  const f=fixture();try{
   f.running();new ConflictRecovery(f.s).install();

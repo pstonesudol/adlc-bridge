@@ -145,7 +145,7 @@ export class LinearBlockers{
    for(const outcome of rows){
     handled.add(outcome.job);
     try{
-    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query('SELECT 1 FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash))continue;
+    if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query('SELECT 1 FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash))continue;
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.
     if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;

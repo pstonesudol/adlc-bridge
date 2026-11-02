@@ -2,6 +2,17 @@ import {test,expect} from 'bun:test';import {Store} from '../src/core';import {P
 const c={version:1 as const,...featureConfig,requiredChecks:['CI'],statusSync:{enabled:true,inProgress:'00000000-0000-0000-0000-000000000006',inReview:'00000000-0000-0000-0000-000000000007',done:'00000000-0000-0000-0000-000000000008'}};
 function issue(id:string,state:string){return {id,identifier:'DEV-1',title:'Task',description:'Requirements',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{id:state},labels:{nodes:[{id:c.linear.readyLabelId}],pageInfo:{hasNextPage:false}}};}
 const response=(nodes:any[])=>new Response(JSON.stringify({data:{issues:{nodes,pageInfo:{hasNextPage:false}}}}));
+for(const state of ['approved_pending','unknown','delivery_accepted'])test(`dependency intake exemption checks started dispatch: ${state}`,async()=>{
+ const old=globalThis.fetch,s=new Store(':memory:');new Workflow(s,{} as any);new FeaturePlanning(s,new Agents());
+ try{
+  const source=issue('dependent',c.linear.readyStateId),id=s.enqueue(c.linear.projectId,'dependent',JSON.stringify({identifier:source.identifier,title:source.title,description:source.description}));
+  s.db.query('INSERT INTO feature_dependencies VALUES (?,?)').run('dependent','prerequisite');
+  s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(id,'plan','session','client',state,'[]','supervised-host','human',null);
+  globalThis.fetch=(async(_url:any,init:any)=>{const b=JSON.parse(init.body);return response(b.variables.ids?[{id:'prerequisite',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{type:'started'}}]:[source]);}) as any;
+  await poll({...c,githubRepo:'owner/repo',statusSync:undefined,dependencyRecovery:{enabled:true,baseBranch:'main',jobs:[]}},s,'test');
+  expect(s.get(id).state==='blocked').toBe(state!=='delivery_accepted');
+ }finally{globalThis.fetch=old;s.close();}
+});
 test('full paginated intake queues overflow even when all planning slots are uncertain',async()=>{
  const old=globalThis.fetch,s=new Store(':memory:');let starts=0;
  const w=new Workflow(s,{startPlan:async()=>{starts++;throw Error('unknown');},findPlans:async()=>[]} as any);
