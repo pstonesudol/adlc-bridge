@@ -798,6 +798,68 @@ session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
 
+### Legacy exhausted jobs from pre-budget databases
+
+Databases created before per-project remediation budgets have no
+`remediation_budget` row for jobs that the older release blocked. The legacy
+implementation wrote the exact reason `Remediation limit exhausted` to both the
+job and its owned run after five cumulative attempts. `adlc review-status` now
+reports those jobs as **Blocked** with a `budget_exhausted` remediation stop
+instead of showing **Addressing feedback** or a neutral budget.
+
+Run the normal extension preview with the project configuration and the current
+review-target head:
+
+```sh
+adlc extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD
+```
+
+Before any compatibility bookkeeping, the command requires current plan
+approval, an orchestrator-owned run, no uncertain remediation delivery, a
+registered review target whose stored head exactly matches `HEAD`, and current
+scoped GitHub authorization. A head mismatch fails with the stored and requested
+values and instructs the operator to refresh evidence with
+`adlc tick-review JOB CONFIG`; it never adopts or bypasses drift.
+
+For a corroborated legacy stop, preview lazily writes a one-time compatibility
+mirror to `remediation_budget` and a provenance row to
+`remediation_budget_migrations`, plus a
+`legacy_remediation_budget_reconciled` audit event. Migration requires the exact
+legacy reason on both job and run, at least the old five-attempt limit, matching
+plan/approval hashes, an existing owned session/worktree, and retained
+remediation history ending at the cumulative attempt count. Arbitrary blocked
+reasons, untrusted messages, missing history, or mismatched ownership are never
+treated as authorization.
+
+Preview grants no budget and dispatches no worker. If the current policy still
+treats the job as exhausted, the returned preview enters the usual extension
+flow; confirm the exact `confirmHash` to append the extension. If the current
+policy has a higher limit or is uncapped, the legacy five-attempt stop no longer
+applies: preview returns `action: "resume_legacy_stop"` with zero additional
+budget, and the exact confirmation clears only that legacy job/run stop so the
+next poll reevaluates current evidence. A lowered limit still uses the exhausted
+path. In every outcome, `jobs.attempts`, consumed counts, prior remediation
+deliveries, Git grants, plan bindings and original audit events are preserved;
+the migration row and audit event are written once even across repeated or
+overlapping previews.
+
+After confirmation, verify recovery without starting replacement work:
+
+```sh
+adlc review-status
+adlc status
+```
+
+The job must be `approved`, the existing run `running`, and the remediation
+budget must show the extension count or, for a superseded stop, the configured
+limit with the legacy migration provenance. Then run the normal
+`adlc tick-review JOB CONFIG` or poll so the existing session is reevaluated
+against the current head. A confirmed budget extension is not a send: an
+uncertain or accepted delivery still requires its normal reconciliation. Do not
+edit SQLite directly, reset attempts, create another session/PR, or install the
+new snapshot automatically; reviewed installation and any live recovery remain
+explicit operator actions. No merge or deployment is automatic.
+
 ## Existing worker PR recovery
 
 Workers must retain the reserved planning branch. At completed delivery, the
