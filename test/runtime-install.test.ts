@@ -21,6 +21,11 @@ test('runtime registration restores both prior files if the post-install trust c
 test('runtime status failures are rejected before creating registrations',async()=>{
  for(const result of [{stdout:Buffer.from('malformed'),exitCode:0},{stdout:Buffer.from('{"state":"stopped"}'),exitCode:1}]){const f=fixture();try{f.io.command=()=>result;await expect(installRuntime(f.binary,true,f.io)).rejects.toThrow();expect(existsSync(f.pin)).toBe(false);expect(existsSync(f.plist)).toBe(false);}finally{f.close();}}
 });
+test('runtime entry point rejects option tokens before reading injected configuration or acquiring a fence',async()=>{
+ for(const binary of ['--apply','--binary','-x',''])for(const apply of [false,true]){
+  const touched=()=>{throw Error('Validation must precede all I/O');};await expect(installRuntime(binary,apply,{state:touched,home:touched,installedCLI:touched,command:touched,trustedDaemon:touched} as any)).rejects.toThrow('--binary requires a binary path, not an option');
+ }
+});
 test('missing runtime launcher rejects apply before service probes, backups or writes while preview stays read-only',async()=>{
  const f=fixture();try{
   rmSync(join(f.root,'versions/version/src/serve-orchestrator.py'));mkdirSync(join(f.io.home(),'Library/LaunchAgents'),{recursive:true});writeFileSync(f.pin,'{"serviceLabel":"local.adlc.orchestrator"}',{mode:0o600});writeFileSync(f.plist,'prior plist');const before=[readFileSync(f.pin),readFileSync(f.plist)];let probes=0;

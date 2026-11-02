@@ -1,5 +1,13 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,existsSync,readdirSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+test('runtime binary option tokens are rejected before creating local state',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-cli-runtime-'));try{
+  for(const args of [['install-runtime','--binary','--apply'],['install-runtime','--binary','-x'],['install-runtime','--binary']]){
+   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),...args],{cwd:root,env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root,ADLC_DB:join(root,'unused.sqlite'),BUN_RUNTIME_TRANSPILER_CACHE_PATH:'0'}});
+   expect(result.exitCode).not.toBe(0);expect(result.stderr.toString()).toMatch(/--binary requires a binary path|--binary PATH required/);expect(readdirSync(root)).toEqual([]);
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('install rejects missing, option-like or relative --bin values before filesystem operations',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-cli-bin-')),home=mkdtempSync(join(tmpdir(),'adlc-cli-home-'));try{
    for(const args of [['install','--apply','--bin','--apply'],['install','--bin'],['install','--bin','-x'],['install','--apply','--bin','relative/adlc'],['install','--bin','./adlc']]){

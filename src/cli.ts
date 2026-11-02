@@ -38,6 +38,30 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
+export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+ const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,io={poll,linearToken,out}}=context;
+ return async()=>runPollTick(async()=>{
+  reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
+  const remediation=remediationPolicy(c.remediation);
+  io.out(await io.poll(c,s,io.linearToken()));
+  const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
+  for(const stage of stages){
+   if(stage.state==='pr_handoff'&&stage.pr){
+    const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
+    if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
+    const delivery=workflow.implementation(stage.job);
+    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
+   }
+  }
+  const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
+  const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
+  for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+   if(target.state==='completed')continue;
+   try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
+  }
+ });
+}
 async function main(){
   if(['recover','cleanup'].includes(command)){const s=new Store(db);try{return out(await maintenance(s,command as 'recover'|'cleanup',req(a[0],'Job'),a.includes('--apply'),a.includes('--confirm')?req(a[a.indexOf('--confirm')+1],'Confirmation hash'):undefined));}finally{s.close();}}
   if(command==='install'){
@@ -189,27 +213,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
     if(command==='approve-plan'){s.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'));return out({approved:true,executionEnabled:false});}
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=async()=>runPollTick(async()=>{
-      reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
-      const remediation=remediationPolicy(c!.remediation);
-      out(await poll(c,s,linearToken()));
-      const stages=await workflow.tick(c);if(stages.length)out({workflow:stages});
-      const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)out({planApprovals});
-      for(const stage of stages){
-        if(stage.state==='pr_handoff'&&stage.pr){
-          const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
-          if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
-          const delivery=workflow.implementation(stage.job);
-          reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true);
-        }
-      }
-      const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)out({linearStatuses:linearUpdates});
-      const featureUpdates=await features.tickProject(c);if(featureUpdates.length)out({features:featureUpdates});
-      for(const target of reviewLoop.list(c.linear.projectId) as any[]){
-        if(target.state==='completed')continue;
-        try{out({job:target.job,review:await reviewLoop.tick(target.job,c!.branchUpdate,remediation,{project:c!.linear.projectId,checks:c!.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
-      }
-    });
+    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();
@@ -218,4 +222,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});
+if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=1;});

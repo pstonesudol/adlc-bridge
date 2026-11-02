@@ -7,6 +7,7 @@ import {turnBarrier} from './turn-submission';
 export function runtimeDefinition(label:string,launcher:string,log:string){const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');return `<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>${xml(launcher)}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>30</integer><key>WorkingDirectory</key><string>${xml(join(homedir(),'.ao'))}</string><key>StandardOutPath</key><string>${xml(log)}</string><key>StandardErrorPath</key><string>${xml(log)}</string></dict></plist>\n`;}
 const runtimeIO={state:appState,home:homedir,installedCLI,command:Bun.spawnSync,trustedDaemon};
 export async function installRuntime(binary:string,apply=false,io=runtimeIO){
+  if(typeof binary!=='string'||!binary||binary.startsWith('-'))throw Error('--binary requires a binary path, not an option');
   if(process.platform!=='darwin')throw Error('Runtime service requires macOS');
   const inspectAndInstall=async()=>{
  binary=realpathSync(binary);const bytes=readFileSync(binary),sha256=createHash('sha256').update(bytes).digest('hex');
