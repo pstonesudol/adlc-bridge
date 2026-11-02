@@ -23,6 +23,15 @@ test('table rows nested inside full details also remain ambiguous instead of bei
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.','Never invent results.\n| Another check | ![Error](error.svg) | Unsupported error |');
  expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toContain('table continues after full details');
 });
+for(const [open,close] of [['```text','```'],['~~~console','~~~'],['````','`````'],['   ```text','   ```']])test(`complete fenced pipe output is not a check table: ${open}`,()=>{
+ const f=customFixture(),output=`${open}\n| tests | passed |\n${close}`;
+ f.comments[0].body=f.comments[0].body.replace('Never invent results.',`Observed output:\n${output}\nNever invent results.`);
+ const e=f.evidence();expect(e.blocker).toBeNull();expect(e.findings).toHaveLength(1);expect(e.findings[0].body).toContain(output);
+});
+for(const close of ['```','~~~','``'])test(`table detection resumes after a fence or rejects an incomplete fence: ${close}`,()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',`Observed output:\n\x60\x60\x60text\n| tests | passed |\n${close}\n| Unsupported check | ![Error](error.svg) | Outside or uncertain fence |`);
+ expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toBeTruthy();
+});
 for(const status of ['![Failed](error.svg)','Error','![Error]()','![Error](error.svg) ![Passed](passed.svg)',''])test(`unclassifiable custom status blocks unrelated remediation: ${status}`,()=>{
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error](error.svg)',status);
  const e=f.evidence();expect(e.findings).toEqual([]);expect(e.bodyReviewed).toBe(false);expect(e.blocker).toContain('unclassifiable');

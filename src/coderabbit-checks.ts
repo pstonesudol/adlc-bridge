@@ -8,6 +8,20 @@ export function customCheckSection(body:string){
 }
 const bot=(user:any)=>user?.login==='coderabbitai[bot]'&&user?.type==='Bot'&&Number.isSafeInteger(user.id);
 const time=(value:any)=>typeof value==='string'?Date.parse(value):NaN;
+function ambiguousDetailsTable(text:string){
+ let fence:{character:string;length:number}|null=null;
+ for(const line of text.split(/\r?\n/)){
+  const marker=line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+  if(fence){
+   if(marker&&marker[1][0]===fence.character&&marker[1].length>=fence.length&&!marker[2].trim())fence=null;
+   continue;
+  }
+  if(marker&&(marker[1][0]!=='`'||!marker[2].includes('`'))){fence={character:marker[1][0],length:marker[1].length};continue;}
+  if(/^\s*\|.*\|\s*$/.test(line))return true;
+ }
+ // An unterminated fence cannot prove that later table rows are output.
+ return fence!==null;
+}
 /** Relevance for remediation, NOT a CI attestation or an approval. A mutable
  * summary must belong to the same completed run as the current change request.
  * PR lastEditedAt is obtained from GitHub, never guessed from updated_at. */
@@ -23,7 +37,7 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  // Unknown status formats cannot be mistaken for an informational pass.
  const detailsAt=section.search(/<summary>\s*<strong>Full details:/i);
  const table=detailsAt<0?section:section.slice(0,detailsAt);
- if(detailsAt>=0&&/^\s*\|.*\|\s*$/m.test(section.slice(detailsAt)))return {...empty,blocker:'CodeRabbit custom-check table continues after full details; obtain the complete supported bot summary'};
+ if(detailsAt>=0&&ambiguousDetailsTable(section.slice(detailsAt)))return {...empty,blocker:'CodeRabbit custom-check table continues after full details or fenced output is incomplete; obtain the complete supported bot summary'};
  const rows=table.split('\n').filter(l=>l.includes('|'));
  const errors:string[]=[];let unclassified=false,dataRows=0;
  for(const row of rows){
