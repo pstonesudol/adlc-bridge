@@ -1,5 +1,9 @@
 {
   "version": 1,
+  "clarifications": {
+    "enabled": false,
+    "humanIds": []
+  },
   "name": "Your project",
   "repo": "/absolute/path/to/your/repository",
   "githubRepo": "OWNER/REPOSITORY",

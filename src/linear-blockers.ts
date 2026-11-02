@@ -4,6 +4,7 @@ import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
+export type NoticeOptions={binding:string;body:string;applyLabel?:boolean;guard:(issue:any)=>void};
 
 function blockerOutcome(outcome:string){return ['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(outcome);}
 
@@ -24,7 +25,7 @@ export class LinearBlockers{
  async comments(issue:string){
   const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
   do{
-   const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body createdAt}pageInfo{hasNextPage endCursor}}}}',{id:issue,after});
+   const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body createdAt editedAt user{id app} botActor{id}}pageInfo{hasNextPage endCursor}}}}',{id:issue,after});
    const page=b.issue?.comments;
    if(b.issue?.id!==issue||!Array.isArray(page?.nodes)||typeof page.pageInfo?.hasNextPage!=='boolean')throw Error('Incomplete blocker comment inventory');
    result.push(...page.nodes);if(result.length>1000)throw Error('Blocker comment inventory exceeds safe bound');
@@ -32,16 +33,17 @@ export class LinearBlockers{
    after=page.pageInfo.endCursor;if(!after||seen.has(after))throw Error('Invalid blocker comment cursor');seen.add(after);
   }while(true);
  }
- async leave(job:string,outcome:any,c:BlockerConfig){
+ async leave(job:string,outcome:any,c:BlockerConfig,options?:NoticeOptions){
   const labelId=c.blockerSync!.labelId!;
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity or label scope mismatch');
+  options?.guard(issue);
   const questions=JSON.parse(outcome.questions),dependencies=JSON.parse(outcome.dependencies);
-  const binding=this.binding(job,outcome,labelId);
+  const binding=options?.binding??this.binding(job,outcome,labelId);
   let row=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(job,binding) as any;
   if(!row){
    const commentId=randomUUID();
-   const body=[
+   const body=options?.body??[
      `## ADLC: implementation stopped — ${issue.identifier}`,
      `Outcome: **${outcome.outcome.replaceAll('_',' ')}**`,
      `Plan version: \`${outcome.plan_hash}\``,
@@ -59,6 +61,7 @@ export class LinearBlockers{
    this.s.db.query("UPDATE blocker_notices SET state='posted',created=?,reason=NULL WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
   }else{
    if(row.state!=='reserved')throw Error('Blocker comment delivery uncertain or missing; never repost blindly');
+   if(options)options.guard(await readLinearIssue(j.issue,this.api));
    const claim=this.s.db.query("UPDATE blocker_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
    if(!claim.changes)return {job,state:'delivery_uncertain',reason:'Blocker comment already claimed'};
    const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:row.comment_id,issueId:j.issue,body:row.body,doNotSubscribeToIssue:false}}).catch(()=>{throw Error('Blocker comment delivery uncertain; never repost blindly');});
@@ -68,6 +71,7 @@ export class LinearBlockers{
    this.s.event(job,'linear_blocker_comment',JSON.stringify({comment:row.comment_id,outcome:outcome.outcome}));
   }
   let labelState='present';
+  if(options?.applyLabel===false)return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:'unchanged'};
   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
    // Record ownership before the mutation so a lost reply or verification failure
    // still lets retract reconcile the bridge-applied label.
@@ -82,6 +86,7 @@ export class LinearBlockers{
  }
  async retract(job:string,c:BlockerConfig){
   if(c.blockerSync?.enabled!==true)return {state:'disabled'};
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&this.s.db.query("SELECT job FROM clarification_receipts WHERE job=? AND state IN ('waiting','partial','confirmed','replan','needs_review')").get(job))return {state:'retained',reason:'Another unresolved clarification remains'};
   const rows=this.s.db.query("SELECT * FROM blocker_notices WHERE job=? AND state='posted' AND label_applied=1").all(job) as any[];
   if(!rows.length)return {state:'none'};
   if(rows.some(row=>!row.applied_label_id))return {state:'needs_reconciliation',reason:'Applied blocker label ownership predates label tracking; inspect the Linear label manually'};
@@ -105,7 +110,7 @@ export class LinearBlockers{
   }
   return {state:removed.length?'retracted':'absent',labels:removed};
  }
- async sync(c:BlockerConfig){
+ async sync(c:BlockerConfig&{clarifications?:{enabled:boolean}}){
   if(c.blockerSync?.enabled!==true)return [];
   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
   if(c.linear.readyLabelId&&c.blockerSync.labelId!.toLowerCase()===c.linear.readyLabelId.toLowerCase())throw Error('Blocker label must differ from the queue label');
@@ -116,6 +121,9 @@ export class LinearBlockers{
   for(const outcome of rows){
    handled.add(outcome.job);
    try{
+    // The clarification adapter uses this same publisher and receipts. Do not
+    // publish a competing generic blocker before it has inspected discovery.
+    if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;
     if(blockerOutcome(outcome.outcome)){results.push(await this.leave(outcome.job,outcome,c));}
     else results.push(await this.retract(outcome.job,c));
    }catch(error){results.push({job:outcome.job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}

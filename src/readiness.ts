@@ -16,6 +16,19 @@ export type ReadinessAssessment={
 export type WorkerOutcome='pr-handoff'|'needs-input'|'blocked-dependency'|'failed'|'uncertain';
 export type WorkerReceipt={outcome:WorkerOutcome;reason:string;questions:PlanQuestion[];dependencies:PlanDependency[]};
 
+/** Evidence supplied by the worker after inspecting accessible context. Absence
+ * is not proof of discovery and must never cause automatic clarification spam. */
+export function clarificationDiscovery(value:string):{summary:string;necessity:string}|null{
+ const matches=[...value.matchAll(/<!--\s*ADLC_DISCOVERY\s*(\{[^\n]*\})\s*-->/g)];
+ if(matches.length!==1)return null;
+ try{
+  const d=JSON.parse(matches[0][1]);
+  if(!Array.isArray(d.checked)||!['ticket','linked-issues','repository'].every(k=>d.checked.includes(k)))return null;
+  if(typeof d.summary!=='string'||!d.summary.trim()||d.summary.length>2000||typeof d.necessity!=='string'||!d.necessity.trim()||d.necessity.length>2000)return null;
+  return {summary:d.summary.trim(),necessity:d.necessity.trim()};
+ }catch{return null;}
+}
+
 const states=new Set<ReadinessState>(['ready','needs-input','blocked-by-dependency']);
 const kinds=new Set<QuestionKind>(['requirement','dependency','security-scope']);
 const outcomes=new Set<WorkerOutcome>(['pr-handoff','needs-input','blocked-dependency','failed','uncertain']);
@@ -243,10 +256,13 @@ export function activeReadinessResolution(s:Store,job:string,sources?:string[]):
 export const PLAN_STATUS_INSTRUCTION=[
   'End the plan with exactly one machine-readable readiness receipt on its own line:',
   '<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready|needs-input|blocked-by-dependency","questions":[{"id":"q1","question":"...","kind":"requirement|dependency|security-scope"}],"dependencies":[{"ref":"ISSUE-OR-REF","reason":"..."}],"risks":["..."]} -->',
-  'Use ready only when no requirement, dependency or security/scope decision is unresolved; ordinary non-blocking risks belong in risks and do not block. Use needs-input for missing decisions or approved wording and blocked-by-dependency for named external dependencies. Never fabricate an answer to make the plan ready.'
+  'Use ready only when no requirement, dependency or security/scope decision is unresolved; ordinary non-blocking risks belong in risks and do not block. Use needs-input for missing decisions or approved wording and blocked-by-dependency for named external dependencies. Never fabricate an answer to make the plan ready.',
+  discoveryInstruction()
 ].join('\n');
 export const WORKER_STATUS_INSTRUCTION=[
   'Before your final response, emit exactly one machine-readable outcome receipt on its own line:',
   '<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"pr-handoff|needs-input|blocked-dependency|failed|uncertain","reason":"...","questions":[{"id":"q1","question":"...","kind":"requirement|dependency|security-scope"}],"dependencies":[{"ref":"ISSUE-OR-REF","reason":"..."}]} -->',
-  'Use pr-handoff only after opening or updating exactly one PR. If you must stop for a human decision or an unmet dependency, report needs-input or blocked-dependency with the exact question or reference. Never invent answers and never claim a PR that does not exist.'
+  'Use pr-handoff only after opening or updating exactly one PR. If you must stop for a human decision or an unmet dependency, report needs-input or blocked-dependency with the exact question or reference. Never invent answers and never claim a PR that does not exist.',
+  discoveryInstruction()
 ].join('\n');
+function discoveryInstruction(){return 'Before asking, inspect the ticket, linked issues/dependencies and accessible repository context. Ask only for genuinely missing essential facts or decisions, never routine choices, information already provided or work already authorized. For a blocker include exactly one ADLC_DISCOVERY receipt, replacing the example with truthful evidence: <!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Specific context inspected and relevant facts already known","necessity":"Why the exact missing answer is essential and not already supplied"} -->. Never request secrets. Material scope or permission changes require replanning and applicable approval.';}
