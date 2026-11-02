@@ -447,6 +447,47 @@ test('a changed reviewer-comment set at the same head rejects stale feedback pro
   expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
  }finally{f.s.close();}
 });
+test('head drift reported during collection rejects delivery before spending budget',async()=>{
+ const f=threadFixture();try{
+  f.e.reasons=['Head changed'];
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],undefined,[],f.io)).rejects.toThrow('Current uncleared PR head required');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+for(const change of ['head','resolved','body','ambiguous','authorization'])test(`submission revalidates after awaited work: ${change}`,async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings);
+  f.io.submit=async(operation:any)=>{
+   if(change==='head')f.e.head='c'.repeat(40);
+   if(change==='resolved')f.e.findings=[];
+   if(change==='body')f.e.findings[0].body='Edited comment, same stable ID';
+   if(change==='ambiguous')f.e.findings.push({...f.e.findings[0]});
+   if(change==='authorization')f.s.db.exec('DELETE FROM git_grants');
+   return operation();
+  };
+  await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],f.io)).rejects.toThrow(change==='head'?'Current uncleared PR head required':change==='authorization'?'Current scoped GitHub authorization required':'Review feedback changed');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM review_feedback').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+test('overlapping batches atomically reject a previously claimed thread without budget consumption',async()=>{
+ const f=threadFixture();try{
+  const first=JSON.stringify(f.e.findings);
+  await sendPilotRemediation(f.s,f.id,f.head,first,'owner/repo',1,['CI'],undefined,[],f.io);
+  f.session.transcript.turns[0].state='completed';
+  f.s.db.exec("UPDATE remediation SET state='completed'");
+  const before=f.s.db.query('SELECT * FROM remediation_budget').all();
+  // New batch orders an unclaimed identity before the overlap. Both its claim
+  // and the attempt/budget must roll back, not just the conflicting INSERT.
+  f.e.findings.unshift({...f.e.findings[0],threadId:'T2',commentsHash:'e'.repeat(64)});
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],undefined,[],f.io)).rejects.toThrow('Review feedback already claimed');
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  expect(f.s.db.query('SELECT * FROM remediation_budget').all()).toEqual(before);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toHaveLength(1);
+  expect(f.s.db.query('SELECT thread_id FROM review_feedback').all()).toEqual([{thread_id:'T1'}]);
+ }finally{f.s.close();}
+});
 test('rate limiting and residual human decisions are distinct from remediation and waiting on a timeout',()=>{
  expect(decision({...pending(),coderabbitRateLimited:true},['a'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'CodeRabbit rate limited; wait for the provider limit to reset'});
  const remaining={category:'human',threadId:'H1',path:'src/human.ts'};

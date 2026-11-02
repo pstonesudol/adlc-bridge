@@ -24,6 +24,14 @@ test('resolved, outdated, human-only and spoofed authors are distinguished inste
  expect(evidence.stale.map(t=>t.threadId)).toEqual(['OUTDATED']);
  expect(evidence.humanOnly.map(t=>t.threadId).sort()).toEqual(['HUMAN','SPOOFED']);
 });
+test('deleted authors remain non-bot evidence in resolved and unresolved threads',()=>{
+ const ghost=thread({comments:{nodes:[{...bot('ghost','Retained comment'),author:null}],pageInfo:{hasNextPage:false}}});
+ const normalized=normalizeReviewThread(ghost);
+ expect(normalized.comments[0]).toMatchObject({id:'ghost',login:'',bot:false});
+ expect(reviewThreadEvidence([normalized])).toMatchObject({unresolved:1,candidates:[],humanOnly:[{threadId:'T1',path:'src/workflow.ts'}]});
+ expect(reviewThreadEvidence([normalizeReviewThread({...ghost,isResolved:true})])).toMatchObject({resolved:1,unresolved:0,candidates:[]});
+ for(const author of [undefined,{}, {login:''}, {login:42}])expect(()=>normalizeReviewThread(thread({comments:{nodes:[{...bot('bad','x'),author}],pageInfo:{hasNextPage:false}}}))).toThrow('Invalid review comment author');
+});
 test('legacy CodeRabbit bot login is accepted only when GitHub reports a Bot author',()=>{
  const evidence=reviewThreadEvidence([normalizeReviewThread(thread({comments:{nodes:[bot('L1','legacy finding','old','coderabbitai','Bot')],pageInfo:{hasNextPage:false}}}) )]);
  expect(evidence.candidates.map(c=>c.threadId)).toEqual(['T1']);

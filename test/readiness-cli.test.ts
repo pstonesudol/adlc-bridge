@@ -51,7 +51,7 @@ console.log(JSON.stringify(result));
   }
  }finally{rmSync(root,{recursive:true,force:true});}
 },15000);
-test('readiness collects every thread and nested comment page and keeps carried-forward identity',()=>{
+for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-pageInfo','nested-repeat','nested-null','nested-errors','nested-pageInfo'])test(`readiness pagination: ${mode}`,()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-review-threads-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
   const pr={head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
@@ -62,6 +62,15 @@ test('readiness collects every thread and nested comment page and keeps carried-
   const page1={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T1',{comments:{nodes:[comment('C1','Planning slot leak')],pageInfo:{hasNextPage:true,endCursor:'c1'}}})],pageInfo:{hasNextPage:true,endCursor:'t2'}}}}}};
   const page2={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T2',{isOutdated:true,path:'src/other.ts'})],pageInfo:{hasNextPage:false}}}}}};
   const commentPage={data:{node:{comments:{nodes:[comment('C2','Follow-up detail')],pageInfo:{hasNextPage:false,endCursor:null}}}}};
+  const outer:any=page2.data.repository.pullRequest.reviewThreads,inner:any=commentPage.data.node.comments;
+  if(mode==='outer-repeat')outer.pageInfo={hasNextPage:true,endCursor:'t2'};
+  if(mode==='outer-null')outer.pageInfo={hasNextPage:true,endCursor:null};
+  if(mode==='outer-errors')(page2 as any).errors=[{message:'Unavailable'}];
+  if(mode==='outer-pageInfo')delete outer.pageInfo;
+  if(mode==='nested-repeat')inner.pageInfo={hasNextPage:true,endCursor:'c1'};
+  if(mode==='nested-null')inner.pageInfo={hasNextPage:true,endCursor:null};
+  if(mode==='nested-errors')(commentPage as any).errors=[{message:'Unavailable'}];
+  if(mode==='nested-pageInfo')delete inner.pageInfo;
   const responses:any={
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
@@ -92,6 +101,11 @@ throw Error('Read-only fixture only');
 `,{mode:0o755});
   writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:[]}));
   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
+  if(mode!=='success'){
+   expect(result.exitCode).not.toBe(0);
+   expect(result.stderr.toString()).toContain(/repeat|null/.test(mode)?'Invalid thread cursor':mode.startsWith('outer')?'Incomplete review threads':'Incomplete thread comments');
+   expect(result.stdout.toString()).toBe('');expect(existsSync(db)).toBe(false);return;
+  }
   expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');
   const output=JSON.parse(result.stdout.toString());
   expect(output).toMatchObject({head,unresolved:2,clear:false});

@@ -24,9 +24,9 @@ export function dispatchedFeedback(s:Store,job:string){
  return new Map(rows.map(r=>[feedbackKey(r.thread_id,r.comments_hash),r]));
 }
 
-// Called inside the same durable delivery transaction as the remediation
-// reservation, before the worker is spawned. A lost receipt therefore keeps
-// its provenance and can never be resent as a fresh finding.
+// The caller wraps reservation and this claim in one immediate transaction.
+// Nested transactions use savepoints; a conflict rolls back the entire attempt,
+// including budget consumption. Never silently accept an overlapping batch.
 export function recordDispatchedFeedback(s:Store,job:string,head:string,attempt:number,findings:any[]){
  if(!Number.isSafeInteger(attempt)||attempt<1)return 0;
  const rows=(Array.isArray(findings)?findings:[]).map(f=>({f,id:feedbackIdentity(f)})).filter(x=>x.id) as any[];
@@ -36,7 +36,8 @@ export function recordDispatchedFeedback(s:Store,job:string,head:string,attempt:
   let recorded=0;
   for(const {f,id} of rows){
    const path=typeof f.path==='string'?f.path:null;
-   const inserted=s.db.query(`INSERT OR IGNORE INTO review_feedback(job,thread_id,comments_hash,path,head,attempt,state)
+   if(s.db.query('SELECT 1 FROM review_feedback WHERE job=? AND thread_id=? AND comments_hash=?').get(job,id.threadId,id.commentsHash))throw Error('Review feedback already claimed; reconcile before retry');
+   const inserted=s.db.query(`INSERT INTO review_feedback(job,thread_id,comments_hash,path,head,attempt,state)
     VALUES (?,?,?,?,?,?,'dispatched')`).run(job,id.threadId,id.commentsHash,path,head,attempt);
    recorded+=inserted.changes?1:0;
   }

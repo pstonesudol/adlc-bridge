@@ -32,8 +32,9 @@ export type ReviewThreadSummary={unresolved:number;resolved:number;candidates:Re
 // only when GitHub itself reports the author as a Bot.
 function reviewComment(node:any):ReviewComment{
  if(typeof node?.id!=='string'||!node.id)throw Error('Invalid review comment');
- const login=node.author?.login;
- if(typeof login!=='string'||!login)throw Error('Invalid review comment author');
+ // GitHub retains comments from deleted accounts with an explicit null author.
+ const login=node.author===null?'':node.author?.login;
+ if(typeof login!=='string'||(node.author!==null&&!login))throw Error('Invalid review comment author');
  const body=typeof node.body==='string'?node.body:'';
  return {id:node.id,login,bot:login==='coderabbitai[bot]'||login==='coderabbitai'&&node.author?.__typename==='Bot',originalCommit:typeof node.originalCommit?.oid==='string'?node.originalCommit.oid:null,body};
 }

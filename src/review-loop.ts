@@ -85,7 +85,17 @@ export class ReviewLoop{
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'}:undefined;
    }
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
- record(job:string,result:any){
+  private reconcileRemediation(job:string,head:string,session:any){
+   const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
+   if(!pending)return;
+   const handle=`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
+   const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
+   const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
+   if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
+   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
+   if(pending.head===head)return this.record(job,{state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
+  }
+  record(job:string,result:any){
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
   return this.s.db.transaction(()=>{
    const t=this.get(job);
@@ -217,15 +227,8 @@ export class ReviewLoop{
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
   // as dispatched.
-  const uncertainRemediation=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
-  if(uncertainRemediation){
-   const handle=`adlc-fix-${job.slice(0,12)}-${uncertainRemediation.attempt}`;
-   const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
-   const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
-   if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
-   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,uncertainRemediation.attempt);
-   if(uncertainRemediation.head===e.head)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
-  }
+  const reconciliation=this.reconcileRemediation(job,e.head,session);
+  if(reconciliation)return reconciliation;
   const dispatched=dispatchedFeedback(this.s,job);
   const threadFindings=e.findings.filter((f:any)=>f.kind==='review_thread');
   const freshThreadFindings=threadFindings.filter((f:any)=>!dispatched.has(feedbackKey(f.threadId,f.commentsHash)));
@@ -247,17 +250,8 @@ export class ReviewLoop{
   }).immediate();
   if(!stored)return {state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
   if(d.send&&t.remediate){
-   const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
-   if(pending){
-    const handle=`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
-    const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
-    const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
-    if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
-     this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
-     if(pending.head===e.head){
-      return this.record(job,{state:'blocked',send:false,head:e.head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
-    }
-   }
+   const reconciliation=this.reconcileRemediation(job,e.head,session);
+   if(reconciliation)return reconciliation;
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
