@@ -140,8 +140,10 @@ export function recordReadiness(s:Store,job:string,plan:string,planHash:string,s
       JSON.stringify(assessment.questions),JSON.stringify(assessment.dependencies),JSON.stringify(assessment.risks));
   return assessment;
 }
+function hasTable(s:Store,name:string){return !!s.db.query('SELECT name FROM sqlite_master WHERE name=?').get(name);}
 export function readinessFor(s:Store,job:string):any{
-  ensureReadinessStore(s);const row=s.db.query('SELECT * FROM plan_readiness WHERE job=?').get(job) as any;
+  ensureReadinessStore(s);if(!hasTable(s,'plan_readiness'))return null;
+  const row=s.db.query('SELECT * FROM plan_readiness WHERE job=?').get(job) as any;
   if(!row)return null;
   return {...row,valid:!!row.valid,questions:JSON.parse(row.questions),dependencies:JSON.parse(row.dependencies),risks:JSON.parse(row.risks)};
 }
@@ -160,7 +162,7 @@ export function resolutionBinding(s:Store,job:string):string|null{
   return digest(JSON.stringify([base,outcome?.plan_hash??null,outcome?.outcome??null,outcome?.questions??null,outcome?.dependencies??null]));
 }
 export function currentResolution(s:Store,job:string,planHash:string,specHash:string,binding:string):any{
-  ensureReadinessStore(s);
+  ensureReadinessStore(s);if(!hasTable(s,'plan_resolutions'))return null;
   return s.db.query("SELECT * FROM plan_resolutions WHERE job=? AND plan_hash=? AND spec_hash=? AND binding=? AND state='active'").get(job,planHash,specHash,binding);
 }
 export function activeResolution(s:Store,job:string):any{
@@ -180,6 +182,12 @@ export function applicableResolution(s:Store,job:string):any{
   }
   if(readiness.valid&&readiness.state==='blocked-by-dependency')return ['human-answer','dependency-satisfied'].includes(resolution.source)?resolution:null;
   if(!readiness.valid&&readiness.source==='plan-text'&&readiness.questions.length)return resolution.source==='human-answer'?resolution:null;
+  const outcome=hasTable(s,'worker_outcomes')?s.db.query('SELECT plan_hash,outcome,questions FROM worker_outcomes WHERE job=?').get(job) as any:null;
+  if(outcome&&outcome.plan_hash===j.plan_hash&&['needs_input','blocked_dependency'].includes(outcome.outcome)){
+   if(resolution.source==='human-answer')return resolution;
+   const dependencyOnly=outcome.outcome==='blocked_dependency'||(JSON.parse(outcome.questions) as any[]).every((q:any)=>q.kind==='dependency');
+   return resolution.source==='dependency-satisfied'&&dependencyOnly?resolution:null;
+  }
   return resolution;
 }
 export function recordResolution(s:Store,job:string,source:string,actor:string,detail:string){
@@ -202,7 +210,7 @@ export function recordResolution(s:Store,job:string,source:string,actor:string,d
   }).immediate();
 }
 export function activeReadinessResolution(s:Store,job:string,sources?:string[]):any{
-  ensureReadinessStore(s);const j=s.get(job),binding=readinessBinding(s,job);
+  ensureReadinessStore(s);if(!hasTable(s,'plan_resolutions'))return null;const j=s.get(job),binding=readinessBinding(s,job);
   if(!binding)return null;
   const sourceFilter=sources?.length?` AND source IN (${sources.map(()=>'?').join(',')})`:'';
   return s.db.query(`SELECT * FROM plan_resolutions WHERE job=? AND plan_hash=? AND spec_hash=? AND readiness_binding=? AND state='active'${sourceFilter} ORDER BY at DESC, rowid DESC LIMIT 1`)

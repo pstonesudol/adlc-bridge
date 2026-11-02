@@ -37,11 +37,13 @@ test('standing grant revokes on policy changes and cannot support stale remediat
  }finally{s.close();}
 });
 test('existing standing authorization remains executable without a retroactive readiness row',async()=>{
- const {s,w,id,policyStore}=fixture();try{
+ const {s,w,id,messages,policyStore}=fixture();try{
   policyStore.snapshot('project',new Set(['issue']));await w.tick(config);expect(s.get(id).state).toBe('approved');
   s.db.query('DELETE FROM plan_readiness WHERE job=?').run(id);
   expect(policyStore.evaluate(id,'project',policy).allowed).toBe(false);
   expect(()=>policyStore.verify(id,'project',policy)).not.toThrow();
+  await expect(w.executeApproved(id,config)).resolves.toBeDefined();
+  expect(messages.length).toBe(1);
  }finally{s.close();}
 });
 test('wildcard repository scope still rejects traversal, secrets, Git metadata and policies',()=>{

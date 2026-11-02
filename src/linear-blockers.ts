@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
-export type BlockerConfig={linear:{projectId:string;teamId:string};blockerSync?:BlockerSurface};
+export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
 
 function blockerOutcome(outcome:string){return ['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(outcome);}
 
@@ -14,7 +14,9 @@ export class LinearBlockers{
   s.db.exec(`CREATE TABLE IF NOT EXISTS blocker_notices(
    job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,
    body TEXT NOT NULL,state TEXT NOT NULL,created TEXT,label_applied INTEGER NOT NULL DEFAULT 0,
-   reason TEXT,PRIMARY KEY(job,binding));`);
+   applied_label_id TEXT,reason TEXT,PRIMARY KEY(job,binding));`);
+  const columns=s.db.query('PRAGMA table_info(blocker_notices)').all() as any[];
+  if(!columns.some(column=>column.name==='applied_label_id'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN applied_label_id TEXT');
  }
  binding(job:string,outcome:any,labelId?:string){
   return digest(JSON.stringify([outcome.plan_hash,outcome.outcome,outcome.reason,outcome.questions,outcome.dependencies,labelId??null]));
@@ -69,7 +71,7 @@ export class LinearBlockers{
   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
    // Record ownership before the mutation so a lost reply or verification failure
    // still lets retract reconcile the bridge-applied label.
-   this.s.db.query("UPDATE blocker_notices SET label_applied=1 WHERE job=? AND binding=?").run(job,binding);
+   this.s.db.query("UPDATE blocker_notices SET label_applied=1,applied_label_id=? WHERE job=? AND binding=?").run(labelId,job,binding);
    const b=await this.api('mutation($id:String!,$added:[String!]!){issueUpdate(id:$id,input:{addedLabelIds:$added}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,added:[labelId]});
    const labels=b.issueUpdate?.issue?.labels;
    if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||labels?.pageInfo?.hasNextPage!==false||!labels.nodes.some((x:any)=>x.id===labelId))throw Error('Blocker label update requires reconciliation; labels were not verified');
@@ -79,23 +81,34 @@ export class LinearBlockers{
   return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:labelState};
  }
  async retract(job:string,c:BlockerConfig){
-  if(!c.blockerSync?.enabled)return {state:'disabled'};
-  const labelId=c.blockerSync.labelId;if(!labelId)return {state:'not_configured'};
+  if(c.blockerSync?.enabled!==true)return {state:'disabled'};
   const rows=this.s.db.query("SELECT * FROM blocker_notices WHERE job=? AND state='posted' AND label_applied=1").all(job) as any[];
   if(!rows.length)return {state:'none'};
+  if(rows.some(row=>!row.applied_label_id))return {state:'needs_reconciliation',reason:'Applied blocker label ownership predates label tracking; inspect the Linear label manually'};
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity mismatch');
-  if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){this.s.db.query("UPDATE blocker_notices SET label_applied=0 WHERE job=?").run(job);return {state:'absent'};}
-  const b=await this.api('mutation($id:String!,$removed:[String!]!){issueUpdate(id:$id,input:{removedLabelIds:$removed}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,removed:[labelId]});
-  const labels=b.issueUpdate?.issue?.labels;
-  if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||labels?.pageInfo?.hasNextPage!==false||labels.nodes.some((x:any)=>x.id===labelId))throw Error('Blocker label removal requires reconciliation');
-  this.s.db.query("UPDATE blocker_notices SET label_applied=0 WHERE job=?").run(job);
-  this.s.event(job,'linear_blocker_label_retracted',labelId);
-  return {state:'retracted'};
+  let labels=issue.labels.nodes.map((x:any)=>x.id as string);
+  const removed:string[]=[];
+  for(const labelId of [...new Set(rows.map((row:any)=>row.applied_label_id as string))]){
+   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(labelId))return {state:'needs_reconciliation',reason:'Recorded blocker label ownership is malformed; inspect the Linear label manually'};
+   if(!labels.includes(labelId)){
+    this.s.db.query("UPDATE blocker_notices SET label_applied=0,applied_label_id=NULL WHERE job=? AND applied_label_id=?").run(job,labelId);
+    continue;
+   }
+   const b=await this.api('mutation($id:String!,$removed:[String!]!){issueUpdate(id:$id,input:{removedLabelIds:$removed}){success issue{id labels(first:100){nodes{id}pageInfo{hasNextPage}}}}}',{id:j.issue,removed:[labelId]});
+   const next=b.issueUpdate?.issue?.labels;
+   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||next?.pageInfo?.hasNextPage!==false||next.nodes.some((x:any)=>x.id===labelId))throw Error('Blocker label removal requires reconciliation');
+   labels=next.nodes.map((x:any)=>x.id);
+   this.s.db.query("UPDATE blocker_notices SET label_applied=0,applied_label_id=NULL WHERE job=? AND applied_label_id=?").run(job,labelId);
+   this.s.event(job,'linear_blocker_label_retracted',labelId);
+   removed.push(labelId);
+  }
+  return {state:removed.length?'retracted':'absent',labels:removed};
  }
  async sync(c:BlockerConfig){
   if(c.blockerSync?.enabled!==true)return [];
   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
+  if(c.linear.readyLabelId&&c.blockerSync.labelId!.toLowerCase()===c.linear.readyLabelId.toLowerCase())throw Error('Blocker label must differ from the queue label');
   const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
   const results:any[]=[];

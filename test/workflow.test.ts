@@ -398,6 +398,41 @@ test('resume rejects a busy worker and a different configured project',async()=>
  await expect(w.resume(id,config)).rejects.toThrow('Worker is not idle');
  expect(f.sends.length).toBe(1);s.close();
 });
+test('worker outcome questions require the same applicable resolution sources as plans',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
+ w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(workerBlock('needs-input','Which security decision applies?'));await w.tick(config);
+ recordResolution(s,id,'human-acknowledgement','Alice','Acknowledged only');
+ await expect(w.resume(id,config)).rejects.toThrow('human answer');
+ recordResolution(s,id,'dependency-satisfied','Alice','Dependency done');
+ await expect(w.resume(id,config)).rejects.toThrow('human answer');
+ recordResolution(s,id,'human-answer','Alice','Use the approved decision');
+ expect((await w.resume(id,config)).state).toBe('continuation_delivery_accepted');
+ s.close();
+});
+test('read-only preview tolerates a base-schema database without blocker tables',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-preview-base-'));try{
+  const path=join(dir,'state.sqlite'),s=new Store(path),p=new Planning(s),id=s.enqueue('p','issue','spec');new Lifecycle(s);
+  s.db.exec(`CREATE TABLE IF NOT EXISTS implementation_dispatch(job TEXT PRIMARY KEY REFERENCES jobs(id),plan_hash TEXT NOT NULL,session_id TEXT NOT NULL,client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,paths TEXT NOT NULL,runtime TEXT NOT NULL,actor TEXT NOT NULL,reason TEXT);`);
+  p.reserve(id,'project');const r=p.get(id);p.gate(id,'project','session',r.branch,'/worktrees/session');
+  s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);
+  s.db.query("UPDATE jobs SET state='approved',plan='plan',plan_hash=?,approved_hash=?,actor='human' WHERE id=?").run(digest(JSON.stringify(['spec','plan'])),digest(JSON.stringify(['spec','plan'])),id);
+  const hash=s.get(id).plan_hash;
+  s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(id,hash,'session','client','delivery_accepted','["src/**"]','supervised-host','human',null);
+  s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree,owner) VALUES (?,?,?,?,?,?,?)').run(id,'correlation',hash,'running','session','/worktrees/session','orchestrator');
+  const tables=s.db.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as any[];
+  s.close();
+  const before=readFileSync(path);
+  const evidence={session:{id:'session',projectId:'project',branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[{sequence:2,kind:'message',role:'user',clientMessageId:'client',turnId:'turn'}],turns:[{id:'turn',state:'completed'}]}};
+  const transport:any={evidence:async()=>evidence,worktree:async()=>({branch:r.branch,head:'a'.repeat(40)}),disableFeedback:async()=>{},sendImplementation:async()=>{}};
+  const ro=new Store(path,true),w=new Workflow(ro,transport,undefined,true);
+  const preview=await w.previewReconcile({repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],githubRepo:'owner/repo',workflow:{prGraceMs:0}});
+  expect(preview.results[0].state).not.toBe('unavailable');ro.close();
+  expect(readFileSync(path).equals(before)).toBe(true);
+  const after=(()=>{const check=new Store(path,true);try{return check.db.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as any[];}finally{check.close();}})();
+  expect(after).toEqual(tables);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
 test('preview reports an existing PR handoff instead of a false blocker',async()=>{
  const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
  await w.tick(config);f.finishImplementation();

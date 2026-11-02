@@ -166,13 +166,39 @@ test('blockerSync requires a boolean and a complete UUID',()=>{
  const base:any={version:1,name:'Project',repo:'/repo',linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'},requiredChecks:['CI']};
  expect(()=>validate({...base,blockerSync:{enabled:true,labelId:'------------------------------------'}})).toThrow('UUID');
  expect(()=>validate({...base,blockerSync:{enabled:'false',labelId:labelId}})).toThrow('boolean');
+ expect(()=>validate({...base,blockerSync:{enabled:true,labelId:base.linear.readyLabelId}})).toThrow('queue label');
  expect(()=>validate({...base,blockerSync:{enabled:false,labelId:'invalid'}})).not.toThrow();
+});
+test('retraction removes only the label this bridge applied',async()=>{
+ const f=fixture();const other='22222222-2222-2222-2222-222222222222';try{
+  await f.blockers().sync(f.config);
+  expect(f.labels).toContain(labelId);
+  f.addLabel(other);
+  const result=await f.blockers().retract(f.id,{...f.config,blockerSync:{enabled:true,labelId:other}} as any);
+  expect(result.state).toBe('retracted');expect(f.labels).toContain(other);expect(f.labels).not.toContain(labelId);
+ }finally{f.s.close();}
+});
+test('ambiguous legacy label ownership is preserved for manual inspection',async()=>{
+ const f=fixture();try{
+  await f.blockers().sync(f.config);
+  f.s.db.query('UPDATE blocker_notices SET applied_label_id=NULL WHERE job=?').run(f.id);
+  const before=f.calls;
+  const result=await f.blockers().retract(f.id,f.config);
+  expect(result.state).toBe('needs_reconciliation');expect(result.reason).toContain('predates label tracking');
+  expect(f.labels).toContain(labelId);expect(f.calls).toBe(before);
+ }finally{f.s.close();}
+});
+test('queue label cannot be configured as the blocker label',async()=>{
+ const f=fixture();try{
+  await expect(f.blockers().sync({linear:{projectId:'p',teamId:'t',readyLabelId:labelId},blockerSync:{enabled:true,labelId}})).rejects.toThrow('queue label');
+ }finally{f.s.close();}
 });
 test('disabled blocker sync and retraction perform no Linear work',async()=>{
  const f=fixture();try{
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
   const before=f.calls;
   expect(await f.blockers().sync({...f.config,blockerSync:{enabled:false,labelId}})).toEqual([]);
   expect((await f.blockers().retract(f.id,{...f.config,blockerSync:{enabled:false,labelId}})).state).toBe('disabled');
-  expect(f.calls).toBe(before);expect(f.labels).toEqual(['ready','team']);
+  expect(f.calls).toBe(before);expect(f.labels).toContain(labelId);
  }finally{f.s.close();}
 });

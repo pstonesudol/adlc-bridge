@@ -33,6 +33,7 @@ export function validate(c: any): asserts c is ProjectConfig {
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
   if(c.blockerSync!==undefined&&(c.blockerSync===null||typeof c.blockerSync!=='object'||typeof c.blockerSync.enabled!=='boolean'))throw Error('blockerSync.enabled must be a boolean');
   if(c.blockerSync?.enabled===true&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
+  if(c.blockerSync?.enabled===true&&c.blockerSync.labelId?.toLowerCase()===c.linear.readyLabelId?.toLowerCase())throw Error('Blocker label must differ from the queue label');
   if(c.workflow?.prGraceMs!==undefined&&(!Number.isSafeInteger(c.workflow.prGraceMs)||c.workflow.prGraceMs<0||c.workflow.prGraceMs>86400000))throw Error('prGraceMs must be an integer from 0 to 86400000');
   if(c.statusSync?.enabled)for(const key of ['inProgress','inReview','done'])if(!/^[0-9a-f-]{36}$/i.test(c.statusSync[key]??''))throw Error('Verified status-sync UUIDs required');
   remediationPolicy(c.remediation);

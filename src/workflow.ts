@@ -280,12 +280,17 @@ export class Workflow{
   return finish(this.completedOutcome(job,d,e,entry,graceMs,now));
  }
  continuation(job:string):any{
+  if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get())return null;
   return this.s.db.query('SELECT * FROM continuations WHERE job=? ORDER BY id DESC LIMIT 1').get(job);
  }
  unresolvedContinuation(job:string,planHash:string):any{
+  if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get())return null;
   return this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state IN ('reserved','delivery_uncertain','delivery_accepted') ORDER BY id DESC LIMIT 1").get(job,planHash);
  }
- outcomes(job:string):any{return this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job);}
+ outcomes(job:string):any{
+  if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return null;
+  return this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job);
+ }
  private saveOutcome(job:string,d:any,result:any,graceMs:number,now:number,previous?:any){
   const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&previous.outcome==='awaiting_pr';
   const first=same&&Number.isFinite(Number(previous.first_observed))?Number(previous.first_observed):now;
