@@ -28,3 +28,11 @@ test('init resumes a saved partial service explicitly, preserving configuration/
 test('atomic service publication never clobbers a competing existing definition',()=>{
  const f=fixture();try{mkdirSync(dirname(f.plist),{recursive:true});writeFileSync(f.plist,'existing operator content');expect(()=>publishServiceFile(f.plist,'replacement')).toThrow();expect(readFileSync(f.plist,'utf8')).toBe('existing operator content');}finally{f.close();}
 });
+test('conflicting existing plist rejects recovery without binding or changing service bytes',()=>{
+ const f=fixture();try{
+  const other=join(f.home,'other/src/cli.ts');mkdirSync(dirname(other),{recursive:true});writeFileSync(other,'different controller');
+  mkdirSync(dirname(f.plist),{recursive:true});writeFileSync(f.plist,serviceDefinition(f.config,process.execPath,other,f.home,f.entry.label));const before=readFileSync(f.plist);
+  expect(()=>publishInitService(f.config,f.home,f.db,f.controller)).toThrow('Service definition does not match this project; existing service preserved');
+  expect(readFileSync(f.plist)).toEqual(before);const s=Store.readonly(f.db);try{expect(s.db.query('SELECT * FROM project_service_controllers').all()).toEqual([]);}finally{s.close();}
+ }finally{f.close();}
+});

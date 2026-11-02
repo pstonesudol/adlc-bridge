@@ -1,7 +1,8 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync,existsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync,existsSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,dirname} from 'node:path';
+import {projectServiceLabel} from '../src/project-services';
 import {validateVerification,verificationInstructions,assertVerificationRepository,runVerification as runConfiguredVerification,type Verification} from '../src/verification';
 import {validateRuntime,runtimeServiceDefinition,setupPreview,sanitizedSetup,type RuntimeConfig} from '../src/setup';
 import {validate} from '../src/linear';
@@ -14,8 +15,8 @@ function git(args:string[]){const p=Bun.spawnSync(['git',...args],{env:gitEnv,st
 function initRepository(root:string){git(['init','--quiet','--template=',root]);}
 function runVerification(root:string,v:Verification,spawn:any,execution:any={}){return runConfiguredVerification(root,v,spawn,{projectRepo:root,...execution});}
 const uuid='00000000-0000-0000-0000-000000000001';
-const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
-function runtime(root:string):RuntimeConfig{return {version:1,platform:'launchd',projectConfig:join(root,'project.json'),controller:join(root,'cli.ts'),workingDirectory:root,tools:Object.fromEntries(['bun','ao','git','gh'].map(n=>[n,{path:join(root,n),version:'1.4.2'}])),service:{label:'local.adlc.legacy',path:join(root,'service.plist'),interval:60,runAtLoad:false,stdout:join(root,'out.log'),stderr:join(root,'err.log')}};}
+const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,automation:{planningEnabled:false,orchestratorProject:'verification-fixture'},requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
+function runtime(root:string):RuntimeConfig{for(const n of ['bun','ao','git','gh','docker'])writeFileSync(join(root,n),'#!/bin/sh\nprintf "1.4.2\\n"\n',{mode:0o755});return {version:1,platform:'launchd',projectConfig:join(root,'project.json'),controller:join(root,'cli.ts'),workingDirectory:root,tools:Object.fromEntries(['bun','ao','git','gh'].map(n=>[n,{path:join(root,n),version:'1.4.2'}])),service:{label:projectServiceLabel('verification-fixture'),path:join(root,'service.plist'),interval:60,runAtLoad:false,stdout:join(root,'out.log'),stderr:join(root,'err.log')}};}
 test('versioned modes reject unknown fields, mutable images and escaping paths',()=>{
  for(const v of [host,container])expect(()=>validateVerification(v)).not.toThrow();
  for(const v of [{...host,version:2},{...host,token:'secret'},{...host,steps:[{cwd:'../outside',argv:['bun']}]},{...container,container:{image:'latest',inputs:['frontend']}},{...container,container:{...container.container,inputs:['.ssh']}}])expect(()=>validateVerification(v)).toThrow();
@@ -27,9 +28,9 @@ test('versioned modes reject unknown fields, mutable images and escaping paths',
 test('host and container argv selection, failures, cleanup and symlink confinement (mocked execution)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-verification-test-'));let calls:any[]=[];
  try{
-  initRepository(root);mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'');writeFileSync(join(root,'frontend','.env'),'secret');
+   initRepository(root);mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'owner-only source',{mode:0o600});writeFileSync(join(root,'frontend','.env'),'secret');
   const spawn=((argv:any,options:any)=>{
-   if(argv[0]===dockerExecution.docker.path){expect(existsSync(join(options.cwd,'index.js'))).toBe(true);expect(existsSync(join(options.cwd,'.env'))).toBe(false);}
+   if(argv[0]===dockerExecution.docker.path){expect(existsSync(join(options.cwd,'index.js'))).toBe(true);expect(existsSync(join(options.cwd,'.env'))).toBe(false);expect(statSync(dirname(options.cwd)).mode&0o777).toBe(0o700);expect(statSync(dirname(options.cwd)).uid).toBe(process.getuid!());expect(statSync(join(options.cwd,'index.js')).mode&0o777).toBe(0o600);expect(argv[argv.indexOf('--user')+1]).toBe(`${process.getuid!()}:${process.getgid!()}`);}
    calls.push({argv,options});return {exited:Promise.resolve(0)};
   }) as any;
   expect((await runVerification(root,host,spawn)).passed).toBe(true);expect(calls[0].argv).toEqual(['bun','test']);
@@ -60,6 +61,14 @@ test('container fails closed for missing/relative Docker pins or a version misma
   expect(spawned).toBe(false);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('container rejects root invocation before creating a snapshot or spawning Docker',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-verification-root-'));
+ try{
+  initRepository(root);
+  const script=`import {runVerification} from ${JSON.stringify(join(import.meta.dir,'../src/verification.ts'))};process.getuid=()=>0;let spawned=false,reason='';try{await runVerification(${JSON.stringify(root)},${JSON.stringify(container)},(()=>{spawned=true;throw Error('must not spawn');}),{projectRepo:${JSON.stringify(root)},docker:${JSON.stringify(dockerExecution.docker)},probeDocker:()=>true});}catch(e){reason=e.message;}console.log(JSON.stringify({spawned,reason}));`;
+  const child=Bun.spawnSync([process.execPath,'-e',script],{stdout:'pipe',stderr:'pipe'});expect(child.exitCode).toBe(0);expect(child.stderr.toString()).toBe('');expect(JSON.parse(child.stdout.toString())).toEqual({spawned:false,reason:'Container verification requires a non-root invoking UID/GID'});
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('runner probes the pinned executable and accepts Docker version punctuation (mocked container)',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-docker-version-test-'));let command:string[]=[];
  try{
@@ -77,7 +86,7 @@ test('both project setup flows preserve config, render deterministically and dis
   writeFileSync(r.projectConfig,JSON.stringify(c));writeFileSync(r.controller,'');
   const before=JSON.stringify(c),preview=setupPreview(c,r,()=>true,undefined,r.projectConfig);
   expect(preview.passed).toBe(true);expect(preview.activation).toBe(false);expect(preview.service).toBe('create');expect(JSON.stringify(c)).toBe(before);
-  expect(preview.definition).toBe(runtimeServiceDefinition(r));expect(preview.definition).toContain('local.adlc.legacy');
+  expect(preview.definition).toBe(runtimeServiceDefinition(r));expect(preview.definition).toContain(projectServiceLabel('verification-fixture'));
   expect(preview.checks.some(x=>x.kind==='injected-probe-not-live')).toBe(true);
   expect(setupPreview(c,r,()=>false,undefined,r.projectConfig).passed).toBe(false);
   const escaped=structuredClone(r);escaped.service.stdout=join(root,'a & b.log');expect(runtimeServiceDefinition(escaped)).toContain('a &amp; b.log');

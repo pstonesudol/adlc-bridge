@@ -1,6 +1,8 @@
 import {existsSync,readFileSync,realpathSync,writeFileSync,lstatSync,statSync} from 'node:fs';
-import {isAbsolute,dirname,resolve} from 'node:path';
+import {isAbsolute,dirname,resolve,basename} from 'node:path';
 import {installedCLI} from './install-state';
+import {Store} from './core';
+import {ProjectServices,projectServiceLabel,legacyLabel,registryPath} from './project-services';
 import {validate} from './linear';
 import {validateVerification,verificationInstructions,type VerificationContext} from './verification';
 
@@ -33,6 +35,7 @@ export function withVerificationContext(c:any,projectPath:string,runtimePath?:st
  return result;
 }
 const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
+const runtimePATH=(r:RuntimeConfig)=>[...new Set(Object.values(r.tools).map(t=>dirname(t.path))),'/usr/bin','/bin'].join(':');
 export function runtimeServiceDefinition(r:RuntimeConfig,runtimePath?:string){
  validateRuntime(r);const s=r.service;
  if(runtimePath)path(runtimePath);
@@ -40,31 +43,52 @@ export function runtimeServiceDefinition(r:RuntimeConfig,runtimePath?:string){
 <key>Label</key><string>${xml(s.label)}</string>
 <key>ProgramArguments</key><array>${[r.tools.bun.path,r.controller,'poll',r.projectConfig].map(a=>`<string>${xml(a)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${xml(r.workingDirectory)}</string>
-<key>EnvironmentVariables</key><dict><key>ADLC_AO_PATH</key><string>${xml(r.tools.ao.path)}</string>${runtimePath?`<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key><string>${xml(runtimePath)}</string>`:''}<key>PATH</key><string>${xml([...new Set(Object.values(r.tools).map(t=>dirname(t.path))),'/usr/bin','/bin'].join(':'))}</string></dict>
+<key>EnvironmentVariables</key><dict><key>ADLC_AO_PATH</key><string>${xml(r.tools.ao.path)}</string>${runtimePath?`<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key><string>${xml(runtimePath)}</string>`:''}<key>PATH</key><string>${xml(runtimePATH(r))}</string></dict>
 <key>StartInterval</key><integer>${s.interval}</integer><key>RunAtLoad</key><${s.runAtLoad?'true':'false'}/>
 <key>StandardOutPath</key><string>${xml(s.stdout)}</string><key>StandardErrorPath</key><string>${xml(s.stderr)}</string>
 </dict></plist>\n`;
 }
-// No provider calls, registry opening, credentials, project-setting changes or launchctl.
+// No provider calls, credentials, project-setting changes or launchctl.
 const liveProbe=(name:string,t:{path:string;version:string})=>{
  if(!existsSync(t.path))return false;
  const p=Bun.spawnSync([t.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
  return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===t.version||x===`v${t.version}`);
 };
-export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string,projectPath?:string){
+function matchesServiceIdentity(c:any,r:RuntimeConfig,projectPath:string|undefined,registry:string){
+ try{
+  const project=c.automation?.orchestratorProject,generated=projectServiceLabel(project),config=realpathSync(projectPath!);
+  let expected=generated;
+  if(existsSync(registry)){
+   const s=Store.readonly(registry);try{
+    const entry=new ProjectServices(s,false).list().find(p=>p.project===project||p.config===config||p.repo===realpathSync(c.repo)||p.linear_project===c.linear.projectId);
+    if(entry){
+     if(entry.project!==project||entry.config!==config||entry.repo!==realpathSync(c.repo)||entry.linear_project!==c.linear.projectId||![generated,legacyLabel].includes(entry.label))return false;
+     expected=entry.label;
+    }
+   }finally{s.close();}
+  }
+  return r.service.label===expected;
+ }catch{return false;}
+}
+export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string,projectPath?:string,registry=registryPath()){
  validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
  if(c.verification?.mode==='container'&&!r.tools.docker)throw Error('Pinned Docker executable required');
  const definition=runtimeServiceDefinition(r,runtimePath);
  const existing=existsSync(r.service.path)?readFileSync(r.service.path,'utf8'):undefined;
  const checks=Object.entries(r.tools).map(([name,t])=>({name,passed:probe(name,t),kind:probe===liveProbe?'live-executable-version':'injected-probe-not-live'}));
+ for(const name of ['git','gh',...(r.tools.docker?['docker']:[])]){
+  let passed=false;try{const selected=Bun.which(name,{PATH:runtimePATH(r)});passed=!!selected&&realpathSync(selected)===realpathSync(r.tools[name].path);}catch{}
+  checks.push({name:`${name}-path`,passed,kind:'live-path-resolution'});
+ }
+ checks.push({name:'service-label',passed:matchesServiceIdentity(c,r,projectPath,registry),kind:'read-only-service-identity'});
  let sameProject=false;try{sameProject=!!projectPath&&realpathSync(projectPath)===realpathSync(r.projectConfig);}catch{}checks.push({name:'project-config-path',passed:sameProject,kind:'live-file-identity'});
  for(const [name,p] of Object.entries({repo:c.repo,projectConfig:r.projectConfig,controller:r.controller,workingDirectory:r.workingDirectory})){
-  let passed=false;try{passed=name==='projectConfig'?existsSync(p as string):['repo','workingDirectory'].includes(name)?statSync(p as string).isDirectory():statSync(p as string).isFile();}catch{}
+  let passed=false;try{passed=name==='projectConfig'?existsSync(p as string):['repo','workingDirectory'].includes(name)?statSync(p as string).isDirectory():basename(p as string)==='cli.ts'&&statSync(p as string).isFile();}catch{}
   checks.push({name,passed,kind:'live-path'});
  }
  if(existsSync(r.projectConfig)){let matches=false;try{matches=JSON.stringify(JSON.parse(readFileSync(r.projectConfig,'utf8')))===JSON.stringify(c);}catch{}checks.push({name:'project-config-content',passed:matches,kind:'live-file'});}
  const conflict=existing!==undefined&&existing!==definition;
- return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict,checks,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['No live provider, registered-project, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
+ return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict,checks,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['Existing local service registration is checked read-only; absent registration permits only the generated project label. No live provider, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
 }
 export function writeSetupService(c:any,r:RuntimeConfig,runtimePath?:string,projectPath?:string){
  const preview=setupPreview(c,r,liveProbe,runtimePath,projectPath);if(!preview.passed)throw Error('Setup validation failed; existing configuration preserved');

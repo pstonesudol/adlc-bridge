@@ -1,4 +1,4 @@
-import {existsSync,lstatSync,realpathSync,mkdtempSync,mkdirSync,rmSync,chmodSync} from 'node:fs';
+import {existsSync,lstatSync,realpathSync,mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {resolve,relative,join,isAbsolute} from 'node:path';
 import {tmpdir} from 'node:os';
 import {copyFrontend} from './container-check';
@@ -47,14 +47,15 @@ export async function runVerification(worktree:string,v:Verification,spawn:typeo
  validateVerification(v);const root=realpathSync(worktree);if(!existsSync(join(root,'.git')))throw Error('Git worktree required');
  assertVerificationRepository(root,execution.projectRepo);
  const docker=execution.docker;
+ const uid=process.getuid?.(),gid=process.getgid?.();
  if(v.mode==='container'){
+  if(typeof uid!=='number'||typeof gid!=='number'||!Number.isSafeInteger(uid)||!Number.isSafeInteger(gid)||uid<1||gid<0)throw Error('Container verification requires a non-root invoking UID/GID');
   if(!docker||typeof docker.path!=='string'||!isAbsolute(docker.path)||/[\x00-\x1f]/.test(docker.path)||typeof docker.version!=='string'||!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(docker.version))throw Error('Container verification requires an absolute Docker executable and exact version from runtime configuration');
   if(!(execution.probeDocker??probeDocker)(docker))throw Error('Configured Docker executable version check failed');
  }
  const snapshot=v.mode==='container'?realpathSync(mkdtempSync(join(tmpdir(),'adlc-verification-'))):undefined;
  try{
   if(snapshot){
-   chmodSync(snapshot,0o755);
    for(const input of v.container!.inputs){
     // Check the lexical path before realpath hides any selected/ancestor link.
     let selected=root;
@@ -65,7 +66,7 @@ export async function runVerification(worktree:string,v:Verification,spawn:typeo
   const results=[];
   for(const step of v.steps){
    const cwd=within(snapshot??root,step.cwd);
-   const argv=snapshot?[docker!.path,'run','--rm','--pull=never',...(process.env.AO_SESSION_ID?['--label',`ao.session=${process.env.AO_SESSION_ID}`]:[]),'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','65534:65534','--pids-limit','128','--memory','2g','--cpus','2','--tmpfs','/tmp:rw,nosuid,nodev,size=512m',...v.container!.inputs.flatMap(input=>['--mount',`type=bind,src=${resolve(snapshot,input)},dst=/workspace/${input},readonly`]),'--workdir',`/workspace/${relative(snapshot,cwd)}`,'--entrypoint',step.argv[0],v.container!.image,...step.argv.slice(1)]:step.argv;
+   const argv=snapshot?[docker!.path,'run','--rm','--pull=never',...(process.env.AO_SESSION_ID?['--label',`ao.session=${process.env.AO_SESSION_ID}`]:[]),'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user',`${uid}:${gid}`,'--pids-limit','128','--memory','2g','--cpus','2','--tmpfs','/tmp:rw,nosuid,nodev,size=512m',...v.container!.inputs.flatMap(input=>['--mount',`type=bind,src=${resolve(snapshot,input)},dst=/workspace/${input},readonly`]),'--workdir',`/workspace/${relative(snapshot,cwd)}`,'--entrypoint',step.argv[0],v.container!.image,...step.argv.slice(1)]:step.argv;
    // Output is inherited, not captured/exported as setup data. Commands must never contain secrets.
    const p=spawn(argv,{cwd,stdin:'ignore',stdout:'inherit',stderr:'inherit',env:snapshot?{PATH:process.env.PATH}:process.env});
    const code=await p.exited;results.push({cwd:step.cwd,argv:step.argv,code});if(code!==0)break;

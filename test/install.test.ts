@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
+import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join,dirname} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
 import {installBridge,rotatedServiceDefinition} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
 import {turnBarrier} from '../src/turn-submission';import {serviceControl} from '../src/service-control';
 const fixtureDefinition=()=>({Label:'local.adlc.fixture',ProgramArguments:[process.execPath,'/old/src/cli.ts','poll','/project.json']});
@@ -79,6 +79,25 @@ test('snapshot rotation preserves every configured service setting except the co
   expect(JSON.parse(parsed.stdout.toString())).toEqual({...def,ProgramArguments:[def.ProgramArguments[0],result.cli,'poll','/project.json']});
   expect(rotatedServiceDefinition(def,result.cli)).not.toBe(def);expect(def.ProgramArguments[1]).toBe('/prior/src/cli.ts');
  }finally{f.close();}
+});
+test('rotation moves only a controller-derived working directory and remains usable after old snapshot removal',async()=>{
+ const f=controlFixture();try{
+  const old=join(f.root,'old-snapshot'),controller=join(old,'src/cli.ts');mkdirSync(dirname(controller),{recursive:true});writeFileSync(controller,'old cli');
+  const def={...fixtureDefinition(),ProgramArguments:[process.execPath,controller,'poll','/project.json'],WorkingDirectory:dirname(controller)};
+  f.io.readDefinition=()=>structuredClone(def);f.unload();const result=await installBridge(true,f.source,f.launcher,f.io);
+  const parsed=Bun.spawnSync(['/usr/bin/plutil','-convert','json','-o','-',f.plist]);expect(parsed.exitCode).toBe(0);const next=JSON.parse(parsed.stdout.toString());
+  rmSync(old,{recursive:true,force:true});expect(next.WorkingDirectory).toBe(dirname(result.cli));expect(existsSync(next.WorkingDirectory)).toBe(true);expect(def.WorkingDirectory).toBe(dirname(controller));
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},result.cli).WorkingDirectory).toBe('/operator/custom');
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:undefined},result.cli).WorkingDirectory).toBeUndefined();
+ }finally{f.close();}
+});
+test('rotation rejects malformed arguments, wrong command and relative controller without changing input',()=>{
+ const valid=fixtureDefinition();
+ for(const args of [undefined,[],valid.ProgramArguments.slice(0,3),[...valid.ProgramArguments,'extra'],[42,...valid.ProgramArguments.slice(1)],[process.execPath,'/old/src/cli.ts','serve','/project.json']]){
+  const def={...valid,ProgramArguments:args},before=structuredClone(def);
+  expect(()=>rotatedServiceDefinition(def,'/new/src/cli.ts')).toThrow('Verified service definition and absolute controller required');expect(def).toEqual(before);
+ }
+ expect(()=>rotatedServiceDefinition(valid,'relative/cli.ts')).toThrow('Verified service definition and absolute controller required');
 });
 test('incomplete installation rollback reports every failure and continues restoration without restarting intake',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-rollback-errors-'));try{

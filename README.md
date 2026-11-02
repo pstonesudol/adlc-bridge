@@ -65,7 +65,13 @@ not started automatically. An unrecognized definition is preserved for inspectio
 
 Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
 container verification is selected. Versions are exact three-component versions
-(the actual `git`, `gh` and `docker` executable names must be on the generated PATH).
+(optional prerelease/build suffix). Setup checks that the actual `git`, `gh` and
+configured `docker` names on the generated PATH resolve to the canonical pinned
+executables; earlier shadow executables fail preview before staging.
+The controller must use the supported `cli.ts` filename. Service labels must
+match the generated project label, or an existing read-only registration's label
+for the same canonical config/repository/Linear identity. Arbitrary labels and
+unregistered legacy labels fail preview; no registry is created or changed.
 Generated services set `ADLC_AO_PATH` to the configured AO executable; legacy
 services retain the bundled-app default. Workflow hooks use the running Bun and
 a stable gate marker; repeating setup replaces prior gates even in versioned
@@ -96,8 +102,9 @@ configuration aborts the tick rather than reusing startup values. Changing the
 repository/project identity requires an explicit restart/reconciliation.
 
 Managed snapshot rotation preserves the entire existing plist (tool/PATH/AO
-settings, interval, RunAtLoad, working directory, logs and other keys), changing
-only the controller argument. Configured directories are not moved implicitly.
+settings, interval, RunAtLoad, logs and other keys), changing the controller
+argument and a working directory only when it exactly equals the prior
+controller's directory. Custom working directories are preserved.
 The active verification runner follows the currently executing snapshot only
 when it matches the owner-validated installation record. Thus `install --apply`
 and its existing rollback atomically select the effective runner through the
@@ -106,12 +113,16 @@ or unrelated process does not claim the installed identity and retains the
 explicit configured runner. Preview reports this supported rotation policy;
 tests exercise rotation, removed old controller files and rollback in temporary
 snapshots. Installation/activation still requires the existing operator action.
-(optional prerelease/build suffix). Configure routing paths in the existing project
-JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
+Configure routing paths in the existing project JSON. Credential mechanisms remain
+`adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,
 passwords, environment assignments or private keys in argv, config or examples.
 Host verification inherits the caller environment; do not use it for untrusted
 code with credentials in scope. Neither mode contains the coding agent.
+Container verification keeps its temporary host snapshot owner-private (0700)
+and uses the invoking non-root UID/GID for read-only container access, including
+owner-only selected files. It never makes the snapshot traversable by other
+local accounts; root invocation is rejected rather than exposing files broadly.
 
 ### Verification and two-project migration
 

@@ -66,8 +66,23 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
 export const liveTransport=createWorkflowTransport();
 
 export const planningGateMarker='ADLC_RESERVED_WORKTREE_GATE_V1';
+// Remove only shell comments: an unquoted # begins a comment at a word
+// boundary, not inside a word, a quote or an escaped literal. Never evaluate.
+function shellCommandText(script:string){
+ let text='',quote='',boundary=true;
+ for(let i=0;i<script.length;i++){
+  const c=script[i];
+  if(c==='\\'&&quote!=="'"){text+=c;if(i+1<script.length)text+=script[++i];boundary=false;continue;}
+  if(quote){text+=c;if(c===quote)quote='';continue;}
+  if(c==='#'&&boundary){while(i<script.length&&script[i]!=='\n')i++;if(i<script.length)text+='\n';boundary=true;continue;}
+  text+=c;
+  if(c==="'"||c==='"'){quote=c;boundary=false;}else boundary=/[\s;&|<>()]/.test(c);
+ }
+ return text;
+}
 // Decode literal shell words only. Never evaluate expansions or execute hook text.
 function literalCommandWords(command:string){
+ command=shellCommandText(command).trimEnd();
  const words:string[]=[];let word='',quote='',active=false;
  for(let i=0;i<command.length;i++){
   const c=command[i];
@@ -83,7 +98,7 @@ function literalCommandWords(command:string){
   active=true;
   if(c==="'"||c==='"'){quote=c;continue;}
   if(c==='\\'){const next=command[++i];if(!next||next==='\n'||next==='\r')return;word+=next;continue;}
-  if(/[;&|<>()$`#]/.test(c))return;
+   if(/[;&|<>()$`]/.test(c))return;
   word+=c;
  }
  if(quote)return;
@@ -97,13 +112,13 @@ export function workflowGateScripts(scripts:unknown,gate=resolve(import.meta.dir
   if(x.includes('ADLC execution disabled pending host approval gate'))return false;
   const suffix=` # ${planningGateMarker}`,trimmed=x.trimEnd(),marked=trimmed.endsWith(suffix);
   const words=literalCommandWords(marked?trimmed.slice(0,-suffix.length):x);
-  const gateInvocation=words?.length===2&&isAbsolute(words[1])&&basename(dirname(words[1]))==='src'&&basename(words[1])==='planning-gate.ts';
+  const gateInvocation=words?.length===2&&words[0]!=='echo'&&isAbsolute(words[1])&&basename(dirname(words[1]))==='src'&&basename(words[1])==='planning-gate.ts';
   const bunInvocation=words&&(basename(words[0]??'')==='bun'||(isAbsolute(words[0]??'')&&resolve(words[0])===resolve(process.execPath)));
   if(gateInvocation&&(marked||(bunInvocation&&resolve(words![1])===resolve(gate))))return false;
   // An owner-validated installation record supplies the source and snapshot namespace.
   if(installation)return !bridgePlanningHook(x,gate,installation.versions,installation.sourceGate);
   // A filename, even under src, does not prove ownership of another installation.
-  if(gateInvocation||(!words&&x.includes('/src/planning-gate.ts')))throw Error('Ambiguous legacy planning gate; reconcile postCreate ownership before setup');
+  if(gateInvocation||(!words&&shellCommandText(x).includes('/src/planning-gate.ts')))throw Error('Ambiguous legacy planning gate; reconcile postCreate ownership before setup');
   return true;
  });
  return [hook,...prior];

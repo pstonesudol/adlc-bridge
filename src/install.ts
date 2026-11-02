@@ -7,7 +7,9 @@ import {join,resolve,dirname} from 'node:path';import {homedir} from 'node:os';i
 import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
 export function rotatedServiceDefinition(def:any,controller:string){
  if(!Array.isArray(def.ProgramArguments)||def.ProgramArguments.length!==4||def.ProgramArguments.some((v:any)=>typeof v!=='string')||def.ProgramArguments[2]!=='poll'||!controller.startsWith('/'))throw Error('Verified service definition and absolute controller required');
- const next=structuredClone(def);next.ProgramArguments[1]=controller;return next;
+ const next=structuredClone(def);
+ if(def.WorkingDirectory===dirname(def.ProgramArguments[1]))next.WorkingDirectory=dirname(controller);
+ next.ProgramArguments[1]=controller;return next;
 }
 export function distributionFiles(root:string){
  const files:string[]=[];
