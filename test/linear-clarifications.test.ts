@@ -200,3 +200,19 @@ test('questions requesting secrets are never published',async()=>{
   expect((await f.adapter().sync(config))[0].reason).toContain('never solicit secrets');expect(f.comments).toHaveLength(0);
  }finally{f.s.close();}
 });
+test('planning answers reach the first implementation delivery and late edits prevent it',async()=>{
+ for(const edit of [false,true]){const f=await fixture(':memory:',true);try{
+  await f.adapter().sync(config);const answer=f.reply('listing-42');f.confirm();await f.adapter().sync(config);
+  f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+  if(edit)answer.editedAt='2026-11-02T12:00:00Z';await f.adapter().preflight(config);
+  if(edit){await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);}
+  else {await f.w.executeApproved(f.id);expect(f.sends).toHaveLength(1);expect(f.sends[0].prompt).toContain('listing-42');expect(f.sends[0].prompt).toContain('untrusted task data');}
+ }finally{f.s.close();}}
+});
+test('an explicit replan after plan approval still blocks the initial dispatch',async()=>{
+ const f=await fixture(':memory:',true);try{
+  await f.adapter().sync(config);f.reply('listing-42');f.confirm();await f.adapter().sync(config);
+  f.w.approve(f.id,f.s.get(f.id).plan_hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+  f.reply(`Replan clarification ${f.reference()}`);await f.adapter().preflight(config);await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}
+});

@@ -50,6 +50,7 @@ export class LinearClarifications{
  private snapshot(job:string,c:ClarificationConfig):Snapshot|null{
   const j=this.s.get(job);if(j.project!==c.linear.projectId||!j.plan||!['awaiting_approval','approved'].includes(j.state))return null;
   const outcome=this.workflow.outcomes(job),r=readinessFor(this.s,job);
+  if(!r||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))throw Error('Current plan readiness evidence required before clarification');
   if(this.workflow.unresolvedContinuation(job,j.plan_hash))return null;
   const worker=outcome?.plan_hash===j.plan_hash&&['needs_input','blocked_dependency'].includes(outcome.outcome);
   if(!worker&&!(j.state==='awaiting_approval'&&r?.plan_hash===j.plan_hash&&['needs-input','blocked-by-dependency'].includes(r.state)))return null;
@@ -103,7 +104,7 @@ export class LinearClarifications{
   const links=await this.inspectLinked(issue,snapshot.outcome),repository=this.inspectRepo(c.repo,snapshot.questions);
   this.guard(job,c,snapshot.binding,issue);
   const reference=`${JSON.parse(j.spec).identifier}-${snapshot.binding.slice(0,24)}`;
-  const context={issue:j.issue,job,binding:snapshot.binding,reference,questions:snapshot.questions,planHash:j.plan_hash,specHash:digest(j.spec)};
+  const context={issue:j.issue,job,binding:snapshot.binding,reference,questions:snapshot.questions,planHash:j.plan_hash,specHash:digest(j.spec),policyHash:digest(JSON.stringify([c.clarifications,c.blockerSync]))};
   this.s.db.query('INSERT OR IGNORE INTO clarification_receipts(job,binding,context) VALUES (?,?,?)').run(job,snapshot.binding,JSON.stringify(context));
   const body=[`## ADLC: Waiting for clarification — ${issue.identifier}`,
    `Clarification: \`${reference}\` · Issue: \`${j.issue}\` · Job: \`${job}\` · Plan: \`${j.plan_hash}\` · Requirements: \`${digest(j.spec)}\``,
@@ -255,6 +256,38 @@ export class LinearClarifications{
   const source=snapshot??{outcome:{plan_hash:j.plan_hash,outcome:'running',questions:'[]',dependencies:'[]'}} as Snapshot;
   await this.acknowledge(job,c,source,row,message);
   return {job,state:continuation?.state??'awaiting_plan_approval',reference:stored.reference};
+ }
+ /** Run after intake but before any approved initial implementation dispatch.
+  * API uncertainty stops the tick; accepted evidence cannot silently go stale
+  * between plan approval on one poll and execution on the next. */
+ async preflight(c:ClarificationConfig){
+  validateClarifications(c);if(c.clarifications?.enabled!==true)return;
+  const rows=this.s.db.query("SELECT r.* FROM clarification_receipts r JOIN jobs j ON j.id=r.job WHERE j.project=? AND j.state IN ('approved','awaiting_approval') AND r.state='resolved'").all(c.linear.projectId) as any[];
+  for(const row of rows){
+   const j=this.s.get(row.job),context=JSON.parse(row.context);
+   if(context.planHash!==j.plan_hash||context.specHash!==digest(j.spec))continue;
+   if(this.s.db.query('SELECT id FROM continuations WHERE job=? AND binding=?').get(row.job,row.continuation_binding))continue;
+   this.ticket(j,c,await readLinearIssue(j.issue,this.blockers.api));
+   const comments=await this.blockers.comments(j.issue),consumed=JSON.parse(row.consumed);
+   let valid=context.policyHash===digest(JSON.stringify([c.clarifications,c.blockerSync]))&&Object.entries(consumed).every(([id,hash])=>comments.some(x=>x.id===id&&x.user?.app===false&&x.botActor===null&&c.clarifications!.humanIds.includes(x.user.id)&&x.editedAt===null&&digest(JSON.stringify([x.id,x.body,x.createdAt,x.editedAt,x.user,x.botActor]))===hash));
+   const notice=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(row.job,row.binding) as any;
+   const self=new Set((this.s.db.query('SELECT comment_id FROM blocker_notices WHERE job=?').all(row.job) as any[]).map(x=>x.comment_id));
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='plan_approval_notices'").get())for(const n of this.s.db.query('SELECT comment_id,approval_comment FROM plan_approval_notices WHERE job=?').all(row.job) as any[]){self.add(n.comment_id);if(n.approval_comment)self.add(n.approval_comment);}
+   if(!notice)valid=false;
+   else for(const raw of comments){
+    if(consumed[raw.id]||self.has(raw.id)||raw.user?.app!==false||raw.botActor!==null||!c.clarifications!.humanIds.includes(raw.user.id)||raw.editedAt!==null||!Number.isFinite(Date.parse(raw.createdAt))||Date.parse(raw.createdAt)<=Date.parse(notice.created))continue;
+    if(raw.body?.trim()===`Replan clarification ${context.reference}`){valid=false;break;}
+    const request={...context,noticeId:notice.comment_id,publishedAt:notice.created};
+    const result=await inspectHumanAnswer({current:async()=>request,authorizedHumanIds:async()=>c.clarifications!.humanIds,consumed:async()=>false},request,{...raw,issue:j.issue});
+    const answers=JSON.parse(row.answers);
+    if(result.answers.some(a=>answers[a.question]?.text!==a.text)){valid=false;break;}
+   }
+   if(!valid)this.s.db.transaction(()=>{
+    const active=activeResolution(this.s,row.job);
+    if(active&&row.continuation_binding===digest(JSON.stringify([active.binding,active.source,active.actor,active.detail,active.at])))this.s.db.query("UPDATE plan_resolutions SET state='invalidated' WHERE job=? AND binding=?").run(row.job,active.binding);
+    this.s.db.query("UPDATE clarification_receipts SET state='needs_review',reason='Human answer evidence or configured identity changed before dispatch' WHERE job=? AND binding=?").run(row.job,row.binding);
+   }).immediate();
+  }
  }
  async sync(c:ClarificationConfig){
   validateClarifications(c);if(c.clarifications?.enabled!==true)return [];

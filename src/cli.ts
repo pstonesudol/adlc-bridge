@@ -41,12 +41,13 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
-export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  return async()=>runPollTick(async()=>{
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
   io.out(await io.poll(c,s,io.linearToken()));
+  await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
   const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});

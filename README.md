@@ -965,6 +965,9 @@ silently truncated.
 state and reconciliation reasons. All answer provenance and resolution activation
 commit atomically under the current binding, without rewriting the resolution
 timestamp on retries. Planning answers still await the existing plan-approval gate.
+Their bound resolution is included as untrusted task context in the first approved
+implementation prompt. A preflight check before workflow dispatch invalidates
+edited or superseded evidence even if plan approval occurred on an earlier poll.
 Implementation answers reserve only the existing foundation continuation, after
 fresh ticket eligibility, exact approval/scope, branch, ownership and idle/queued
 work checks. An answer arriving while a worker is active is retained and waits for
