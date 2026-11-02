@@ -152,6 +152,25 @@ test('deduplicated dependency/resolution notices share publisher and retain wait
    }
  }finally{f.s.close();}
 });
+test('resumed dependency wait retains blocked label for a later worker blocker',async()=>{
+ const f=await fixture();try{
+  const comments:any[]=[],label=one;let labelWrites=0;f.c.blockerSync={enabled:true,labelId:label};
+  const blockers=new LinearBlockers(f.s,async(q,v)=>{
+   if(q.includes('commentCreate')){const comment={...v.input,createdAt:'2026-11-02T00:00:00Z'};comments.push(comment);return {commentCreate:{success:true,comment}};}
+   if(q.includes('comments(first:100'))return {issue:{id:root,comments:{nodes:comments,pageInfo:{hasNextPage:false}}}};
+   if(q.includes('issueUpdate')){labelWrites++;f.issue.labels.nodes=v.added?[...f.issue.labels.nodes,{id:label}]:f.issue.labels.nodes.filter(l=>l.id!==label);return {issueUpdate:{success:true,issue:f.issue}};}
+   return {issue:f.issue};
+  });
+  await f.r.tick(f.job,f.c);await f.r.notices(f.c,blockers);
+  expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(true);
+  f.s.db.query("UPDATE dependency_waits SET state='resumed' WHERE job=?").run(f.job);
+  f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency' WHERE job=?").run(f.job);
+  const before=labelWrites;
+  await f.r.notices(f.c,blockers);await blockers.sync(f.c);
+  expect(f.issue.labels.nodes.some(l=>l.id===label)).toBe(true);
+  expect(labelWrites).toBe(before);
+ }finally{f.s.close();}
+});
 test('explicit confirmation reconciles interrupted pre-update Git stage, automatic poll does not',async()=>{
  const f=await fixture();try{f.setMerged(2);const update=f.r.io.update;f.r.io.update=async()=>{throw Error('interrupted');};await f.r.tick(f.job,f.c);f.r.io.update=update;expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');const p=await f.r.preview(f.job,f.c);expect((await f.r.tick(f.job,f.c,p.confirmation)).state).toBe('resumed');expect(f.updates()).toBe(1);}finally{f.s.close();}
 });
