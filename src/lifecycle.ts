@@ -264,7 +264,7 @@ export class Lifecycle {
       if(!r||r.state!=='running'||r.owner!=='orchestrator')throw Error('Active agent-owned run required');
       const hash=digest(findings),budget=this.ensureBudget(job,policy);
       const previous=this.s.db.query('SELECT * FROM remediation WHERE job=? AND head=? AND findings_hash=?').get(job,head,hash) as any;
-      if(previous)return {...previous,budget:this.summarizeBudget(job,budget,policy)};
+      if(previous)return {...previous,reused:true,budget:this.summarizeBudget(job,budget,policy)};
       const uncertain=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job);
       if(uncertain)return {blocked:true,reason:'Previous remediation delivery is uncertain; reconcile it before reserving another attempt',budget:this.summarizeBudget(job,budget,policy)};
       if(budget.stop_reason)return {blocked:true,reason:`Remediation is stopped (${budget.stop_reason}); authorized budget extension required`,budget:this.summarizeBudget(job,budget,policy)};

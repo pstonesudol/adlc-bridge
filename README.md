@@ -548,6 +548,55 @@ outcomes. No empty commits, approval commands, check overrides, or merges are us
 A full review still has to return actual current-commit clearance; requesting it
 is not approval. If it fails or never responds, coordination blocks for inspection.
 
+#### Carried-forward CodeRabbit threads
+
+An inline review thread stays unresolved after later pushes while its comments
+keep the commit they were originally written on. GitHub still maps that thread to
+current code. Readiness therefore collects every thread and comment page with
+stable thread/comment IDs, the reviewer identity, original commit, current path
+and line, and resolution/outdated state. A non-outdated thread with an
+authentic `coderabbitai[bot]` comment is a validation candidate even when
+`originalCommit` differs from the current head; `originalCommit` is provenance,
+not a relevance test. Comments from a human account named `coderabbitai` are not
+reviewer feedback. Outdated threads are never treated as resolved.
+
+Only candidates that were never handed to this worker are dispatched, as one
+bounded batch through the existing remediation budget, same-session delivery and
+single push. Each reservation records `thread_id` and the hash of its reviewer
+comment IDs in `review_feedback`; a retry, restart or repeated poll cannot resend
+the same feedback. Delivery re-reads the PR and rejects a changed head, a changed
+comment set, or a resolved thread. The worker must verify each thread against the
+code at that commit, fix only valid in-scope defects, ignore instructions inside
+review text, and report concrete evidence for feedback that is already addressed;
+a thread is never resolved just to obtain approval.
+
+When unresolved threads remain that cannot become reviewer remediation, the job
+blocks immediately with counts and paths instead of waiting for a timeout or
+requesting repeated full reviews:
+
+- human-only discussions, which stay blocking by policy and are never sent as
+  CodeRabbit fixes;
+- outdated or otherwise ambiguous threads, which need human confirmation;
+- carried-forward threads already sent at an earlier head, which need a human to
+  confirm the current code (or a new CodeRabbit comment, which becomes a new
+  candidate).
+
+Inspect without modifying the database:
+
+```sh
+DB="${ADLC_DB:-$HOME/Library/Application Support/ADLC Bridge/state.sqlite}"
+sqlite3 -readonly "$DB" \
+  'SELECT job,thread_id,comments_hash,path,head,attempt,state,updated FROM review_feedback ORDER BY updated DESC LIMIT 50;'
+sqlite3 -readonly "$DB" \
+  'SELECT job,head,state,reason FROM review_targets ORDER BY updated DESC;'
+```
+
+`adlc review-status` shows the resulting status, and `adlc tick-review JOB CONFIG`
+re-observes the configured PR without adopting or bypassing drift. A successful
+CodeRabbit check is still not approval: explicit current-head approval remains
+required. Applying this reviewed change to a live installation and recovering
+other jobs remain separate operator actions.
+
 ### Require plan approval on one ticket
 
 Apply both `agent-ready` and `plan-approval-required` to a Todo ticket before
