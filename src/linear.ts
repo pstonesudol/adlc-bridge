@@ -5,11 +5,14 @@ import {remediationPolicy,type RemediationConfig} from './remediation';
 import {validateConflictPolicy,type ConflictPolicy} from './conflict-policy';
 import {validateClarifications} from './linear-clarifications';
 import {validateVerification,type Verification} from './verification';
+import {effectiveSettings} from './project-settings';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
   requiredChecks:string[];
   verification?:Verification;
+  pollingIntervalSeconds?:number;
+  automation?:{planningEnabled?:boolean;orchestratorProject?:string;maxPlanning?:number};
   linear: { projectId: string; teamId: string; readyStateId: string; readyLabelId: string };
   statusSync?:{enabled:boolean;inProgress:string;inReview:string;done:string};
   prMetadataChecks?:string[];
@@ -33,6 +36,7 @@ export function metadataCheckNames(value:unknown):string[]{
 }
 export function validate(c: any): asserts c is ProjectConfig {
   if(c?.verification!==undefined)validateVerification(c.verification);
+  effectiveSettings(c??{});
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   requiredCheckNames(c.requiredChecks);
   validateClarifications(c);

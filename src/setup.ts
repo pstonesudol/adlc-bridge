@@ -4,6 +4,7 @@ import {installedCLI} from './install-state';
 import {Store} from './core';
 import {ProjectServices,projectServiceLabel,legacyLabel,registryPath} from './project-services';
 import {validate} from './linear';
+import {effectiveSettings,type ProjectSettings} from './project-settings';
 import {validateVerification,verificationInstructions,type VerificationContext} from './verification';
 
 export type RuntimeConfig={version:1;platform:'launchd';projectConfig:string;controller:string;workingDirectory:string;tools:Record<string,{path:string;version:string}>;service:{label:string;path:string;interval:number;runAtLoad:boolean;stdout:string;stderr:string}};
@@ -36,15 +37,16 @@ export function withVerificationContext(c:any,projectPath:string,runtimePath?:st
 }
 const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
 const runtimePATH=(r:RuntimeConfig)=>[...new Set(Object.values(r.tools).map(t=>dirname(t.path))),'/usr/bin','/bin'].join(':');
-export function runtimeServiceDefinition(r:RuntimeConfig,runtimePath?:string){
+export function runtimeServiceDefinition(r:RuntimeConfig,runtimePath?:string,settings?:ProjectSettings){
  validateRuntime(r);const s=r.service;
+ const interval=settings?.pollingIntervalSeconds===undefined?s.interval:effectiveSettings(settings).pollingIntervalSeconds;
  if(runtimePath)path(runtimePath);
  return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>
 <key>Label</key><string>${xml(s.label)}</string>
 <key>ProgramArguments</key><array>${[r.tools.bun.path,r.controller,'poll',r.projectConfig].map(a=>`<string>${xml(a)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${xml(r.workingDirectory)}</string>
 <key>EnvironmentVariables</key><dict><key>ADLC_AO_PATH</key><string>${xml(r.tools.ao.path)}</string>${runtimePath?`<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key><string>${xml(runtimePath)}</string>`:''}<key>PATH</key><string>${xml(runtimePATH(r))}</string></dict>
-<key>StartInterval</key><integer>${s.interval}</integer><key>RunAtLoad</key><${s.runAtLoad?'true':'false'}/>
+<key>StartInterval</key><integer>${interval}</integer><key>RunAtLoad</key><${s.runAtLoad?'true':'false'}/>
 <key>StandardOutPath</key><string>${xml(s.stdout)}</string><key>StandardErrorPath</key><string>${xml(s.stderr)}</string>
 </dict></plist>\n`;
 }
@@ -73,7 +75,7 @@ function matchesServiceIdentity(c:any,r:RuntimeConfig,projectPath:string|undefin
 export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string,projectPath?:string,registry=registryPath()){
  validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
  if(c.verification?.mode==='container'&&!r.tools.docker)throw Error('Pinned Docker executable required');
- const definition=runtimeServiceDefinition(r,runtimePath);
+ const definition=runtimeServiceDefinition(r,runtimePath,c);
  const existing=existsSync(r.service.path)?readFileSync(r.service.path,'utf8'):undefined;
  const checks=Object.entries(r.tools).map(([name,t])=>({name,passed:probe(name,t),kind:probe===liveProbe?'live-executable-version':'injected-probe-not-live'}));
  for(const name of ['git','gh',...(r.tools.docker?['docker']:[])]){

@@ -13,6 +13,7 @@ import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
 import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime,withVerificationContext} from './setup';
 import {verificationInstructions,runVerification} from './verification';
+import {serveLoop} from './project-settings';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
@@ -134,7 +135,10 @@ async function main(){
     }
     const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker,projectRepo:c.repo});out(result);if(!result.passed)process.exitCode=1;return;
   }
-  if(['start','stop','service-status'].includes(command))return out(await serviceControl(command,a[0]));
+  if(['start','stop','service-status','service-config'].includes(command)){
+    if(a.slice(1).some(x=>x!=='--apply')||(a.includes('--apply')&&command!=='service-config'))throw Error('Unsupported service option');
+    return out(await serviceControl(command,a[0],a.includes('--apply')));
+  }
   if(command==='projects')return out(await registeredProjects());
   if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
   recover JOB                         inspect guarded recovery
@@ -157,6 +161,7 @@ async function main(){
                                        trusted reference supplied to verification workers
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
+  service-config PROJECT [--apply]     preview interval update; apply reloads loaded service
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
                                        parallel feature planning; no Linear writes
   feature-show ID | feature-list        review proposed ticket batch and dependencies
@@ -204,7 +209,7 @@ async function main(){
   approve-plan JOB HASH HUMAN           record current plan approval
   prepare JOB AO_PROJECT_ID             persist spawn preview; never executes
   poll CONFIG                          one intake, planning, execution and review tick
-  serve CONFIG                         workflow tick every 60 seconds
+  serve CONFIG                         sequential ticks at configured interval (default 60s)
   readiness OWNER/REPO PR CONFIG        read latest-SHA CI/CodeRabbit gate
   handoff WORKTREE                      print OpenChamber handoff checklist
 No arbitrary send, merge, push, deploy or existing-credential-copy command exists.
@@ -366,7 +371,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     try{
     if(command==='poll')return await tick();
     let stop=false;process.on('SIGTERM',()=>stop=true);process.on('SIGINT',()=>stop=true);
-    while(!stop){try{await tick();}catch(e){console.error(e instanceof Error?e.message:'Poll failed');}for(let i=0;i<60&&!stop;i++)await Bun.sleep(1000);}
+    await serveLoop(tick,c,()=>stop,Bun.sleep,e=>console.error(e instanceof Error?e.message:'Poll failed'));
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
