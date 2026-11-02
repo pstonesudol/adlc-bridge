@@ -32,8 +32,10 @@ Source edits and these commands do not activate that installed copy.
 After human installation, service discovery records the existing user-installed
 controller's canonical path for the registered config/label, rather than tying it
 to whichever development CLI is running. Later controller-identity changes are
-rejected and require explicit reconciliation; discovery never replaces a plist
-or starts a service. Existing registry rows remain compatible.
+rejected unless authorized by the validated managed installation record. Read-only
+discovery/status never creates or updates controller bindings; a subsequent
+explicit write path can retain an operator-installed snapshot rotation. Discovery
+never replaces a plist or starts a service. Existing registry rows remain compatible.
 
 Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
 container verification is selected. Versions are exact three-component versions
@@ -43,11 +45,14 @@ services retain the bundled-app default. Workflow hooks use the running Bun and
 a stable gate marker; repeating setup replaces prior gates even in versioned
 installation directories while retaining unrelated setup scripts.
 Unmarked legacy gates are automatically replaced only for the current Bridge
-installation's exact gate path. Literal shell quoting, including apostrophes and
-spaces, is decoded without execution. Unknown unmarked `src/planning-gate.ts`
-invocations block setup before any backup or configuration write: an operator
-must reconcile ownership in the existing `postCreate` list instead of allowing
-the installer to delete a user hook or silently add a duplicate Bridge gate.
+installation's exact gate path, or source/snapshot paths established by the
+owner-validated installation record. Generated gates continue to target the
+installed snapshot. Literal shell quoting, including apostrophes and spaces,
+is decoded without execution. Without installation proof, unknown unmarked
+`src/planning-gate.ts` invocations block setup before any backup or configuration
+write; reconcile ownership in `postCreate` instead of deleting a user hook or
+silently adding a duplicate gate. With a validated installation identity, hooks
+outside its known paths remain untouched.
 (optional prerelease/build suffix). Configure routing paths in the existing project
 JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,

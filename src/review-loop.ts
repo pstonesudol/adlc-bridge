@@ -263,8 +263,7 @@ export class ReviewLoop{
    const operations=metadataOnly?['open-pr']:['commit','push-feature'];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await this.io.disableNativeFeedback(run.session_id);
-   const verification=this.s.db.query('SELECT configuration FROM review_verification WHERE job=?').get(job) as any;
-   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks,{},verification?JSON.parse(verification.configuration):undefined);
+   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
    if(result.blocked)return this.record(job,{state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
    if(result.reused)return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
    return {...d,head:e.head,delivery:result};

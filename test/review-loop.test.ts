@@ -65,6 +65,16 @@ function templateFixture(){
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+test('scoped remediation combines persisted project verification with current delivery and budget safeguards',async()=>{
+ const f=templateFixture();try{
+  f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','commit','push-feature'],'human');
+  f.e.failedChecks=[];f.e.findings=[{path:'src/fix.ts',body:'Fix the scoped defect',sha:f.head}];
+  let prompt='';const original=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return original(args);};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(prompt).toContain('execution mode: host');expect(prompt).toContain('["bun","test"]');expect(prompt).toContain('Budget:');expect(f.s.get(f.id).attempts).toBe(1);expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 function failureEvidence(e:any){return e.findings.map((f:any)=>({name:f.check,checkId:f.checkId,sha:f.sha,status:'completed',conclusion:'failure',descriptionHash:f.descriptionHash}));}
 test('initial clear metadata checks cannot bypass body evidence without a preexisting wait',async()=>{
  const f=templateFixture();try{

@@ -22,8 +22,9 @@ export function definitionXML(def:unknown){
 export function assertDefinition(def:any,label:string,config:string,controller=join(import.meta.dir,'cli.ts')){
  const a=def.ProgramArguments;
  try{if(def.Label===label&&Array.isArray(a)&&a.length===4&&a.every(x=>typeof x==='string')&&a[2]==='poll'&&realpathSync(a[3])===realpathSync(config)&&isAbsolute(a[1])&&basename(a[1])==='cli.ts'){
-  if(realpathSync(a[1])===realpathSync(controller))return;
-  const installed=installedCLI();if(installed&&realpathSync(a[1])===realpathSync(installed))return;
+  const installed=installedCLI();
+  if(existsSync(controller)&&realpathSync(a[1])===realpathSync(controller))return;
+  if(installed&&realpathSync(a[1])===realpathSync(installed))return;
  }}catch{}
  throw Error('Service definition does not match this project; existing service preserved');
 }

@@ -14,7 +14,7 @@ function git(args:string[]){const p=Bun.spawnSync(['git',...args],{env:gitEnv,st
 function initRepository(root:string){git(['init','--quiet','--template=',root]);}
 function runVerification(root:string,v:Verification,spawn:any,execution:any={}){return runConfiguredVerification(root,v,spawn,{projectRepo:root,...execution});}
 const uuid='00000000-0000-0000-0000-000000000001';
-const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
+const project=(repo:string,verification?:Verification)=>({version:1,name:'PRIVATE_NAME',repo,requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},approval:{mode:'manual'},verification});
 function runtime(root:string):RuntimeConfig{return {version:1,platform:'launchd',projectConfig:join(root,'project.json'),controller:join(root,'cli.ts'),workingDirectory:root,tools:Object.fromEntries(['bun','ao','git','gh'].map(n=>[n,{path:join(root,n),version:'1.4.2'}])),service:{label:'local.adlc.legacy',path:join(root,'service.plist'),interval:60,runAtLoad:false,stdout:join(root,'out.log'),stderr:join(root,'err.log')}};}
 test('versioned modes reject unknown fields, mutable images and escaping paths',()=>{
  for(const v of [host,container])expect(()=>validateVerification(v)).not.toThrow();
@@ -81,6 +81,7 @@ test('both project setup flows preserve config, render deterministically and dis
   writeFileSync(r.service.path,preview.definition);expect(setupPreview(c,r,()=>true).service).toBe('unchanged');
   writeFileSync(r.service.path,'existing');expect(setupPreview(c,r,()=>true).passed).toBe(false);rmSync(r.service.path);
   const exported=JSON.stringify(sanitizedSetup(c,r));expect(exported).not.toContain(root);expect(exported).not.toContain(uuid);expect(exported).not.toContain('PRIVATE_NAME');expect(exported).not.toContain('ready-queue');
+  expect(sanitizedSetup(c,r).project.requiredChecks).toEqual(['REPLACE_REQUIRED_CHECK_NAME']);
  }
  const r=runtime(root);expect(()=>validateRuntime({...r,credentials:'no'})).toThrow();expect(()=>validateRuntime({...r,version:2})).toThrow();
  r.service.label='unsafe<label';expect(()=>runtimeServiceDefinition(r)).toThrow();
