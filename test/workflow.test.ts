@@ -681,11 +681,11 @@ test('blocked captured plans retain their dispatch and can be recaptured after e
 });
 
 // Real inventory transport path, but no host AO command or provider request.
-function inventoryTransport(sessions:any[]){
+function inventoryTransport(sessions:any[],omitBranch=false){
  const calls:string[][]=[];
  const spawn=((args:string[])=>{
   calls.push(args);
-  const data=args[2]==='ls'?{data:sessions.map(s=>({id:s.id,projectId:s.projectId,isTerminated:s.isTerminated}))}:{session:sessions.find(s=>s.id===args[3])};
+  const data=args[2]==='ls'?{data:sessions.map(s=>({id:s.id,projectId:s.projectId,...(omitBranch?{}:{branch:s.branch}),isTerminated:s.isTerminated}))}:{session:sessions.find(s=>s.id===args[3])};
   return {stdout:new Blob([JSON.stringify(data)]).stream(),stderr:new Blob([]).stream(),exited:Promise.resolve(0)};
  }) as any;
  return {calls,transport:createWorkflowTransport(async operation=>operation(),spawn)};
@@ -700,6 +700,7 @@ test('inventory transport includes terminated matches only when explicitly reque
  expect(calls.filter(a=>a[2]==='ls').every(a=>a.includes('--include-terminated'))).toBe(true);
  rows.push({...ended,id:'another-ended'});
  expect((await transport.findPlans('project','branch',true)).length).toBe(2);
+ expect(calls.filter(a=>a[2]==='get').map(a=>a[3])).toEqual(['ended','ended','another-ended']);
 });
 
 test('lost spawn reply then termination releases blocked capacity using recorded run or terminated inventory',async()=>{
@@ -721,4 +722,13 @@ test('lost spawn reply then termination releases blocked capacity using recorded
    expect(calls.length>0).toBe(!recorded);
   }finally{s.close();rmSync(dir,{recursive:true,force:true});}
  }
+});
+
+
+test('inventory rows without branch metadata still fetch details and exclude mismatched branches',async()=>{
+ const match={id:'matching',projectId:'project',branch:'branch',isTerminated:false};
+ const rows=[match,{id:'unrelated-branch',projectId:'project',branch:'elsewhere',isTerminated:false},{id:'unrelated-project',projectId:'elsewhere',branch:'branch',isTerminated:false}];
+ const {calls,transport}=inventoryTransport(rows,true);
+ expect(await transport.findPlans('project','branch')).toEqual([match]);
+ expect(calls.filter(a=>a[2]==='get').map(a=>a[3])).toEqual(['matching','unrelated-branch']);
 });

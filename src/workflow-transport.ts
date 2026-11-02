@@ -46,7 +46,7 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
   const inventory=await jsonCommand([AO,'session','ls','--all','--include-terminated','--json'],spawn);
   if(!Array.isArray(inventory.data))throw Error('Incomplete session inventory');
   const matches=[];
-  for(const s of inventory.data.filter((s:any)=>s.projectId===project&&(includeTerminated||!s.isTerminated))){
+  for(const s of inventory.data.filter((s:any)=>s.projectId===project&&(!s.branch||s.branch===branch)&&(includeTerminated||!s.isTerminated))){
    const d=await jsonCommand([AO,'session','get',s.id,'--json'],spawn);
    if(d.session?.id===s.id&&d.session.projectId===project&&d.session.branch===branch&&(includeTerminated||!d.session.isTerminated))matches.push(d.session);
   }return matches;
