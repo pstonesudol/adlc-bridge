@@ -123,6 +123,71 @@ test('planning concurrency limit holds across overlapping ticks',async()=>{
  await Promise.all([w.tick(config),w.tick(config)]);expect(f.starts.length).toBe(1);s.close();
 });
 
+test('manually completed planning frees slots in tick and direct transactional admission',async()=>{
+ for(const state of ['awaiting_approval','approved','done'])for(const direct of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   await w.startPlanning(first,config);
+   const hash=s.propose(first,'Manually submitted plan');
+   if(state!=='awaiting_approval')s.approve(first,hash,'human');
+   if(state==='done')s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(first);
+   expect(w.planning(first).state).toBe('planning');
+   if(direct)await w.startPlanning(next,config);else await w.tick(config);
+   expect(f.starts.length).toBe(2);expect(w.planning(next).state).toBe('planning');
+   expect(f.sends).toEqual([]);
+  }finally{s.close();}
+ }
+});
+
+test('manual proposal after an uncertain or reconciliation-blocked spawn keeps its planning slot',async()=>{
+ for(const blocked of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);f.loseSpawn=true;
+  try{
+   const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   expect((await w.startPlanning(first,config)).state).toBe('dispatch_uncertain');
+   if(blocked){
+    s.enqueue('p','first','changed specification');await w.tick(config);
+    expect(w.planning(first).state).toBe('needs_reconciliation');
+   }
+   expect(f.starts.length).toBe(1);
+   s.propose(first,'Manually submitted plan');
+   expect(s.get(first).state).toBe('awaiting_approval');
+   await expect(w.startPlanning(next,config)).rejects.toThrow('Planning concurrency limit reached');
+   await w.tick(config);
+   expect(f.starts.length).toBe(1);expect(w.planning(next)).toBe(null);
+  }finally{s.close();}
+ }
+});
+
+test('capacity above two queues overflow, lowering waits, completion admits queued work',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+ const c={...config,automation:{...config.automation,maxPlanning:3}};
+ for(let i=0;i<6;i++)s.enqueue('p',String(i),'spec');
+ await Promise.all([w.tick(c),w.tick(c)]);expect(f.starts.length).toBe(3);expect(s.list().length).toBe(6);
+ await w.tick(config);expect(f.starts.length).toBe(3);
+ f.completePlan('session-1');await w.tick(c);expect(f.starts.length).toBe(4);expect(f.sends.length).toBe(0);s.close();
+});
+test('uncertain reservations survive separate connections and restart, even after eligibility loss',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-reservations-'));let s=new Store(join(dir,'db'));let other:Store|undefined;
+ try{
+  const f=new Fake(s);f.startPlan=async r=>{f.starts.push(r);throw Error('unknown');};
+  let w=new Workflow(s,f);const ids=[s.enqueue('p','a','spec'),s.enqueue('p','b','spec'),s.enqueue('p','c','spec')];
+  other=new Store(join(dir,'db'));const w2=new Workflow(other,f);
+  await Promise.all([w.tick(config),w2.tick(config)]);expect(f.starts.length).toBe(1);
+  s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(ids[0]);
+  other.close();other=undefined;s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+  await w.tick(config);expect(f.starts.length).toBe(1);expect(s.list().length).toBe(3);
+ }finally{other?.close();s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('two projects have independent planning capacities and omitted concurrency defaults to one',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+ for(const project of ['p','q'])for(let i=0;i<5;i++)s.enqueue(project,String(i),'spec');
+ const a={...config,automation:{planningEnabled:true,orchestratorProject:'project'}};
+ const b={...config,linear:{projectId:'q'},automation:{...config.automation,orchestratorProject:'other',maxPlanning:4}};
+ await Promise.all([w.tick(a),w.tick(b)]);expect(f.starts.filter(x=>x.project==='project').length).toBe(1);expect(f.starts.filter(x=>x.project==='other').length).toBe(4);s.close();
+});
+
 test('Docker approval is rejected and local execution remains available',async()=>{
  const {s,f,w,id,hash}=await planned();
  expect(()=>w.approve(id,hash,'human',['src/a.ts'],'docker',ops)).toThrow('removed');
@@ -533,4 +598,137 @@ test('preview reconciliation exposes the three reported blockers without applyin
  expect((s.db.query('SELECT count(*) AS n FROM worker_outcomes').get() as any).n).toBe(outcomeCount.n);
  expect(s.db.query('SELECT job,state FROM implementation_dispatch ORDER BY job').all()).toEqual(before);
  s.close();
+});
+
+test('blocked planning releases capacity only after authoritative completion without restoring eligibility',async()=>{
+ for(const terminated of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const id=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');await w.startPlanning(id,config);
+   s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+   await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('planning');
+   if(terminated)f.sessions.get('session-1').session.isTerminated=true;else f.completePlan();
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(w.planning(next).state).toBe('planning');
+   expect(s.get(id).state).toBe('blocked');expect(s.get(id).plan_hash).toBeNull();expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+   await w.tick(config);expect(f.starts.length).toBe(2);
+  }finally{s.close();}
+ }
+});
+
+test('blocked uncertain reservations persist across restart until unique matching ended-session evidence',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-blocked-plan-'));let s=new Store(join(dir,'db'));const f=new Fake(s);f.loseSpawn=true;
+ try{
+  let w=new Workflow(s,f);const id=s.enqueue('p','first','spec');s.enqueue('p','next','spec');await w.startPlanning(id,config);
+  s.db.query('UPDATE planning_runs SET session_id=NULL WHERE job=?').run(id);
+  s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(id);s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+  const find=f.findPlans.bind(f),e=f.sessions.get('session-1');f.completePlan();
+  for(const matches of [[],[e.session,e.session]]){
+   f.findPlans=async()=>matches;await w.tick(config);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');
+  }
+  f.findPlans=find;
+  const originalEvidence=f.evidence.bind(f);
+  for(const key of ['id','projectId','branch']){
+   f.evidence=async(sid:string)=>{const r=await originalEvidence(sid);return {...r,session:{...r.session,[key]:'wrong'}};};
+   const result=await w.tick(config);
+   expect(result.find(x=>x.job===id)).toMatchObject({state:'needs_reconciliation',reason:'Blocked planning session identity mismatch'});
+   expect(result.some(x=>x.error)).toBe(false);expect(f.starts.length).toBe(1);expect(w.planning(id).state).toBe('dispatch_uncertain');
+  }
+  f.evidence=originalEvidence;
+  e.transcript.controller='busy';await w.tick(config);expect(f.starts.length).toBe(1);
+  e.transcript.controller='ready';e.transcript.turns.push({id:'live',state:'running'});await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.turns.pop();
+  const text=e.transcript.entries[0].text;e.transcript.entries[0].text='Uncorrelated plan';await w.tick(config);expect(f.starts.length).toBe(1);e.transcript.entries[0].text=text;
+  await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(f.starts.length).toBe(2);expect(f.sends).toEqual([]);expect(s.get(id).state).toBe('blocked');
+ }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('finished planning remains released after eligibility re-enqueue and waits for explicit recovery',async()=>{
+ for(const terminated of [false,true])for(const changed of [false,true]){
+  const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f);
+  try{
+   const id=s.enqueue('p','first','spec');await w.startPlanning(id,config);
+   s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+   if(terminated)f.sessions.get('session-1').session.isTerminated=true;else f.completePlan();
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');
+   s.enqueue('p','first',changed?'changed specification':'spec');expect(s.get(id).state).toBe('awaiting_plan');
+   const next=s.enqueue('p','next','spec');
+   f.evidence=async()=>{throw Error('Finished dispatch must not inspect its old session');};
+   const result=await w.tick(config);
+   expect(result.find(x=>x.job===id)).toMatchObject({state:'planning_finished'});
+   expect(result.some(x=>x.error)).toBe(false);expect(w.planning(id).state).toBe('planning_finished');
+   expect(w.planning(next).state).toBe('planning');expect(f.starts.length).toBe(2);
+   await w.tick(config);expect(w.planning(id).state).toBe('planning_finished');expect(f.starts.length).toBe(2);
+   expect(s.get(id).state).toBe('awaiting_plan');expect(s.get(id).plan_hash).toBeNull();expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+  }finally{s.close();}
+ }
+});
+
+test('blocked captured plans retain their dispatch and can be recaptured after eligible re-enqueue',async()=>{
+ const {s,f,w,id,hash}=await planned();
+ try{
+  const dispatch={...w.planning(id)},evidence=f.evidence.bind(f);let reads=0;
+  s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+  f.evidence=async sid=>{reads++;return evidence(sid);};
+  expect(await w.reconcileBlockedPlanning(id)).toEqual({state:'awaiting_approval'});expect(reads).toBe(0);
+  const result=await w.tick(config);
+  expect(result.some(x=>x.job===id)).toBe(false);expect(reads).toBe(0);expect(w.planning(id)).toEqual(dispatch);
+  expect(s.get(id).state).toBe('blocked');expect(s.get(id).plan_hash).toBe(hash);expect(f.sends).toEqual([]);
+  s.enqueue('p','issue',s.get(id).spec);expect(s.get(id).state).toBe('awaiting_plan');
+  await w.tick(config);
+  expect(reads).toBe(1);expect(w.planning(id).state).toBe('awaiting_approval');expect(s.get(id).state).toBe('awaiting_approval');
+  expect(s.get(id).plan_hash).toBe(hash);expect(s.get(id).approved_hash).toBeNull();expect(f.starts.length).toBe(1);expect(f.sends).toEqual([]);
+ }finally{s.close();}
+});
+
+// Real inventory transport path, but no host AO command or provider request.
+function inventoryTransport(sessions:any[],omitBranch=false){
+ const calls:string[][]=[];
+ const spawn=((args:string[])=>{
+  calls.push(args);
+  const data=args[2]==='ls'?{data:sessions.map(s=>({id:s.id,projectId:s.projectId,...(omitBranch?{}:{branch:s.branch}),isTerminated:s.isTerminated}))}:{session:sessions.find(s=>s.id===args[3])};
+  return {stdout:new Blob([JSON.stringify(data)]).stream(),stderr:new Blob([]).stream(),exited:Promise.resolve(0)};
+ }) as any;
+ return {calls,transport:createWorkflowTransport(async operation=>operation(),spawn)};
+}
+
+test('inventory transport includes terminated matches only when explicitly requested and retains ambiguity',async()=>{
+ const ended={id:'ended',projectId:'project',branch:'branch',isTerminated:true};
+ const rows=[ended,{id:'other-project',projectId:'elsewhere',branch:'branch',isTerminated:true},{id:'other-branch',projectId:'project',branch:'elsewhere',isTerminated:true}];
+ const {calls,transport}=inventoryTransport(rows);
+ expect(await transport.findPlans('project','branch')).toEqual([]);
+ expect(await transport.findPlans('project','branch',true)).toEqual([ended]);
+ expect(calls.filter(a=>a[2]==='ls').every(a=>a.includes('--include-terminated'))).toBe(true);
+ rows.push({...ended,id:'another-ended'});
+ expect((await transport.findPlans('project','branch',true)).length).toBe(2);
+ expect(calls.filter(a=>a[2]==='get').map(a=>a[3])).toEqual(['ended','ended','another-ended']);
+});
+
+test('lost spawn reply then termination releases blocked capacity using recorded run or terminated inventory',async()=>{
+ for(const recorded of [true,false]){
+  const dir=mkdtempSync(join(tmpdir(),'adlc-terminated-spawn-'));let s=new Store(join(dir,'db'));const f=new Fake(s);f.loseSpawn=true;
+  try{
+   let w=new Workflow(s,f);const id=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
+   await w.startPlanning(id,config);expect(w.planning(id).session_id).toBeNull();
+   if(!recorded)s.db.query('UPDATE planning_runs SET session_id=NULL WHERE job=?').run(id);
+   s.db.query("UPDATE jobs SET state='blocked' WHERE id=?").run(id);
+   const ended=f.sessions.get('session-1').session;ended.isTerminated=true;
+   const {calls,transport}=inventoryTransport([ended]);
+   f.findPlans=recorded?async()=>{throw Error('Recorded planning-run identity must avoid inventory');}:transport.findPlans;
+   s.close();s=new Store(join(dir,'db'));f.s=s;w=new Workflow(s,f);
+   await w.tick(config);
+   expect(w.planning(id).state).toBe('planning_finished');expect(w.planning(id).session_id).toBe('session-1');
+   expect(w.planning(next).state).toBe('dispatch_uncertain');expect(f.starts.length).toBe(2);
+   expect(s.get(id).state).toBe('blocked');expect(s.get(id).approved_hash).toBeNull();expect(f.sends).toEqual([]);
+   expect(calls.length>0).toBe(!recorded);
+  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+ }
+});
+
+
+test('inventory rows without branch metadata still fetch details and exclude mismatched branches',async()=>{
+ const match={id:'matching',projectId:'project',branch:'branch',isTerminated:false};
+ const rows=[match,{id:'unrelated-branch',projectId:'project',branch:'elsewhere',isTerminated:false},{id:'unrelated-project',projectId:'elsewhere',branch:'branch',isTerminated:false}];
+ const {calls,transport}=inventoryTransport(rows,true);
+ expect(await transport.findPlans('project','branch')).toEqual([match]);
+ expect(calls.filter(a=>a[2]==='get').map(a=>a[3])).toEqual(['matching','unrelated-branch']);
 });
