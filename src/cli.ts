@@ -41,6 +41,7 @@ import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
 import {recoveryRows} from './worktree-reservation';
+import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 
 const [command='help',...a]=process.argv.slice(2);
@@ -189,6 +190,9 @@ async function main(){
    recover-handoff JOB CONFIG [--confirm HASH]  read-only preview; confirm exact proposal
   recovery-status                      read-only conflict stages, evidence and blockers
   recovery-preview JOB CONFIG          read-only conflict eligibility preview
+  retry-observation JOB                rearm read-only provider checks; never replay mutation
+  reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]
+                                       inspect/confirm proven published Git intent only
   reconcile-conflict JOB CONFIG        read-only published-merge reconciliation preview
     [--confirm HASH --human NAME]      verify and release only proven completed recovery
   authorize-base-merge JOB HASH HUMAN  explicitly add merge-base-feature to current job grant
@@ -242,8 +246,13 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
-   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
+    if(command==='reconcile-publication'){
+     if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
+     const config=JSON.parse(readFileSync(a[1],'utf8'));validate(config);
+     const store=new Store(db,a.length===4);try{const recovery=new ConflictRecovery(store);return out(a.length===4?await recovery.publishedPreview(a[0],config,a[2] as any,a[3]):await recovery.publishedConfirm(a[0],config,a[2] as any,a[3],a[5]));}finally{store.close();}
+    }
     if(command==='reconcile-conflict'){
      if(a.length!==2&&!(a.length===6&&a[2]==='--confirm'&&a[4]==='--human'))throw Error('Use reconcile-conflict JOB CONFIG [--confirm HASH --human NAME]');
      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
@@ -279,6 +288,9 @@ Registered approved review targets can request bounded in-scope fixes from their
     return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
   });
    try{
+    if(command==='retry-observation'){
+     if(a.length!==1)throw Error('Use retry-observation JOB');lifecycle.current(a[0]);new RecoveryObservation(s).clear(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');return out({job:a[0],readRetry:true,mutationReplay:false});
+    }
     if(command==='authorize-base-merge'){
      return out(authorizeBaseMerge(lifecycle,a));
     }

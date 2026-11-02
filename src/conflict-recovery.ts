@@ -114,6 +114,85 @@ export class ConflictRecovery{
   if(x.b.mergeable!==false||x.b.behind<1)throw Error('Confirmed base conflict required');
   return {mode:'preview_only',job,repo,pr,plan:x.auth.plan,head:x.b.head,base:x.b.base,worktree:x.facts.worktree,policy:c.conflictRecovery,mergePR:false};
  }
+ async publishedPreview(job:string,c:any,source:'merge'|'commits'|'fast-forward'|'authorized-rebase',human:string){
+  if(!human?.trim()||human.trim().startsWith('-')||!['merge','commits','fast-forward','authorized-rebase'].includes(source))throw Error('Named human and explicit publication source required');
+  const auth=this.auth(job,c),target=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
+  if(!target)throw Error('Existing PR review target required; never replace a PR');
+  const x=await this.inspect(job,c,target.repo,target.pr);
+  if(!x.facts.clean||x.facts.head!==x.b.head)throw Error('Dirty, unpublished or divergent local work; preserve edits and publish only under separate authorization');
+  await this.noOperation(x.facts.worktree);
+  const conflict=this.row(job),active=conflict&&conflict.state!=='completed'?conflict:null;
+  if(active&&(active.plan!==auth.plan||active.policy!==JSON.stringify(c.conflictRecovery)||active.repo!==target.repo||active.pr!==target.pr||active.branch!==x.b.branch||active.base_branch!==x.b.baseBranch))throw Error('Stale plan/policy, retargeted PR or changed ownership; reapprove current specification, do not supersede this intent');
+  const updates=this.s.db.query("SELECT name FROM sqlite_master WHERE name='branch_updates'").get()?this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND state IN ('accepted','delivery_uncertain') ORDER BY head,base").all(job) as any[]:[];
+  const inputs=[...updates,...active?[active]:[]];
+  if(!inputs.length&&sha(target.head??'')&&target.state==='blocked'&&/^(Feature branch has conflicts with base|Conflict recovery|Earlier branch update outcome uncertain)/.test(target.reason??''))inputs.push({head:target.head,base:x.b.base});
+  if(!inputs.length)throw Error('No superseded Git intent to reconcile');
+  const proofs=[];
+  for(const input of inputs){
+   if(!sha(input.head)||!sha(input.base))throw Error('Invalid retained input identities');
+   const included=async(ancestor:string)=>(await this.git(x.facts.worktree,'merge-base',ancestor,x.b.head))===ancestor;
+   if(!await included(input.base)||!await included(x.b.base))throw Error('Required old/current base not included in published head');
+   const descendant=await included(input.head);
+   let equivalence:string|null=null;
+   if(!descendant){
+    if(source!=='authorized-rebase')throw Error('Published history was rewritten; explicit prior human-authorized rebase attestation and equivalent patches required');
+    const anchor=await this.git(x.facts.worktree,'merge-base',input.head,input.base);
+    equivalence=await this.git(x.facts.worktree,'range-diff','--no-color','--no-dual-color',`${anchor}..${input.head}`,`${x.b.base}..${x.b.head}`);
+    if(!equivalence.trim()||equivalence.split('\n').some(l=>!/^\s*\d+:\s+[a-f0-9]+\s+=\s+\d+:\s+[a-f0-9]+/.test(l)))throw Error('Replayed feature patches differ; product/scope reconciliation required');
+   }
+   proofs.push({head:input.head,base:input.base,descendant,equivalence});
+  }
+  const paths=(await this.git(x.facts.worktree,'diff','--name-only','-z',`${x.b.base}...${x.b.head}`)).split('\0').filter(Boolean);
+  if(paths.some(path=>!scopeAllows(path,JSON.parse(auth.paths))))throw Error(`Published feature changes outside current scope: ${JSON.stringify(paths)}`);
+  const markers=paths.length?await this.io.command(['git','grep','-n','-I','-E','^(<<<<<<< |[|]{7} |=======[[:space:]]*$|>>>>>>> )',x.b.head,'--',...paths.map(p=>`:(literal)${p}`)],x.facts.worktree):{code:1};
+  if(markers.code!==1)throw Error('Published conflict markers remain or inspection failed');
+  let message='not-applicable';
+  if(active?.state==='resolving'||active&&this.s.db.query("SELECT state FROM remediation WHERE job=? AND attempt=? AND state='delivery_uncertain'").get(job,active.attempt)){
+   const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===active.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
+   message=turn?.state==='completed'?'completed':'uncertain';
+  }
+  const evidence={job,plan:auth.plan,spec:auth.spec,auth,target,source,human,base:x.b.base,head:x.b.head,branch:x.b.branch,worktree:x.facts.worktree,updates,active,proofs,paths,message,policy:c.conflictRecovery};
+  return {preview:true,confirmation:digest(JSON.stringify(evidence)),evidence,independentGates:{message,latestSHAReview:'required',authorization:'current'},note:'Observation only; no Git mutation, send, grant or history rewrite. Rebase source attests a previously separately authorized operation, not new force-push authority.'};
+ }
+ async publishedConfirm(job:string,c:any,source:'merge'|'commits'|'fast-forward'|'authorized-rebase',human:string,hash:string){
+  return this.io.submit(async()=>{
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='publication_reconciliations'").get()){
+    const prior=this.s.db.query('SELECT detail FROM publication_reconciliations WHERE id=? AND job=?').get(hash,job) as any;
+    if(prior){
+     const p=JSON.parse(prior.detail).proof,x=await this.inspect(job,c,p.target.repo,p.target.pr);
+     if(p.source!==source||p.human!==human||JSON.stringify(x.auth)!==JSON.stringify(p.auth)||x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Previously reconciled publication evidence changed');
+     return {job,head:p.head,base:p.base,state:'git_reconciled',message:p.message,reused:true,mergePR:false};
+    }
+   }
+   const first=await this.publishedPreview(job,c,source,human);if(first.confirmation!==hash)throw Error('Published recovery preview changed');
+   const proof=first.evidence,verification=[];
+   for(const argv of c.conflictRecovery.verification){
+    const result=await this.io.verify(argv,proof.worktree);verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});
+    if(result.code!==0)throw Error('Published-tree verification failed; no intent superseded');
+   }
+   const fresh=await this.publishedPreview(job,c,source,human);if(fresh.confirmation!==hash)throw Error('Evidence changed during verification; no intent superseded');
+   const final=await this.inspect(job,c,proof.target.repo,proof.target.pr);
+   if(final.b.head!==proof.head||final.b.base!==proof.base||final.facts.head!==proof.head||!final.facts.clean||JSON.stringify(final.auth)!==JSON.stringify(proof.auth))throw Error('Publication changed immediately before commit; reservation retained');
+   return this.s.db.transaction(()=>{
+    const auth=this.auth(job,c),target=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);
+    if(JSON.stringify(auth)!==JSON.stringify(proof.auth)||JSON.stringify(target)!==JSON.stringify(proof.target)||JSON.stringify(this.row(job)?.state!=='completed'?this.row(job)??null:null)!==JSON.stringify(proof.active))throw Error('Authorization, target or intent changed before reconciliation commit');
+    const updates=this.s.db.query("SELECT name FROM sqlite_master WHERE name='branch_updates'").get()?this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND state IN ('accepted','delivery_uncertain') ORDER BY head,base").all(job):[];
+    if(JSON.stringify(updates)!==JSON.stringify(proof.updates))throw Error('Concurrent Git intent change; preview again');
+    this.s.db.exec('CREATE TABLE IF NOT EXISTS publication_reconciliations(id TEXT PRIMARY KEY,job TEXT NOT NULL,detail TEXT NOT NULL)');
+    this.s.db.query('INSERT INTO publication_reconciliations VALUES (?,?,?)').run(hash,job,JSON.stringify({proof,verification,at:Date.now()}));
+    for(const update of proof.updates)this.s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=?").run(job,update.head,update.base);
+    if(proof.active){
+     this.set(proof.active,'completed',{...JSON.parse(proof.active.detail),result:proof.head,publication:hash,message:proof.message});
+     if(proof.message!=='uncertain')this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,proof.active.attempt);
+    }
+    // Never clear job/run approval or unrelated waits/findings/delivery records.
+    const unrelated=['blocked','needs_reconciliation'].includes(proof.target.state)&&!/(conflict|branch update|updating branch|published Git|base merged)/i.test(proof.target.reason??'');
+    this.s.db.query('UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=NULL WHERE job=?').run(proof.head,Date.now(),unrelated?proof.target.state:'waiting_for_ci',unrelated?proof.target.reason:'Published Git update reconciled; independent delivery and latest-SHA gates remain',job);
+    this.s.event(job,'published_git_reconciled',JSON.stringify({hash,source,human,old:proof.proofs,head:proof.head,base:proof.base,message:proof.message}));
+    return {job,head:proof.head,base:proof.base,state:'git_reconciled',message:proof.message,mergePR:false};
+   }).immediate();
+  });
+ }
  set(r:any,state:string,detail:any=JSON.parse(r.detail),reason:string|null=null){
   if(r.state===state&&r.detail===JSON.stringify(detail)&&r.reason===reason)return;
   const changed=this.s.db.query('UPDATE conflict_recoveries SET state=?,detail=?,reason=? WHERE id=? AND state=? AND detail=? AND reason IS ?').run(state,JSON.stringify(detail),reason,r.id,r.state,r.detail,r.reason);

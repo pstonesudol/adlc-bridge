@@ -83,7 +83,7 @@ test('conflict recovery blockers and completion reuse dedupe without granting re
   const review=f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id);
   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
-  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('Conflict recovery recovery stopped at stage resolving');
+  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('Conflict recovery recovery has an independent reconciliation gate at stage resolving');
   expect(f.comments[0].body).not.toContain('app.txt');
   expect(f.comments[0].body).not.toContain('security decision');
   expect((f.s.db.query('SELECT reason FROM conflict_recoveries').get() as any).reason).toBe('app.txt requires a security decision');
@@ -101,6 +101,16 @@ test('label verification failure after a successful write is retractable',async(
   expect(f.labels).toContain(labelId);
   const retract=await f.blockers().retract(f.id,f.config);expect(retract.state).toBe('retracted');
   expect(f.labels).toEqual(['ready','team']);
+ }finally{f.s.close();}
+});
+test('proven Git publication keeps an independent message-receipt blocker until observed completion',async()=>{
+ const f=fixture();try{
+  f.running();new ConflictRecovery(f.s).install();
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','completed','client',1,JSON.stringify({result:'new-sha',message:'uncertain'}),null,1);
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
+  expect(f.comments.some(c=>c.body.includes('independent reconciliation gate'))).toBe(true);
+  f.s.db.query('UPDATE conflict_recoveries SET detail=?').run(JSON.stringify({result:'new-sha',message:'completed'}));
+  await f.blockers().sync(f.config);expect(f.labels).not.toContain(labelId);
  }finally{f.s.close();}
 });
 test('stale-plan recovery retains its blocker after a spec change and a newer running outcome',async()=>{

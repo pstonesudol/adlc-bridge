@@ -32,8 +32,8 @@ async function fixture(filename='app.txt'){
  writeFileSync(join(source,filename),'feature=old\nsafety=new\n');writeFileSync(join(source,'safeguard.txt'),'base safeguard\n');await git(source,'add','.');await git(source,'commit','-m','Base safety');await git(source,'push','origin','main');
  p.gate(job,'ao','worker',reserved.branch,tree);const plan=s.propose(job,'approved plan');s.approve(job,plan,'human');const l=new Lifecycle(s);l.grantGit(job,plan,[...featureGit,'merge-base-feature'],'human');l.adoptSupervised(job,{id:'worker',correlation:reserved.correlation,worktree:tree,controller:'running'});
  s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(job,plan,'worker','original','pr_handoff',JSON.stringify([filename]),'supervised-host','human',null);
- s.db.exec(`CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,head_since INTEGER,state TEXT,reason TEXT,last_signature TEXT);`);
- s.db.query('INSERT INTO review_targets VALUES (?,?,?,?,?,?)').run(job,null,0,'ready_for_human',null,'old');
+ s.db.exec(`CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,head_since INTEGER,state TEXT,reason TEXT,last_signature TEXT,repo TEXT DEFAULT 'owner/repo',pr INTEGER DEFAULT 1);`);
+ s.db.query('INSERT INTO review_targets(job,head,head_since,state,reason,last_signature) VALUES (?,?,?,?,?,?)').run(job,null,0,'ready_for_human',null,'old');
  const config={repo:source,githubRepo:'owner/repo',linear:{projectId:'project'},conflictRecovery:{version:1 as const,enabled:true,authorizedBy:'human',baseBranch:'main',maxRecoveries:3,verification:[[process.execPath,'-e',`if(require('fs').readFileSync(${JSON.stringify(filename)},'utf8')!=='feature=new\\nsafety=new\\n')process.exit(1)`]]}};
  const e:any={session:{id:'worker',branch:reserved.branch,isTerminated:false,activity:{state:'idle'},prs:[{number:1,url:'https://github.com/owner/repo/pull/1',state:'open'}]},transcript:{controller:'ready',entries:[],turns:[]}};
  let sends=0,owners=['worker'],idle=true,lost=false;
@@ -55,6 +55,93 @@ test('DEV-15/16 conflict preserves feature and base safeguards, normal pushes an
   expect(f.commands.filter(a=>a[0]==='git'&&a[1]==='push').at(-1)).toEqual(['git','push','origin',`${detail.result}:refs/heads/${f.branch}`]);
   expect(f.commands.flat().some(a=>['--force','--force-with-lease','reset','rebase','--ours','--theirs'].includes(a))).toBe(false);
  }finally{f.close();}
+},60000);
+test('DEV-50 operator merge settles stale Git conflict but retains missing resolution receipt independently',async()=>{
+ const f=await fixture();try{
+  f.lose();await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator resolved merge');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  f.e.transcript.entries=[];f.e.transcript.turns=[];
+  const before=JSON.stringify(f.recovery.row(f.job)),attempts=f.s.get(f.job).attempts;
+  const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','Patrick');
+  expect(preview.evidence.message).toBe('uncertain');expect(JSON.stringify(f.recovery.row(f.job))).toBe(before);
+  const result=await f.recovery.publishedConfirm(f.job,f.config,'merge','Patrick',preview.confirmation);
+  expect(result.message).toBe('uncertain');expect(f.recovery.row(f.job).state).toBe('completed');
+  expect((f.s.db.query('SELECT state FROM remediation').get() as any).state).toBe('delivery_uncertain');
+  expect(f.s.get(f.job).attempts).toBe(attempts);expect(f.sends()).toBe(1);
+  expect(worktreeReservation(f.s,f.job)).toBeFalsy();
+  expect((f.s.db.query('SELECT state FROM review_targets').get() as any).state).toBe('waiting_for_ci');
+  expect((await f.recovery.publishedConfirm(f.job,f.config,'merge','Patrick',preview.confirmation)).reused).toBe(true);
+ }finally{f.close();}
+},60000);
+test('publication confirmation rejects remote/base changes and revoked approval after verification',async()=>{
+ for(const change of ['head','base','approval']){
+  const f=await fixture();try{
+   f.lose();await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+   await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator repair');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+   const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','human');
+   const io={...f.io,verify:async()=>{
+    if(change==='approval')f.s.db.query("UPDATE jobs SET approved_hash=NULL WHERE id=?").run(f.job);
+    else{const tree=change==='base'?f.source:f.tree;await f.git(tree,'commit','--allow-empty','-m','Concurrent change');await f.git(tree,'push','origin',change==='base'?'main':`HEAD:refs/heads/${f.branch}`);}
+    return {code:0,out:'ok',err:''};
+   }};
+   await expect(new ConflictRecovery(f.s,io as any).publishedConfirm(f.job,f.config,'merge','human',preview.confirmation)).rejects.toThrow();
+   expect(f.recovery.row(f.job).state).not.toBe('completed');expect(f.sends()).toBe(1);
+  }finally{f.close();}
+ }
+},60000);
+test('DEV-16 separately authorized equivalent rebase settles uncertain Git update without new force authority',async()=>{
+ const f=await fixture();try{
+  const old=(await f.io.snapshot()).head;
+  writeFileSync(join(f.source,'app.txt'),'feature=old\nsafety=old\n');await f.git(f.source,'add','.');await f.git(f.source,'commit','-m','Base separate safeguard');await f.git(f.source,'push','origin','main');
+  const base=(await f.io.snapshot()).base;
+  // Simulate a previously published operator rewrite with commit-tree/ref CAS.
+  // No rebase, reset, or force-push is run by production or this test.
+  await f.git(f.tree,'merge','--no-ff','-m','Operator merge',base);
+  const tree=await f.git(f.tree,'rev-parse','HEAD^{tree}'),merged=await f.git(f.tree,'rev-parse','HEAD');
+  const rewritten=await f.git(f.tree,'commit-tree',tree,'-p',base,'-m','Feature');
+  await f.git(f.tree,'update-ref',`refs/heads/${f.branch}`,rewritten,merged);
+  await f.git(f.remote,'fetch','--no-tags',f.tree,rewritten);
+  await f.git(f.remote,'update-ref',`refs/heads/${f.branch}`,rewritten,old);
+  new BranchUpdates(f.s);f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.job,old,base,'delivery_uncertain',1,'lost update');
+  f.config.conflictRecovery.verification=[[process.execPath,'-e','process.exit(0)']];
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason='Security review is still required' WHERE job=?").run(f.job);
+  await expect(f.recovery.publishedPreview(f.job,f.config,'merge','Patrick')).rejects.toThrow('rewritten');
+  const preview=await f.recovery.publishedPreview(f.job,f.config,'authorized-rebase','Patrick');
+  expect(preview.evidence.proofs[0].descendant).toBe(false);
+  const before=f.s.get(f.job).attempts;
+  await f.recovery.publishedConfirm(f.job,f.config,'authorized-rebase','Patrick',preview.confirmation);
+  expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('observed');
+  expect(f.s.get(f.job).attempts).toBe(before);expect(f.sends()).toBe(0);
+  expect((f.s.db.query('SELECT reason FROM review_targets').get() as any).reason).toContain('Security');
+  expect((f.s.db.query('SELECT operations FROM git_grants').get() as any).operations).not.toContain('force');
+ }finally{f.close();}
+},60000);
+test('operator merge supersedes an observation-only stale conflict without inventing an absent old head',async()=>{
+ const f=await fixture();try{
+  const old=(await f.io.snapshot()).head,base=(await f.io.snapshot()).base;
+  await f.io.command(['git','merge','--no-ff','--no-commit',base],f.tree);f.resolve();
+  await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator merge');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason='Feature branch has conflicts with base; human reconciliation required',head=NULL").run();
+  await expect(f.recovery.publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow('No superseded');
+  f.s.db.query('UPDATE review_targets SET head=?').run(old);
+  const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','human');
+  await f.recovery.publishedConfirm(f.job,f.config,'merge','human',preview.confirmation);
+  expect((f.s.db.query('SELECT state FROM review_targets').get() as any).state).toBe('waiting_for_ci');expect(f.sends()).toBe(0);expect(f.s.get(f.job).attempts).toBe(0);
+ }finally{f.close();}
+},60000);
+test('publication proof rejects detached/dirty/unpublished work, lifecycle and identity drift',async()=>{
+ for(const kind of ['dirty','unpublished','closed','retargeted','fork','owner']){
+  const f=await fixture();try{
+   f.lose();await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+   await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Repair');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+   if(kind==='dirty')writeFileSync(join(f.tree,'extra'),'keep me');
+   if(kind==='unpublished')await f.git(f.tree,'commit','--allow-empty','-m','Unpublished');
+   if(kind==='owner')f.setOwners(['worker','another']);
+   const io={...f.io,snapshot:async()=>({...await f.io.snapshot(),...kind==='closed'?{state:'closed'}:kind==='retargeted'?{baseBranch:'other'}:kind==='fork'?{headRepo:'fork/repo'}:{}})};
+   await expect(new ConflictRecovery(f.s,io as any).publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow();
+   expect(f.recovery.row(f.job).state).not.toBe('completed');
+  }finally{f.close();}
+ }
 },60000);
 test('quoted Unicode conflict paths keep raw index identities through resolution and push',async()=>{
  const filename='café".md',f=await fixture(filename);try{

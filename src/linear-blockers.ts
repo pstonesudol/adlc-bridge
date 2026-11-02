@@ -132,13 +132,14 @@ export class LinearBlockers{
    }
    // Reuse the same dedupe/label ownership contract without overwriting the
    // original implementation receipt or inventing another approval engine.
-   for(const recovery of recoveryRows(this.s).filter(r=>r.state!=='completed')){
+    for(const recovery of recoveryRows(this.s).filter(r=>r.state!=='completed'||JSON.parse(r.detail).message==='uncertain')){
     const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId)continue;
     handled.add(recovery.job);
     const prior=rows.findIndex(r=>r.job===recovery.job);if(prior>=0)rows.splice(prior,1);
     if(j.plan_hash!==recovery.plan)continue;
-    const notice=recovery.reason?`Conflict recovery ${recovery.id} stopped at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
-    rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:recovery.reason?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(recovery.reason?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
+    const stopped=!!recovery.reason||JSON.parse(recovery.detail).message==='uncertain';
+    const notice=stopped?`Conflict recovery ${recovery.id} has an independent reconciliation gate at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
+    rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:stopped?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(stopped?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
    }
   for(const outcome of rows){
    handled.add(outcome.job);

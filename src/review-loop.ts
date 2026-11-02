@@ -19,6 +19,7 @@ import {worktreeIdentity} from './delivery-evidence';
 import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
 import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
+import {RecoveryObservation} from './recovery-observation';
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
@@ -103,11 +104,13 @@ export class ReviewLoop{
   private reconcileRemediation(job:string,head:string,session:any){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
    if(!pending)return;
-   const handle=`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
+   const recovery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get()?this.s.db.query('SELECT id,detail,client_id FROM conflict_recoveries WHERE job=? AND attempt=?').get(job,pending.attempt) as any:null;
+   const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
    const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
    const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
    if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
+   if(recovery){const detail=JSON.parse(recovery.detail);if(detail.message==='uncertain')this.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=? AND detail=?').run(JSON.stringify({...detail,message:'completed'}),recovery.id,recovery.detail);}
    if(pending.head===head)return this.record(job,{state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
   }
   record(job:string,result:any){
@@ -148,6 +151,8 @@ export class ReviewLoop{
   const metadataChecks=[...metadataCheckNames(policy===undefined?this.metadataChecks(job):policy.checks)];
   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
+  const observation=config?.conflictRecovery?.enabled?new RecoveryObservation(this.s):null;
+  const wait=observation?.wait(job);if(wait)return this.record(job,wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
    if(recovery){
@@ -162,15 +167,22 @@ export class ReviewLoop{
    const snapshot=await this.io.readBranchSnapshot(t.repo,t.pr),local=await this.io.worktreeIdentity(this.s,job);
    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
-  }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
+  }catch(e){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
    let branch;
    if(config?.conflictRecovery?.enabled===true){
-    const snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);
+    let snapshot;
+    try{snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);}
+    catch(error){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
+    if(snapshot.behind>0&&snapshot.mergeable===null){observation?.failed(job);return this.record(job,{state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; bounded provider observation only, no remediation attempt'});}
     if(snapshot.mergeable===false&&snapshot.behind>0){
+     try{await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).observeAccepted(job,t.repo,t.pr,snapshot);}
+     catch(error){observation?.failed(job);return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:'Accepted base update evidence unavailable; inspect published recovery'});}
+     observation?.clear(job);
      try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
      catch(error){return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
+    observation?.clear(job);
    }
    try{branch=await new BranchUpdates(this.s,{...branchTransport,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
    catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}

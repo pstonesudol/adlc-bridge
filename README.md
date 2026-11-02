@@ -1380,6 +1380,72 @@ Completion notices report the new SHA but do not grant readiness or merge approv
 Installation/activation is a separate reviewed operator step. Human-only PR
 merging remains mandatory.
 
+#### Operator publication and stale-blocker recovery matrix
+
+An operator may complete a previously authorized Git operation outside the bridge.
+Do not repeat a successful merge/update merely because a controller intent is
+stale. The supported observation interface is:
+
+```sh
+adlc reconcile-publication JOB CONFIG merge HUMAN
+adlc reconcile-publication JOB CONFIG merge HUMAN --confirm EXACT_PREVIEW_HASH
+# Other observed sources: commits, fast-forward, authorized-rebase
+```
+
+Preview is read-only: no schema writes, sends, fetches, commits, pushes, grants,
+or blocker clearing. It reports independent message/latest-SHA gates. Confirmation
+requires current unchanged plan/spec approval, applicable policy/grants, exact
+registered repository/PR/base/feature/worktree, an idle unique owner, clean local
+HEAD equal to the remote, and the retained old/current bases included in that
+head. Normal publications must descend from each retained feature head. Feature
+changes relative to the current base must fit current approved paths, and
+configured verification is rerun. Changed SHA alone never proves recovery.
+
+`authorized-rebase` is a named operator attestation that a rewrite was **already**
+separately authorized and published. The observer does not rebase or force-push.
+It requires an equivalent ordered patch replay (`git range-diff`, all entries
+equal); changed, dropped, merged, added or ambiguous patches block for explicit
+scope/product reconciliation. Observation never grants future rewrite authority.
+Old objects must remain locally available; missing evidence blocks without fetch
+or mutation. Broader rewrite/adoption is deliberately unsupported.
+
+Confirmation rechecks evidence after verification and immediately before the
+transaction. That transaction compares the authorization, target and intents,
+appends old/new SHA/base, actor/source, verification and disposition evidence,
+supersedes only the proven Git records and invalidates old CI/review readiness.
+It preserves planning identity, grants, budgets, attempts, unrelated blockers and
+all original audit history. An unrelated review/security stop remains stopped.
+Repeated confirmation of the same current proof is idempotent. Native writers
+remain outside the advisory fence: no claim of an atomic GitHub/native lock is
+made, including after the last observation.
+
+**Git publication and message delivery are separate layers.** A proven published
+merge can release its Git reservation while retaining `delivery_uncertain` for
+the original stable resolution client ID. No send is replayed and no receipt is
+fabricated. The deduplicated reconciliation blocker remains until the existing
+receipt reconciler observes that exact completed turn. A missing/failed receipt
+still requires explicit operator investigation even when Git is proven current.
+
+| Matrix category | Supported behavior and validation |
+|---|---|
+| Base current / clean update / unknown mergeability | No-op, existing GitHub update or bounded read-only observation; unknown is never readiness. Accepted updates are observed before conflict recovery only after both inputs are proven included and head/base rechecked. |
+| Automated merge boundaries | Existing local-Git fixtures cover merged safeguards, text decisions, verification failure, interrupted merge/commit, normal/rejected push and lost reply. Interrupted mutations are never blindly replayed. |
+| Operator merge / commits / fast-forward / authorized rewrite | Inspect/confirm publication proof; DEV-50 merge-with-missing-receipt and DEV-16 equivalent-rewrite-with-uncertain-update fixtures verify independent dispositions and no new sends or grants. |
+| Dirty, detached, pre-existing operations, unpublished/divergent work | Preserve all edits/objects; preview rejects. A completed local merge without publication is not a published proof. Operator must separately authorize publication, not reset/abort/stash as a shortcut. |
+| Concurrent base/head, changed owner/repository/base | Recheck and reject changed evidence; verification/head/base/approval-race fixtures retain intent. Out-of-scope publications and non-equivalent replay stop for a decision. |
+| PR lifecycle / branch recreation | Closed/merged PRs fail open-feature proof; normal human-merge lifecycle remains authoritative. Reopened PRs are revalidated. Deleted/recreated branches, missing objects, replacement PRs and changed delivery identity are not silently adopted. No closure alone completes a job. |
+| Crash and uncertain receipts | Existing reservations/receipts remain authoritative; published Git can settle separately, unknown delivery never resends. Same proof cannot spend another attempt or duplicate handoff. |
+| Stale blocker and stale transaction | Only matching Git intents are superseded. Current head/base proof, scope and transaction-bound authorization are mandatory. Unrelated security/review/delivery gates remain. |
+| Atomic identity/audit disposition | Publication ledger and target/intent changes commit together; planning reservation, attempt/budget history and original inputs remain untouched. |
+| Latest-SHA pipeline | Target gets the observed head and fresh CI/review obligation, not approval; uncertain resolution receipt uses its actual client ID. Reconciliation performs no full-review request or remediation dispatch. |
+| Bounded observations/no progress | Provider observation failures/unknown state use a durable six-read budget with backoff (one second, then sixty seconds); no remediation attempts consumed. `retry-observation JOB` rearms reads only after operator inspection, never resets mutation uncertainty or budgets. |
+| Human decision and CLI fallback | DEV-17 deduplicated fixed notices identify recovery/stage and local evidence. Existing DEV-18 clarification/resume paths remain fenced; publication confirmation is a trusted named operator CLI action, not authority inferred from reviewer text or a Linear acknowledgement. |
+
+The test suite combines injected provider state with isolated local Git remotes;
+it performs no real main merge, paid provider call, installation, or live controller
+repair. The lifecycle/rename/recreation and non-equivalent rewrite cases above
+are conservative escalation boundaries, not universal automatic recovery claims.
+
 ### Existing worker handoff recovery
 
 Workers must retain the reserved planning branch. At completed delivery, the
