@@ -23,8 +23,8 @@ test('read-only discovery does not initialize a project-services table in an old
 });
 test('maintenance registration reads do not initialize tables, change bytes or modes, or create a missing registry',()=>{
  for(const initialized of [false,true]){const f=fixture();try{
-  const s=new Store(f.path);if(initialized)new ProjectServices(s);s.close();const before=readFileSync(f.path),mode=statSync(f.path).mode,files=readdirSync(dirname(f.path));
-  expect(registrations(f.path)).toEqual([]);expect(readFileSync(f.path)).toEqual(before);expect(statSync(f.path).mode).toBe(mode);expect(readdirSync(dirname(f.path))).toEqual(files);
+   const s=new Store(f.path),expected=initialized?[new ProjectServices(s).register(f.config,legacyLabel)]:[];s.close();const before=readFileSync(f.path),mode=statSync(f.path).mode,files=readdirSync(dirname(f.path));
+   expect(registrations(f.path)).toEqual(expected);expect(readFileSync(f.path)).toEqual(before);expect(statSync(f.path).mode).toBe(mode);expect(readdirSync(dirname(f.path))).toEqual(files);
   const inspect=Store.readonly(f.path);try{expect(inspect.db.query("SELECT name FROM sqlite_master WHERE name='project_services'").all()).toHaveLength(initialized?1:0);}finally{inspect.close();}
  }finally{f.close();}}
  const f=fixture();try{expect(()=>registrations(f.path)).toThrow();expect(existsSync(f.path)).toBe(false);expect(existsSync(dirname(f.path))).toBe(false);}finally{f.close();}
