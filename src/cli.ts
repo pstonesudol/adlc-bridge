@@ -201,10 +201,14 @@ Registered approved review targets can request bounded in-scope fixes from their
       return out({job,state:'resolution_recorded',resumeAuthorized:false,readiness:readinessFor(s,job)});
     }
     if(command==='resume-job'){
-      const job=req(a[0],'Job');await poll(c!,s,linearToken());
-      const stage=await workflow.resume(job,c!);
-      const retracted=await blockers.retract(job,c!);
-      return out({...stage,blockerLabel:retracted.state});
+      const job=req(a[0],'Job');
+      const result=await runPollTick(async()=>{
+       await poll(c!,s,linearToken());
+       const stage=await workflow.resume(job,c!);
+       const retracted=await blockers.retract(job,c!);
+       return {...stage,blockerLabel:retracted.state};
+      });
+      return out(result);
     }
     if(command==='register-review'){
       const job=req(a[0],'Job'),config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));
