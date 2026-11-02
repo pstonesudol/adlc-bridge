@@ -16,6 +16,7 @@ import {DEFAULT_REMEDIATION_POLICY,type RemediationPolicy} from './remediation';
 import {assertDeliveryTarget} from './delivery-identity';
 import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
+import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -24,6 +25,20 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
   if(e.findings.some((f:any)=>f.kind!=='pr_description'&&!scopeAllows(f.path,allowedPaths)))return {state:'blocked',send:false,reason:'Review findings exceed approved file scope'};
   return {state:'remediation_pending',send:true,reason:e.failedChecks.length?'Actionable PR-template CI failure':'Actionable latest-SHA CodeRabbit findings'};
  }
+ // Unresolved threads that cannot become a CodeRabbit remediation are never
+ // resolved by waiting or by requesting another full review. Surface exactly
+ // what a human must decide instead of blocking silently after a timeout.
+ const remaining:any[]=Array.isArray(e.remainingFeedback)?e.remainingFeedback:[];
+ if(remaining.length){
+  const count=(category:string)=>remaining.filter(x=>x.category===category).length;
+  const parts=[];
+  if(count('human'))parts.push(`${count('human')} human-only`);
+  if(count('stale'))parts.push(`${count('stale')} outdated or ambiguous`);
+  if(count('addressed'))parts.push(`${count('addressed')} carried-forward already sent for verification`);
+  const paths=[...new Set(remaining.map((x:any)=>x.path).filter((p:any)=>typeof p==='string'&&p))].slice(0,10);
+  return {state:'blocked',send:false,reason:`Unresolved review threads require human decision (${parts.join(', ')}): ${paths.join(', ')||'path unavailable'}`};
+ }
+ if(e.coderabbitRateLimited)return {state:waitingMs>=30*60*1000?'blocked':'waiting_for_coderabbit',send:false,reason:'CodeRabbit rate limited; wait for the provider limit to reset'};
  if(waitingMs>=30*60*1000)return {state:'blocked',send:false,reason:e.reasons.join('; ')};
  if(e.pendingChecks?.length||e.missingChecks?.length)return {state:'waiting_for_ci',send:false,reason:`Waiting for CI: ${[...(e.pendingChecks??[]),...(e.missingChecks??[])].join(', ')}`};
  return {state:'waiting_for_coderabbit',send:false,reason:e.reasons.join('; ')};
@@ -39,7 +54,7 @@ export function reviewDisplay(state:string){
 const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity};
 export class ReviewLoop{
  io:typeof reviewIO;
- constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
+ constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
   head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,
@@ -199,7 +214,30 @@ export class ReviewLoop{
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
    if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
-  const d=decision(e,JSON.parse(t.allowed_paths),Date.now()-since);
+  // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
+  // unverified send must be reconciled even when its thread is already recorded
+  // as dispatched.
+  const uncertainRemediation=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
+  if(uncertainRemediation){
+   const handle=`adlc-fix-${job.slice(0,12)}-${uncertainRemediation.attempt}`;
+   const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
+   const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
+   if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
+   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,uncertainRemediation.attempt);
+   if(uncertainRemediation.head===e.head)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
+  }
+  const dispatched=dispatchedFeedback(this.s,job);
+  const threadFindings=e.findings.filter((f:any)=>f.kind==='review_thread');
+  const freshThreadFindings=threadFindings.filter((f:any)=>!dispatched.has(feedbackKey(f.threadId,f.commentsHash)));
+  const remainingFeedback:any[]=[
+   ...(e.reviewThreads?.humanOnly??[]).map((t:any)=>({category:'human',threadId:t.threadId,path:t.path})),
+   ...(e.reviewThreads?.stale??[]).map((t:any)=>({category:'stale',threadId:t.threadId,path:t.path})),
+   ...threadFindings.filter((f:any)=>!freshThreadFindings.includes(f)).map((f:any)=>({category:'addressed',threadId:f.threadId,path:f.path})),
+  ];
+  // Only feedback never handed to this worker is actionable. Metadata findings
+  // keep their existing path untouched.
+  const reviewView={...e,findings:[...e.findings.filter((f:any)=>f.kind!=='review_thread'),...freshThreadFindings],remainingFeedback};
+  const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
   const stored=this.s.db.transaction(()=>{
    const update=this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND state!='completed'").run(e.head,since,d.state,d.reason,signature,job);
@@ -222,12 +260,13 @@ export class ReviewLoop{
    }
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
-   const metadataOnly=e.findings.every((f:any)=>f.kind==='pr_description');
+   const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
    const operations=metadataOnly?['open-pr']:['commit','push-feature'];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await this.io.disableNativeFeedback(run.session_id);
-   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(e.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
+   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
    if(result.blocked)return this.record(job,{state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
+   if(result.reused)return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
    return {...d,head:e.head,delivery:result};
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};

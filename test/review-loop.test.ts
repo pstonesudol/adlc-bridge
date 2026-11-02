@@ -370,3 +370,86 @@ test('description edits cannot escape same-head review-request uncertainty or tr
   f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
+// #4/#5-shaped carried-forward thread: unresolved, mapped to current code, but
+// its comment keeps the original commit from an earlier push.
+function threadFixture(){
+ const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['commit','push-feature'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
+ const head='a'.repeat(40),candidate={threadId:'T1',path:'src/workflow.ts',line:12,commentIds:['C1'],commentsHash:'d'.repeat(64),body:'Planning slot is not released on failure',originalCommit:'dcf66943',outdated:false};
+ const finding={source:'github-review',kind:'review_thread',threadId:'T1',path:'src/workflow.ts',line:12,body:candidate.body,sha:head,originalCommit:'dcf66943',commentIds:['C1'],commentsHash:'d'.repeat(64),outdated:false};
+ const e:any={clear:false,reasons:['Unresolved or unknown findings'],head,descriptionHash:'body',templateSignature:'sig',findings:[finding],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,coderabbitRateLimited:false,metadataCheckEvidence:[],reviewThreads:{unresolved:1,resolved:0,candidates:[candidate],stale:[],humanOnly:[]}};
+ const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>({...e,findings:e.findings.map((f:any)=>({...f})),reviewThreads:{...e.reviewThreads,candidates:e.reviewThreads.candidates.map((c:any)=>({...c}))}}),sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
+  sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
+  session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
+  return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
+ }};
+ const loop=new ReviewLoop(s,async()=>{reviews++;},{readBranchSnapshot:io.readBranchSnapshot,worktreeIdentity:io.worktreeIdentity,readiness:io.readiness,sessionEvidence:io.sessionEvidence,disableNativeFeedback:async()=>({}),sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)} as any);
+ loop.configureMetadataChecks('project',[]);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
+ return {s,id,head,e,session,loop,io,candidate,sends:()=>sends,reviews:()=>reviews};
+}
+test('carried-forward review thread dispatches exactly one provenance-bound remediation',async()=>{
+ const f=threadFixture();try{
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  expect(f.s.db.query('SELECT thread_id,comments_hash,path,head,attempt,state FROM review_feedback').get()).toEqual({thread_id:'T1',comments_hash:f.candidate.commentsHash,path:'src/workflow.ts',head:f.head,attempt:1,state:'dispatched'});
+  expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  // Uncertain delivery is reconciled, never resent.
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(1);
+  // Worker completes and pushes. The same thread remains unresolved and mapped,
+  // so it is not sent again; a human must confirm the current code.
+  f.session.transcript.turns[0].state='completed';const newer='c'.repeat(40);f.e.head=newer;f.e.findings[0].sha=newer;
+  const result=await f.loop.tick(f.id);expect(result).toMatchObject({state:'blocked',send:false});
+  expect(f.loop.get(f.id).reason).toContain('human decision');expect(f.loop.get(f.id).reason).toContain('carried-forward already sent for verification');
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  // Dispositions are durable: a restarted loop reads the same identity.
+  const restarted=new ReviewLoop(f.s,async()=>{},f.loop.io as any);
+  expect((await restarted.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('a duplicate remediation reservation never spawns a second worker for the same feedback',async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings);
+  const first=await sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],f.io);
+  expect(first.state).toBe('delivery_uncertain');expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  f.session.transcript.turns[0].state='completed';
+  const second=await sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],f.io);
+  expect(second).toMatchObject({reused:true,state:'delivery_uncertain'});expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('outdated and human-only unresolved threads block immediately without another full review',async()=>{
+ const f=threadFixture();try{
+  f.e.findings=[];f.e.reviewThreads={unresolved:2,resolved:0,candidates:[],stale:[{threadId:'T2',path:'src/old.ts',commentIds:['C9']}],humanOnly:[{threadId:'H1',path:'src/human.ts'}]};
+  const result=await f.loop.tick(f.id);
+  expect(result).toMatchObject({state:'blocked',send:false});
+  expect(result.reason).toContain('1 human-only');expect(result.reason).toContain('1 outdated or ambiguous');
+  expect(result.reason).toContain('src/human.ts');expect(result.reason).toContain('src/old.ts');
+  expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
+test('a carried thread outside the approved file scope is blocked before delivery',async()=>{
+ const f=threadFixture();try{
+  f.e.findings[0].path='backend/secrets.py';
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'Review findings exceed approved file scope'});
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+test('a head change between collection and delivery rejects the stale authorization',async()=>{
+ const f=threadFixture();try{
+  let calls=0;const base=f.io.readiness;const changed=async(...args:any[])=>{calls++;const result=await base(...args);return calls===1?result:{...result,head:'c'.repeat(40)};};f.io.readiness=changed;f.loop.io.readiness=changed;
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Current uncleared PR head required');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+test('a changed reviewer-comment set at the same head rejects stale feedback provenance',async()=>{
+ const f=threadFixture();try{
+  let calls=0;const base=f.io.readiness;const changed=async(...args:any[])=>{calls++;const result=await base(...args);if(calls===1)return result;return {...result,findings:[{...result.findings[0],commentsHash:'e'.repeat(64)}]};};f.io.readiness=changed;f.loop.io.readiness=changed;
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Review feedback changed');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+test('rate limiting and residual human decisions are distinct from remediation and waiting on a timeout',()=>{
+ expect(decision({...pending(),coderabbitRateLimited:true},['a'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'CodeRabbit rate limited; wait for the provider limit to reset'});
+ const remaining={category:'human',threadId:'H1',path:'src/human.ts'};
+ expect(decision({...pending(),remainingFeedback:[remaining]},['a'],0)).toMatchObject({state:'blocked',send:false});
+ expect(decision({...pending(),remainingFeedback:[remaining]},['a'],0).reason).toContain('human decision');
+});
