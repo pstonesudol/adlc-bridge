@@ -283,7 +283,7 @@ export class Workflow{
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='remediation_context'").get()){
    const latest=this.s.db.query('SELECT attempt FROM remediation_context WHERE job=? ORDER BY attempt DESC LIMIT 1').get(job) as any;
    const fix=latest&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===`adlc-fix-${job.slice(0,12)}-${latest.attempt}`);
-   if(fix&&(!cont||entry)&&e.transcript.entries.indexOf(fix)>e.transcript.entries.indexOf(entry))entry=fix;
+   if(fix&&entry&&e.transcript.entries.indexOf(fix)>e.transcript.entries.indexOf(entry))entry=fix;
   }
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{

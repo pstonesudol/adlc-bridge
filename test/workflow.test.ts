@@ -57,6 +57,20 @@ async function planned(path=':memory:'){
  const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue',JSON.stringify({identifier:'DEMO-1',title:'Test',description:'Update src/a.ts'}));
  await w.tick(config);f.completePlan();await w.tick(config);return {s,f,w,id,hash:s.get(id).plan_hash};
 }
+test('a remediation receipt cannot substitute for a missing original delivery receipt',async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();
+  new ReviewLoop(s);
+  const attempt=new Lifecycle(s).reserveRemediation(id,'a'.repeat(40),'fix') as any;
+  s.db.query('INSERT INTO remediation_context VALUES (?,?,?,?)').run(id,attempt.attempt,'code','old-body');
+  const e=f.sessions.get('session-1');
+  e.transcript.entries=e.transcript.entries.filter((x:any)=>x.clientMessageId!==w.implementation(id).client_id);
+  e.transcript.entries.push({sequence:4,clientMessageId:`adlc-fix-${id.slice(0,12)}-${attempt.attempt}`,turnId:'fix'});
+  e.transcript.turns.push({id:'fix',state:'completed'});
+  expect(await w.executionStatus(id,e,config)).toMatchObject({state:'needs_reconciliation',reason:'No authoritative delivery receipt; never resend'});
+  expect(w.implementation(id).state).toBe('needs_reconciliation');expect(f.sends).toHaveLength(1);
+ }finally{s.close();}
+});
 test('an existing PR does not hide a delivered remediation blocker; only the reconciled owned target can continue',async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);

@@ -91,6 +91,19 @@ test('custom Verification Evidence goes to the existing worker once, uses config
   expect(f.reviews()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
  }finally{f.s.close();}
 });
+test('fresh custom-check blockers retain their reason after a description edit; stale and pending reviews wait',async()=>{
+ const f=customLoopFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
+  const reason='CodeRabbit custom-check failure: pre-merge row is unclassifiable';
+  Object.assign(f.e,{descriptionHash:'edited-body',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,botReviewSubmittedAt:0});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);
+  Object.assign(f.e,{botReviewSubmittedAt:Date.now()+10000,coderabbitPending:true});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  f.e.coderabbitPending=false;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 test('custom finding is revalidated at dispatch; edits cannot spend an attempt or send stale instructions',async()=>{
  const f=customLoopFixture();try{
   let reads=0;f.io.readiness=async()=>{if(++reads===2)f.e.findings=[{...f.e.findings[0],evidenceHash:'changed'}];return f.e;};

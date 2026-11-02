@@ -278,11 +278,13 @@ export class ReviewLoop{
   }
    if(waiting&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
-    if(!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,e.head,reviewBodyKey);
+    const freshBlocker=customObligation&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>reviewStarted;
+    if(!freshBlocker&&!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,e.head,reviewBodyKey);
     const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,reviewBodyKey) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
-   if(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed)return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
+   const surfaceBlocker=freshBlocker&&e.botReviewSubmittedAt>sinceReview;
+   if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
