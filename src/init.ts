@@ -117,8 +117,9 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
    if(!io.linearToken())throw Error('Run adlc auth-linear first to enter your dedicated Linear key locally. Then rerun init.');
   const c:any={version:1,name,repo,githubRepo:await ask('GitHub owner/repository'),automation:{planningEnabled:true,orchestratorProject:await ask('Existing Orchestrator project ID'),maxPlanning:1},linear:{projectId:await ask('Linear project UUID'),teamId:await ask('Linear team UUID'),readyStateId:await ask('Todo state UUID'),readyLabelId:await ask('agent-ready label UUID')},requiredChecks:(await ask('Required GitHub Actions check names (comma separated)')).split(',').map(x=>x.trim()).filter(Boolean),reviewAllowedPaths:(await ask('Allowed review path patterns (comma separated)','src/**')).split(',').map(x=>x.trim()),approval:{mode:'manual'}};
    c.prMetadataChecks=await collectMetadataChecks(ask);
-   c.pollingIntervalSeconds=Number(await ask('Polling interval seconds (5–86400)','60'));
-   c.automation.maxPlanning=Number(await ask('Concurrent planning stages (1–32; not implementation/review workers)','1'));
+   const decimal=(label:string,answer:string)=>{if(!/^\d+$/.test(answer))throw Error(`${label} must be a decimal integer`);return Number(answer);};
+   c.pollingIntervalSeconds=decimal('pollingIntervalSeconds',await ask('Polling interval seconds (5–86400)','60'));
+   c.automation.maxPlanning=decimal('automation.maxPlanning',await ask('Concurrent planning stages (1–32; not implementation/review workers)','1'));
    validate(c);
    if(await yes('Enable shared OpenChamber task routing')){
    c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};

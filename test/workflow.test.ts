@@ -661,3 +661,20 @@ test('finished planning remains released after eligibility re-enqueue and waits 
   }finally{s.close();}
  }
 });
+
+test('blocked captured plans retain their dispatch and can be recaptured after eligible re-enqueue',async()=>{
+ const {s,f,w,id,hash}=await planned();
+ try{
+  const dispatch={...w.planning(id)},evidence=f.evidence.bind(f);let reads=0;
+  s.db.query("UPDATE jobs SET state='blocked',reason='No longer eligible in Linear' WHERE id=?").run(id);
+  f.evidence=async sid=>{reads++;return evidence(sid);};
+  expect(await w.reconcileBlockedPlanning(id)).toEqual({state:'awaiting_approval'});expect(reads).toBe(0);
+  const result=await w.tick(config);
+  expect(result.some(x=>x.job===id)).toBe(false);expect(reads).toBe(0);expect(w.planning(id)).toEqual(dispatch);
+  expect(s.get(id).state).toBe('blocked');expect(s.get(id).plan_hash).toBe(hash);expect(f.sends).toEqual([]);
+  s.enqueue('p','issue',s.get(id).spec);expect(s.get(id).state).toBe('awaiting_plan');
+  await w.tick(config);
+  expect(reads).toBe(1);expect(w.planning(id).state).toBe('awaiting_approval');expect(s.get(id).state).toBe('awaiting_approval');
+  expect(s.get(id).plan_hash).toBe(hash);expect(s.get(id).approved_hash).toBeNull();expect(f.starts.length).toBe(1);expect(f.sends).toEqual([]);
+ }finally{s.close();}
+});

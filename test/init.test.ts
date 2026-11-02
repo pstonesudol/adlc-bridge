@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,existsSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {verifyInitConfig,saveInitConfig,serviceDefinition,branchUpdateLimit,initWizard} from '../src/init';
@@ -66,7 +66,24 @@ test('wizard saves finite defaults and requires separate explicit confirmation f
    const f=fixture(home),path=join(home,'project.json'),answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','','','','no','no','no','yes','Test operator',answer,...(confirmation===null?[]:[confirmation]),'no','yes','no'],questions:string[]=[];
    const result=await initWizard(home,['--config',path],{interactive:()=>true,home:()=>home,registryPath:()=>join(home,'registry.sqlite'),log:()=>{},linearToken:()=> 'test-only-placeholder',verifyInitConfig:c=>verifyInitConfig(c,f.api,f.ao),prompts:()=>({question:async(label:string)=>{questions.push(label);if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})});
    expect(result).toMatchObject({configuration:path,gateInstalled:false,serviceEnabled:false});expect(answers).toEqual([]);expect(closed).toBe(true);
-   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [3]: ');expect(questions.some(q=>q.includes('production blocked until body attestation exists'))).toBe(true);expect(questions.some(q=>q.includes('Explicitly authorize unlimited branch updates')&&q.includes('[no]'))).toBe(confirmation!==null);
+   const saved=JSON.parse(readFileSync(path,'utf8'));expect(saved.pollingIntervalSeconds).toBe(60);expect(saved.automation.maxPlanning).toBe(1);expect(saved.branchUpdate).toEqual({enabled:true,authorizedBy:'Test operator',maxUpdates});expect(saved.approval).toEqual({mode:'manual'});expect(questions).toContain('Maximum automatic branch updates per PR (1-10, or "unlimited") [3]: ');expect(questions.some(q=>q.includes('production blocked until body attestation exists'))).toBe(true);expect(questions.some(q=>q.includes('Explicitly authorize unlimited branch updates')&&q.includes('[no]'))).toBe(confirmation!==null);
+  }finally{rmSync(home,{recursive:true,force:true});}
+ }
+});
+
+
+test('wizard rejects nondecimal or unsupported polling/capacity before writing configuration',async()=>{
+ const cases=[
+  ...['0x10','0b101','6e1','1.5','4','86401','9007199254740992'].map(value=>[value,'1','pollingIntervalSeconds']),
+  ...['0x10','0b11','3e0','1.5','0','33','9007199254740992'].map(value=>['60',value,'automation.maxPlanning'])
+ ];
+ for(const [interval,capacity,field] of cases){
+  const home=mkdtempSync(join(tmpdir(),'adlc-wizard-settings-'));let closed=false,verified=false;
+  try{
+   const path=join(home,'project.json'),registry=join(home,'registry.sqlite');
+   const answers=['Test','owner/repo','test',uuid(1),uuid(2),uuid(3),uuid(4),'CI','src/**','',interval,capacity];
+   await expect(initWizard(home,['--config',path],{interactive:()=>true,home:()=>home,registryPath:()=>registry,log:()=>{},linearToken:()=> 'test-only-placeholder',verifyInitConfig:async()=>{verified=true;},prompts:()=>({question:async(label:string)=>{if(!answers.length)throw Error('Unexpected wizard prompt: '+label);return answers.shift()!;},close:()=>{closed=true;}})})).rejects.toThrow(field);
+   expect(closed).toBe(true);expect(verified).toBe(false);expect(existsSync(path)).toBe(false);expect(existsSync(registry)).toBe(false);
   }finally{rmSync(home,{recursive:true,force:true});}
  }
 });

@@ -103,7 +103,7 @@ export class Workflow{
  }
  async reconcileBlockedPlanning(job:string){
   const dispatch=this.planning(job),r=new Planning(this.s).get(job);
-  if(dispatch.state==='planning_finished')return {state:'planning_finished'};
+  if(!['planning','dispatch_uncertain','needs_reconciliation'].includes(dispatch.state))return {state:dispatch.state};
   let session=dispatch.session_id;
   if(!session){
    const matches=await this.t.findPlans(r.project,r.branch);
@@ -119,7 +119,7 @@ export class Workflow{
   if(!ended)return {state:'needs_reconciliation',reason:'No authoritative end of blocked planning'};
   return this.s.db.transaction(()=>{
    const latest=this.planning(job);
-   if(this.s.get(job).state!=='blocked'||latest.client_id!==dispatch.client_id||latest.session_id!==dispatch.session_id)return {state:'needs_reconciliation'};
+   if(!['planning','dispatch_uncertain','needs_reconciliation'].includes(latest.state)||this.s.get(job).state!=='blocked'||latest.client_id!==dispatch.client_id||latest.session_id!==dispatch.session_id)return {state:'needs_reconciliation'};
    this.s.db.query("UPDATE planning_dispatch SET state='planning_finished',session_id=?,reason='Planning ended while job remained blocked; no plan captured or approval granted' WHERE job=?").run(session,job);
    this.s.event(job,'blocked_planning_finished',session);
    return {state:'planning_finished',session};
@@ -485,7 +485,7 @@ export class Workflow{
   new ApprovalPolicyStore(this.s).revokeChanged(c.linear.projectId,c.approval);
   this.s.db.query('INSERT INTO project_execution_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET runtime=excluded.runtime').run(c.linear.projectId,'supervised-host');
   // Recover existing planning/delivery first. One uncertain session consumes a slot.
-  const planning=this.s.db.query("SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND (j.state IN ('awaiting_plan','awaiting_approval') OR (j.state='blocked' AND d.state!='planning_finished'))").all(c.linear.projectId) as any[];
+  const planning=this.s.db.query("SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND (j.state IN ('awaiting_plan','awaiting_approval') OR (j.state='blocked' AND d.state IN ('planning','dispatch_uncertain','needs_reconciliation')))").all(c.linear.projectId) as any[];
   for(const d of planning)try{results.push({job:d.job,...await this.reconcilePlanning(d.job,c)});}catch(e){results.push({job:d.job,error:e instanceof Error?e.message:'Planning reconcile failed'});}
   if(c.approval?.mode==='ready-queue'){
    const waiting=this.s.db.query("SELECT id FROM jobs WHERE project=? AND state='awaiting_approval'").all(c.linear.projectId) as any[];
