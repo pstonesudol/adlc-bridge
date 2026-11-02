@@ -97,6 +97,13 @@ test('custom finding is revalidated at dispatch; edits cannot spend an attempt o
   await expect(f.loop.tick(f.id)).rejects.toThrow('Custom-check evidence');expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
+test('custom finding is rejected at dispatch when the description changes after the poll',async()=>{
+ const f=customLoopFixture();try{
+  let reads=0;f.io.readiness=async()=>{if(++reads===2)f.e.descriptionHash='edited-before-dispatch';return f.e;};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Custom-check evidence');expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.s.db.query('SELECT * FROM custom_description_obligations').all()).toEqual([]);
+ }finally{f.s.close();}
+});
 test('failed continuation outcome blocks review dispatch until workflow republishes a recovered handoff',async()=>{
  const f=templateFixture();try{
   f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT)');
