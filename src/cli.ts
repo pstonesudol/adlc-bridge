@@ -36,6 +36,7 @@ import {readinessFor,recordResolution,assertApprovalReadiness} from './readiness
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
+import {withTurnSubmission} from './turn-submission';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {migrateController} from './controller-migration';
@@ -275,13 +276,15 @@ Registered approved review targets can request bounded in-scope fixes from their
       return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification,config.verificationContext));
     }
     if(command==='tick-review'){
-      const config=projectConfiguration(req(a[1],'Config'));validate(config);
-      const job=req(a[0],'Job'),target=reviewLoop.get(job);
-      if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
-      new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
-      reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      reviewLoop.setVerification(job,config.verification,config.verificationContext);
-      return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
+      return out(await withTurnSubmission(async()=>{
+       const config=projectConfiguration(req(a[1],'Config'));validate(config);
+       const job=req(a[0],'Job'),target=reviewLoop.get(job);
+       if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+       new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
+       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
+       reviewLoop.setVerification(job,config.verification,config.verificationContext);
+       return reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]});
+      }));
     }
     if(command==='extend-budget'){
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
