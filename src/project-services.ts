@@ -32,12 +32,24 @@ export class ProjectServices{
  constructor(public s:Store,initialize=true){if(initialize)s.db.exec(`CREATE TABLE IF NOT EXISTS project_services(project TEXT PRIMARY KEY,name TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,linear_project TEXT NOT NULL UNIQUE,config TEXT NOT NULL UNIQUE,label TEXT NOT NULL UNIQUE);
  CREATE TABLE IF NOT EXISTS project_service_controllers(config TEXT PRIMARY KEY,controller TEXT NOT NULL);`);}
  assertInstalled(def:any,label:string,config:string,persist=true){
+  return this.verifyInstalled(def,label,config,persist,false);
+ }
+ // Explicit setup input, not inferred from a mutable installed plist.
+ registerController(config:string,controller:string){
+  const path=realpathSync(config);
+  if(!this.list().some(p=>p.config===path)||!isAbsolute(controller)||basename(controller)!=='cli.ts')throw Error('Registered project and explicit controller path required');
+  const canonical=realpathSync(controller),old=this.s.db.query('SELECT controller FROM project_service_controllers WHERE config=?').get(path) as any;
+  if(old&&old.controller!==canonical)throw Error('Controller identity changed; explicit migration required');
+  this.s.db.query('INSERT OR IGNORE INTO project_service_controllers VALUES (?,?)').run(path,canonical);
+ }
+ private verifyInstalled(def:any,label:string,config:string,persist:boolean,discovery:boolean){
   const path=realpathSync(config);
   const entry=this.list().find(p=>p.config===path);
   if((persist&&!entry)||(entry&&entry.label!==label))throw Error('Registered project service required; existing service preserved');
   const hasControllers=this.s.db.query("SELECT name FROM sqlite_master WHERE name='project_service_controllers'").get();
   const registered=hasControllers?this.s.db.query('SELECT controller FROM project_service_controllers WHERE config=?').get(path) as any:undefined;
-  // First discovery trusts the existing user-installed plist, not this development checkout.
+  if(!registered&&!discovery)throw Error('Registered controller identity missing; explicit migration required');
+  // Only legacy discovery may adopt an existing user-installed plist identity.
   const controller=registered?.controller??def.ProgramArguments?.[1];
   if(typeof controller!=='string'||!isAbsolute(controller))throw Error('Installed controller identity required; existing service preserved');
   assertDefinition(def,label,path,controller);
@@ -62,8 +74,8 @@ export class ProjectServices{
   if(!existsSync(path))return;
   const b=read(path),config=b.ProgramArguments?.[3];
   if(typeof config!=='string')throw Error('Existing legacy service configuration is unknown');
-  if(!persist){const entry=this.register(config,legacyLabel,false);this.assertInstalled(b,legacyLabel,config,false);return entry;}
-  return this.s.db.transaction(()=>{const entry=this.register(config,legacyLabel);this.assertInstalled(b,legacyLabel,config);return entry;})();
+  if(!persist){const entry=this.register(config,legacyLabel,false);this.verifyInstalled(b,legacyLabel,config,false,true);return entry;}
+  return this.s.db.transaction(()=>{const entry=this.register(config,legacyLabel);this.verifyInstalled(b,legacyLabel,config,true,true);return entry;})();
  }
  select(project?:string,extra:ProjectService[]=[]){
   const stored=this.list(),entries=[...stored,...extra.filter(p=>!stored.some(old=>old.project===p.project))];

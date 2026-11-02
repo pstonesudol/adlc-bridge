@@ -17,7 +17,7 @@ import {assertDeliveryTarget} from './delivery-identity';
 import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
 import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
-import {validateVerification,type Verification} from './verification';
+import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -67,22 +67,30 @@ export class ReviewLoop{
    CREATE TABLE IF NOT EXISTS metadata_waits(job TEXT NOT NULL,head TEXT NOT NULL,body TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(job,head,body));
    CREATE TABLE IF NOT EXISTS description_delivery_gates(job TEXT PRIMARY KEY,head TEXT NOT NULL,body TEXT NOT NULL,started INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));
-  CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);`);}
+  CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);}
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
   this.s.db.query('INSERT INTO metadata_check_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET checks=excluded.checks').run(project,JSON.stringify([...new Set(names)]));
  }
  metadataChecks(job:string):string[]{const row=this.s.db.query('SELECT checks FROM metadata_check_policy WHERE project=?').get(this.s.get(job).project) as any;if(!row)throw Error('Explicit project metadata-check policy required before review');return metadataCheckNames(JSON.parse(row.checks));}
- register(job:string,repo:string,pr:number,required:string[],paths:string[],remediate=false,verification?:Verification){
+ register(job:string,repo:string,pr:number,required:string[],paths:string[],remediate=false,verification?:Verification,context?:VerificationContext){
   if(verification)validateVerification(verification);
+  if(context)validateVerificationContext(context);
   const l=new Lifecycle(this.s);l.current(job);if(!l.run(job))throw Error('Existing approved run required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1||!required.length||!paths.length||paths.some(p=>p.startsWith('/')||p.split('/').includes('..')))throw Error('Invalid review target');
-  const old=this.get(job);if(old){if(old.repo!==repo||old.pr!==pr||old.required_checks!==JSON.stringify(required)||old.allowed_paths!==JSON.stringify(paths)||old.remediate!==Number(remediate))throw Error('Target changed; explicit reconciliation required');this.setVerification(job,verification);return old;}
+  const old=this.get(job);if(old){if(old.repo!==repo||old.pr!==pr||old.required_checks!==JSON.stringify(required)||old.allowed_paths!==JSON.stringify(paths)||old.remediate!==Number(remediate))throw Error('Target changed; explicit reconciliation required');this.setVerification(job,verification,context);return old;}
   this.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)').run(job,repo,pr,JSON.stringify(required),JSON.stringify(paths),Number(remediate),Date.now());
-  this.setVerification(job,verification);
+  this.setVerification(job,verification,context);
   this.s.event(job,'review_target_registered',JSON.stringify({repo,pr,remediate}));return this.get(job);
  }
- setVerification(job:string,v?:Verification){if(v){validateVerification(v);this.s.db.query('INSERT INTO review_verification VALUES (?,?) ON CONFLICT(job) DO UPDATE SET configuration=excluded.configuration').run(job,JSON.stringify(v));}else this.s.db.query('DELETE FROM review_verification WHERE job=?').run(job);}
+ setVerification(job:string,v?:Verification,context?:VerificationContext){
+  if(v)validateVerification(v);if(context)validateVerificationContext(context);
+  this.s.db.transaction(()=>{
+   if(v)this.s.db.query('INSERT INTO review_verification VALUES (?,?) ON CONFLICT(job) DO UPDATE SET configuration=excluded.configuration').run(job,JSON.stringify(v));else this.s.db.query('DELETE FROM review_verification WHERE job=?').run(job);
+   if(v&&context)this.s.db.query('INSERT INTO review_verification_runtime VALUES (?,?) ON CONFLICT(job) DO UPDATE SET context=excluded.context').run(job,JSON.stringify(context));else this.s.db.query('DELETE FROM review_verification_runtime WHERE job=?').run(job);
+  })();
+ }
   get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
    private completed(job:string){const t=this.get(job);return t?.state==='completed'?{state:'completed',send:false,head:t.head,reason:t.reason}:undefined;}
    private uncertainReview(job:string,head:string){

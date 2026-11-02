@@ -11,7 +11,7 @@ import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
 import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
-import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime} from './setup';
+import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime,withVerificationContext} from './setup';
 import {verificationInstructions,runVerification} from './verification';
 import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
@@ -43,6 +43,11 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite');
+function projectConfiguration(path:string){
+ const i=a.indexOf('--runtime'),runtime=i>=0?req(a[i+1],'Runtime config'):process.env.ADLC_VERIFICATION_RUNTIME_CONFIG;
+ if(runtime?.startsWith('--'))throw Error('--runtime requires a runtime configuration path');
+ return withVerificationContext(JSON.parse(readFileSync(path,'utf8')),path,runtime);
+}
 export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  return async()=>runPollTick(async()=>{
@@ -58,14 +63,14 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
     const url=new URL(stage.pr.url),match=url.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
     if(url.hostname!=='github.com'||!match||match[1]!==c.githubRepo)throw Error('PR handoff is outside configured GitHub repository');
     const delivery=workflow.implementation(stage.job);
-    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true,c.verification);
+    reviewLoop.register(stage.job,c.githubRepo,Number(match[2]),c.requiredChecks,JSON.parse(delivery.paths),true,c.verification,c.verificationContext);
    }
   }
   const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
   const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
-   reviewLoop.setVerification(target.job,c.verification);
+   reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
    if(target.state==='completed')continue;
    try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]})});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
   }
@@ -84,17 +89,17 @@ async function main(){
   if(command==='setup'){
     const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
     if(a.includes('--export'))return out(sanitizedSetup(c,r));
-    if(a.includes('--write-service'))return out(writeSetupService(c,r));
-    const preview=setupPreview(c,r);out(preview);if(!preview.passed)process.exitCode=1;return;
+    if(a.includes('--write-service'))return out(writeSetupService(c,r,realpathSync(a[1])));
+    const preview=setupPreview(c,r,undefined,realpathSync(a[1]));out(preview);if(!preview.passed)process.exitCode=1;return;
   }
   if(command==='verification'){
-    const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(c);
-    if(!a.includes('--run'))return console.log(verificationInstructions(c.verification));
+    const c=projectConfiguration(req(a[0],'Config'));validate(c);
+    if(!a.includes('--run'))return console.log(verificationInstructions(c.verification,c.verificationContext));
     if(!c.verification)throw Error('Project verification is not configured');
     let docker;
     if(c.verification.mode==='container'){
-      const i=a.indexOf('--runtime');if(i<0)throw Error('Container verification requires --runtime RUNTIME_JSON');
-      const runtime=JSON.parse(readFileSync(req(a[i+1],'Runtime config'),'utf8'));validateRuntime(runtime);
+      if(!c.verificationContext)throw Error('Container verification requires --runtime RUNTIME_JSON');
+      const runtime=JSON.parse(readFileSync(c.verificationContext.runtimeConfig,'utf8'));validateRuntime(runtime);
       if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
       docker=runtime.tools.docker;
     }
@@ -117,6 +122,8 @@ async function main(){
     [--export]                          print sanitized, disabled setup template
   verification CONFIG [WORKTREE]        instructions; --run requires worktree
     --runtime RUNTIME_JSON              required for container execution; pins Docker
+  poll/serve/tick-review/register-review also accept --runtime RUNTIME_JSON
+                                       trusted reference supplied to verification workers
   start [PROJECT] | stop [PROJECT]      control one project; ID required if multiple
   service-status [PROJECT]             inspect one or all project services
   feature-start CONFIG REQUIREMENTS_FILE [--title TITLE] [--no-source]
@@ -201,7 +208,7 @@ Registered approved review targets can request bounded in-scope fixes from their
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
   if(!['approvals','review-status','recover-handoff','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
-  const c=['poll','serve','reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[['poll','serve','reconcile-preview'].includes(command)?0:1],'Config'),'utf8')):null;if(c)validate(c);
+  const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
    if(command==='recover-handoff'){
     const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use recover-handoff JOB CONFIG [--confirm HASH]');
@@ -251,19 +258,19 @@ Registered approved review targets can request bounded in-scope fixes from their
       return out(result);
     }
     if(command==='register-review'){
-      const job=req(a[0],'Job'),config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));
+      const job=req(a[0],'Job'),config=projectConfiguration(req(a[3],'Config'));
       const run=lifecycle.run(job);if(!run)throw Error('Existing approved run required');
       await disableNativeFeedback(run.session_id);
       if(!Array.isArray(config.reviewAllowedPaths)||config.reviewAllowedPaths.length===0)throw Error('Explicit reviewAllowedPaths required');
-      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification));
+      return out(reviewLoop.register(job,req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.reviewAllowedPaths,true,config.verification,config.verificationContext));
     }
     if(command==='tick-review'){
-      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+      const config=projectConfiguration(req(a[1],'Config'));validate(config);
       const job=req(a[0],'Job'),target=reviewLoop.get(job);
       if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
       new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
       reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
-      reviewLoop.setVerification(job,config.verification);
+      reviewLoop.setVerification(job,config.verification,config.verificationContext);
       return out(await reviewLoop.tick(job,config.branchUpdate,remediationPolicy(config.remediation),{project:config.linear.projectId,checks:config.prMetadataChecks??[]}));
     }
     if(command==='extend-budget'){

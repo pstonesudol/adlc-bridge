@@ -28,7 +28,10 @@ test('host and container argv selection, failures, cleanup and symlink confineme
  const root=mkdtempSync(join(tmpdir(),'adlc-verification-test-'));let calls:any[]=[];
  try{
   initRepository(root);mkdirSync(join(root,'frontend'));writeFileSync(join(root,'frontend','index.js'),'');writeFileSync(join(root,'frontend','.env'),'secret');
-  const spawn=((argv:any,options:any)=>{calls.push({argv,options});return {exited:Promise.resolve(0)};}) as any;
+  const spawn=((argv:any,options:any)=>{
+   if(argv[0]===dockerExecution.docker.path){expect(existsSync(join(options.cwd,'index.js'))).toBe(true);expect(existsSync(join(options.cwd,'.env'))).toBe(false);}
+   calls.push({argv,options});return {exited:Promise.resolve(0)};
+  }) as any;
   expect((await runVerification(root,host,spawn)).passed).toBe(true);expect(calls[0].argv).toEqual(['bun','test']);
   expect((await runVerification(root,container,spawn,dockerExecution)).passed).toBe(true);
   const cmd=calls[1].argv;expect(cmd[0]).toBe(dockerExecution.docker.path);expect(cmd).toContain('--pull=never');expect(cmd).toContain('--read-only');expect(cmd).toContain(container.container!.image);
@@ -116,5 +119,17 @@ test('repository identity supports pre-2.31 relative common-dir output and absol
   expect(commands.every(args=>args.length===5&&args[3]==='rev-parse'&&args[4]==='--git-common-dir')).toBe(true);
   const failed=(()=>({exitCode:1,stdout:Buffer.from('')})) as any;
   expect(()=>assertVerificationRepository(repo,repo,failed)).toThrow('Valid project repository/worktree required');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('setup preview rejects missing and wrong path types instead of staging unusable services',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-setup-path-types-'));
+ try{
+  const regular=join(root,'file'),directory=join(root,'dir'),missing=join(root,'missing');writeFileSync(regular,'');mkdirSync(directory);
+  for(const [name,invalid] of [['repo',regular],['workingDirectory',regular],['controller',directory],['repo',missing],['workingDirectory',missing],['controller',missing]]){
+   const c=project(root,host),r=runtime(root);writeFileSync(r.controller,'');
+   if(name==='repo')c.repo=invalid;else (r as any)[name]=invalid;
+   writeFileSync(r.projectConfig,JSON.stringify(c));const preview=setupPreview(c,r,()=>true);
+   expect(preview.checks.find(check=>check.name===name)?.passed).toBe(false);expect(preview.passed).toBe(false);expect(existsSync(r.service.path)).toBe(false);
+  }
  }finally{rmSync(root,{recursive:true,force:true});}
 });

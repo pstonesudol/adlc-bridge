@@ -75,6 +75,15 @@ test('scoped remediation combines persisted project verification with current de
   expect(prompt).toContain('execution mode: host');expect(prompt).toContain('["bun","test"]');expect(prompt).toContain('Budget:');expect(f.s.get(f.id).attempts).toBe(1);expect(f.sends()).toBe(1);
  }finally{f.s.close();}
 });
+test('container remediation receives persisted host runtime paths and clears them when withdrawn',async()=>{
+ const f=templateFixture();try{
+  const v:any={version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}},context={projectConfig:'/trusted/project.json',runtimeConfig:'/trusted/runtime.json',bun:'/trusted/bun',cli:'/trusted/installed/src/cli.ts'};
+  f.loop.setVerification(f.id,v,context);new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','commit','push-feature'],'human');f.e.failedChecks=[];f.e.findings=[{path:'src/fix.ts',body:'Fix scoped code',sha:f.head}];
+  let prompt='';const original=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return original(args);};
+  await f.loop.tick(f.id);expect(prompt).toContain(JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,'/worktree','--run','--runtime',context.runtimeConfig]));expect(prompt).not.toContain('STOP before container verification');
+  f.loop.setVerification(f.id,v);expect(f.s.db.query('SELECT * FROM review_verification_runtime WHERE job=?').all(f.id)).toEqual([]);
+ }finally{f.s.close();}
+});
 function failureEvidence(e:any){return e.findings.map((f:any)=>({name:f.check,checkId:f.checkId,sha:f.sha,status:'completed',conclusion:'failure',descriptionHash:f.descriptionHash}));}
 test('initial clear metadata checks cannot bypass body evidence without a preexisting wait',async()=>{
  const f=templateFixture();try{

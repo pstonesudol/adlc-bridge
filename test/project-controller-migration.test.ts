@@ -15,7 +15,7 @@ const oldCLI=join(state,'versions/old/src/cli.ts'),newCLI=join(state,'versions/n
 for(const path of [oldCLI,newCLI,rogue]){mkdirSync(dirname(path),{recursive:true});writeFileSync(path,'');}
 const uuid='00000000-0000-0000-0000-000000000001';writeFileSync(config,JSON.stringify({version:1,name:'Fixture',repo,requiredChecks:['CI'],automation:{orchestratorProject:'fixture'},linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid}}));
 const def=cli=>({Label:legacyLabel,ProgramArguments:[process.execPath,cli,'poll',config]});
-let s=new Store(db),registry=new ProjectServices(s);registry.register(config,legacyLabel);registry.assertInstalled(def(oldCLI),legacyLabel,config);s.close();
+let s=new Store(db),registry=new ProjectServices(s);registry.register(config,legacyLabel);registry.registerController(config,oldCLI);registry.assertInstalled(def(oldCLI),legacyLabel,config);s.close();
 writeFileSync(join(state,'installation.json'),JSON.stringify({source:repo,cli:newCLI}),{mode:0o600});rmSync(oldCLI);
 const before=readFileSync(db);s=Store.readonly(db);registry=new ProjectServices(s,false);registry.assertInstalled(def(newCLI),legacyLabel,config,false);const readBinding=s.db.query('SELECT controller FROM project_service_controllers').get().controller;s.close();const unchanged=before.equals(readFileSync(db));
 s=new Store(db);registry=new ProjectServices(s);registry.assertInstalled(def(newCLI),legacyLabel,config);const writeBinding=s.db.query('SELECT controller FROM project_service_controllers').get().controller;let rejected=false;try{registry.assertInstalled(def(rogue),legacyLabel,config);}catch{rejected=true;}const finalBinding=s.db.query('SELECT controller FROM project_service_controllers').get().controller;s.close();

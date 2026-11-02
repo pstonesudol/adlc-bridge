@@ -35,7 +35,11 @@ to whichever development CLI is running. Later controller-identity changes are
 rejected unless authorized by the validated managed installation record. Read-only
 discovery/status never creates or updates controller bindings; a subsequent
 explicit write path can retain an operator-installed snapshot rotation. Discovery
-never replaces a plist or starts a service. Existing registry rows remain compatible.
+never replaces a plist or starts a service. Previously bound registry rows remain compatible.
+Only first legacy discovery may infer a missing controller identity from its
+existing plist. Ordinary service checks reject an unbound registration and require
+explicit operator migration; new setup records its known controller input rather
+than learning it from a subsequently mutable plist.
 
 Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
 container verification is selected. Versions are exact three-component versions
@@ -53,6 +57,17 @@ is decoded without execution. Without installation proof, unknown unmarked
 write; reconcile ownership in `postCreate` instead of deleting a user hook or
 silently adding a duplicate gate. With a validated installation identity, hooks
 outside its known paths remain untouched.
+For container verification, supply the trusted machine JSON to the host command:
+`adlc poll PROJECT_JSON --runtime RUNTIME_JSON` (also supported by `serve`,
+`tick-review` and `register-review`). The host validates that the runtime file
+references the same project config and supplies only the required path references
+to implementation/remediation instructions, including an explicit `--runtime`
+runner argv and the reserved worktree. Serialized context in project JSON and
+ticket text is not used as this source. Without host runtime context, container
+instructions explicitly stop and request it instead of guessing or bypassing the
+runner. Generated staged services retain their runtime source via
+`ADLC_VERIFICATION_RUNTIME_CONFIG`; managed snapshot migration preserves that
+reference. Credentials are never copied into this context or service environment.
 (optional prerelease/build suffix). Configure routing paths in the existing project
 JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,

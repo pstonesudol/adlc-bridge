@@ -66,7 +66,7 @@ export async function installBridge(apply=false,root=resolve(import.meta.dir,'..
  try{
    for(const {p,def,original} of definitions){if(!def)continue;if(loaded.has(p.project)){active.push(p.project);await io.serviceControl('stop',p.project);}writeFileSync(join(backup,p.label+'.plist'),original!,{mode:0o600});}
   atomic(recordPath,JSON.stringify({source:root,...built,launcher,installedAt:new Date().toISOString()},null,2)+'\n');
-  for(const {p,path,def} of definitions){if(def){const xml=serviceDefinition(p.config,process.execPath,built.cli,io.home(),p.label);atomic(path,xml);}await io.installWorkflowHook(p.config);}
+  for(const {p,path,def} of definitions){if(def){const xml=serviceDefinition(p.config,process.execPath,built.cli,io.home(),p.label,def.EnvironmentVariables?.ADLC_VERIFICATION_RUNTIME_CONFIG);atomic(path,xml);}await io.installWorkflowHook(p.config);}
   if(runtime){
    const nextLauncher=join(dirname(built.cli),'serve-orchestrator.py');if(!existsSync(nextLauncher))throw Error('Installed runtime launcher is missing');
    if(!readFileSync(runtime.pinPath).equals(runtime.pinBytes)||!readFileSync(runtime.plist).equals(runtime.plistBytes))throw Error('Runtime registration changed during installation; preserved');

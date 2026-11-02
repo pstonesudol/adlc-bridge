@@ -1,7 +1,7 @@
 import {createInterface} from 'node:readline/promises';
 import {stdin,stdout} from 'node:process';
 import {existsSync,realpathSync,mkdirSync,writeFileSync} from 'node:fs';
-import {resolve,join,dirname,basename} from 'node:path';
+import {resolve,join,dirname,basename,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {linearAPI,type LinearAPI} from './linear-api';
 import {linearToken} from './credential';
@@ -38,7 +38,8 @@ export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO)
 export function saveInitConfig(path:string,c:any){
  mkdirSync(dirname(path),{recursive:true});writeFileSync(path,JSON.stringify(c,null,2)+'\n',{flag:'wx',mode:0o600});
 }
-export function serviceDefinition(config:string,bun=process.execPath,source=resolve(import.meta.dir,'cli.ts'),home=homedir(),label=legacyLabel){
+export function serviceDefinition(config:string,bun=process.execPath,source=resolve(import.meta.dir,'cli.ts'),home=homedir(),label=legacyLabel,runtimeConfig?:string){
+ if(runtimeConfig!==undefined&&(typeof runtimeConfig!=='string'||!isAbsolute(runtimeConfig)||/[\x00-\x1f]/.test(runtimeConfig)))throw Error('Absolute verification runtime config path required');
  const xml=(v:string)=>v.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
  const state=join(home,'Library','Application Support','ADLC Bridge');
  const logName=label===legacyLabel?'intake':label;
@@ -46,7 +47,7 @@ export function serviceDefinition(config:string,bun=process.execPath,source=reso
 <key>Label</key><string>${xml(label)}</string>
 <key>ProgramArguments</key><array>${[bun,source,'poll',config].map(x=>`<string>${xml(x)}</string>`).join('')}</array>
 <key>WorkingDirectory</key><string>${xml(dirname(source))}</string>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(dirname(bun))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+<key>EnvironmentVariables</key><dict>${runtimeConfig?`<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key><string>${xml(runtimeConfig)}</string>`:''}<key>PATH</key><string>${xml(dirname(bun))}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
 <key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>
 <key>StandardOutPath</key><string>${xml(join(state,`${logName}.log`))}</string>
 <key>StandardErrorPath</key><string>${xml(join(state,`${logName}-error.log`))}</string>
@@ -107,6 +108,7 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
   if(!await yes('Install this project’s 60-second background service (loads at next login)'))return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false};
    mkdirSync(dirname(plist),{recursive:true});mkdirSync(join(home,'Library/Application Support/ADLC Bridge'),{recursive:true,mode:0o700});
    writeFileSync(plist,serviceDefinition(path,process.execPath,resolve(import.meta.dir,'cli.ts'),home,entry.label),{flag:'wx',mode:0o600});
+   {const store=new Store(io.registryPath());try{new ProjectServices(store).registerController(path,resolve(import.meta.dir,'cli.ts'));}finally{store.close();}}
   if(await yes('Start this project now (can pick up eligible tickets and perform authorized work)'))return {configuration:path,project:entry.project,gateInstalled:true,service:await serviceControl('start',entry.project)};
   return {configuration:path,project:entry.project,gateInstalled:true,serviceEnabled:false,note:'Service installed but not loaded; it can load at next login.'};
  }finally{rl.close();}

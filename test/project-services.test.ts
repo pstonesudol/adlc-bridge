@@ -18,3 +18,14 @@ test('installed stable controller discovery is independent of running developmen
   const fresh=new ProjectServices(f.s);expect(()=>fresh.assertInstalled({...def,ProgramArguments:['/bun',other,'poll',config]},entry.label,config)).toThrow('preserved');expect(fresh.list()).toEqual([entry]);
  }finally{f.close();}
 });
+test('ordinary service checks cannot adopt a plist when an existing registration has no controller identity',()=>{
+ const f=fixture();try{
+  const config=f.config('unbound','00000000-0000-0000-0000-000000000004'),entry=f.registry.register(config);
+  const controller=resolve(import.meta.dir,'../src/cli.ts'),changed=join(f.dir,'changed','cli.ts');mkdirSync(join(f.dir,'changed'));writeFileSync(changed,'');
+  const def=(path:string)=>({Label:entry.label,ProgramArguments:['/bun',path,'poll',config]});
+  for(const persist of [true,false])for(const path of [controller,changed])expect(()=>f.registry.assertInstalled(def(path),entry.label,config,persist)).toThrow('controller identity missing');
+  expect(f.s.db.query('SELECT * FROM project_service_controllers').all()).toEqual([]);
+  f.registry.registerController(config,controller);expect(()=>f.registry.assertInstalled(def(controller),entry.label,config)).not.toThrow();
+  expect(()=>f.registry.assertInstalled(def(changed),entry.label,config)).toThrow('preserved');
+ }finally{f.close();}
+});

@@ -63,6 +63,13 @@ test('install uses read-only project discovery for preview and writable discover
   await installBridge(false,source,join(root,'adlc'),io);expect(existsSync(join(state,'installation.json'))).toBe(false);await installBridge(true,source,join(root,'adlc'),io);expect(modes).toEqual([true,false]);expect(existsSync(join(state,'installation.json'))).toBe(true);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('snapshot service migration retains the host verification runtime reference (fixture-only installation)',async()=>{
+ const f=controlFixture();try{
+  const runtime=join(f.root,"runtime owner's & config.json");f.io.readDefinition=()=>({EnvironmentVariables:{ADLC_VERIFICATION_RUNTIME_CONFIG:runtime}});f.unload();
+  await installBridge(true,f.source,f.launcher,f.io);
+  const xml=readFileSync(f.plist,'utf8');expect(xml).toContain('<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key>');expect(xml).toContain('runtime owner&apos;s &amp; config.json');
+ }finally{f.close();}
+});
 test('incomplete installation rollback reports every failure and continues restoration without restarting intake',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-rollback-errors-'));try{
   const source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json');

@@ -4,6 +4,11 @@ import {tmpdir} from 'node:os';
 import {copyFrontend} from './container-check';
 
 export type Verification={version:1;mode:'host'|'container';steps:{cwd:string;argv:string[]}[];container?:{image:string;inputs:string[]}};
+export type VerificationContext={projectConfig:string;runtimeConfig:string;bun:string;cli:string};
+export function validateVerificationContext(c:any):asserts c is VerificationContext{
+ keys(c,['projectConfig','runtimeConfig','bun','cli']);
+ for(const name of ['projectConfig','runtimeConfig','bun','cli'])if(typeof c[name]!=='string'||!isAbsolute(c[name])||/[\x00-\x1f]/.test(c[name]))throw Error('Validated absolute verification context paths required');
+}
 const safePath=(p:unknown):p is string=>typeof p==='string'&&p.length>0&&/^[\w. /-]+$/.test(p)&&!p.startsWith('/')&&!p.split('/').includes('..');
 function keys(v:any,allowed:string[]){if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).some(k=>!allowed.includes(k)))throw Error('Unknown verification field');}
 export function validateVerification(v:any):asserts v is Verification{
@@ -16,10 +21,12 @@ export function validateVerification(v:any):asserts v is Verification{
   if(typeof v.container.image!=='string'||!/^([\w./:-]+@)?sha256:[a-f0-9]{64}$/.test(v.container.image)||!Array.isArray(v.container.inputs)||!v.container.inputs.length||v.container.inputs.some((p:any)=>!safePath(p)||p==='.'||p.split('/').some((x:string)=>x.startsWith('.')||['node_modules','AGENTS.md'].includes(x))))throw Error('Container requires immutable image and explicit non-private input paths');
  }
 }
-export function verificationInstructions(v?:Verification){
+export function verificationInstructions(v?:Verification,context?:VerificationContext,worktree='CURRENT_ISOLATED_WORKTREE'){
  if(!v)return 'Verification is not configured in this legacy project. Use only the human-approved plan verification; report this configuration gap. Do not assume Docker or invent results.';
  validateVerification(v);
- return `Project verification v1, execution mode: ${v.mode}. ${v.mode==='container'?`Use existing image ${v.container!.image}; no pulls, host credentials or Docker socket. Inputs: ${JSON.stringify(v.container!.inputs)}.`:'Commands run on the supervised host, not in a container.'}\n${v.steps.map(s=>`Working directory relative to the current isolated worktree: ${JSON.stringify(s.cwd)}; argv: ${JSON.stringify(s.argv)}`).join('\n')}\nNever put credentials in commands or evidence. Report exact commands, exit codes and limitations; mocked checks are not live verification.`;
+ if(context)validateVerificationContext(context);
+ const runner=v.mode==='container'?(context?`Host-validated verification runner argv (use the current reserved worktree): ${JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,worktree,'--run','--runtime',context.runtimeConfig])}`:'STOP before container verification: the host has not supplied a validated runtime configuration path. Request it; never guess a --runtime path or bypass the configured runner.'):'Host verification uses the commands below.';
+ return `Project verification v1, execution mode: ${v.mode}. ${v.mode==='container'?`Use existing image ${v.container!.image}; no pulls, host credentials or Docker socket. Inputs: ${JSON.stringify(v.container!.inputs)}.`:'Commands run on the supervised host, not in a container.'}\n${runner}\n${v.steps.map(s=>`Working directory relative to the current isolated worktree: ${JSON.stringify(s.cwd)}; argv: ${JSON.stringify(s.argv)}`).join('\n')}\nNever put credentials in commands or evidence. Report exact commands, exit codes and limitations; mocked checks are not live verification.`;
 }
 function within(root:string,path:string){const p=realpathSync(resolve(root,path));if(relative(root,p).startsWith('..')||relative(root,p).startsWith('/'))throw Error('Verification path escapes worktree');return p;}
 type DockerPin={path:string;version:string};

@@ -64,6 +64,15 @@ test('implementation prompt selects project verification without an unconditiona
   expect(f.sends[0].prompt).toContain('execution mode: host');expect(f.sends[0].prompt).toContain('["bun","test"]');expect(f.sends[0].prompt).not.toContain('Use the configured Docker');
  }finally{s.close();}
 });
+test('container implementation instructions include the host runtime reference and reserved worktree',async()=>{
+ const {s,f,w,id,hash}=await planned();
+ try{
+  const context={projectConfig:'/trusted/project.json',runtimeConfig:'/trusted/runtime.json',bun:'/trusted/bun',cli:'/trusted/installed/src/cli.ts'};
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);
+  await w.executeApproved(id,{...config,verification:{version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}},verificationContext:context});
+  expect(f.sends[0].prompt).toContain(JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,'/worktrees/session-1','--run','--runtime',context.runtimeConfig]));
+ }finally{s.close();}
+});
 test('eligible ticket plans automatically, captures actual response, and stops without implementation',async()=>{
  const {s,f,w,id}=await planned();expect(f.starts.length).toBe(1);expect(f.starts[0].name).toContain('DEMO-1');
  expect(f.starts[0].prompt).toContain('Return text only');expect(s.get(id).state).toBe('awaiting_approval');
