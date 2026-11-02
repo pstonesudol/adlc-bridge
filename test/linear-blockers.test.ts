@@ -78,6 +78,9 @@ test('blocker comment and label are idempotent across polls and restarts',async(
 test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
  const f=fixture();try{
   f.running();new ConflictRecovery(f.s).install();
+  f.s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,state TEXT,required_checks TEXT)");
+  f.s.db.query('INSERT INTO review_targets VALUES (?,?,?,?)').run(f.id,'new-sha','waiting_for_ci','["latest-SHA CI","CodeRabbit"]');
+  const review=f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id);
   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
   expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('app.txt');
@@ -85,6 +88,7 @@ test('conflict recovery blockers and completion reuse dedupe without granting re
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
   expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.comments[1].body).toContain('new-sha');expect(f.comments[1].body).toContain('not readiness');
   expect(f.s.get(f.id).state).toBe('approved');
+  expect(f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id)).toEqual(review);
  }finally{f.s.close();}
 });
 test('label verification failure after a successful write is retractable',async()=>{

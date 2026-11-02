@@ -10,9 +10,9 @@ export function recoveryRows(s:Store):any[]{
 // These reservations fence cooperating bridge paths, not arbitrary native AO or
 // human writers. Never expire a reservation based on elapsed time or a dead PID.
 export function worktreeReservation(s:Store,job:string):any{
- const rows=recoveryRows(s);if(!rows.some(r=>r.state!=='completed'))return;
+ if(!s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get())return;
  const p=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
- return rows.find(r=>r.state!=='completed'&&(r.job===job||p?.worktree&&r.worktree===canonicalWorktree(p.worktree)));
+ return s.db.query("SELECT * FROM conflict_recoveries WHERE state!='completed' AND (job=? OR worktree=?) LIMIT 1").get(job,p?.worktree?canonicalWorktree(p.worktree):null);
 }
 export function assertWorktreeAvailable(s:Store,job:string){
  const r=worktreeReservation(s,job);

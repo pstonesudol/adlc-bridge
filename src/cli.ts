@@ -216,10 +216,7 @@ Registered approved review targets can request bounded in-scope fixes from their
    try{
     if(command==='authorize-base-merge'){
      const job=req(a[0],'Job'),hash=req(a[1],'Plan hash'),human=req(a[2],'Human');
-     const grant=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
-     if(!grant||grant.plan_hash!==hash)throw Error('Existing current scoped Git grant required');
-     lifecycle.grantGit(job,hash,[...JSON.parse(grant.operations),'merge-base-feature'],human);
-     return out({job,hash,grant:'merge-base-feature',policyStillRequired:true,mergePR:false});
+     return out(lifecycle.grantBaseMerge(job,hash,human));
     }
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
     if(command==='review-status')return out(reviewStatus());

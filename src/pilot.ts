@@ -51,14 +51,15 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
   if(parsed.some((f:any)=>f.source==='github-ci'&&(!metadataChecks.includes(f.check)||!metadataFailureBodyCovered(review,f)||!review.findings.some((x:any)=>x.source==='github-ci'&&x.check===f.check&&x.checkId===f.checkId&&x.sha===f.sha&&x.descriptionHash===f.descriptionHash))))throw Error('Template failure changed or body-bound evidence unavailable; recheck before delivery');
  };
  validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));
- const router=new TaskRouting(s),settings=router.settings(job);
+  return io.submit(async()=>{
+  assertWorktreeAvailable(s,job);
+  const router=new TaskRouting(s),settings=router.settings(job);
  if(settings&&router.get(job,'planning')){
   const phase=`remediation:${head}:${digest(findings).slice(0,16)}`;
   const route=await router.choose(job,phase,digest(JSON.stringify([j.spec,j.plan_hash,head,findings])),`Implement the requested review fixes within the approved task. This is remediation, not review-only feedback. Task: ${j.spec}\nFindings: ${findings}`,settings);
   await configureSessionRoute(r.session_id,route);router.verified(job,phase);l.current(job);
  }
- return io.submit(async()=>{
- // Routing/submission may await external work. Refresh evidence inside the
+  // Routing/submission may await external work. Refresh evidence inside the
  // submission fence, then reserve synchronously without an intervening await.
  const review=await observePilot(s,job,repo,pr,required,metadataChecks,io);
  validateReview(review);

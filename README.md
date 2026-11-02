@@ -1081,6 +1081,8 @@ completion notices report the new SHA but do not grant readiness or merge approv
 Installation/activation is a separate reviewed operator step. Human-only PR
 merging remains mandatory.
 
+### Existing worker handoff recovery
+
 Workers must retain the reserved planning branch. At completed delivery, the
 bridge verifies the registered worktree branch/HEAD and PR identity. Drift is
 reported as **Blocked — branch mismatch**, with a deduplicated Linear comment

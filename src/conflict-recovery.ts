@@ -17,7 +17,9 @@ import {type RemediationPolicy,DEFAULT_REMEDIATION_POLICY} from './remediation';
 
 export type RecoveryCommand=(args:string[],cwd:string)=>Promise<{code:number;out:string;err:string}>;
 export const recoveryCommand:RecoveryCommand=async(args,cwd)=>{
- const p=Bun.spawn(args,{cwd,stdout:'pipe',stderr:'pipe',timeout:600000});
+ const env={...process.env};
+ for(const key of Object.keys(env))if(key.startsWith('GIT_')&&!['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM'].includes(key))delete env[key];
+ const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
 };
 export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;evidence:typeof sessionEvidence;command:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
@@ -88,7 +90,7 @@ export class ConflictRecovery{
    try{
     for(const argv of c.conflictRecovery.verification){
      const result=await this.io.command(argv,r.worktree);d.verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});this.set(r,'manual_verifying',d);
-     if(result.code!==0)throw Error(`Verification failed: ${JSON.stringify(argv)} (${result.code})`);
+     if(result.code!==0)throw Error(`Verification failed (${result.code}); no publication`);
     }
     const x=await this.guard(r,c,proof.head);await this.noOperation(r.worktree);await this.assertResolved(r,d);
     if(!x.facts.clean||x.facts.head!==proof.head||await this.git(r.worktree,'write-tree')!==proof.tree)throw Error('Verification changed worktree or published evidence');
@@ -153,7 +155,13 @@ export class ConflictRecovery{
  async index(r:any){return (await this.git(r.worktree,'ls-files','--stage')).split('\n').filter(Boolean);}
  async assertResolved(r:any,d:any){
   if(await this.git(r.worktree,'diff','--name-only','--diff-filter=U'))throw Error('Unresolved index entries remain');
-  await this.git(r.worktree,'diff','--check');await this.git(r.worktree,'diff','--cached','--check');
+  // Base-side whitespace is already committed and must not block recovery.
+  const whitespace=['-c','core.whitespace=-blank-at-eol,-space-before-tab,-blank-at-eof'];
+  if(d.conflicts.length){
+   const paths=d.conflicts.map((p:string)=>`:(literal)${p}`);
+   await this.git(r.worktree,...whitespace,'diff','--check','--',...paths);
+   await this.git(r.worktree,...whitespace,'diff','--cached','--check','--',...paths);
+  }
   const current=await this.index(r);
   for(const path of d.conflicts){
    const entry=current.filter(l=>l.split('\t')[1]===path),original=d.index.find((l:string)=>l.split('\t')[1]===path);
@@ -162,8 +170,10 @@ export class ConflictRecovery{
   if(JSON.stringify(current.filter(l=>!d.conflicts.includes(l.split('\t')[1])))!==JSON.stringify(d.index.filter((l:string)=>!d.conflicts.includes(l.split('\t')[1]))))throw Error('Worker changed non-conflict staged content; preserve base safeguards');
   const unstaged=await this.git(r.worktree,'diff','--name-only');
   if(unstaged||await this.git(r.worktree,'ls-files','--others','--exclude-standard'))throw Error('Unstaged or untracked work remains; preserve it');
-  const markers=await this.io.command(['git','grep','--cached','-n','-I','-E','^(<<<<<<< |=======$|>>>>>>> )','--'],r.worktree);
-  if(markers.code!==1)throw Error('Conflict markers remain or marker inspection failed');
+  if(d.conflicts.length){
+   const markers=await this.io.command(['git','grep','--cached','-n','-I','-E','^(<<<<<<< |[|]{7} |=======[[:space:]]*$|>>>>>>> )','--',...d.conflicts.map((p:string)=>`:(literal)${p}`)],r.worktree);
+   if(markers.code!==1)throw Error('Conflict markers remain or marker inspection failed');
+  }
  }
  async advance(r:any,c:any):Promise<any>{
   const d=JSON.parse(r.detail);
@@ -224,7 +234,7 @@ export class ConflictRecovery{
   for(const argv of c.conflictRecovery.verification){
    const result=await this.io.command(argv,r.worktree);
    d.verification.push({argv,code:result.code,stdout:result.out.slice(-8000),stderr:result.err.slice(-8000)});this.set(r,'verifying',d);
-   if(result.code!==0)throw Error(`Verification failed: ${JSON.stringify(argv)} (${result.code}); no publication`);
+   if(result.code!==0)throw Error(`Verification failed (${result.code}); no publication`);
   }
   await this.assertResolved(r,d);
   if(await this.git(r.worktree,'write-tree')!==d.tree)throw Error('Verification changed merged tree');
@@ -232,6 +242,7 @@ export class ConflictRecovery{
   this.set(r,'committing',d);
   await this.git(r.worktree,'commit','-m',`Merge ${r.base_branch} into ${r.branch} (ADLC recovery ${r.id})`);
   d.result=await this.git(r.worktree,'rev-parse','HEAD');
+  this.set(r,'committing',d);
   if(await this.git(r.worktree,'show','-s','--format=%P',d.result)!==`${r.head} ${r.base}`||await this.git(r.worktree,'rev-parse',`${d.result}^{tree}`)!==d.tree)throw Error('Unexpected merge parents/tree');
   await this.noOperation(r.worktree);const fresh=await this.guard(r,c);
   if(!fresh.facts.clean||fresh.facts.head!==d.result)throw Error('Worktree changed before publication');

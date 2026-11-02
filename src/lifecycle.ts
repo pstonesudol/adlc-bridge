@@ -174,6 +174,15 @@ export class Lifecycle {
     const updated=this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
     return {blocked:true,reason:detail,budget:this.summarizeBudget(job,updated,policy)};
   }
+  grantBaseMerge(job:string,hash:string,human:string){
+    return this.s.db.transaction(()=>{
+      const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+      if(!grant||grant.plan_hash!==hash)throw Error('Existing current scoped Git grant required');
+      // The named operator becomes the grant actor; prior actor remains in audit events.
+      this.grantGit(job,hash,[...JSON.parse(grant.operations),'merge-base-feature'],human);
+      return {job,hash,grant:'merge-base-feature',policyStillRequired:true,mergePR:false};
+    }).immediate();
+  }
   grantGit(job:string,hash:string,operations:string[],actor:string) {
     if(!actor.trim()||!operations.length||operations.some(op=>!allowedGit.has(op)))throw Error('Invalid scoped Git authorization');
     this.s.db.transaction(()=>{

@@ -7,7 +7,7 @@ import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
 import {Lifecycle} from '../src/lifecycle';
 import {featureGit} from '../src/approval-policy';
-import {ConflictRecovery,type RecoveryCommand} from '../src/conflict-recovery';
+import {ConflictRecovery,recoveryCommand,type RecoveryCommand} from '../src/conflict-recovery';
 import {validateConflictPolicy} from '../src/conflict-policy';
 import {BranchUpdates} from '../src/branch-updates';
 import {sendPilotRemediation} from '../src/pilot';
@@ -90,6 +90,64 @@ test('existing grants do not acquire merge authority; disabled and malformed pol
   f.l.grantGit(f.job,f.plan,featureGit,'human');await expect(f.recovery.tick(f.job,f.config,'owner/repo',1)).rejects.toThrow('merge-base-feature');expect(f.s.get(f.job).attempts).toBe(0);
   expect(()=>validateConflictPolicy({...f.config.conflictRecovery,version:2})).toThrow();expect(()=>validateConflictPolicy({...f.config.conflictRecovery,verification:[]})).toThrow();
   await expect(f.recovery.tick(f.job,{...f.config,conflictRecovery:undefined},'owner/repo',1)).rejects.toThrow('enabled');
+ }finally{f.close();}
+});
+test('explicit base merge grant rejects missing/stale/unapproved jobs and preserves existing operations with named actor',async()=>{
+ const f=await fixture();try{
+  f.l.grantGit(f.job,f.plan,featureGit,'original operator');
+  const before=f.s.db.query('SELECT * FROM git_grants WHERE job=?').get(f.job);
+  expect(()=>f.l.grantBaseMerge(f.job,'stale','new operator')).toThrow();
+  expect(f.s.db.query('SELECT * FROM git_grants WHERE job=?').get(f.job)).toEqual(before);
+  f.s.db.query("UPDATE jobs SET approved_hash='revoked' WHERE id=?").run(f.job);
+  expect(()=>f.l.grantBaseMerge(f.job,f.plan,'new operator')).toThrow('approval');
+  f.s.db.query('UPDATE jobs SET approved_hash=? WHERE id=?').run(f.plan,f.job);
+  expect(f.l.grantBaseMerge(f.job,f.plan,'new operator')).toMatchObject({mergePR:false,policyStillRequired:true});
+  const grant=f.s.db.query('SELECT * FROM git_grants WHERE job=?').get(f.job) as any;
+  expect(JSON.parse(grant.operations)).toEqual([...featureGit,'merge-base-feature']);expect(grant.actor).toBe('new operator');
+  expect(f.commands.some(a=>a.includes('merge'))).toBe(false);
+  f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.job);
+  expect(()=>f.l.grantBaseMerge(f.job,f.plan,'human')).toThrow('Existing current scoped');
+ }finally{f.close();}
+});
+test('recovery commands sanitize inherited Git repository context for commands and verification',async()=>{
+ const f=await fixture();const keys=['GIT_DIR','GIT_WORK_TREE','GIT_COMMON_DIR','GIT_INDEX_FILE','GIT_CONFIG_COUNT','GIT_CONFIG_KEY_0','GIT_CONFIG_VALUE_0'];
+ const saved=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+ try{
+  for(const key of keys)process.env[key]='/nonexistent-wrong-context';
+  expect((await recoveryCommand(['git','rev-parse','--show-toplevel'],f.tree)).out.trim()).toBe(f.tree);
+  const result=await recoveryCommand([process.execPath,'-e',`console.log(JSON.stringify(${JSON.stringify(keys)}.map(k=>process.env[k]??null)))`],f.tree);
+  expect(JSON.parse(result.out)).toEqual(keys.map(()=>null));
+ }finally{for(const key of keys){if(saved[key]===undefined)delete process.env[key];else process.env[key]=saved[key];}f.close();}
+});
+test('marker inspection detects diff3 base and CRLF separators in literal conflict paths only',async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);const r=f.recovery.row(f.job),d=JSON.parse(r.detail);
+  for(const content of ['||||||| base\n','=======\r\n','<<<<<<< ours\n','>>>>>>> theirs\n']){
+   writeFileSync(join(f.tree,'app.txt'),content);await f.git(f.tree,'add','app.txt');
+   await expect(f.recovery.assertResolved(r,d)).rejects.toThrow();
+  }
+  writeFileSync(join(f.tree,'app.txt'),'resolved\n');await f.git(f.tree,'add','app.txt');
+  writeFileSync(join(f.tree,'literal[1].txt'),'||||||| base\n');await f.git(f.tree,'add','literal[1].txt');
+  const index=await f.recovery.index(r);
+  await f.recovery.assertResolved(r,{...d,index,conflicts:['app.txt']});
+  await expect(f.recovery.assertResolved(r,{index,conflicts:['literal[1].txt']})).rejects.toThrow();
+  await f.recovery.assertResolved(r,{index,conflicts:[]});
+ }finally{f.close();}
+});
+test('base-side trailing whitespace does not reject a valid merged index',async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();await f.git(f.tree,'add','app.txt');
+  writeFileSync(join(f.tree,'safeguard.txt'),'Markdown hard break  \n');await f.git(f.tree,'add','safeguard.txt');
+  const r=f.recovery.row(f.job),d=JSON.parse(r.detail);d.index=await f.recovery.index(r);
+  await f.recovery.assertResolved(r,d);
+ }finally{f.close();}
+});
+test('post-commit validation failure retains exact merge SHA in recovery detail',async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  const io={...f.io,command:async(args:string[],cwd:string)=>args.includes('--format=%P')?{code:1,out:'',err:'validation unavailable'}:f.io.command(args,cwd)};
+  await new ConflictRecovery(f.s,io as any).tick(f.job,f.config,'owner/repo',1);
+  expect(JSON.parse(f.recovery.row(f.job).detail).result).toBe(await f.git(f.tree,'rev-parse','HEAD'));
  }finally{f.close();}
 });
 test('dirty, divergent, competing-owner, stale approval and pre-existing merge refuse before reservation',async()=>{
@@ -177,6 +235,22 @@ test('verification is fail-fast and never publishes a failed merged tree',async(
   await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();const before=await f.git(f.remote,'rev-parse',`refs/heads/${f.branch}`);
   expect((await f.recovery.tick(f.job,f.config,'owner/repo',1))?.reason).toContain('Verification failed');expect(await f.git(f.remote,'rev-parse',`refs/heads/${f.branch}`)).toBe(before);
   expect(JSON.parse(f.recovery.row(f.job).detail).verification.length).toBe(1);
+  expect(f.recovery.row(f.job).reason).not.toContain('process.exit');
+  expect(f.recovery.row(f.job).reason).toContain('(3)');
   await new ConflictRecovery(f.s,f.io as any).tick(f.job,f.config,'owner/repo',1);expect(JSON.parse(f.recovery.row(f.job).detail).verification.length).toBe(1);
+ }finally{f.close();}
+});
+test('remediation rechecks worktree reservation inside submission fence before routing or delivery',async()=>{
+ const f=await fixture();try{
+  const head=(await f.io.snapshot()).head;
+  let sends=0;
+  await expect(sendPilotRemediation(f.s,f.job,head,'[]','owner/repo',1,['CI'],undefined,[],{
+   sessionEvidence:f.io.evidence as any,readBranchSnapshot:f.io.snapshot as any,
+   worktreeIdentity:async()=>({tree:f.tree,branch:f.branch,head}),
+   readiness:async()=>({head,clear:false,reasons:[]}) as any,
+   submit:async fn=>{await f.recovery.tick(f.job,f.config,'owner/repo',1);return fn();},
+   spawn:(()=>{sends++;throw Error('must not send');}) as any
+  })).rejects.toThrow('reserved');
+  expect(sends).toBe(0);expect(f.s.get(f.job).attempts).toBe(1);
  }finally{f.close();}
 });
