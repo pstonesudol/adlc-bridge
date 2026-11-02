@@ -115,6 +115,7 @@ export function assessWorkerReceipt(textValue:string):{valid:boolean;receipt:Wor
 }
 
 export function ensureReadinessStore(s:Store){
+  if(s.readonly)return;
   s.db.exec(`CREATE TABLE IF NOT EXISTS plan_readiness (
     job TEXT PRIMARY KEY REFERENCES jobs(id),plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,
     state TEXT NOT NULL,valid INTEGER NOT NULL,source TEXT NOT NULL,reason TEXT,
@@ -165,6 +166,21 @@ export function currentResolution(s:Store,job:string,planHash:string,specHash:st
 export function activeResolution(s:Store,job:string):any{
   ensureReadinessStore(s);const j=s.get(job),binding=resolutionBinding(s,job);
   return binding&&currentResolution(s,job,j.plan_hash,digest(j.spec),binding);
+}
+/** A resolution is applicable only when its source can resolve the current
+ * readiness evidence. Acknowledgement never answers a concrete question. */
+export function applicableResolution(s:Store,job:string):any{
+  const resolution=activeResolution(s,job);if(!resolution)return null;
+  const readiness=readinessFor(s,job),j=s.get(job);
+  if(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))return resolution;
+  if(readiness.valid&&readiness.state==='needs-input'){
+   if(resolution.source==='human-answer')return resolution;
+   if(resolution.source==='dependency-satisfied'&&readiness.questions.every((q:any)=>q.kind==='dependency'))return resolution;
+   return null;
+  }
+  if(readiness.valid&&readiness.state==='blocked-by-dependency')return ['human-answer','dependency-satisfied'].includes(resolution.source)?resolution:null;
+  if(!readiness.valid&&readiness.source==='plan-text'&&readiness.questions.length)return resolution.source==='human-answer'?resolution:null;
+  return resolution;
 }
 export function recordResolution(s:Store,job:string,source:string,actor:string,detail:string){
   ensureReadinessStore(s);

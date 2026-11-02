@@ -79,7 +79,8 @@ export class LinearBlockers{
   return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:labelState};
  }
  async retract(job:string,c:BlockerConfig){
-  const labelId=c.blockerSync?.labelId;if(!labelId)return {state:'not_configured'};
+  if(!c.blockerSync?.enabled)return {state:'disabled'};
+  const labelId=c.blockerSync.labelId;if(!labelId)return {state:'not_configured'};
   const rows=this.s.db.query("SELECT * FROM blocker_notices WHERE job=? AND state='posted' AND label_applied=1").all(job) as any[];
   if(!rows.length)return {state:'none'};
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
@@ -93,8 +94,8 @@ export class LinearBlockers{
   return {state:'retracted'};
  }
  async sync(c:BlockerConfig){
-  if(!c.blockerSync?.enabled)return [];
-  if(!/^[0-9a-f-]{36}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
+  if(c.blockerSync?.enabled!==true)return [];
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
   const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
   const results:any[]=[];

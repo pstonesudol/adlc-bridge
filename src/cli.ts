@@ -5,7 +5,7 @@ import {installRuntime} from './runtime-install';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
-import {Store} from './core';
+import {Store,digest} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {stackControl} from './stack-control';
@@ -29,7 +29,7 @@ import {LinearLifecycle} from './linear-lifecycle';
 import {LinearApprovals} from './linear-approvals';
 import {Workflow} from './workflow';
 import {LinearBlockers} from './linear-blockers';
-import {readinessFor,recordReadiness,recordResolution,activeResolution} from './readiness';
+import {readinessFor,recordReadiness,recordResolution,applicableResolution} from './readiness';
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
@@ -179,6 +179,12 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,a.length===2);
     try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
    }
+   if(command==='reconcile-preview'){
+    const config=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(config);
+    if(!existsSync(db))throw Error('Existing state database required');
+    const store=new Store(db,true);
+    try{return out(await new Workflow(store,liveTransport,undefined,true).previewReconcile(config));}finally{store.close();}
+   }
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
@@ -194,7 +200,6 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(option('--git')!=='feature-pr')throw Error('Only feature-pr Git scope is supported; merge/deploy are forbidden');
       return out(workflow.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'),option('--paths').split(','),option('--runtime'),['inspect','fetch','worktree','branch','commit','push-feature','open-pr'],undefined,{readiness:a.includes('--acknowledge-readiness')}));
     }
-    if(command==='reconcile-preview')return out(await workflow.previewReconcile(c!));
     if(command==='resolve-plan'){
       const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
       const job=req(a[0],'Job');recordResolution(s,job,option('--source'),option('--human'),option('--answer'));
@@ -202,11 +207,16 @@ Registered approved review targets can request bounded in-scope fixes from their
     }
     if(command==='resume-job'){
       const job=req(a[0],'Job');
+      if(s.get(job).project!==c!.linear.projectId)throw Error('Job project does not match configured project');
       const result=await runPollTick(async()=>{
        await poll(c!,s,linearToken());
        const stage=await workflow.resume(job,c!);
-       const retracted=await blockers.retract(job,c!);
-       return {...stage,blockerLabel:retracted.state};
+       let blockerLabel='retained';
+       if(stage.state==='continuation_delivery_accepted'){
+        try{blockerLabel=(await blockers.retract(job,c!)).state;}
+        catch(e){blockerLabel=`retract_failed: ${e instanceof Error?e.message:'unknown error'}`;}
+       }
+       return {...stage,blockerLabel};
       });
       return out(result);
     }
@@ -243,7 +253,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
       let r=readinessFor(s,job);
       if(j.plan&&(!r||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));r=readinessFor(s,job);}
-      const resolved=activeResolution(s,job);
+      const resolved=applicableResolution(s,job);
       if(r?.valid&&r.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
       if((!r||!r.valid)&&!resolved&&!a.includes('--acknowledge-readiness'))throw Error('Structured plan readiness is missing or malformed; explicit --acknowledge-readiness required');
       if((!r||!r.valid)&&!resolved)recordResolution(s,job,'human-acknowledgement',req(a[2],'Human'),'Human explicitly acknowledged legacy or malformed plan readiness');

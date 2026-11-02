@@ -13,15 +13,15 @@ export class ApprovalPolicyStore{
   for(const j of jobs)this.s.db.query('INSERT INTO ticket_approval_requirements VALUES (?,?) ON CONFLICT(job) DO UPDATE SET required=excluded.required').run(j.id,Number(manual.has(j.issue)));
   for(const j of jobs)this.s.db.query('INSERT INTO queue_eligibility VALUES (?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET project=excluded.project,spec_hash=excluded.spec_hash,ready=excluded.ready,observed=excluded.observed').run(j.id,project,digest(j.spec),Number(eligible.has(j.issue)),at);
  }
- evaluate(job:string,project:string,p:ApprovalPolicy|undefined,now=Date.now()){
+ evaluate(job:string,project:string,p:ApprovalPolicy|undefined,now=Date.now(),requireReadiness=true){
   if(p?.mode!=='ready-queue')return {allowed:false,reason:'Manual plan approval required'};
   if(this.requiresManual(job))return {allowed:false,reason:'Ticket has plan-approval-required; explicit human plan approval required'};
   if(!p.id?.trim()||!p.authorizedBy?.trim()||p.gitScope!=='feature-pr'||!p.scope||!validScopes(p.scope))throw Error('Explicit user, repository scope and feature-pr Git grant required for standing approval policy');
   const j=this.s.get(job),e=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;
   if(j.project!==project||!e||e.project!==project||!e.ready||e.spec_hash!==digest(j.spec)||e.observed>now+5000||now-e.observed>120000)return {allowed:false,reason:'Fresh complete Todo + agent-ready snapshot required'};
   if(!['awaiting_approval','approved'].includes(j.state)||!j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))return {allowed:false,reason:'Current captured plan required'};
-  const readiness=readinessFor(this.s,job);
-  if(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))return {allowed:false,reason:'Actionable plan required; resolve outstanding questions or dependencies before standing authorization'};
+  const readiness=requireReadiness?readinessFor(this.s,job):null;
+  if(requireReadiness&&(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec)))return {allowed:false,reason:'Actionable plan required; resolve outstanding questions or dependencies before standing authorization'};
   return {allowed:true,reason:'Authorized by user standing ready-queue policy',policyHash:this.hash(p),actor:`standing-policy:${p.id}`,paths:[...p.scope]};
  }
  record(job:string,project:string,p:ApprovalPolicy){
@@ -37,9 +37,9 @@ export class ApprovalPolicyStore{
   if(!e||e.project!==j.project||!e.ready||e.spec_hash!==digest(j.spec)||proof.spec_hash!==digest(j.spec)||proof.plan_hash!==j.plan_hash||now-e.observed>120000||e.observed>now+5000)throw Error('Current Todo + agent-ready eligibility required for standing policy execution');
  }
  get(job:string):any{return this.s.db.query('SELECT * FROM policy_authorizations WHERE job=?').get(job);}
- verify(job:string,project:string,p:ApprovalPolicy|undefined){
+ verify(job:string,project:string,p:ApprovalPolicy|undefined,requireReadiness=false){
   const proof=this.get(job);if(!proof)return;
-  const current=this.evaluate(job,project,p),j=this.s.get(job);
+  const current=this.evaluate(job,project,p,Date.now(),requireReadiness),j=this.s.get(job);
   if(!current.allowed||proof.policy_hash!==this.hash(p)||proof.plan_hash!==j.plan_hash||proof.spec_hash!==digest(j.spec))throw Error('Standing policy authorization is stale or no longer eligible');
  }
  revokeChanged(project:string,p:ApprovalPolicy|undefined){

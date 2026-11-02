@@ -3,7 +3,7 @@ import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
@@ -32,6 +32,7 @@ class Fake implements WorkflowTransport{
  }
  workerReceipt(text:string){
   const e=this.sessions.get('session-1');
+  e.transcript.controller='ready';
   e.transcript.entries.push({sequence:3,kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'implementation',text});
   e.transcript.turns.find((x:any)=>x.id==='implementation').state='completed';
  }
@@ -265,11 +266,11 @@ test('legacy session without structured output is classified conservatively afte
 });
 
 test('PR metadata grace begins when completion is observed, not when the turn started',async()=>{
- const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
- const e=f.sessions.get('session-1');expect((await w.executionStatus(id,e,60000,1000)).state).toBe('implementation_running');
+ const {s,f,w,id,hash}=await planned();const grace={...config,workflow:{prGraceMs:60000}};w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ const e=f.sessions.get('session-1');expect((await w.executionStatus(id,e,grace,1000)).state).toBe('implementation_running');
  f.finishImplementation();e.session.prs=[];
- const waiting=await w.executionStatus(id,e,60000,91000);expect(waiting.state).toBe('awaiting_pr');expect(waiting.graceDeadline).toBe(151000);
- expect((await w.executionStatus(id,e,60000,151001)).state).toBe('needs_reconciliation');expect(f.sends.length).toBe(1);s.close();
+ const waiting=await w.executionStatus(id,e,grace,91000);expect(waiting.state).toBe('awaiting_pr');expect(waiting.graceDeadline).toBe(151000);
+ expect((await w.executionStatus(id,e,grace,151001)).state).toBe('needs_reconciliation');expect(f.sends.length).toBe(1);s.close();
 });
 
 test('guarded resume requires current resolution, resends no original request and is single-shot',async()=>{
@@ -285,7 +286,9 @@ test('guarded resume requires current resolution, resends no original request an
  expect(result.state).toBe('continuation_delivery_accepted');expect(f.sends.length).toBe(before+1);
  expect(f.sends.at(-1).prompt).toContain('GUARDED CONTINUATION');expect(f.sends.at(-1).prompt).not.toContain('ADLC APPROVED IMPLEMENTATION');
  expect(f.sends.at(-1).clientId).not.toBe(w.implementation(id).client_id);
- await expect(w.resume(id,config)).rejects.toThrow();
+ s.db.query("UPDATE worker_outcomes SET outcome='needs_input' WHERE job=?").run(id);
+ f.sessions.get('session-1').transcript.controller='ready';
+ await expect(w.resume(id,config)).rejects.toThrow('already in flight');
  expect(f.sends.length).toBe(before+1);s.close();
 });
 
@@ -300,7 +303,7 @@ test('changed requirements or stale answers invalidate resume authorization',asy
  s.db.query("UPDATE worker_outcomes SET questions=? WHERE job=?").run(JSON.stringify([{id:'w2',question:'A new worker question',kind:'requirement'}]),id);
  await expect(w.resume(id,config)).rejects.toThrow('human answer');
  s.enqueue('p','issue','materially changed requirements');
- await expect(w.resume(id,config)).rejects.toThrow();expect(f.sends.length).toBe(1);s.close();
+ await expect(w.resume(id,config)).rejects.toThrow('replan after material changes');expect(f.sends.length).toBe(1);s.close();
 });
 
 test('uncertain continuation send is never resent',async()=>{
@@ -309,6 +312,7 @@ test('uncertain continuation send is never resent',async()=>{
  f.workerReceipt(workerBlock('needs-input','Which listing ID?'));await w.tick(config);
  recordResolution(s,id,'human-answer','Alice','SKU-42');
  f.loseSend=true;const first=await w.resume(id,config);expect(first.state).toBe('continuation_delivery_uncertain');
+ f.sessions.get('session-1').transcript.controller='ready';
  await expect(w.resume(id,config)).rejects.toThrow('never resend');
  recordResolution(s,id,'human-answer','Alice','A newer answer recorded after the uncertain send');
  await expect(w.resume(id,config)).rejects.toThrow('never resend');
@@ -373,6 +377,45 @@ test('the reservation transaction refuses an in-flight continuation even if the 
  expect(f.sends.length).toBe(1);s.close();
 });
 
+test('acknowledgement cannot satisfy a structured blocker at approval',async()=>{
+ const {recordResolution}=await import('../src/readiness');
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue','spec');
+ await w.tick(config);f.completePlan('session-1',blockedPlan('Which approved copy?'));
+ await w.tick(config);
+ recordResolution(s,id,'human-acknowledgement','Alice','Acknowledged legacy readiness');
+ expect(()=>w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops)).toThrow('unresolved');
+ recordResolution(s,id,'human-answer','Alice','Use the approved copy');
+ w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+ s.close();
+});
+test('resume rejects a busy worker and a different configured project',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
+ w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+ f.workerReceipt(workerBlock('needs-input','Which listing ID?'));await w.tick(config);
+ recordResolution(s,id,'human-answer','Alice','SKU-42');
+ expect(()=>w.resume(id,{...config,linear:{projectId:'other'}})).toThrow('Job project does not match');
+ f.sessions.get('session-1').transcript.controller='busy';
+ await expect(w.resume(id,config)).rejects.toThrow('Worker is not idle');
+ expect(f.sends.length).toBe(1);s.close();
+});
+test('preview reports an existing PR handoff instead of a false blocker',async()=>{
+ const {s,f,w,id,hash}=await planned();w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+ await w.tick(config);f.finishImplementation();
+ const preview=await w.previewReconcile(config);
+ expect(preview.results[0].state).toBe('pr_handoff');expect(preview.results[0].pr?.number).toBe(1);
+ s.close();
+});
+test('read-only reconciliation preview does not modify the state database',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-preview-'));try{
+  const path=join(dir,'state.sqlite'),{s,f,w,id,hash}=await planned(path);w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);
+  await w.tick(config);f.finishImplementation();s.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');s.close();
+  const before=readFileSync(path);
+  const ro=new Store(path,true),readonly=new Workflow(ro,f,undefined,true);f.s=ro;
+  const preview=await readonly.previewReconcile(config);
+  expect(preview.results[0].state).toBe('pr_handoff');ro.close();
+  expect(readFileSync(path).equals(before)).toBe(true);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
 test('preview reconciliation exposes the three reported blockers without applying repairs',async()=>{
  const cases=[
   ['DEV-6','May we publish repository-only preview metadata while Cloudflare Access changes remain out of scope?','security-scope'],

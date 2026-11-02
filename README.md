@@ -368,6 +368,10 @@ dependency references. Missing or malformed receipts are non-actionable. The
 ordinary non-blocking risks do not prevent execution. Human plan approval does
 not silently resolve a structured question or dependency.
 
+Legacy plans with no structured receipt can be approved only with an explicit
+`--acknowledge-readiness` flag; this records a `human-acknowledgement` and does
+not answer any concrete question quoted from the legacy plan.
+
 Inspect readiness and worker blockers with `adlc status`. When a completed
 implementation turn has no PR, the bridge prefers the worker's
 `ADLC_WORKER_STATUS` receipt. A needs-input or blocked-dependency receipt becomes

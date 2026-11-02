@@ -10,7 +10,7 @@ import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
 import {PreSendFailure} from './pre-send';
-import {ensureReadinessStore,activeResolution,activeReadinessResolution,readinessBinding,resolutionBinding,readinessFor,recordReadiness,recordResolution,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
+import {ensureReadinessStore,activeReadinessResolution,applicableResolution,readinessBinding,resolutionBinding,readinessFor,recordReadiness,recordResolution,assessPlan,assessWorkerReceipt,WORKER_STATUS_INSTRUCTION} from './readiness';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number}};
 export interface WorkflowTransport{
@@ -26,7 +26,10 @@ export interface WorkflowTransport{
   branchSnapshot?(repo:string,pr:number):Promise<any>;
 }
 export class Workflow{
- constructor(public s:Store,public t:WorkflowTransport,public router=new TaskRouting(s)){
+ router:TaskRouting;
+ constructor(public s:Store,public t:WorkflowTransport,router?:TaskRouting,readonly=false){
+  if(readonly){this.router=router??({} as TaskRouting);return;}
+  this.router=router??new TaskRouting(s);
   new Planning(s);new Lifecycle(s);new ApprovalPolicyStore(s);ensureReadinessStore(s);
   s.db.exec('CREATE TABLE IF NOT EXISTS project_execution_policy(project TEXT PRIMARY KEY,runtime TEXT NOT NULL)');
   s.db.exec(`CREATE TABLE IF NOT EXISTS worker_outcomes (
@@ -169,7 +172,7 @@ export class Workflow{
    if(this.implementation(job)||new Lifecycle(this.s).run(job))throw Error('Existing execution requires reconciliation');
    let readiness=readinessFor(this.s,job);
    if(j.plan&&(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))){recordReadiness(this.s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(this.s,job);}
-   const resolved=activeResolution(this.s,job);
+   const resolved=applicableResolution(this.s,job);
    if(standing&&(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash))throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
    if(!standing&&readiness?.valid&&readiness.state!=='ready'&&!resolved)throw Error('Plan has unresolved questions or dependencies; record a resolution before approval');
    if(!standing&&(!readiness||!readiness.valid)&&!resolved){
@@ -232,10 +235,9 @@ export class Workflow{
    const recovery=new DeliveryRecovery(this.s,recoveryTransport(this.s));
    return hash?recovery.confirm(job,c,hash):recovery.preview(job,c);
   }
- async executionStatus(job:string,e:any,c?:WorkflowConfig|number,now=Date.now(),persist=true){
+ async executionStatus(job:string,e:any,c?:WorkflowConfig,now=Date.now(),persist=true){
   const d=this.implementation(job);if(!d)return;
-  const cfg=typeof c==='object'?c:undefined;
-  let graceMs=typeof c==='number'?c:(cfg?.workflow?.prGraceMs??120000);
+  let graceMs=c?.workflow?.prGraceMs??120000;
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
   const cont=this.continuation(job);
   const clientId=cont?cont.client_id:d.client_id;
@@ -265,9 +267,9 @@ export class Workflow{
    const expected=deliveryBranch(this.s,job,e.session);
    if(local.branch!==expected)throw Error(`Blocked — branch mismatch: reserved ${e.session.branch}; actual ${local.branch}; candidate ${prs.map((p:any)=>p.url).join(', ')||'not attached (preview discovers exact remote candidates)'}; run recover-handoff ${job} CONFIG, then --confirm HASH`);
    if(prs.length===1){
-    if(!cfg?.githubRepo||prs[0].url!==`https://github.com/${cfg.githubRepo}/pull/${prs[0].number}`)throw Error('Exact configured PR repository required');
-    const b=await (this.t.branchSnapshot?this.t.branchSnapshot(cfg.githubRepo,prs[0].number):readBranchSnapshot(cfg.githubRepo,prs[0].number));
-    assertDeliveryTarget(this.s,job,e.session,cfg.githubRepo,prs[0].number,b);
+    if(!c?.githubRepo||prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)throw Error('Exact configured PR repository required');
+    const b=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
+    assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,b);
     if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
    }
   }catch(err){
@@ -346,7 +348,7 @@ export class Workflow{
    if(d.plan_hash!==j.plan_hash){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,state:'stale_plan',outcome:'needs_reconciliation',reason:'Dispatch belongs to a superseded plan; replan and reapprove',questions:[],dependencies:[],source:'plan',confidence:'high',applied:false});continue;}
    try{
     const e=await this.t.evidence(d.session_id);
-    const result=await this.executionStatus(row.job,e,graceMs,now,false);
+    const result=await this.executionStatus(row.job,e,c,now,false);
     results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,...result,applied:false});
    }catch(error){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,outcome:'uncertain',state:'unavailable',reason:error instanceof Error?error.message:'Session evidence unavailable',applied:false});}
   }
@@ -354,6 +356,7 @@ export class Workflow{
  }
  async resume(job:string,c:WorkflowConfig){
   const j=this.s.get(job),d=this.implementation(job),r=new Planning(this.s).get(job),run=new Lifecycle(this.s).run(job),policy=new ApprovalPolicyStore(this.s),proof=policy.get(job);
+  if(j.project!==c.linear.projectId)throw Error('Job project does not match configured project');
   if(!d||!r||!run)throw Error('Existing owned worker and delivery required');
   if(j.state!=='approved'||j.approved_hash!==j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))throw Error('Current unchanged plan approval required; replan after material changes');
   if(d.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))throw Error('Material plan or requirement change invalidates the previous authorization');
@@ -362,10 +365,10 @@ export class Workflow{
   if(outcome.plan_hash!==d.plan_hash)throw Error('Worker outcome belongs to a different plan');
   const readinessBindingValue=readinessBinding(this.s,job);
   if(!readinessBindingValue)throw Error('Current readiness evidence required');
-  const resolution=activeResolution(this.s,job);
+  const resolution=applicableResolution(this.s,job);
   if(!resolution||resolution.plan_hash!==j.plan_hash||resolution.spec_hash!==digest(j.spec)||resolution.binding!==resolutionBinding(this.s,job))throw Error('Current human answer or satisfied dependency required');
   if(proof){
-   const allowed=policy.evaluate(job,c.linear.projectId,c.approval);
+   const allowed=policy.evaluate(job,c.linear.projectId,c.approval,Date.now(),false);
    if(!allowed.allowed||proof.plan_hash!==j.plan_hash||proof.spec_hash!==digest(j.spec))throw Error(allowed.allowed?'Standing authorization is stale':'Current standing authorization required for resume');
   }else if(!j.actor?.trim())throw Error('Current plan approval required for resume');
   const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
@@ -376,6 +379,7 @@ export class Workflow{
   if(proof){const approvedScope=JSON.parse(proof.scope);if(JSON.stringify([...paths].sort())!==JSON.stringify([...approvedScope].sort()))throw Error('Scoped permissions changed; replan and reapprove');}
   const e=await this.t.evidence(d.session_id);
   if(e.session?.id!==d.session_id||r.session_id!==d.session_id||run.session_id!==d.session_id||e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Existing execution session identity changed');
+  if(e.transcript?.controller!=='ready')throw Error('Worker is not idle; wait before resuming');
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   if(prs.length)throw Error(prs.length===1?'A PR already exists; use its handoff instead of resuming':'Multiple PRs require reconciliation');
   const unresolved=this.unresolvedContinuation(job,j.plan_hash);

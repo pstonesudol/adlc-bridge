@@ -2,6 +2,7 @@ import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
+import {validate} from '../src/linear';
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};
@@ -159,5 +160,19 @@ test('uncertain comment delivery is never reposted blindly',async()=>{
 test('blocker synchronization refuses missing or malformed labels',async()=>{
  const f=fixture();try{
   await expect(f.blockers().sync({linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true}} as any)).rejects.toThrow('UUID');
+ }finally{f.s.close();}
+});
+test('blockerSync requires a boolean and a complete UUID',()=>{
+ const base:any={version:1,name:'Project',repo:'/repo',linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'},requiredChecks:['CI']};
+ expect(()=>validate({...base,blockerSync:{enabled:true,labelId:'------------------------------------'}})).toThrow('UUID');
+ expect(()=>validate({...base,blockerSync:{enabled:'false',labelId:labelId}})).toThrow('boolean');
+ expect(()=>validate({...base,blockerSync:{enabled:false,labelId:'invalid'}})).not.toThrow();
+});
+test('disabled blocker sync and retraction perform no Linear work',async()=>{
+ const f=fixture();try{
+  const before=f.calls;
+  expect(await f.blockers().sync({...f.config,blockerSync:{enabled:false,labelId}})).toEqual([]);
+  expect((await f.blockers().retract(f.id,{...f.config,blockerSync:{enabled:false,labelId}})).state).toBe('disabled');
+  expect(f.calls).toBe(before);expect(f.labels).toEqual(['ready','team']);
  }finally{f.s.close();}
 });
