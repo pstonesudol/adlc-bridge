@@ -10,7 +10,9 @@ export class Store {
   static readonly(path:string){
     return new Store(path,true);
   }
+  readonly: boolean;
   constructor(path: string, readonly=false) {
+    this.readonly=readonly;
     if(readonly){this.db=new Database(path,{readonly:true,create:false});return;}
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });
