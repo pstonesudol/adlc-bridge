@@ -97,6 +97,16 @@ test('custom finding is revalidated at dispatch; edits cannot spend an attempt o
   await expect(f.loop.tick(f.id)).rejects.toThrow('Custom-check evidence');expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
+test('failed continuation outcome blocks review dispatch until workflow republishes a recovered handoff',async()=>{
+ const f=templateFixture();try{
+  f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT)');
+  const j=f.s.get(f.id),hash=j.plan_hash;
+  f.s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,hash,'session','failed','Continuation failed','[]','[]','continuation','high',Date.now(),null,Date.now(),null);
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff',reason=NULL WHERE job=?").run(f.id);
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 test('custom verification runtime prerequisites are requested through the existing worker, not guessed',async()=>{
  const f=customLoopFixture();try{
   f.loop.setVerification(f.id,{version:1,mode:'container',steps:[{cwd:'src',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}});

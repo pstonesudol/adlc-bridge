@@ -205,6 +205,9 @@ export class ReviewLoop{
    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
    const outcome=this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get()?this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any:null;
+   // The workflow publishes this only while the failed continuation lacks an
+   // exact adopted-delivery recovery; a recovered handoff replaces the outcome.
+   if(outcome?.plan_hash===run.plan_hash&&outcome.source==='continuation'&&outcome.outcome==='failed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous guarded continuation failed without reviewed delivery recovery; no handoff or remediation'});
    if(outcome?.plan_hash===run.plan_hash&&typeof outcome.source==='string'&&outcome.source.startsWith('remediation:')&&['needs_input','blocked_dependency','failed','uncertain'].includes(outcome.outcome)){
     const handle=outcome.source.slice('remediation:'.length),entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
     if(turn?.state==='completed')this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state='delivery_uncertain'").run(job,Number(handle.split('-').at(-1)));

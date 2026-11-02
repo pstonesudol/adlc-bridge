@@ -46,7 +46,7 @@ for(const text of ['Run `go test ./...` and record the result.','The log output 
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',text);
  const result=f.evidence();expect(result.blocker).toBeNull();expect(result.findings).toHaveLength(1);expect(result.findings[0].body).toContain(text);
 });
-for(const ending of ['Incomplete…','Incomplete...','<dl><dd>Incomplete… </dd> </dl>','<p>Incomplete... </p>'])test(`trailing ellipsis still fails closed: ${ending}`,()=>{
+for(const ending of ['Incomplete…','Incomplete...','**Incomplete…**','**Incomplete...**','[truncated]','[incomplete]','[TRUNCATED]','<dl><dd>Incomplete… </dd> </dl>','<p>Incomplete... </p>','<p><strong>Incomplete…</strong></p>'])test(`trailing truncation marker still fails closed: ${ending}`,()=>{
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',ending);
  expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toContain('missing or truncated');
 });

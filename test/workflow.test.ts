@@ -14,7 +14,7 @@ const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-p
 class Fake implements WorkflowTransport{
  starts:any[]=[];sends:any[]=[];sessions=new Map<string,any>();loseSpawn=false;loseSend=false;
  constructor(public s:Store){}
- async worktree(job:string){const r=this.s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(job) as any;return {branch:r?.branch??this.starts[0].branch,head:'a'.repeat(40)};}
+ async worktree(job:string){const r=this.s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(job) as any;return {branch:r?.branch??this.starts[0].branch,head:'a'.repeat(40),tree:'/worktrees/session-1'};}
  async branchSnapshot(){return {branch:this.starts[0].branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'};}
  async startPlan(r:any){
   this.starts.push(r);const id=`session-${this.starts.length}`;
@@ -74,14 +74,14 @@ test('an existing PR does not hide a delivered remediation blocker; only the rec
   expect(f.sends.at(-1).prompt).toContain('Description and verification only');expect(f.sends).toHaveLength(2);expect(s.get(id).attempts).toBe(1);
  }finally{s.close();}
 });
-for(const [continuationTurn,selectedTurn,priorState,expected] of [
- ['completed','running','delivery_accepted','completed'],
- ['completed','completed','delivery_accepted','completed'],
- ['failed','completed','delivery_accepted','failed'],
- ['cancelled','completed','delivery_accepted','failed'],
- ['interrupted','completed','delivery_accepted','failed'],
- ['running','completed','delivery_accepted','delivery_accepted'],
- ['completed','completed','failed','failed'],
+for(const [continuationTurn,selectedTurn,priorState,expected,state] of [
+ ['completed','running','delivery_accepted','completed','implementation_running'],
+ ['completed','completed','delivery_accepted','completed','pr_handoff'],
+ ['failed','completed','delivery_accepted','failed','needs_reconciliation'],
+ ['cancelled','completed','delivery_accepted','failed','needs_reconciliation'],
+ ['interrupted','completed','delivery_accepted','failed','needs_reconciliation'],
+ ['running','completed','delivery_accepted','delivery_accepted','implementation_running'],
+ ['completed','completed','failed','failed','needs_reconciliation'],
 ])test(`continuation receipt ${continuationTurn} settles independently of newer remediation ${selectedTurn} (${priorState})`,async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
@@ -94,9 +94,26 @@ for(const [continuationTurn,selectedTurn,priorState,expected] of [
   e.transcript.turns.push({id:'continue-turn',state:continuationTurn},{id:'newer-fix',state:selectedTurn});
   await w.executionStatus(id,e,config,Date.now(),false);expect(w.continuation(id).state).toBe(priorState);
   const result=await w.executionStatus(id,e,config);
-  expect(result.state).toBe(selectedTurn==='running'?'implementation_running':'pr_handoff');
+  expect(result.state).toBe(state);
   expect(w.continuation(id).state).toBe(expected);
   if(expected==='completed')expect(w.unresolvedContinuation(id,hash)).toBeNull();
+ }finally{s.close();}
+});
+test('a failed continuation hands off only with exact adopted-delivery recovery evidence',async()=>{
+ const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
+  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','failed');
+  const e=f.sessions.get('session-1'),r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any;
+  e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'});
+  e.transcript.turns.push({id:'continue-turn',state:'completed'});
+  s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL)');
+  const adopt=(over:any={})=>s.db.query('INSERT OR REPLACE INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal',over.state??'adopted',over.session??'session-1',over.worktree??'/worktrees/session-1',r.branch,over.branch??r.branch,'owner/repo',1,over.head??'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
+  expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  adopt({state:'reserved'});expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  adopt({head:'c'.repeat(40)});expect((await w.executionStatus(id,e,config)).state).toBe('needs_reconciliation');
+  adopt({worktree:'/other'});expect((await w.executionStatus(id,e,config)).state).toBe('blocked');
+  adopt();const recovered=await w.executionStatus(id,e,config);
+  expect(recovered.state).toBe('pr_handoff');expect(w.outcomes(id).outcome).toBe('pr_handoff');
  }finally{s.close();}
 });
 test('implementation prompt selects project verification without an unconditional Docker instruction',async()=>{
@@ -417,6 +434,16 @@ test('guarded resume requires current resolution, resends no original request an
  expect(f.sends.length).toBe(before+1);s.close();
 });
 
+test('failed continuation requires exact reviewed delivery recovery before another resume',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+  f.workerReceipt(workerBlock('needs-input','Which listing ID?'));await w.tick(config);
+  recordResolution(s,id,'human-answer','Alice','SKU-42');
+  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'old-resolution','continue-failed','session-1','failed');
+  await expect(w.resume(id,config)).rejects.toThrow('exact reviewed delivery recovery required');
+  expect(f.sends).toHaveLength(1);
+ }finally{s.close();}
+});
 test('changed requirements or stale answers invalidate resume authorization',async()=>{
  const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();
  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
