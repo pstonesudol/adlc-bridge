@@ -19,7 +19,7 @@ import {runtimeCheck} from './runtime';
 import {containerCheck} from './container-check';
 import {sessionEvidence,capturePlan} from './session-evidence';
 import {adoptPilot,observePilot} from './pilot';
-import {ReviewLoop} from './review-loop';
+import {ReviewLoop,reviewDisplay} from './review-loop';
 import {disableNativeFeedback} from './ao-policy';
 import {TaskRouting,loadOpenChamber,selectRoute} from './task-routing';
 import {FeaturePlanning} from './feature-planning';
@@ -173,10 +173,14 @@ Registered approved review targets can request bounded in-scope fixes from their
     try{const recovery=new DeliveryRecovery(store,recoveryTransport(store));return out(a.length===2?await recovery.preview(req(a[0],'Job'),config):await recovery.confirm(req(a[0],'Job'),config,a[3]));}finally{store.close();}
    }
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);
+  const reviewStatus=()=>reviewLoop.list().map(t=>{
+    const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
+    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
+  });
   try{
     if(command==='approvals')return out((s.db.query("SELECT j.id,j.spec,j.plan_hash,d.reason FROM jobs j LEFT JOIN planning_dispatch d ON d.job=j.id WHERE j.state='awaiting_approval'").all() as any[]).map(j=>{let issue=null;try{issue=JSON.parse(j.spec).identifier;}catch{}return {job:j.id,issue,hash:j.plan_hash,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),reason:j.reason,linearNotice:s.db.query('SELECT comment_id,state,reason FROM plan_approval_notices WHERE job=? ORDER BY rowid DESC LIMIT 1').get(j.id)};}));
-    if(command==='review-status')return out(reviewLoop.list().map(t=>({...t,remediation:lifecycle.budgetSummary(t.job)})));
-    if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewLoop.list(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
+    if(command==='review-status')return out(reviewStatus());
+    if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewStatus(),workflow:workflow.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
     if(command==='show-plan'){const j=s.get(req(a[0],'Job'));return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),routing:new TaskRouting(s).list(j.id)});}
     if(command==='approve-job'){
       const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};

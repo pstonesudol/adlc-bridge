@@ -6,6 +6,13 @@ import {adoptedDelivery} from './delivery-identity';
 export type Session = {id:string;correlation:string;worktree:string;controller:'running'|'stopped'|'unknown'};
 export type Transport = {start(request:{correlation:string;spec:string;plan:string}):Promise<Session>};
 const allowedGit=new Set(['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+// Pre-budget releases blocked a job after its fifth cumulative remediation
+// reservation with this exact structured reason on both the job and its run.
+// Compatibility migration only trusts that pair plus retained history; an
+// arbitrary blocked reason is never treated as budget authorization.
+const LEGACY_EXHAUSTION_REASON='Remediation limit exhausted';
+const LEGACY_MAX_ATTEMPTS=5;
+type LegacyBudgetEvidence={attempts:number;lastHead:string|null;lastFindingsHash:string|null};
 
 /** Durable host coordination. Transport remains disconnected until a restricted
  * worker runtime is validated. This store must never be writable by that runtime. */
@@ -30,14 +37,87 @@ export class Lifecycle {
       CREATE TABLE IF NOT EXISTS remediation_budget_extensions (
       seq INTEGER PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id), plan_hash TEXT NOT NULL,
       head TEXT NOT NULL, actor TEXT NOT NULL, additional INTEGER NOT NULL, reason TEXT,
-      consumed INTEGER NOT NULL, extensions INTEGER NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
+      consumed INTEGER NOT NULL, extensions INTEGER NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE IF NOT EXISTS remediation_budget_migrations (
+      job TEXT PRIMARY KEY REFERENCES jobs(id), version INTEGER NOT NULL,
+      legacy_reason TEXT NOT NULL, attempts INTEGER NOT NULL, outcome TEXT NOT NULL,
+      policy TEXT NOT NULL, detail TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
   }
 
-  private ensureBudget(job:string){
-    const j=this.s.get(job);
-    this.s.db.query('INSERT OR IGNORE INTO remediation_budget(job,consumed,no_progress,configured_max_attempts,configured_max_no_progress,window) VALUES (?,?,?,?,?,?)')
-      .run(job,j.attempts,0,DEFAULT_REMEDIATION_POLICY.maxAttempts,DEFAULT_REMEDIATION_POLICY.maxNoProgress,DEFAULT_REMEDIATION_POLICY.window);
+  private budgetRow(job:string){
     return this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
+  }
+
+  private migrationRow(job:string){
+    return this.s.db.query('SELECT * FROM remediation_budget_migrations WHERE job=?').get(job) as any;
+  }
+
+  /** Corroborated pre-budget exhaustion: blocked job and owned run both carry
+   * the historical reason, attempts reached the old fixed limit, and the
+   * current plan approval plus cumulative remediation history are intact. */
+  private legacyBudget(job:string):LegacyBudgetEvidence|null{
+    const j=this.s.get(job),run=this.run(job);
+    if(j.state!=='blocked'||j.reason!==LEGACY_EXHAUSTION_REASON)return null;
+    if(!Number.isSafeInteger(j.attempts)||j.attempts<LEGACY_MAX_ATTEMPTS)return null;
+    if(!j.plan||!j.actor||!j.plan_hash||j.plan_hash!==j.approved_hash)return null;
+    if(digest(JSON.stringify([j.spec,j.plan]))!==j.plan_hash)return null;
+    if(!run||run.owner!=='orchestrator'||run.plan_hash!==j.plan_hash||run.state!=='blocked'||run.reason!==LEGACY_EXHAUSTION_REASON)return null;
+    if(typeof run.session_id!=='string'||!run.session_id||typeof run.worktree!=='string'||!run.worktree.startsWith('/'))return null;
+    const history=this.s.db.query('SELECT count(*) AS n,max(attempt) AS attempt FROM remediation WHERE job=?').get(job) as any;
+    const last=this.s.db.query('SELECT head,findings_hash FROM remediation WHERE job=? ORDER BY attempt DESC LIMIT 1').get(job) as any;
+    if(!history||history.n<1||history.attempt!==j.attempts)return null;
+    return {attempts:j.attempts,lastHead:last?.head??null,lastFindingsHash:last?.findings_hash??null};
+  }
+
+  /** Lazily mirror legacy exhaustion into the budget table. The migration row is
+   * written once per job; a later policy change updates that same row so the
+   * stored outcome follows the policy currently being applied. It never grants
+   * an extension or dispatches work. */
+  private reconcileLegacyBudget(job:string,policy:RemediationPolicy){
+    const row=this.budgetRow(job),migration=this.migrationRow(job),legacy=this.legacyBudget(job);
+    if(!legacy)return row;
+    const extensions=row?.extensions??0;
+    const effective=policy.maxAttempts===null?null:policy.maxAttempts+extensions;
+    const exhausted=effective!==null&&legacy.attempts>=effective;
+    const outcome=exhausted?'exhausted':policy.maxAttempts===null?'uncapped_current_policy':'raised_current_policy';
+    const stopReason=exhausted?'budget_exhausted':null;
+    const consumed=Math.max(row?.consumed??0,legacy.attempts);
+    if(!row){
+      this.s.db.query(`INSERT INTO remediation_budget(job,consumed,extensions,no_progress,last_head,last_findings_hash,last_attempt,stop_reason,
+        configured_max_attempts,configured_max_no_progress,window) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(job,consumed,0,0,legacy.lastHead,legacy.lastFindingsHash,legacy.attempts,stopReason,policy.maxAttempts,policy.maxNoProgress,policy.window);
+    }else{
+      this.s.db.query(`UPDATE remediation_budget SET consumed=?,last_head=COALESCE(last_head,?),last_findings_hash=COALESCE(last_findings_hash,?),
+        last_attempt=COALESCE(last_attempt,?),stop_reason=?,configured_max_attempts=?,configured_max_no_progress=?,window=?,updated=CURRENT_TIMESTAMP WHERE job=?`)
+        .run(consumed,legacy.lastHead,legacy.lastFindingsHash,legacy.attempts,stopReason,policy.maxAttempts,policy.maxNoProgress,policy.window,job);
+    }
+    const detail=JSON.stringify({effective,historicalLimit:LEGACY_MAX_ATTEMPTS,jobReason:LEGACY_EXHAUSTION_REASON,runReason:LEGACY_EXHAUSTION_REASON,reassessedFrom:migration?.outcome??null});
+    if(migration){
+      if(migration.outcome!==outcome){
+        this.s.db.query('UPDATE remediation_budget_migrations SET outcome=?,policy=?,detail=? WHERE job=?').run(outcome,JSON.stringify(policy),detail,job);
+        this.s.event(job,'legacy_remediation_budget_reassessed',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective,previousOutcome:migration.outcome}));
+      }
+    }else{
+      const inserted=this.s.db.query(`INSERT OR IGNORE INTO remediation_budget_migrations(job,version,legacy_reason,attempts,outcome,policy,detail)
+        VALUES (?,?,?,?,?,?,?)`).run(job,1,LEGACY_EXHAUSTION_REASON,legacy.attempts,outcome,JSON.stringify(policy),detail);
+      if(inserted.changes)this.s.event(job,'legacy_remediation_budget_reconciled',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective}));
+      else{
+        const concurrent=this.migrationRow(job);
+        if(concurrent&&concurrent.outcome!==outcome){
+          this.s.db.query('UPDATE remediation_budget_migrations SET outcome=?,policy=?,detail=? WHERE job=?').run(outcome,JSON.stringify(policy),detail,job);
+          this.s.event(job,'legacy_remediation_budget_reassessed',JSON.stringify({version:1,attempts:legacy.attempts,outcome,stopReason,policy,effective,previousOutcome:concurrent.outcome}));
+        }
+      }
+    }
+    return this.budgetRow(job);
+  }
+
+  private ensureBudget(job:string,policy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY){
+    const reconciled=this.reconcileLegacyBudget(job,policy);
+    if(reconciled)return reconciled;
+    this.s.db.query('INSERT OR IGNORE INTO remediation_budget(job,consumed,no_progress,configured_max_attempts,configured_max_no_progress,window) VALUES (?,?,?,?,?,?)')
+      .run(job,this.s.get(job).attempts,0,policy.maxAttempts,policy.maxNoProgress,policy.window);
+    return this.budgetRow(job);
   }
 
   private summarizeBudget(job:string,row:any,policy?:RemediationPolicy){
@@ -60,22 +140,25 @@ export class Lifecycle {
   }
 
   budgetSummary(job:string,policyInput?:RemediationPolicy):RemediationSummary {
-    const j=this.s.get(job),row=this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
-    if(row)return this.summarizeBudget(job,row,policyInput?remediationPolicy(policyInput):undefined);
-    const policy=remediationPolicy(policyInput);
+    const j=this.s.get(job),row=this.budgetRow(job),policy=remediationPolicy(policyInput);
+    if(row)return this.summarizeBudget(job,row,policyInput?policy:undefined);
+    const legacy=this.legacyBudget(job);
+    if(legacy&&policy.maxAttempts!==null&&legacy.attempts>=policy.maxAttempts){
+      return remediationSummary({job,policy,consumed:legacy.attempts,extensions:0,noProgress:0,stopReason:'budget_exhausted'});
+    }
     return remediationSummary({job,policy,consumed:j.attempts,extensions:0,noProgress:0,stopReason:null});
   }
 
   recordRemediationPolicy(job:string,policyInput:RemediationPolicy){
     const policy=remediationPolicy(policyInput);
     return this.s.db.transaction(()=>{
-      const row=this.ensureBudget(job);
+      const row=this.ensureBudget(job,policy);
       if(row.configured_max_attempts===policy.maxAttempts&&row.configured_max_no_progress===policy.maxNoProgress&&row.window===policy.window)return this.summarizeBudget(job,row,policy);
       this.s.db.query('UPDATE remediation_budget SET configured_max_attempts=?,configured_max_no_progress=?,window=?,updated=CURRENT_TIMESTAMP WHERE job=?')
         .run(policy.maxAttempts,policy.maxNoProgress,policy.window,job);
       this.s.event(job,'remediation_policy_observed',JSON.stringify(policy));
       return this.summarizeBudget(job,this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any,policy);
-    })();
+    }).immediate();
   }
 
   private stopBudget(job:string,row:any,reason:string,total:number,policy:RemediationPolicy){
@@ -179,7 +262,7 @@ export class Lifecycle {
     return this.s.db.transaction(()=>{
       this.current(job);const r=this.run(job);
       if(!r||r.state!=='running'||r.owner!=='orchestrator')throw Error('Active agent-owned run required');
-      const hash=digest(findings),budget=this.ensureBudget(job);
+      const hash=digest(findings),budget=this.ensureBudget(job,policy);
       const previous=this.s.db.query('SELECT * FROM remediation WHERE job=? AND head=? AND findings_hash=?').get(job,head,hash) as any;
       if(previous)return {...previous,budget:this.summarizeBudget(job,budget,policy)};
       const uncertain=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job);
@@ -217,16 +300,37 @@ export class Lifecycle {
       if(!j.plan||!j.actor||j.plan_hash!==j.approved_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!['approved','blocked'].includes(j.state))throw Error('Current plan approval required');
       if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='policy_authorizations'").get())new ApprovalPolicyStore(this.s).assertEligible(job);
       const run=this.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==j.plan_hash)throw Error('Existing owned job required');
-      const budget=this.ensureBudget(job);
-      if(!budget.stop_reason)throw Error('Remediation budget is not exhausted; extension refused');
-      if(policy.maxAttempts===null&&budget.stop_reason!=='no_progress_exhausted')throw Error('Uncapped remediation budgets only support recovery from no-progress stops');
+      // Check delivery uncertainty and current evidence before compatibility
+      // bookkeeping so a refused preview leaves no partial migration behind.
       if(this.s.db.query("SELECT 1 FROM remediation WHERE job=? AND state='delivery_uncertain'").get(job))throw Error('Prior delivery uncertainty must be reconciled before extension');
       const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()
         ?this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any:null;
-      if(!target||target.head!==head)throw Error('Current review target and exact PR head required');
+      if(!target)throw Error('Current review target required; register review evidence before extension');
+      if(target.head!==head)throw Error(`Current review target head ${target.head??'unknown'} differs from requested ${head}; refresh evidence with adlc tick-review JOB CONFIG before extension`);
       const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
       if(!grant||grant.plan_hash!==j.plan_hash||!['open-pr','push-feature'].some(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
-      const previewHash=digest(JSON.stringify([job,j.plan_hash,head,actor,additional,budget.consumed,budget.extensions,budget.no_progress,budget.stop_reason,policy]));
+      // Preview may persist the one-time compatibility mirror and provenance.
+      // It never grants an extension, clears a stop, or dispatches a worker.
+      const budget=this.reconcileLegacyBudget(job,policy)??this.budgetRow(job),migration=this.migrationRow(job);
+      if(!budget)throw Error('Remediation budget is not exhausted; extension refused');
+      const alreadyApplied=j.state==='approved'&&run.state==='running';
+      if(!budget.stop_reason&&migration&&(migration.outcome!=='exhausted'||this.legacyBudget(job))){
+        const action='resume_legacy_stop';
+        if(!alreadyApplied&&!this.legacyBudget(job))throw Error('Legacy budget stop changed; preview the current state before resuming');
+        const previewHash=digest(JSON.stringify([action,job,j.plan_hash,head,target.repo,target.pr,actor,budget.consumed,budget.extensions,budget.no_progress,migration.outcome,policy]));
+        const summary=this.summarizeBudget(job,budget,policy);
+        if(options.confirm!==previewHash)return {preview:true,action,confirmHash:previewHash,head,additional:0,requestedAdditional:additional,actor,reason:options.reason??null,budget:summary};
+        if(!alreadyApplied){
+          this.s.db.query("UPDATE jobs SET state='approved',reason=NULL,updated=CURRENT_TIMESTAMP WHERE id=? AND state='blocked' AND reason=?").run(job,LEGACY_EXHAUSTION_REASON);
+          this.s.db.query("UPDATE runs SET state='running',reason=NULL WHERE job=? AND state='blocked' AND reason=?").run(job,LEGACY_EXHAUSTION_REASON);
+          this.s.db.query("UPDATE review_targets SET state='remediation_pending',reason='Legacy budget stop cleared under current policy; next poll reevaluates current evidence' WHERE job=?").run(job);
+          this.s.event(job,'legacy_remediation_budget_resumed',JSON.stringify({actor,head,outcome:migration.outcome,policy,previewHash}));
+        }
+        return {preview:false,action,alreadyApplied,head,additional:0,actor,budget:this.summarizeBudget(job,this.budgetRow(job),policy)};
+      }
+      if(!budget.stop_reason)throw Error('Remediation budget is not exhausted; extension refused');
+      if(policy.maxAttempts===null&&budget.stop_reason!=='no_progress_exhausted')throw Error('Uncapped remediation budgets only support recovery from no-progress stops');
+      const previewHash=digest(JSON.stringify([job,j.plan_hash,head,target.repo,target.pr,actor,additional,budget.consumed,budget.extensions,budget.no_progress,budget.stop_reason,policy]));
       const summary=this.summarizeBudget(job,budget,policy);
       if(options.confirm!==previewHash)return {preview:true,confirmHash:previewHash,head,additional,actor,reason:options.reason??null,budget:summary};
       const nextExtensions=budget.extensions+additional;
