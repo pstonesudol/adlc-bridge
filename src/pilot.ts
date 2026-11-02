@@ -12,6 +12,7 @@ import {readBranchSnapshot} from './branch-updates';
 import {worktreeIdentity} from './delivery-evidence';
 import {metadataFailureBodyCovered} from './pr-template-ci';
 import {recordDispatchedFeedback} from './review-feedback';
+import {assertWorktreeAvailable} from './worktree-reservation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
 export function codeRemediationInstructions(verification?:Verification,context?:VerificationContext,worktree?:string){return `Fix only actionable findings within the approved ticket scope. ${verificationInstructions(verification,context,worktree)} Commit and push the existing feature branch, then STOP for host review.`;}
 
@@ -34,6 +35,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
 export async function sendPilotRemediation(s:Store,job:string,head:string,findings:string,repo:string,pr:number,required:string[],policy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,metadataChecks:string[]=[],overrides:Partial<typeof pilotIO>={}){
+  assertWorktreeAvailable(s,job);
  const io={...pilotIO,...overrides};
  const l=new Lifecycle(s),r=l.run(job);if(!r)throw Error('Existing pilot required');
  const parsed=JSON.parse(findings);
@@ -51,14 +53,15 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
   if(parsed.some((f:any)=>f.source==='github-ci'&&(!metadataChecks.includes(f.check)||!metadataFailureBodyCovered(review,f)||!review.findings.some((x:any)=>x.source==='github-ci'&&x.check===f.check&&x.checkId===f.checkId&&x.sha===f.sha&&x.descriptionHash===f.descriptionHash))))throw Error('Template failure changed or body-bound evidence unavailable; recheck before delivery');
  };
  validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));
- const router=new TaskRouting(s),settings=router.settings(job);
+  return io.submit(async()=>{
+  assertWorktreeAvailable(s,job);
+  const router=new TaskRouting(s),settings=router.settings(job);
  if(settings&&router.get(job,'planning')){
   const phase=`remediation:${head}:${digest(findings).slice(0,16)}`;
   const route=await router.choose(job,phase,digest(JSON.stringify([j.spec,j.plan_hash,head,findings])),`Implement the requested review fixes within the approved task. This is remediation, not review-only feedback. Task: ${j.spec}\nFindings: ${findings}`,settings);
   await configureSessionRoute(r.session_id,route);router.verified(job,phase);l.current(job);
  }
- return io.submit(async()=>{
- // Routing/submission may await external work. Refresh evidence inside the
+  // Routing/submission may await external work. Refresh evidence inside the
  // submission fence, then reserve synchronously without an intervening await.
  const review=await observePilot(s,job,repo,pr,required,metadataChecks,io);
  validateReview(review);

@@ -66,6 +66,49 @@ function templateFixture(){
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+test('second branch read failure invalidates stale readiness and enters durable read backoff',async()=>{
+ const f=templateFixture();try{
+  f.s.db.query("UPDATE review_targets SET state='ready_for_human' WHERE job=?").run(f.id);
+  let reads=0;const original=f.loop.io.readBranchSnapshot;
+  f.loop.io.readBranchSnapshot=async(...args)=>{if(++reads===2)throw Error('provider unavailable');return original(...args);};
+  const config={conflictRecovery:{enabled:true}};
+  expect((await f.loop.tick(f.id,undefined,undefined,undefined,config)).state).toBe('blocked');
+  expect((f.loop.get(f.id)).state).toBe('blocked');
+  await f.loop.tick(f.id,undefined,undefined,undefined,config);expect(reads).toBe(2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+test('accepted ancestry provider errors back off outside conflict path without resetting consecutive failures',async()=>{
+ const f=templateFixture();try{
+  const l=new Lifecycle(f.s);l.grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');
+  new (await import('../src/branch-updates')).BranchUpdates(f.s);
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
+  let reads=0;f.loop.io.contains=async()=>{reads++;throw Error('provider rate limited');};
+  const c={conflictRecovery:{enabled:true}},p={enabled:true,authorizedBy:'human',maxUpdates:3};
+  for(let n=1;n<=6;n++){
+   if(n>1)f.s.db.query('UPDATE recovery_observations SET next_read=0').run();
+   expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('blocked');
+   expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(n);
+   await f.loop.tick(f.id,p,undefined,undefined,c);expect(reads).toBe(n);
+  }
+  expect(f.s.get(f.id).attempts).toBe(0);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+test('identity failures retain specific hints and do not consume provider read retries',async()=>{
+ for(const kind of ['session','local','repository','authorization']){
+  const f=templateFixture();try{
+   const original=f.loop.io.readBranchSnapshot;
+   if(kind==='session')f.session.session.prs=[];
+   if(kind==='local')f.loop.io.worktreeIdentity=async()=>({tree:'/worktree',branch:'wrong',head:f.head});
+   if(kind==='repository')f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),headRepo:'fork/repo'});
+   const expected={session:'Target/session mismatch',local:'Blocked — branch mismatch',repository:'Target is not the owned open feature PR'};
+   for(let n=0;n<7;n++){
+    if(kind==='authorization')await expect(f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3},undefined,undefined,{conflictRecovery:{enabled:true}})).rejects.toThrow('approved feature branch execution');
+    else expect((await f.loop.tick(f.id,undefined,undefined,undefined,{conflictRecovery:{enabled:true}})).reason).toContain(expected[kind]);
+   }
+   expect(f.s.db.query('SELECT * FROM recovery_observations').all()).toEqual([]);expect(f.s.get(f.id).attempts).toBe(0);
+  }finally{f.s.close();}
+ }
+});
 test('scoped remediation combines persisted project verification with current delivery and budget safeguards',async()=>{
  const f=templateFixture();try{
   f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});

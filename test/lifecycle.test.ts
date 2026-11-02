@@ -2,6 +2,8 @@ import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
 import {Lifecycle,type Session,type Transport} from '../src/lifecycle';
 import {ReviewLoop} from '../src/review-loop';
+import {ConflictRecovery} from '../src/conflict-recovery';
+import {assertWorktreeAvailable} from '../src/worktree-reservation';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -12,7 +14,28 @@ function setup(path=':memory:'){
   l.grantGit(id,hash,['inspect','fetch','worktree','branch'],'human');return {s,l,id,hash};
 }
 const receipt=(correlation:string):Session=>({id:'session-1',correlation,worktree:'/isolated/worktree',controller:'running'});
-const runtime={isolated:true,hostVerified:true};
+const runtime={isolated:true,hostVerified:true,worktree:'/isolated/worktree'};
+test('dispatch binds and checks the transport worktree before start; active run paths remain fenced',async()=>{
+ const {s,l,id}=setup();try{
+  new ConflictRecovery(s).install();
+  const other=s.enqueue('p','other','spec');
+  s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('held',other,'plan','/reserved/tree','session','o/r',1,'feature','main','head','base','{}','resolving','client',1,'{}',null,1);
+  let starts=0;
+  const t:Transport={start:async r=>{starts++;expect(r.worktree).toBe('/isolated/worktree');expect(l.run(id).worktree).toBe(r.worktree);return receipt(r.correlation);}};
+  await expect(l.dispatch(id,t,{...runtime,worktree:'/reserved/tree'})).rejects.toThrow('reserved');
+  await expect(l.dispatch(id,t,{isolated:true,hostVerified:true})).rejects.toThrow('worktree required');
+  expect(starts).toBe(0);expect(l.run(id)).toBeNull();
+  await l.dispatch(id,t,runtime);expect(starts).toBe(1);
+  s.db.query('UPDATE conflict_recoveries SET worktree=? WHERE id=?').run('/isolated/worktree','held');
+  expect(()=>assertWorktreeAvailable(s,id)).toThrow('reserved');
+ }finally{s.close();}
+});
+test('dispatch rejects a receipt for an unbound worktree and preserves uncertain intent',async()=>{
+ const {s,l,id}=setup();try{
+  await expect(l.dispatch(id,{start:async r=>({...receipt(r.correlation),worktree:'/unexpected/tree'})},runtime)).rejects.toThrow('uncertain');
+  expect(l.run(id).state).toBe('needs_reconciliation');expect(l.run(id).worktree).toBe(runtime.worktree);
+ }finally{s.close();}
+});
 
 test('dispatch requires approved plan, scoped Git grant and validated runtime',async()=>{
   const {s,l,id,hash}=setup();let called=false;

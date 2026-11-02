@@ -1,9 +1,12 @@
 import {Store} from './core';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
+import {assertWorktreeAvailable} from './worktree-reservation';
 export type BranchPolicy={enabled:boolean;authorizedBy:string;maxUpdates:number|null};
 export type BranchSnapshot={head:string;base:string;branch:string;baseBranch:string;defaultBranch:string;headRepo:string;baseRepo:string;state:string;draft:boolean;mergeable:boolean|null;behind:number};
-export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>};
+export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>;contains?(repo:string,ancestor:string,head:string):Promise<boolean>};
+export class BranchObservationFailure extends Error{}
+async function providerObservation<T>(read:()=>Promise<T>){try{return await read();}catch(error){throw new BranchObservationFailure('Provider branch/ancestry observation unavailable',{cause:error});}}
 async function gh(args:string[]){const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub branch operation failed; inspect before retry');return JSON.parse(out);}
 export async function baseTip(repo:string,branch:string,read=gh){
  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||typeof branch!=='string'||!branch||/[\s\x00-\x1f]/.test(branch))throw Error('Valid base repository and branch required');
@@ -21,20 +24,33 @@ export async function readBranchSnapshot(repo:string,pr:number,read=gh){
  }
 export const branchTransport:BranchTransport={
  read:readBranchSnapshot,
+ async contains(repo,ancestor,head){const b=await gh(['api',`repos/${repo}/compare/${ancestor}...${head}`]);return ['ahead','identical'].includes(b.status);},
  async update(repo,pr,head){await gh(['api','--method','PUT',`repos/${repo}/pulls/${pr}/update-branch`,'-f',`expected_head_sha=${head}`]);}
 };
 export class BranchUpdates{
  constructor(public s:Store,public transport:BranchTransport=branchTransport){s.db.exec(`CREATE TABLE IF NOT EXISTS branch_updates(job TEXT NOT NULL REFERENCES jobs(id),head TEXT NOT NULL,base TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,reason TEXT,PRIMARY KEY(job,head,base));`);}
- async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
+  async observeAccepted(job:string,repo:string,pr:number,b:BranchSnapshot){
+   // A changed SHA is insufficient: prove both recorded inputs in current head.
+   // Keep uncertainty separate; operator reconciliation handles rewritten history.
+   const rows=this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND state='accepted' AND head!=?").all(job,b.head) as any[];
+   for(const row of rows){
+    if(!this.transport.contains||!await providerObservation(()=>this.transport.contains!(repo,row.head,b.head))||!await providerObservation(()=>this.transport.contains!(repo,row.base,b.head)))continue;
+    const fresh=await providerObservation(()=>this.transport.read(repo,pr));
+    if(fresh.head!==b.head||fresh.base!==b.base)continue;
+    this.s.db.transaction(()=>{new Lifecycle(this.s).current(job);this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head=? AND base=? AND state='accepted'").run(job,row.head,row.base);}).immediate();
+   }
+  }
+  async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
+   assertWorktreeAvailable(this.s,job);
   if(policy?.enabled&&(!policy.authorizedBy?.trim()||policy.maxUpdates!==null&&(!Number.isSafeInteger(policy.maxUpdates)||policy.maxUpdates<1||policy.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1)throw Error('Valid PR required');
   const l=new Lifecycle(this.s),j=l.current(job),run=l.run(job),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const operations=policy?.enabled?['fetch','push-feature']:[];
   if(!run||run.owner!=='orchestrator'||run.session_id!==session.session?.id||run.plan_hash!==j.plan_hash||!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Existing approved feature branch execution required');
-  const b=await this.transport.read(repo,pr);
+  const b=await providerObservation(()=>this.transport.read(repo,pr));
   assertDeliveryTarget(this.s,job,session.session,repo,pr,b);
   if(!policy?.enabled)return null;
-  this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head!=? AND state='accepted'").run(job,b.head);
+  await this.observeAccepted(job,repo,pr,b);
   const uncertain=this.s.db.query("SELECT 1 FROM branch_updates WHERE job=? AND state='delivery_uncertain' LIMIT 1").get(job);
   if(uncertain)return {state:'blocked',send:false,head:b.head,reason:'Earlier branch update outcome uncertain; inspect before recovery'};
   if(b.behind===0)return null;
@@ -44,10 +60,11 @@ export class BranchUpdates{
   const row=this.s.db.query('SELECT * FROM branch_updates WHERE job=? AND head=? AND base=?').get(job,b.head,b.base) as any;
   if(row)return {state:row.reason||Date.now()-row.requested>=10*60*1000?'blocked':'updating_branch',send:false,head:b.head,reason:'Branch update already requested or uncertain; never resend for the same commit/base'};
   // Re-read before the mutation; GitHub also enforces expected_head_sha.
-  const fresh=await this.transport.read(repo,pr);
+  const fresh=await providerObservation(()=>this.transport.read(repo,pr));
   if(JSON.stringify(fresh)!==JSON.stringify(b))return {state:'updating_branch',send:false,head:fresh.head,reason:'Branch changed during inspection; recheck next poll'};
   l.current(job);
-  const claim=this.s.db.transaction(()=>{
+   const claim=this.s.db.transaction(()=>{
+    assertWorktreeAvailable(this.s,job);
    const count=(this.s.db.query('SELECT count(*) AS n FROM branch_updates WHERE job=?').get(job) as any).n;
    if(policy.maxUpdates!==null&&count>=policy.maxUpdates)return 'limit';
    return this.s.db.query('INSERT OR IGNORE INTO branch_updates VALUES (?,?,?,?,?,?)').run(job,b.head,b.base,'delivery_uncertain',Date.now(),null).changes?'claimed':'existing';

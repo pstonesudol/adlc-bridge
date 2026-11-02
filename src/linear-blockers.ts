@@ -1,6 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {recoveryRows} from './worktree-reservation';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -44,13 +45,13 @@ export class LinearBlockers{
   if(!row){
    const commentId=randomUUID();
    const body=options?.body??[
-     `## ADLC: implementation stopped — ${issue.identifier}`,
+      `## ADLC: ${outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped'} — ${issue.identifier}`,
      `Outcome: **${outcome.outcome.replaceAll('_',' ')}**`,
      `Plan version: \`${outcome.plan_hash}\``,
      outcome.reason?`Reason: ${outcome.reason}`:null,
      questions.length?`### Questions requiring a human answer\n${questions.map((q:any)=>`- **${q.id}** (${q.kind}): ${q.question}`).join('\n')}`:null,
      dependencies.length?`### Referenced dependencies\n${dependencies.map((d:any)=>`- **${d.ref}**: ${d.reason}`).join('\n')}`:null,
-     `This synchronization records a blocker only. It does not grant readiness, resolve a question, expand permissions or authorize implementation. Human PR merges remain required.`
+      `This synchronization records an outcome only. It does not grant readiness, resolve a question, expand permissions or authorize implementation. Human PR merges remain required.`
    ].filter(Boolean).join('\n\n');
    this.s.db.query('INSERT OR IGNORE INTO blocker_notices(job,binding,comment_id,body,state) VALUES (?,?,?,?,?)').run(job,binding,commentId,body,'reserved');
    row=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(job,binding) as any;
@@ -70,8 +71,8 @@ export class LinearBlockers{
    this.s.db.query("UPDATE blocker_notices SET state='posted',created=? WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
    this.s.event(job,'linear_blocker_comment',JSON.stringify({comment:row.comment_id,outcome:outcome.outcome}));
   }
-  let labelState='present';
-  if(options?.applyLabel===false)return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:'unchanged'};
+   if(outcome.outcome==='recovery_completed'||options?.applyLabel===false)return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:'unchanged'};
+   let labelState='present';
   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
    // Record ownership before the mutation so a lost reply or verification failure
    // still lets retract reconcile the bridge-applied label.
@@ -116,8 +117,30 @@ export class LinearBlockers{
   if(c.linear.readyLabelId&&c.blockerSync.labelId!.toLowerCase()===c.linear.readyLabelId.toLowerCase())throw Error('Blocker label must differ from the queue label');
   const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
-  const results:any[]=[];
-  const handled=new Set<string>();
+   const results:any[]=[];
+    const recoveries=recoveryRows(this.s);
+    const handled=new Set<string>();
+   for(const recovery of recoveries.filter(r=>r.state==='completed'&&!recoveries.some(later=>later.job===r.job&&later.created>r.created))){
+    const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId||j.plan_hash!==recovery.plan)continue;
+    const detail=JSON.parse(recovery.detail);
+    const outcome={plan_hash:recovery.plan,outcome:'recovery_completed',reason:`Recovery ${recovery.id} published ${detail.result}; fresh latest-SHA CI and CodeRabbit are required. This is not readiness or merge approval.`,questions:'[]',dependencies:'[]'};
+    const binding=this.binding(recovery.job,outcome,c.blockerSync.labelId);
+    const notice=this.s.db.query('SELECT state FROM blocker_notices WHERE job=? AND binding=?').get(recovery.job,binding) as any;
+    if(notice?.state==='posted')continue;
+    try{results.push(await this.leave(recovery.job,outcome,c));}
+    catch(error){results.push({job:recovery.job,state:'blocked',reason:error instanceof Error?error.message:'Recovery outcome synchronization failed'});}
+   }
+   // Reuse the same dedupe/label ownership contract without overwriting the
+   // original implementation receipt or inventing another approval engine.
+    for(const recovery of recoveryRows(this.s).filter(r=>r.state!=='completed'||JSON.parse(r.detail).message==='uncertain')){
+    const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId)continue;
+    handled.add(recovery.job);
+    const prior=rows.findIndex(r=>r.job===recovery.job);if(prior>=0)rows.splice(prior,1);
+    if(j.plan_hash!==recovery.plan)continue;
+    const stopped=!!recovery.reason||JSON.parse(recovery.detail).message==='uncertain';
+    const notice=stopped?`Conflict recovery ${recovery.id} has an independent reconciliation gate at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
+    rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:stopped?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(stopped?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
+   }
   for(const outcome of rows){
    handled.add(outcome.job);
    try{

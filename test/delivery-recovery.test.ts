@@ -8,7 +8,7 @@ import {deliveryBranch,assertDeliveryTarget} from '../src/delivery-identity';
 import {BranchUpdates} from '../src/branch-updates';
 import {ReviewLoop} from '../src/review-loop';
 import {recordReadiness} from '../src/readiness';
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,mkdirSync,symlinkSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
@@ -49,6 +49,19 @@ test('canonical worktree comparison accepts equivalent paths and persists the ra
   expect(f.s.db.query('SELECT worktree FROM delivery_adoptions WHERE job=?').get(f.id).worktree).toBe('/worktree/');
   expect(deliveryBranch(f.s,f.id,{id:'worker',branch:f.r.branch},'owner/repo',7)).toBe(f.facts.branch);
  }finally{f.s.close();}
+});
+test('delivery authorization and confirmed adoption accept symlink planning path and canonical dispatch path',async()=>{
+ const f=fixture(),dir=mkdtempSync(join(tmpdir(),'adlc-symlink-'));try{
+  const tree=join(dir,'tree'),link=join(dir,'link');mkdirSync(tree);symlinkSync(tree,link);
+  f.s.db.query('UPDATE planning_runs SET worktree=? WHERE job=?').run(link,f.id);
+  f.s.db.query('UPDATE runs SET worktree=? WHERE job=?').run(realpathSync(tree),f.id);
+  f.facts.worktree=realpathSync(tree);
+  expect(f.recovery.authorization(f.id,f.c).worktree).toBe(realpathSync(tree));
+  const preview=await f.recovery.preview(f.id,f.c);await f.recovery.confirm(f.id,f.c,preview.hash);
+  expect((f.s.db.query('SELECT worktree FROM delivery_adoptions').get() as any).worktree).toBe(realpathSync(tree));
+  expect(deliveryBranch(f.s,f.id,{id:'worker',branch:f.r.branch},'owner/repo',7)).toBe(f.facts.branch);
+  expect(new Lifecycle(f.s).reconcile(f.id,[{id:'worker',correlation:f.r.correlation,worktree:realpathSync(tree),controller:'running'}],true).state).toBe('running');
+ }finally{f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
 for(const [name,change] of Object.entries({
  lineage:(f:DeliveryFacts)=>f.lineage=false,dirty:(f:DeliveryFacts)=>f.clean=false,shared:(f:DeliveryFacts)=>f.isolated=false,queued:(f:DeliveryFacts)=>f.idle=false,receipt:(f:DeliveryFacts)=>f.completed=false,

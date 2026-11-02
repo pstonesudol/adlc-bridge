@@ -3,6 +3,7 @@ import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
+import {ConflictRecovery} from '../src/conflict-recovery';
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};
@@ -74,6 +75,25 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
  }finally{f.s.close();}
 });
+test('conflict recovery blockers and completion reuse dedupe without granting readiness',async()=>{
+ const f=fixture();try{
+  f.running();new ConflictRecovery(f.s).install();
+  f.s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,state TEXT,required_checks TEXT)");
+  f.s.db.query('INSERT INTO review_targets VALUES (?,?,?,?)').run(f.id,'new-sha','waiting_for_ci','["latest-SHA CI","CodeRabbit"]');
+  const review=f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id);
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt requires a security decision',1);
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.labels).toContain(labelId);expect(f.comments[0].body).toContain('Conflict recovery recovery has an independent reconciliation gate at stage resolving');
+  expect(f.comments[0].body).not.toContain('app.txt');
+  expect(f.comments[0].body).not.toContain('security decision');
+  expect((f.s.db.query('SELECT reason FROM conflict_recoveries').get() as any).reason).toBe('app.txt requires a security decision');
+  f.s.db.query("UPDATE conflict_recoveries SET state='completed',reason=NULL,detail=?").run(JSON.stringify({result:'new-sha'}));
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);
+  expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.comments[1].body).toContain('new-sha');expect(f.comments[1].body).toContain('not readiness');
+  expect(f.s.get(f.id).state).toBe('approved');
+  expect(f.s.db.query('SELECT * FROM review_targets WHERE job=?').get(f.id)).toEqual(review);
+ }finally{f.s.close();}
+});
 test('label verification failure after a successful write is retractable',async()=>{
  const f=fixture();try{
   f.failLabel();
@@ -82,6 +102,43 @@ test('label verification failure after a successful write is retractable',async(
   const retract=await f.blockers().retract(f.id,f.config);expect(retract.state).toBe('retracted');
   expect(f.labels).toEqual(['ready','team']);
  }finally{f.s.close();}
+});
+test('proven Git publication keeps an independent message-receipt blocker until observed completion',async()=>{
+ const f=fixture();try{
+  f.running();new ConflictRecovery(f.s).install();
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','completed','client',1,JSON.stringify({result:'new-sha',message:'uncertain'}),null,1);
+  await f.blockers().sync(f.config);await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
+  expect(f.comments.some(c=>c.body.includes('independent reconciliation gate'))).toBe(true);
+  f.s.db.query('UPDATE conflict_recoveries SET detail=?').run(JSON.stringify({result:'new-sha',message:'completed'}));
+  await f.blockers().sync(f.config);expect(f.labels).not.toContain(labelId);
+ }finally{f.s.close();}
+});
+test('stale-plan recovery retains its blocker after a spec change and a newer running outcome',async()=>{
+ const f=fixture();try{
+  new ConflictRecovery(f.s).install();
+  f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','resolving','client',1,'{}','app.txt needs reconciliation',1);
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);
+  f.s.enqueue('p','issue',spec+' changed');
+  const before=f.calls;await f.blockers().sync(f.config);
+  expect(f.labels).toContain(labelId);expect(f.calls).toBe(before);
+  f.s.db.query("UPDATE jobs SET plan_hash='new-plan',state='approved' WHERE id=?").run(f.id);
+  f.s.db.query("UPDATE worker_outcomes SET plan_hash='new-plan',outcome='running' WHERE job=?").run(f.id);
+  await f.blockers().sync(f.config);expect(f.labels).toContain(labelId);expect(f.calls).toBe(before);
+ }finally{f.s.close();}
+});
+test('confirmed completion notices skip provider reads for done jobs, uncertain notices still reconcile',async()=>{
+ for(const uncertain of [false,true]){
+  const f=fixture();try{
+   new ConflictRecovery(f.s).install();f.s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(f.id);
+   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,f.s.get(f.id).plan_hash,'/tree','session','owner/repo',1,'feature','main','head','base','{}','completed','client',1,JSON.stringify({result:'new-sha'}),null,1);
+   if(uncertain)f.loseReplyAfterCreate();
+   await f.blockers().sync(f.config);expect(f.creates).toBe(1);
+   const calls=f.calls;
+   await f.blockers().sync(f.config);
+   if(uncertain)expect(f.calls).toBeGreaterThan(calls);else expect(f.calls).toBe(calls);
+   const confirmed=f.calls;await f.blockers().sync(f.config);expect(f.calls).toBe(confirmed);expect(f.creates).toBe(1);
+  }finally{f.s.close();}
+ }
 });
 test('a comment that lands before its reply is lost is adopted without reposting',async()=>{
  const f=fixture();try{

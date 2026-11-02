@@ -2,10 +2,11 @@ import {ApprovalPolicyStore} from './approval-policy';
 import {Store,digest} from './core';
 import {DEFAULT_REMEDIATION_POLICY,remediationPolicy,remediationSummary,type RemediationPolicy,type RemediationSummary} from './remediation';
 import {adoptedDelivery} from './delivery-identity';
+import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation';
 
 export type Session = {id:string;correlation:string;worktree:string;controller:'running'|'stopped'|'unknown'};
-export type Transport = {start(request:{correlation:string;spec:string;plan:string}):Promise<Session>};
-const allowedGit=new Set(['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);
+export type Transport = {start(request:{correlation:string;spec:string;plan:string;worktree:string}):Promise<Session>};
+const allowedGit=new Set(['inspect','fetch','worktree','branch','commit','push-feature','open-pr','merge-base-feature']);
 // Pre-budget releases blocked a job after its fifth cumulative remediation
 // reservation with this exact structured reason on both the job and its run.
 // Compatibility migration only trusts that pair plus retained history; an
@@ -173,6 +174,15 @@ export class Lifecycle {
     const updated=this.s.db.query('SELECT * FROM remediation_budget WHERE job=?').get(job) as any;
     return {blocked:true,reason:detail,budget:this.summarizeBudget(job,updated,policy)};
   }
+  grantBaseMerge(job:string,hash:string,human:string){
+    return this.s.db.transaction(()=>{
+      const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+      if(!grant||grant.plan_hash!==hash)throw Error('Existing current scoped Git grant required');
+      // The named operator becomes the grant actor; prior actor remains in audit events.
+      this.grantGit(job,hash,[...JSON.parse(grant.operations),'merge-base-feature'],human);
+      return {job,hash,grant:'merge-base-feature',policyStillRequired:true,mergePR:false};
+    }).immediate();
+  }
   grantGit(job:string,hash:string,operations:string[],actor:string) {
     if(!actor.trim()||!operations.length||operations.some(op=>!allowedGit.has(op)))throw Error('Invalid scoped Git authorization');
     this.s.db.transaction(()=>{
@@ -188,24 +198,28 @@ export class Lifecycle {
     if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='policy_authorizations'").get())new ApprovalPolicyStore(this.s).assertEligible(job);
     return j;
   }
-  async dispatch(job:string,transport:Transport,runtime:{isolated:boolean;hostVerified:boolean}) {
+  async dispatch(job:string,transport:Transport,runtime:{isolated:boolean;hostVerified:boolean;worktree?:string}) {
+    if(!runtime.worktree?.startsWith('/'))throw Error('Verified transport worktree required before dispatch');
+    const worktree=canonicalWorktree(runtime.worktree);
+    assertWorktreeAvailable(this.s,job,worktree);
     // Not exposed by the CLI. These booleans are a dependency contract, not
     // evidence of isolation; a production host verifier is still required.
     if(!runtime.isolated||!runtime.hostVerified)throw Error('Verified isolated worker runtime required');
     const request=this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job,worktree);
       const j=this.current(job);
       const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
       const required=['inspect','fetch','worktree','branch'];
       if(!grant||grant.plan_hash!==j.plan_hash||required.some(op=>!JSON.parse(grant.operations).includes(op)))throw Error('Scoped Git authorization required');
       if(this.s.db.query('SELECT job FROM runs WHERE job=?').get(job))throw Error('Existing run requires reconciliation; never retry blindly');
       const correlation=digest(JSON.stringify([job,j.plan_hash]));
-      this.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state) VALUES (?,?,?,?)').run(job,correlation,j.plan_hash,'dispatching');
+      this.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,worktree) VALUES (?,?,?,?,?)').run(job,correlation,j.plan_hash,'dispatching',worktree);
       this.s.event(job,'dispatch_reserved',correlation);
-      return {correlation,spec:j.spec,plan:j.plan};
+      return {correlation,spec:j.spec,plan:j.plan,worktree};
     })();
     try {
       const session=await transport.start(request);
-      if(!session.id||session.correlation!==request.correlation||!session.worktree.startsWith('/'))throw Error('Unverifiable session receipt');
+      if(!session.id||session.correlation!==request.correlation||!session.worktree.startsWith('/')||canonicalWorktree(session.worktree)!==worktree)throw Error('Unverifiable session receipt or transport worktree mismatch');
       this.s.db.transaction(()=>{
         const j=this.s.get(job);
         // A plan can be revoked while the external transport is starting.
@@ -222,6 +236,7 @@ export class Lifecycle {
     }
   }
   adoptSupervised(job:string,session:Session) {
+    assertWorktreeAvailable(this.s,job);
     // Recovery/adoption of an already-running, human-supervised pilot only.
     // This does not satisfy the isolated-runtime contract for new dispatches.
     return this.s.db.transaction(()=>{
@@ -237,6 +252,7 @@ export class Lifecycle {
   }
   run(job:string):any{return this.s.db.query('SELECT * FROM runs WHERE job=?').get(job);}
   reconcile(job:string,sessions:Session[],complete:boolean) {
+    assertWorktreeAvailable(this.s,job);
     if(!complete)throw Error('Complete authoritative session inventory required');
     return this.s.db.transaction(()=>{
       const r=this.run(job);if(!r)throw Error('No run to reconcile');
@@ -260,6 +276,7 @@ export class Lifecycle {
     if(!/^[a-f0-9]{40,64}$/.test(head)||!findings.trim())throw Error('Current SHA and actionable findings required');
     const policy=remediationPolicy(policyInput);
     return this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);
       this.current(job);const r=this.run(job);
       if(!r||r.state!=='running'||r.owner!=='orchestrator')throw Error('Active agent-owned run required');
       const hash=digest(findings),budget=this.ensureBudget(job,policy);

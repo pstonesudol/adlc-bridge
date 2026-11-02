@@ -44,7 +44,7 @@ function fixture(shared=false){
    if(cmd==='remote')return state.origin;
    if(cmd==='merge-base')return state.mergeBase;
    if(cmd==='status')return state.status;
-   if(cmd==='ls-remote')return `${state.remoteHead}\trefs/heads/${state.branch}`;
+    if(cmd==='ls-remote')return state.remoteOutput??`${state.remoteHead}\trefs/heads/${state.branch}`;
   }
   if(args[0]==='gh')return JSON.stringify(args.includes('--slurp')?state.slurp:state.prDetail);
   if(args[0]===AO){
@@ -95,6 +95,17 @@ test('collector rejects a remote feature ref that differs from the local head',a
 test('collector rejects non-array --slurp pages',async()=>{
  const f=fixture();try{
   f.state.slurp={message:'Not Found'};await expect(f.inspect()).rejects.toThrow('Incomplete GitHub candidate inventory');
+ }finally{f.cleanup();}
+});
+test('relaxed HEAD comparison still requires the exact present remote feature ref',async()=>{
+ const f=fixture();try{
+  f.state.remoteHead='c'.repeat(40);
+  await expect(f.inspect()).rejects.toThrow('Local HEAD');
+  const inspect=()=>recoveryTransport(f.s,f.run,async()=>f.state.evidence,true).inspect(f.id,{repo:f.source,githubRepo:'owner/repo'});
+  expect((await inspect()).head).toBe(head);
+  f.state.remoteOutput=`${f.state.remoteHead}\trefs/heads/unexpected`;
+  await expect(inspect()).rejects.toThrow('remote feature ref');
+  f.state.remoteOutput='';await expect(inspect()).rejects.toThrow('remote feature ref');
  }finally{f.cleanup();}
 });
 test('collector flags a pull request whose head repo is a fork',async()=>{

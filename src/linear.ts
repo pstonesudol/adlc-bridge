@@ -2,6 +2,7 @@ import {ApprovalPolicyStore} from './approval-policy';
 import {validScopes} from './file-scope';
 import { Store } from './core';
 import {remediationPolicy,type RemediationConfig} from './remediation';
+import {validateConflictPolicy,type ConflictPolicy} from './conflict-policy';
 import {validateClarifications} from './linear-clarifications';
 import {validateVerification,type Verification} from './verification';
 import {effectiveSettings} from './project-settings';
@@ -16,6 +17,7 @@ export type ProjectConfig = {
   statusSync?:{enabled:boolean;inProgress:string;inReview:string;done:string};
   prMetadataChecks?:string[];
   branchUpdate?:{enabled:boolean;authorizedBy:string;maxUpdates:number|null};
+  conflictRecovery?:ConflictPolicy;
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
   blockerSync?:{enabled:boolean;labelId?:string};
   clarifications?:{enabled:boolean;humanIds:string[]};
@@ -39,6 +41,7 @@ export function validate(c: any): asserts c is ProjectConfig {
   requiredCheckNames(c.requiredChecks);
   validateClarifications(c);
   metadataCheckNames(c.prMetadataChecks);
+  validateConflictPolicy(c.conflictRecovery);
   if(c.branchUpdate?.enabled&&(!c.branchUpdate.authorizedBy?.trim()||c.branchUpdate.maxUpdates!==null&&(!Number.isSafeInteger(c.branchUpdate.maxUpdates)||c.branchUpdate.maxUpdates<1||c.branchUpdate.maxUpdates>10)))throw Error('Explicit branch update authorization and limit required');
   if(c.planApproval?.enabled&&(!Array.isArray(c.planApproval.approverIds)||!c.planApproval.approverIds.length||c.planApproval.approverIds.some((id:any)=>typeof id!=='string'||!/^[-a-f0-9]{36}$/i.test(id))||!validScopes(c.planApproval.scope)))throw Error('Explicit plan approver UUIDs and safe scope required');
   if(c.blockerSync!==undefined&&(c.blockerSync===null||typeof c.blockerSync!=='object'||typeof c.blockerSync.enabled!=='boolean'))throw Error('blockerSync.enabled must be a boolean');

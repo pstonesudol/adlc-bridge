@@ -1,9 +1,28 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {featureGit} from '../src/approval-policy';import {BranchUpdates,type BranchSnapshot} from '../src/branch-updates';
 const policy={enabled:true,authorizedBy:'test human',maxUpdates:3};
+test('accepted-update observation requires both inputs and stable current head; uncertainty is independent',async()=>{
+ const f=fixture();try{
+  await f.updater.ensure(f.id,'owner/repo',1,f.session,policy);
+  const old=f.b.head;
+  await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});
+  expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
+  f.b.head='c'.repeat(40);f.updater.transport.contains=async()=>false;
+  await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
+  f.updater.transport.contains=async(_repo,ancestor)=>ancestor===old;
+  await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
+  f.updater.transport.contains=async()=>true;
+  const stale={...f.b};f.b.head='d'.repeat(40);
+  await f.updater.observeAccepted(f.id,'owner/repo',1,stale);expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('accepted');
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'e'.repeat(40),'f'.repeat(40),'delivery_uncertain',1,'unknown');
+  await f.updater.observeAccepted(f.id,'owner/repo',1,{...f.b});
+  expect((f.s.db.query('SELECT state FROM branch_updates WHERE head=?').get(old) as any).state).toBe('observed');
+  expect((f.s.db.query("SELECT state FROM branch_updates WHERE state='delivery_uncertain'").get() as any).state).toBe('delivery_uncertain');expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
 function fixture(){const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','worker',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,featureGit,'human');l.adoptSupervised(id,{id:'worker',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  let calls=0,lost=false;const session={session:{id:'worker',branch:r.branch},transcript:{controller:'ready',turns:[]}};
  const b:BranchSnapshot={head:'a'.repeat(40),base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:2};
- const updater=new BranchUpdates(s,{read:async()=>({...b}),update:async(repo,pr,head)=>{expect(repo).toBe('owner/repo');expect(pr).toBe(1);expect(head).toBe(b.head);calls++;if(lost)throw Error('Lost');}});return {s,id,session,b,updater,calls:()=>calls,lose:()=>lost=true};}
+ const updater=new BranchUpdates(s,{contains:async()=>true,read:async()=>({...b}),update:async(repo,pr,head)=>{expect(repo).toBe('owner/repo');expect(pr).toBe(1);expect(head).toBe(b.head);calls++;if(lost)throw Error('Lost');}});return {s,id,session,b,updater,calls:()=>calls,lose:()=>lost=true};}
 test('updates only owned feature branch with exact head guard, once per head/base',async()=>{const f=fixture();try{expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('updating_branch');await f.updater.ensure(f.id,'owner/repo',1,f.session,policy);expect(f.calls()).toBe(1);f.b.head='c'.repeat(40);f.b.behind=0;expect(await f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).toBeNull();expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('observed');}finally{f.s.close();}});
 test('conflicts and active workers block branch updates without mutation',async()=>{const f=fixture();try{f.b.mergeable=false;expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');f.b.mergeable=true;f.session.transcript.controller='busy';expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('waiting_for_worker');expect(f.calls()).toBe(0);}finally{f.s.close();}});
 test('lost API response cannot repeat mutation; fork/default targets are refused',async()=>{const f=fixture();try{f.lose();expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');expect(f.calls()).toBe(1);f.b.headRepo='fork/repo';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('owned');f.b.headRepo='owner/repo';f.b.defaultBranch=f.b.branch;await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('owned');}finally{f.s.close();}});
