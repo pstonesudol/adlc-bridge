@@ -897,69 +897,86 @@ session or PR, or forges approval. Uncapped projects may require an extension
 after a no-progress stop; the budget stays uncapped while the no-progress counter resets.
 PR merges remain human-only and deployment is never automatic.
 
-# DEV-18 independent answer adapter (not activated)
+## Clarification questions and replies in Linear (DEV-18)
 
-`src/clarification-answers.ts` is a read-only, dependency-injected parser for
-authorized human answer **candidates**. It is not registered in intake or CLI
-polling. A complete candidate is neither a semantic resolution nor permission to
-continue. Ordinary single-question prose is supported; multiple questions use
-exact question IDs (`q1: answer`). Edited, quoted, stale and duplicate replies
-fail closed. Partial answers return the remaining IDs without inferring answers.
-The host must retain partial evidence durably and validate meaning and scope;
-this module does not accumulate answers or write receipts.
+Clarifications reuse the merged DEV-17 readiness/resolution bindings, blocker
+publication receipts and guarded same-session continuation. Enable explicitly in
+the project configuration after reviewing the exact human account IDs:
 
-## Pending foundation integration
+```json
+"blockerSync": {
+  "enabled": true,
+  "labelId": "YOUR_NEEDS_HUMAN_LABEL_UUID"
+},
+"clarifications": {
+  "enabled": true,
+  "humanIds": ["YOUR_AUTHORIZED_LINEAR_HUMAN_UUID"]
+}
+```
 
-Inspected read-only: proposed DEV-17 PR #4 at
-`f7eb9500dee57dca404b89086ca6a39b0818a800` (open and unmerged when inspected).
-No foundation code is copied here, and the tests are isolated parser contract
-tests, **not** integrated Linear or continuation tests.
+The needs-human label must differ from `agent-ready`. Enabling replies does not
+grant plan approval, Git scope, merge/deployment permissions, or readiness. It
+does not install/activate this source version. Live installation and configuration
+remain explicit operator actions.
 
-Once an approved base contains the foundation, integration must:
+Before asking, the worker must inspect the original ticket, linked issues and
+dependencies, and accessible repository context. Its `ADLC_DISCOVERY` receipt
+records the specific context checked and why the missing information is essential.
+Ordinary implementation choices, facts already supplied and authorized work are
+not blockers. The bridge refreshes the ticket/comments, linked-issue inventory and
+referenced context, and hashes bounded repository files before publication. Missing
+discovery evidence or incomplete API context fails closed without publishing a new
+question. Older workers without discovery receipts require inspection, not a blind
+restart or another implementation request.
 
-- Obtain the current question set from `Workflow.outcomes` and bind the request
-  to issue/job, current requirements/plan hashes and `resolutionBinding` (which
-  includes `readinessBinding` and the worker outcome). Do not substitute
-  `LinearBlockers.binding`, whose purpose is notice publication deduplication.
-- Extend `LinearBlockers`' existing publication/receipts, not create another
-  blocker table or publisher. Add exact question instructions, discovery evidence,
-  why each answer is essential, and the issue/job/version-bound reference there.
-- Inject complete paginated Linear comment evidence including author identity,
-  bot/app identity, creation and edit times, and issue association. Use explicit
-  configured authorized human IDs, never display names or ticket content.
-- After semantic validation of **all** blocking questions and dependencies,
-  record the validated evidence with `recordResolution(..., 'human-answer', ...)`.
-  Recheck binding and authorization atomically before activating a resolution;
-  partial answers must never call this function. Scope changes require replanning.
-- Use `activeResolution`/`currentResolution` and `Workflow.resume` for the existing
-  owned session. Reconcile its existing continuation receipts; no new dispatcher,
-  worker spawn, or original implementation resend is permitted.
-- Reuse bridge-owned label provenance and deduplicated publication for cleanup
-  and acknowledgment; preserve other unresolved blockers and human-applied labels.
+One deduplicated comment on the original issue lists the exact numbered questions,
+reason, checked context and issue/job/requirements/plan/round-bound clarification
+reference. Reply there, not in Terminal or worker chat. For a single question in
+the first round, an ordinary answer is accepted. Multiple questions, dependency
+answers and later rounds use the exact IDs and reference shown in the comment:
 
-Contract questions still requiring foundation coordination:
+```text
+Clarification DEV-18-REFERENCE_FROM_NOTICE
+q1: exact listing identifier
+q2: final approved display wording
+```
 
-1. `recordResolution` at the inspected SHA activates immediately and overwrites
-   an active resolution's timestamp. What atomic expected-binding and durable
-   consumed-comment/partial-answer receipt will prevent repeated polls from
-   changing the continuation binding? The parser's injected `consumed` read is
-   not an atomic claim and cannot provide delivery idempotency.
-2. Who validates answer meaning, unresolved dependencies and material scope
-   changes? Structural parsing alone cannot distinguish an answer from a request
-   to change scope. Until that validator exists, candidates cannot resolve work.
-3. `LinearBlockers` reads only comment ID/body/time at the inspected SHA. Its
-   publisher needs contextual discovery and reply-reference inputs, and answer
-   reads need authenticated author/edit metadata without a second publisher.
-4. How are active-worker answers queued, and how are label changes reconciled
-   after lost receipts or human remove/re-add? The proposed label-applied flag
-   alone does not prove continuous ownership. Cleanup must fail closed.
-5. How will bounded resolution detail (currently 4,000 characters) reference
-   multiple durable partial answers without truncating essential task context?
+Partial answers are retained durably; acknowledgments list only what remains.
+Once all questions and dependencies have answers, a configured human must attest
+that the answers resolve them within existing scope by posting the **exact**
+confirmation printed in the notice. This can accompany the answers or be a later
+comment. Structural parsing is not a semantic oracle: this explicit human
+completeness/scope attestation is required before resolution activation. Generic
+assent to a factual question and placeholders are not answers. Permission-sensitive
+answer text escalates conservatively, even when accompanied by confirmation.
 
-Remaining acceptance work includes discovery-before-asking, publication and label
-ownership, durable partial-answer receipts, semantic validation, acknowledgment,
-runtime wiring and restart/overlapping-poll continuation tests. No live project
-configuration, Linear labels, sessions or execution authority are changed here.
+For a material requirement/scope change, use the exact `Replan clarification …`
+line shown in the notice. Security decisions and changed dependencies never
+silently authorize production exposure, credentials, merge/deployment or expanded
+scope. Replanning and applicable human approval are required. Never post secrets.
+
+Bot/app/self-authored, unauthorized, quoted, duplicate, stale and edited comments
+cannot release the gate. Edits/removals of accepted evidence before continuation
+invalidate the adapter's resolution and require review. Ambiguous or conflicting
+answers remain blocked; no answer is guessed. Bounded resolution detail is never
+silently truncated.
+
+`adlc status` includes **Waiting for clarification**, partial/confirmed evidence
+state and reconciliation reasons. All answer provenance and resolution activation
+commit atomically under the current binding, without rewriting the resolution
+timestamp on retries. Planning answers still await the existing plan-approval gate.
+Implementation answers reserve only the existing foundation continuation, after
+fresh ticket eligibility, exact approval/scope, branch, ownership and idle/queued
+work checks. An answer arriving while a worker is active is retained and waits for
+idle; it is not steered into competing work.
+
+Requests and acknowledgments use `LinearBlockers`' existing publication receipts.
+Only a tracked bridge-applied needs-human label is removed, with additive/removal
+label mutations preserving unrelated human labels and other unresolved blockers.
+Uncertain sends or comments reconcile their existing receipts and never replay the
+original implementation request, spawn another worker, or resend an uncertain
+continuation. Tests cover the real merged foundation with fake provider/session
+evidence; they do not exercise live Linear, install code or activate services.
 
 ### Legacy exhausted jobs from pre-budget databases
 
