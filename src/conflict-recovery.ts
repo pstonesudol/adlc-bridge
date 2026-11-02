@@ -102,7 +102,7 @@ export class ConflictRecovery{
     }
     const x=await this.guard(r,c,proof.head);await this.noOperation(r.worktree);await this.assertResolved(r,d);
     if(!x.facts.clean||x.facts.head!==proof.head||await this.git(r.worktree,'write-tree')!==proof.tree)throw Error('Verification changed worktree or published evidence');
-    this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d);
+    this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d,c);
     return {...proof,preview:false,state:'completed',mergePR:false};
    }catch(e){this.set(r,'manual_verifying',d,e instanceof Error?e.message:'Verification uncertain');throw e;}
   });
@@ -189,7 +189,7 @@ export class ConflictRecovery{
   if(r.state==='pushing'){
    const x=await this.guard(r,c,d.result);
    if(!x.facts.clean||x.facts.head!==d.result)throw Error('Pushed commit/local evidence mismatch');
-   await this.noOperation(r.worktree);this.complete(r,d);return null;
+   await this.noOperation(r.worktree);this.complete(r,d,c);return null;
   }
   if(!['reserved','resolving'].includes(r.state))throw Error(`Interrupted ${r.state}; operator must reconcile observed Git and receipt evidence`);
   const x=await this.guard(r,c);
@@ -259,9 +259,14 @@ export class ConflictRecovery{
   // An error/lost response is reconciled against the remote, never retried.
   const observed=await this.io.snapshot(r.repo,r.pr);
   if(observed.head!==d.result)throw Error(`Normal push rejected or uncertain (${pushed.code}): ${pushed.err.slice(0,2000)}; remote ${observed.head}; preserve commit ${d.result}`);
-  await this.guard(r,c,d.result);this.complete(r,d);return null;
+  await this.guard(r,c,d.result);this.complete(r,d,c);return null;
  }
- complete(r:any,d:any){this.s.db.transaction(()=>{
+ complete(r:any,d:any,c:any){this.s.db.transaction(()=>{
+  // Approval, scope or grants can be revoked during the final asynchronous Git
+  // checks. Recheck inside this transaction and leave the reservation untouched
+  // on failure; never release it under stale authorization.
+  const a=this.auth(r.job,c);
+  if(a.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy)throw Error('Current approval, policy or scope changed before completion; reservation retained for reconciliation');
   this.set(r,'completed',d);
   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(r.job,r.attempt);
   this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state='waiting_for_ci',reason='Base merged; fresh latest-SHA CI and CodeRabbit required',last_signature=NULL WHERE job=?").run(d.result,Date.now(),r.job);

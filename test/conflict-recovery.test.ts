@@ -276,6 +276,32 @@ test('verification is fail-fast and never publishes a failed merged tree',async(
   await new ConflictRecovery(f.s,f.io as any).tick(f.job,f.config,'owner/repo',1);expect(JSON.parse(f.recovery.row(f.job).detail).verification.length).toBe(1);
  }finally{f.close();}
 });
+test('completion rechecks authorization and keeps the reservation when grants were revoked',async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  const io={...f.io,command:async(args:string[],cwd:string)=>{const result=await f.io.command(args,cwd);if(args[0]==='git'&&args[1]==='push')throw Error('Lost push response');return result;}};
+  await new ConflictRecovery(f.s,io as any).tick(f.job,f.config,'owner/repo',1);
+  const r=f.recovery.row(f.job),d=JSON.parse(r.detail);
+  expect(r.state).toBe('pushing');
+  f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.job);
+  expect(()=>f.recovery.complete(r,d,f.config)).toThrow('Current');
+  expect(f.recovery.row(f.job).state).toBe('pushing');
+  expect(JSON.parse(f.recovery.row(f.job).detail).result).toBe(d.result);
+ }finally{f.close();}
+});
+test('manual reconciliation cannot release a reservation revoked before completion',async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  const io={...f.io,command:async(args:string[],cwd:string)=>{const result=await f.io.command(args,cwd);if(args.includes('commit')&&args[0]==='git')throw Error('Lost commit receipt');return result;}};
+  await new ConflictRecovery(f.s,io as any).tick(f.job,f.config,'owner/repo',1);
+  await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  const preview=await f.recovery.manualPreview(f.job,f.config);
+  const revoke={...f.io,command:async(args:string[],cwd:string)=>{const result=await f.io.command(args,cwd);if(args[0]==='git'&&args[1]==='write-tree')f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.job);return result;}};
+  await expect(new ConflictRecovery(f.s,revoke as any).manualConfirm(f.job,f.config,preview.confirmation,'human')).rejects.toThrow('Current');
+  expect(f.recovery.row(f.job).state).toBe('manual_verifying');
+  expect(f.recovery.row(f.job).reason).toContain('Current');
+ }finally{f.close();}
+});
 test('remediation rechecks worktree reservation inside submission fence before routing or delivery',async()=>{
  const f=await fixture();try{
   const head=(await f.io.snapshot()).head;

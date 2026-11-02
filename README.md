@@ -1163,7 +1163,10 @@ adlc reconcile-conflict JOB CONFIG --confirm HASH --human NAME
 Confirmation verifies the same approval/policy/scope/ownership, exact original
 parents, clean published tree, retained non-conflict content and a terminal
 worker receipt, then reruns configured verification and releases only that proven
-completed reservation. It never sends, commits, pushes, resets or expands scope.
+completed reservation. Completion rechecks current approval and grants inside its
+transaction; revocation keeps the reservation for reconciliation rather than
+releasing it under stale authority. It never sends, commits, pushes, resets or
+expands scope.
 If that proof cannot be obtained, preserve the reservation and request explicit
 operator reconciliation/replanning; do not edit SQLite or rewrite history to
 satisfy the check. DEV-18 answer intake is not required or assumed: a human answer
