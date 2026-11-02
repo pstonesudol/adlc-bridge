@@ -21,6 +21,9 @@ configured paths, exact executable versions via `--version`, project-file
 agreement and existing service-file conflicts. It does not read credentials,
 contact providers, open the registry, install a workflow hook, or run launchctl.
 Only supply trusted executable paths: version checks execute those programs.
+The runtime project-config reference must identify the same canonical file as
+the CLI project argument; a content-identical copy is not accepted. Setup checks
+repo/working-directory directory types and controller file type before passing.
 Existing definitions must match byte-for-byte or are preserved as conflicts.
 `service.path` must be a staging path for writes, not a LaunchAgents/Daemons
 directory. Parent directories must already exist. XML escaping is automatic.
@@ -40,6 +43,25 @@ Only first legacy discovery may infer a missing controller identity from its
 existing plist. Ordinary service checks reject an unbound registration and require
 explicit operator migration; new setup records its known controller input rather
 than learning it from a subsequently mutable plist.
+
+For an older non-legacy registration without a controller binding, an operator can
+run `adlc bind-controller PROJECT /absolute/verified/src/cli.ts` to preview the
+identity. Only the executing CLI or owner-validated installed CLI is accepted;
+the controller must be an owner-controlled regular file. The preview hashes the
+registration, config, controller bytes and file identity. Apply only that fresh
+preview with `--apply --confirm HASH`. Apply uses the existing submission/control
+fence, never reads a plist for authority, never changes a definition or starts a
+service, and refuses conflicting existing bindings. Source/identity changes
+invalidate the hash. This command is an operator migration, not automatic repair.
+
+Interrupted interactive setup can be resumed with the same
+`adlc init REPO --config PROJECT_JSON`: confirm resuming the saved configuration
+unchanged, then explicitly approve the remaining setup steps. Config/policies
+are not rewritten. The known controller binding is committed before an atomic,
+no-clobber service publication. A failed publication can be retried; a matching
+old plist without a binding is checked against the known setup controller before
+recording that identity. Existing matching service definitions are preserved and
+not started automatically. An unrecognized definition is preserved for inspection.
 
 Pin Bun, AO, Git and gh paths/versions under `tools`; pin Docker there too if
 container verification is selected. Versions are exact three-component versions
@@ -68,6 +90,22 @@ instructions explicitly stop and request it instead of guessing or bypassing the
 runner. Generated staged services retain their runtime source via
 `ADLC_VERIFICATION_RUNTIME_CONFIG`; managed snapshot migration preserves that
 reference. Credentials are never copied into this context or service environment.
+`serve` reloads and validates the project/runtime configuration inside each fenced
+tick. Verification edits and removal reach remediation on the next tick; invalid
+configuration aborts the tick rather than reusing startup values. Changing the
+repository/project identity requires an explicit restart/reconciliation.
+
+Managed snapshot rotation preserves the entire existing plist (tool/PATH/AO
+settings, interval, RunAtLoad, working directory, logs and other keys), changing
+only the controller argument. Configured directories are not moved implicitly.
+The active verification runner follows the currently executing snapshot only
+when it matches the owner-validated installation record. Thus `install --apply`
+and its existing rollback atomically select the effective runner through the
+installed pin; the original runtime JSON is never rewritten. A development CLI
+or unrelated process does not claim the installed identity and retains the
+explicit configured runner. Preview reports this supported rotation policy;
+tests exercise rotation, removed old controller files and rollback in temporary
+snapshots. Installation/activation still requires the existing operator action.
 (optional prerelease/build suffix). Configure routing paths in the existing project
 JSON. Credential mechanisms remain `adlc auth-linear`/the existing token override,
 native gh authentication and Orchestrator provider login. Never put tokens,

@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,realpathSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,realpathSync,symlinkSync} from 'node:fs';
 import {join} from 'node:path';import {tmpdir} from 'node:os';
-import {withVerificationContext,runtimeServiceDefinition,type RuntimeConfig} from '../src/setup';
+import {withVerificationContext,runtimeServiceDefinition,setupPreview,type RuntimeConfig} from '../src/setup';
 import {verificationInstructions,type Verification} from '../src/verification';
 import {serviceDefinition} from '../src/init';
 
@@ -21,6 +21,9 @@ test('trusted runtime file context reaches CLI instructions; forged project cont
   const cli=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'verification',project,'--runtime',runtime],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root},stdout:'pipe',stderr:'pipe'});
   expect(cli.exitCode).toBe(0);expect(cli.stdout.toString()).toContain(JSON.stringify(runtime));expect(cli.stdout.toString()).not.toContain('/FORGED_RUNTIME');
   expect(runtimeServiceDefinition(r,runtime)).toContain('<key>ADLC_VERIFICATION_RUNTIME_CONFIG</key>');expect(serviceDefinition(project,process.execPath,r.controller,root,r.service.label,runtime)).toContain('runtime owner&apos;s config.json');
+  const alias=join(root,'project-alias.json');symlinkSync(project,alias);expect(setupPreview(c,r,()=>true,runtime,alias).checks.find(x=>x.name==='project-config-path')?.passed).toBe(true);expect(setupPreview(c,r,()=>true).passed).toBe(false);
   const other=join(root,'other.json');writeFileSync(other,JSON.stringify(c));writeFileSync(runtime,JSON.stringify({...r,projectConfig:other}));expect(()=>withVerificationContext(c,project,runtime)).toThrow('different project config');
+  const copyPreview=setupPreview(c,{...r,projectConfig:other},()=>true,runtime,project);expect(copyPreview.checks.find(x=>x.name==='project-config-content')?.passed).toBe(true);expect(copyPreview.checks.find(x=>x.name==='project-config-path')?.passed).toBe(false);expect(copyPreview.passed).toBe(false);
+  const copyCLI=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'setup',project,runtime],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root},stdout:'pipe',stderr:'pipe'});expect(copyCLI.exitCode).not.toBe(0);expect(JSON.parse(copyCLI.stdout.toString()).checks.find((x:any)=>x.name==='project-config-path').passed).toBe(false);
  }finally{rmSync(root,{recursive:true,force:true});}
 });

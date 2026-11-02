@@ -38,6 +38,7 @@ import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
+import {migrateController} from './controller-migration';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -48,9 +49,13 @@ function projectConfiguration(path:string){
  if(runtime?.startsWith('--'))throw Error('--runtime requires a runtime configuration path');
  return withVerificationContext(JSON.parse(readFileSync(path,'utf8')),path,runtime);
 }
-export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
- const {config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
+export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
+ const {config:startup,loadConfig,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
+ const identity=(c:any)=>JSON.stringify([realpathSync(c.repo),c.linear.projectId,c.linear.teamId,c.automation?.orchestratorProject,c.githubRepo]);
+ const initialIdentity=loadConfig?identity(startup):undefined;
  return async()=>runPollTick(async()=>{
+  const c=loadConfig?loadConfig():startup;
+  if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
   io.out(await io.poll(c,s,io.linearToken()));
@@ -77,6 +82,9 @@ export function createCLIPollTick(context:{config:any;store:Store;reviewLoop:Pic
  });
 }
 async function main(){
+  if(command==='bind-controller'){
+   const i=a.indexOf('--confirm');return out(await migrateController(req(a[0],'Project'),req(a[1],'Controller'),a.includes('--apply'),i>=0?req(a[i+1],'Confirmation hash'):undefined));
+  }
   if(['recover','cleanup'].includes(command)){const s=new Store(db);try{return out(await maintenance(s,command as 'recover'|'cleanup',req(a[0],'Job'),a.includes('--apply'),a.includes('--confirm')?req(a[a.indexOf('--confirm')+1],'Confirmation hash'):undefined));}finally{s.close();}}
   if(command==='install'){
     const bin=a.includes('--bin')?req(a[a.indexOf('--bin')+1],'Launcher path'):undefined;
@@ -89,8 +97,8 @@ async function main(){
   if(command==='setup'){
     const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
     if(a.includes('--export'))return out(sanitizedSetup(c,r));
-    if(a.includes('--write-service'))return out(writeSetupService(c,r,realpathSync(a[1])));
-    const preview=setupPreview(c,r,undefined,realpathSync(a[1]));out(preview);if(!preview.passed)process.exitCode=1;return;
+    if(a.includes('--write-service'))return out(writeSetupService(c,r,realpathSync(a[1]),realpathSync(a[0])));
+    const preview=setupPreview(c,r,undefined,realpathSync(a[1]),realpathSync(a[0]));out(preview);if(!preview.passed)process.exitCode=1;return;
   }
   if(command==='verification'){
     const c=projectConfiguration(req(a[0],'Config'));validate(c);
@@ -117,6 +125,8 @@ async function main(){
   start --all | stop --all | status --all
                                        full background stack; stop requires idle workers
   projects                             list registered project services
+  bind-controller PROJECT CONTROLLER   preview verified missing-identity migration
+    [--apply --confirm HASH]            bind only the currently inspected identity; no activation
   setup PROJECT_JSON RUNTIME_JSON       read-only prerequisite/service preview
     [--write-service]                   create staged definition only; no activation
     [--export]                          print sanitized, disabled setup template
@@ -293,7 +303,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-    const tick=createCLIPollTick({config:c,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
+    const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();

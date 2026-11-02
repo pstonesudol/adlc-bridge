@@ -75,14 +75,14 @@ test('both project setup flows preserve config, render deterministically and dis
  try{for(const verification of [host,container]){
   const c=project(root,verification),r=runtime(root);if(verification.mode==='container')r.tools.docker={path:join(root,'docker'),version:'1.2.3'};
   writeFileSync(r.projectConfig,JSON.stringify(c));writeFileSync(r.controller,'');
-  const before=JSON.stringify(c),preview=setupPreview(c,r,()=>true);
+  const before=JSON.stringify(c),preview=setupPreview(c,r,()=>true,undefined,r.projectConfig);
   expect(preview.passed).toBe(true);expect(preview.activation).toBe(false);expect(preview.service).toBe('create');expect(JSON.stringify(c)).toBe(before);
   expect(preview.definition).toBe(runtimeServiceDefinition(r));expect(preview.definition).toContain('local.adlc.legacy');
   expect(preview.checks.some(x=>x.kind==='injected-probe-not-live')).toBe(true);
-  expect(setupPreview(c,r,()=>false).passed).toBe(false);
+  expect(setupPreview(c,r,()=>false,undefined,r.projectConfig).passed).toBe(false);
   const escaped=structuredClone(r);escaped.service.stdout=join(root,'a & b.log');expect(runtimeServiceDefinition(escaped)).toContain('a &amp; b.log');
-  writeFileSync(r.service.path,preview.definition);expect(setupPreview(c,r,()=>true).service).toBe('unchanged');
-  writeFileSync(r.service.path,'existing');expect(setupPreview(c,r,()=>true).passed).toBe(false);rmSync(r.service.path);
+  writeFileSync(r.service.path,preview.definition);expect(setupPreview(c,r,()=>true,undefined,r.projectConfig).service).toBe('unchanged');
+  writeFileSync(r.service.path,'existing');expect(setupPreview(c,r,()=>true,undefined,r.projectConfig).passed).toBe(false);rmSync(r.service.path);
   const exported=JSON.stringify(sanitizedSetup(c,r));expect(exported).not.toContain(root);expect(exported).not.toContain(uuid);expect(exported).not.toContain('PRIVATE_NAME');expect(exported).not.toContain('ready-queue');
   expect(sanitizedSetup(c,r).project.requiredChecks).toEqual(['REPLACE_REQUIRED_CHECK_NAME']);
  }
@@ -128,7 +128,7 @@ test('setup preview rejects missing and wrong path types instead of staging unus
   for(const [name,invalid] of [['repo',regular],['workingDirectory',regular],['controller',directory],['repo',missing],['workingDirectory',missing],['controller',missing]]){
    const c=project(root,host),r=runtime(root);writeFileSync(r.controller,'');
    if(name==='repo')c.repo=invalid;else (r as any)[name]=invalid;
-   writeFileSync(r.projectConfig,JSON.stringify(c));const preview=setupPreview(c,r,()=>true);
+   writeFileSync(r.projectConfig,JSON.stringify(c));const preview=setupPreview(c,r,()=>true,undefined,r.projectConfig);
    expect(preview.checks.find(check=>check.name===name)?.passed).toBe(false);expect(preview.passed).toBe(false);expect(existsSync(r.service.path)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}

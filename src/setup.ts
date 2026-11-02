@@ -1,5 +1,6 @@
 import {existsSync,readFileSync,realpathSync,writeFileSync,lstatSync,statSync} from 'node:fs';
-import {isAbsolute,dirname} from 'node:path';
+import {isAbsolute,dirname,resolve} from 'node:path';
+import {installedCLI} from './install-state';
 import {validate} from './linear';
 import {validateVerification,verificationInstructions,type VerificationContext} from './verification';
 
@@ -24,7 +25,11 @@ export function withVerificationContext(c:any,projectPath:string,runtimePath?:st
  if(!runtimePath)return result;
  const runtimeConfig=realpathSync(runtimePath),r=JSON.parse(readFileSync(runtimeConfig,'utf8'));validateRuntime(r);
  if(realpathSync(r.projectConfig)!==realpathSync(projectPath))throw Error('Runtime configuration belongs to a different project config');
- result.verificationContext={projectConfig:realpathSync(projectPath),runtimeConfig,bun:r.tools.bun.path,cli:r.controller};
+ // The currently executing, owner-pinned snapshot is authoritative after an
+ // operator installation/rollback. Runtime JSON remains unchanged and recoverable.
+ const pin=installedCLI(),executing=realpathSync(resolve(import.meta.dir,'cli.ts'));
+ const controller=pin&&existsSync(pin)&&realpathSync(pin)===executing?executing:r.controller;
+ result.verificationContext={projectConfig:realpathSync(projectPath),runtimeConfig,bun:r.tools.bun.path,cli:controller};
  return result;
 }
 const xml=(s:string)=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&apos;');
@@ -46,12 +51,13 @@ const liveProbe=(name:string,t:{path:string;version:string})=>{
  const p=Bun.spawnSync([t.path,'--version'],{stdout:'pipe',stderr:'pipe',timeout:10000,env:{PATH:'/usr/bin:/bin'}});
  return p.exitCode===0&&p.stdout.toString().trim().split(/\s+/).some(x=>x.replace(/,$/,'')===t.version||x===`v${t.version}`);
 };
-export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string){
+export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:string,projectPath?:string){
  validate(c);validateRuntime(r);if(c.verification)validateVerification(c.verification);
  if(c.verification?.mode==='container'&&!r.tools.docker)throw Error('Pinned Docker executable required');
  const definition=runtimeServiceDefinition(r,runtimePath);
  const existing=existsSync(r.service.path)?readFileSync(r.service.path,'utf8'):undefined;
  const checks=Object.entries(r.tools).map(([name,t])=>({name,passed:probe(name,t),kind:probe===liveProbe?'live-executable-version':'injected-probe-not-live'}));
+ let sameProject=false;try{sameProject=!!projectPath&&realpathSync(projectPath)===realpathSync(r.projectConfig);}catch{}checks.push({name:'project-config-path',passed:sameProject,kind:'live-file-identity'});
  for(const [name,p] of Object.entries({repo:c.repo,projectConfig:r.projectConfig,controller:r.controller,workingDirectory:r.workingDirectory})){
   let passed=false;try{passed=name==='projectConfig'?existsSync(p as string):['repo','workingDirectory'].includes(name)?statSync(p as string).isDirectory():statSync(p as string).isFile();}catch{}
   checks.push({name,passed,kind:'live-path'});
@@ -60,8 +66,8 @@ export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:
  const conflict=existing!==undefined&&existing!==definition;
  return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict,checks,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['No live provider, registered-project, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
 }
-export function writeSetupService(c:any,r:RuntimeConfig,runtimePath?:string){
- const preview=setupPreview(c,r,liveProbe,runtimePath);if(!preview.passed)throw Error('Setup validation failed; existing configuration preserved');
+export function writeSetupService(c:any,r:RuntimeConfig,runtimePath?:string,projectPath?:string){
+ const preview=setupPreview(c,r,liveProbe,runtimePath,projectPath);if(!preview.passed)throw Error('Setup validation failed; existing configuration preserved');
  if(preview.service==='unchanged')return {written:false,activation:false};
  // Render to a staging file only. Never install into a login-loaded service directory.
  if(r.service.path.includes('/Library/LaunchAgents/')||r.service.path.includes('/Library/LaunchDaemons/'))throw Error('Use a staging service.path; installation/activation requires separate human action');
