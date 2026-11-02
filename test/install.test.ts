@@ -1,7 +1,8 @@
-import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join,dirname} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
+import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';import {join,dirname,relative,resolve} from 'node:path';import {tmpdir} from 'node:os';import {snapshot,distributionFiles} from '../src/install';
 import {installBridge,rotatedServiceDefinition} from '../src/install';import {copyFileSync,readdirSync,existsSync,realpathSync,chmodSync,symlinkSync} from 'node:fs';
 import {turnBarrier} from '../src/turn-submission';import {serviceControl} from '../src/service-control';
 import {Store} from '../src/core';
+import {assertDefinition} from '../src/project-services';
 const fixtureDefinition=()=>({Label:'local.adlc.fixture',ProgramArguments:[process.execPath,'/old/src/cli.ts','poll','/project.json']});
 function controlFixture(){
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-install-control-'))),source=join(root,'source'),state=join(root,'state'),home=join(root,'home'),launcher=join(root,'adlc'),record=join(state,'installation.json'),plist=join(home,'Library/LaunchAgents/local.adlc.project.plist');
@@ -110,6 +111,26 @@ test('relative state paths refuse directory rotation before writes and preserve 
   const custom=rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},next);expect(custom.WorkingDirectory).toBe('/operator/custom');expect(custom.EnvironmentVariables.ADLC_DB).toBe('state.sqlite');
   expect(rotatedServiceDefinition(def,controller).WorkingDirectory).toBe(dirname(controller));
   const runtime={...def,EnvironmentVariables:{ADLC_DB:database,ADLC_VERIFICATION_RUNTIME_CONFIG:'runtime.json'}};expect(()=>rotatedServiceDefinition(runtime,next)).toThrow('requires absolute ADLC_VERIFICATION_RUNTIME_CONFIG');
+ }finally{f.close();}
+});
+test('relative project config that passes current identity checks refuses directory rotation before writes',async()=>{
+ const f=controlFixture();try{
+  const controller=join(f.root,'old-snapshot/src/cli.ts'),next=join(f.root,'new-snapshot/src/cli.ts'),config=join(f.root,'project.json');
+  for(const cli of [controller,next]){mkdirSync(dirname(cli),{recursive:true});writeFileSync(cli,'fixture cli');}
+  const uuid='00000000-0000-0000-0000-000000000001';writeFileSync(config,JSON.stringify({version:1,name:'Existing project',repo:f.source,requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid}}));
+  const relativeConfig=relative(process.cwd(),config),def={Label:f.projects[0].label,ProgramArguments:[process.execPath,controller,'poll',relativeConfig],WorkingDirectory:dirname(controller)};
+  expect(()=>assertDefinition(def,def.Label,config,controller)).not.toThrow();expect(resolve(dirname(next),relativeConfig)).not.toBe(config);
+  const before=structuredClone(def),files=[f.plist,f.record,f.launcher,config],bytes=files.map(path=>readFileSync(path));let verified=0;
+  f.projects[0].config=config;f.io.readDefinition=()=>structuredClone(def);f.io.assertDefinition=(candidate:any,label:string,path:string)=>{assertDefinition(candidate,label,path,controller);verified++;};
+  expect(()=>rotatedServiceDefinition(def,next)).toThrow('Controller-directory rotation requires absolute project config');expect(def).toEqual(before);
+  for(const apply of [false,true]){
+   await expect(installBridge(apply,f.source,f.launcher,f.io)).rejects.toThrow('Controller-directory rotation requires absolute project config');
+   expect(files.map(path=>readFileSync(path))).toEqual(bytes);expect(f.calls).toEqual([]);expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+  }
+  expect(verified).toBe(2);
+  const absolute={...def,ProgramArguments:[process.execPath,controller,'poll',config]},rotated=rotatedServiceDefinition(absolute,next);
+  expect(rotated.WorkingDirectory).toBe(dirname(next));expect(rotated.ProgramArguments[3]).toBe(config);expect(readFileSync(rotated.ProgramArguments[3])).toEqual(bytes[3]);expect(()=>assertDefinition(rotated,def.Label,config,next)).not.toThrow();
+  expect(rotatedServiceDefinition({...def,WorkingDirectory:'/operator/custom'},next).WorkingDirectory).toBe('/operator/custom');expect(rotatedServiceDefinition(def,controller).WorkingDirectory).toBe(dirname(controller));
  }finally{f.close();}
 });
 test('rotation rejects malformed arguments, wrong command and relative controller without changing input',()=>{

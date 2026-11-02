@@ -8,6 +8,8 @@ import {appState,installedCLI,verifiedInstallationSource} from './install-state'
 function assertMovableStatePaths(def:any){
  const controller=def.ProgramArguments?.[1];
  if(typeof controller!=='string'||def.WorkingDirectory!==dirname(controller))return;
+ const config=def.ProgramArguments?.[3];
+ if(typeof config!=='string'||!isAbsolute(config))throw Error('Controller-directory rotation requires absolute project config; reconcile the existing path before installation; existing service preserved');
  for(const name of ['ADLC_DB','ADLC_VERIFICATION_RUNTIME_CONFIG']){
   const path=def.EnvironmentVariables?.[name];
   if(path!==undefined&&(typeof path!=='string'||!isAbsolute(path)))throw Error(`Controller-directory rotation requires absolute ${name}; reconcile the existing path before installation; existing service preserved`);
