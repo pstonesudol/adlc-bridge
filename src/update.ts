@@ -1,5 +1,5 @@
 import {existsSync,lstatSync,readFileSync,mkdirSync,rmSync,renameSync,unlinkSync} from 'node:fs';
-import {join,dirname,isAbsolute} from 'node:path';
+import {join,dirname,isAbsolute,relative,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {appState,installationRecord} from './install-state';
@@ -59,8 +59,9 @@ export function validateUpdatePolicy(input:any):UpdatePolicy{
  if(refKind!=='branch'&&refKind!=='release')throw Error('Update refKind must be branch or release');
  const mode=input.mode??'manual';if(mode!=='manual'&&mode!=='automatic')throw Error('Update mode must be manual or automatic');
  const cadenceSeconds=input.cadenceSeconds??3600;if(!Number.isSafeInteger(cadenceSeconds)||cadenceSeconds<60)throw Error('Update cadenceSeconds must be an integer of at least 60');
- const verification=input.verification??{};
+ const verification=input.verification===undefined?{}:input.verification;if(!verification||typeof verification!=='object'||Array.isArray(verification))throw Error('Update verification must be a JSON object');
  const requiredChecks=verification.requiredChecks??[];if(!Array.isArray(requiredChecks)||requiredChecks.some((name:any)=>typeof name!=='string'||!name.trim()))throw Error('Update requiredChecks must be a list of check names');
+ if(mode==='automatic'&&!requiredChecks.length)throw Error('Automatic updates require at least one required check name');
  const allowCandidateTests=verification.allowCandidateTests??false;if(typeof allowCandidateTests!=='boolean')throw Error('allowCandidateTests must be true or false');
  const testCommand=verification.testCommand??['bun','test'];if(!Array.isArray(testCommand)||!testCommand.length||testCommand.some((part:any)=>typeof part!=='string'||!part.trim()))throw Error('Update testCommand must be a non-empty argument list');
  const maintenance=input.maintenance??{};if(maintenance.blockIntakeDuringActivation!==undefined&&maintenance.blockIntakeDuringActivation!==true)throw Error('Updates always block intake during activation');
@@ -114,7 +115,7 @@ export async function stageCandidate(policy:UpdatePolicy,candidate:Candidate,sta
  const inspect=()=>{
   if(!existsSync(join(root,'.git')))throw Error('Staged update checkout is missing its pinned Git identity');
   const head=runGit(['rev-parse','HEAD'],root).trim();if(head!==candidate.commit)throw Error('Staged update checkout no longer matches the pinned candidate');
-  if(runGit(['status','--porcelain'],root).trim())throw Error('Staged update checkout was modified; operator action required');
+  if(runGit(['status','--porcelain','--ignored'],root).trim())throw Error('Staged update checkout was modified; operator action required');
   const files=distributionFiles(root);return {root,commit:head,version:distributionVersion(root,files),files};
  };
  if(existsSync(root))return inspect();
@@ -167,7 +168,7 @@ function installedVersion(state:string){
 }
 function readIntent(state:string):UpdateIntent|undefined{const path=join(state,'update-intent.json');if(!existsSync(path))return;const intent=readJson(path);if(intent.version!==1||typeof intent.stage!=='string')throw Error('Update intent is invalid; operator action required');return intent;}
 function writeIntent(state:string,intent:UpdateIntent){atomicFile(join(state,'update-intent.json'),JSON.stringify(intent,null,2)+'\n');return intent;}
-function advance(state:string,intent:UpdateIntent,stage:string,extra:Partial<UpdateIntent>={}){return writeIntent(state,{...intent,...extra,stage,updatedAt:new Date().toISOString()});}
+function advance(state:string,intent:UpdateIntent,stage:string,extra:Partial<UpdateIntent>={}){return writeIntent(state,{...(readIntent(state)??intent),...extra,stage,updatedAt:new Date().toISOString()});}
 function readInstalledState(state:string):InstalledUpdateState|undefined{const path=join(state,'update-state.json');if(!existsSync(path))return;const value=readJson(path);if(value.version!==1||(typeof value.commit!=='string'&&value.commit!==null))throw Error('Installed update state is invalid; operator action required');return value;}
 function writeInstalledState(state:string,value:InstalledUpdateState){atomicFile(join(state,'update-state.json'),JSON.stringify(value,null,2)+'\n');return value;}
 function acquireLock(state:string){
@@ -306,15 +307,18 @@ export class UpdateManager{
     }
     advance(state,intent,'installing');
     const confirmed=await this.io.resolve(policy);if(confirmed.commit!==plan.candidate.commit)throw Error('Authoritative candidate changed during activation; no installation attempted');
+    const verified=await this.io.stage(policy,confirmed);
+    if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version)throw Error('Staged candidate changed after verification; no installation attempted');
     installAttempted=true;
     const result=await this.io.install(true,plan.staged.root,this.io.launcher());
     advance(state,intent,'starting',{installed:true});
     if(backendStopped)await this.io.stack.backendStart();
+    const baselineDb=this.io.dbHash();
     for(const service of prior)if(service.loaded){await startService(service.project);}
     advance(state,intent,'verifying');
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Activated runtime is not healthy');
     for(const service of prior)if(service.loaded){const status=await this.io.stack.project('service-status',service.project);if(!status?.loaded)throw Error(`Project ${service.project} did not restore after activation`);}
-    writeInstalledState(state,{version:1,commit:plan.candidate.commit,contentVersion:plan.staged.version,classification:plan.classification,rollbackSafe:plan.migration?.rollbackSafe??true,restartRequired:plan.classification==='hot'&&!!result?.runtimeRestartRequired,previousSource:join(state,'versions',plan.installedVersion),previousVersion:plan.installedVersion,previousCommit:readInstalledState(state)?.commit??null,dbHash:this.io.dbHash(),activatedAt:new Date().toISOString()});
+    writeInstalledState(state,{version:1,commit:plan.candidate.commit,contentVersion:plan.staged.version,classification:plan.classification,rollbackSafe:(plan.migration?.rollbackSafe??true)&&(plan.classification!=='schema'||baselineDb!==null),restartRequired:plan.classification==='hot'&&!!result?.runtimeRestartRequired,previousSource:join(state,'versions',plan.installedVersion),previousVersion:plan.installedVersion,previousCommit:readInstalledState(state)?.commit??null,dbHash:baselineDb,activatedAt:new Date().toISOString()});
     advance(state,intent,'completed');
     this.notify('activated',plan.candidate.commit,{version:plan.staged.version,classification:plan.classification});
     if(!wasPaused)this.turns.resume();
@@ -364,9 +368,9 @@ export class UpdateManager{
   try{
    const installed=readInstalledState(state);if(!installed)throw Error('No activated update is recorded; nothing to roll back');
    if(!installed.rollbackSafe)throw Error(`Rollback is unsafe: ${installed.classification} changes require explicit migration restore evidence; backups preserved at ${join(state,'backups')}`);
-   if(installed.classification==='schema'&&installed.dbHash!==null&&this.io.dbHash()!==installed.dbHash)throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
+   if(installed.classification==='schema'&&(installed.dbHash===null||this.io.dbHash()!==installed.dbHash))throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; explicit operator recovery is required`);
-   const source=installed.previousSource;if(typeof source!=='string'||!isAbsolute(source)||!source.startsWith(join(state,'versions')+'/')||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
+   const source=installed.previousSource;const rel=typeof source==='string'&&isAbsolute(source)?relative(join(state,'versions'),source):'..';if(typeof source!=='string'||!rel||rel.startsWith('..')||isAbsolute(rel)||rel.includes(sep)||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
    const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
    if(!wasPaused)this.turns.pause();
    let prior:PriorService[]=[];let leavePaused=false,backendStopped=false;
