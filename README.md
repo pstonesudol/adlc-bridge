@@ -1141,6 +1141,8 @@ still a new edit version. Existing body-bound metadata-check gates remain intact
 No check weakening, review dismissal, automatic approval, merging or deployment
 is added.
 
+### Budget configuration
+
 Remediation budgeting is a per-project setting:
 
 ```json

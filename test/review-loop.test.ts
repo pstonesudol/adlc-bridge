@@ -91,6 +91,16 @@ test('custom Verification Evidence goes to the existing worker once, uses config
   expect(f.reviews()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
  }finally{f.s.close();}
 });
+test('a fresh custom-check blocker on the first tick after an edit does not request another review',async()=>{
+ const f=customLoopFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
+  const reason='CodeRabbit custom-check failure: pre-merge row is unclassifiable';
+  Object.assign(f.e,{descriptionHash:'edited-body',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,reasons:[reason],botReviewSubmittedAt:Date.now()+10000});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.reviews()).toBe(0);expect(f.sends()).toBe(1);
+  expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(0);
+ }finally{f.s.close();}
+});
 test('fresh custom-check blockers retain their reason after a description edit; stale and pending reviews wait',async()=>{
  const f=customLoopFixture();try{
   await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';

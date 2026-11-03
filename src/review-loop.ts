@@ -265,7 +265,9 @@ export class ReviewLoop{
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.
-  if(!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
+  const waitStart=Math.max(waiting?.started??0,deliveryWait?.started??0);
+  const blockerAlreadyFresh=!!(e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
+  if(!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
    const requested=await this.requestReview(job,e.head,reviewBodyKey);
    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
    if(requested){
