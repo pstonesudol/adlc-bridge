@@ -15,9 +15,9 @@ function fixture(over:any={}){
  writeFileSync(join(state,'installation.json'),JSON.stringify({source:join(root,'source'),version:'v1',cli:join(v1,'src/cli.ts'),launcher:join(root,'adlc')}),{mode:0o600});
  writeUpdatePolicy(policy(over.policy),state);
  const services:Record<string,boolean>={one:true,two:false},calls:string[]=[],installs:string[]=[],notifications:string[]=[];
- let blockers:{session:string;reason:string}[]=over.blockers??[],backendReady=true,managed=true,failInstall=false,backendStartFailures=over.failBackendStarts??0,serviceStartFailures=over.failServiceStartOnce?1:0,candidate=over.candidate??'a'.repeat(40),checks=over.checks??{passed:true,names:['CI'],detail:'ok'},tests=over.tests??{passed:true,skipped:true,detail:'skipped'};
+ let blockers:{session:string;reason:string}[]=over.blockers??[],backendReady=true,backendLoaded=true,managed=true,failInstall=false,backendStartFailures=over.failBackendStarts??0,serviceStartFailures=over.failServiceStartOnce?1:0,candidate=over.candidate??'a'.repeat(40),checks=over.checks??{passed:true,names:['CI'],detail:'ok'},tests=over.tests??{passed:true,skipped:true,detail:'skipped'};
  const turns=turnBarrier(state);
- const stack:any={turns,projects:async()=>Object.keys(services).map(project=>({project})),project:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {project:id,loaded:services[id]};if(action==='stop')services[id]=false;if(action==='start'){await turns.run(async()=>{},'start');if(over.failStart||serviceStartFailures-->0)throw Error('start failed');services[id]=true;}return {project:id,loaded:services[id]};},backend:async()=>({ready:backendReady,loaded:true,managed,pid:1}),backendStart:async()=>{calls.push('backend:start');if(backendStartFailures-->0)throw Error('backend start failed');backendReady=true;},backendStop:async()=>{calls.push('backend:stop');backendReady=false;},blockers:async()=>{if(over.blockersError)throw new Error(over.blockersError);return blockers;}};
+ const stack:any={turns,projects:async()=>Object.keys(services).map(project=>({project})),project:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {project:id,loaded:services[id]};if(action==='stop')services[id]=false;if(action==='start'){await turns.run(async()=>{},'start');if(over.failStart||serviceStartFailures-->0)throw Error('start failed');services[id]=true;}return {project:id,loaded:services[id]};},backend:async()=>({ready:backendReady,loaded:backendLoaded,managed,pid:1}),backendStart:async()=>{calls.push('backend:start');if(backendStartFailures-->0){backendLoaded=true;throw Error('backend start failed');}backendReady=true;backendLoaded=true;},backendStop:async()=>{calls.push('backend:stop');backendReady=false;backendLoaded=false;},blockers:async()=>{if(over.blockersError)throw new Error(over.blockersError);return blockers;}};
  const io:UpdateIO={state:()=>state,resolve:async p=>({commit:typeof candidate==='function'?candidate():candidate,ref:'refs/heads/main',source:p.remote}),stage:async(p,c)=>{if(over.stageCommit)return {root:join(root,'stage'),commit:over.stageCommit,version:'v2',files:['src/cli.ts']};return {root:join(root,'stage'),commit:c.commit,version:over.version??'v2',files:over.files??['src/cli.ts']};},checks:async()=>checks,tests:async()=>tests,compatibility:()=>({compatible:over.incompatible?false:true,detail:over.incompatible?'incompatible candidate':'compatible'}),reattachment:async()=>({safe:over.reattachment??true,detail:over.reattachment===false?'controller attachment unverified':'reattachment verified'}),stack,install:async(_apply:boolean,source:string)=>{installs.push(source);calls.push(`install:${source}`);if(failInstall){failInstall=false;throw Error('install failed');}return {installed:true};},launcher:()=>join(root,'adlc'),migrations:async()=>over.migration,dbHash:()=>over.dbHash??'db1',notify:(event,key)=>notifications.push(`${event}:${key}`),now:()=>over.now??1000};
  return {root,state,services,calls,installs,notifications,io,manager:new UpdateManager(io,turnBarrier(state)),policy:policy(over.policy),setBlockers:(value:any)=>blockers=value,setBackend:(ready:boolean,isManaged=true)=>{backendReady=ready;managed=isManaged;},setFail:(value:boolean)=>failInstall=value,setCandidate:(value:any)=>candidate=value,setChecks:(value:any)=>checks=value,setTests:(value:any)=>tests=value,close:()=>rmSync(root,{recursive:true,force:true})};
 }
@@ -112,6 +112,15 @@ test('installation preserves explicit prior snapshot roots instead of redirectin
   expect(result.source).toBe(join(f.state,'versions','v1'));
  }finally{f.close();}
 });
+test('an automatic attempt starts the cadence window even when it defers',async()=>{
+ const f=fixture({policy:{mode:'automatic',cadenceSeconds:60},blockers:[{session:'s',reason:'busy'}]});try{
+  expect(await f.manager.apply({automatic:true})).toMatchObject({deferred:true});
+  expect(existsSync(join(f.state,'update-auto.json'))).toBe(true);
+  await f.manager.check();
+  expect(await f.manager.apply({automatic:true})).toEqual({skipped:true,reason:'Update cadence has not elapsed'});
+  expect(f.installs).toEqual([]);
+ }finally{f.close();}
+});
 test('automatic adoption requires explicit opt-in and cadence, and never schedules itself',async()=>{
  const f=fixture();try{
   await expect(f.manager.apply({automatic:true})).rejects.toThrow('not enabled');expect(f.installs).toEqual([]);
@@ -159,6 +168,8 @@ test('backend recovery stops before restoring files and starts afterwards',async
   await expect(f.manager.apply()).rejects.toThrow('Update failed');
   const installedStage=`install:${join(f.root,'stage')}`,installedPrior=`install:${join(f.state,'versions','v1')}`;
   expect(f.installs).toEqual([join(f.root,'stage'),join(f.state,'versions','v1')]);
+  expect(f.calls.filter(x=>x==='backend:stop')).toHaveLength(2);
+  expect(f.calls.lastIndexOf('backend:stop')).toBeLessThan(f.calls.indexOf(installedPrior));
   expect(f.calls.indexOf('backend:stop')).toBeLessThan(f.calls.indexOf(installedStage));
   expect(f.calls.indexOf('backend:start')).toBeGreaterThan(f.calls.indexOf(installedStage));
   expect(f.calls.lastIndexOf('backend:start')).toBeGreaterThan(f.calls.indexOf(installedPrior));
@@ -198,6 +209,13 @@ test('rollback restores the prior verified snapshot and refuses after incompatib
  const changed=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'reversible'},dbHash:'db1'});try{
   await changed.manager.apply();changed.io.dbHash=()=> 'db2';await expect(changed.manager.rollback()).rejects.toThrow('Database changed after activation');expect(changed.installs).toHaveLength(1);
  }finally{changed.close();}
+});
+test('rollback acquires the update lock before reading or changing state',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();const installations=f.installs.length;mkdirSync(join(f.state,'update.lock'));
+  await expect(f.manager.rollback()).rejects.toThrow('in progress');
+  expect(existsSync(join(f.state,'update-state.json'))).toBe(true);expect(f.installs).toHaveLength(installations);
+ }finally{f.close();}
 });
 test('rollback rejects an empty or foreign previous source',async()=>{
  const f=fixture();try{
