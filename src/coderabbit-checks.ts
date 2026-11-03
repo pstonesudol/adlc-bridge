@@ -64,8 +64,9 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  // failure. Missing/malformed provenance must still take the fail-closed path.
  if(context&&bot(review?.user)&&review.user.id===summary.user.id&&typeof review.commit_id==='string'&&/^[a-f0-9]{40}$/.test(review.commit_id)&&review.commit_id!==head){
   const staleSummary=commits.length===1&&commits[0][1]===context.repo&&commits[0][2]===review.commit_id&&summary.issue_url===`https://api.github.com/repos/${context.repo}/issues/${context.pr}`&&Number.isFinite(time(summary.updated_at))&&Number.isFinite(time(review.submitted_at))&&time(summary.updated_at)<=time(review.submitted_at);
-  const currentRun=context.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head);
-  if(staleSummary&&!currentRun)return empty;
+  const currentRuns=context.checks.filter(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head);
+  const singlePendingRun=currentRuns.length===1&&currentRuns[0].status!=='completed';
+  if(staleSummary&&(!currentRuns.length||singlePendingRun))return empty;
   return {...empty,blocker:'CodeRabbit custom-check summary or run currency is ambiguous for the stale review; obtain current-head review evidence'};
  }
  if(unclassified)return blocked('pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary');

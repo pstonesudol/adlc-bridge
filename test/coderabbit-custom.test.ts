@@ -83,6 +83,16 @@ test('a known stale-head bot review waits for the current-head run rather than b
  expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],failedChecks:[],pendingChecks:[],missingChecks:[]},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false});
  expect(customCheckEvidence(f.review,f.head,f.comments).blocker).toBeTruthy();
 });
+test('a valid stale summary waits for exactly one pending current-head run',()=>{
+ const f=customFixture();f.review.commit_id='b'.repeat(40);
+ f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
+ f.context.checks[0].status='in_progress';
+ expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ f.context.checks.push({...f.context.checks[0],id:31});
+ expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toBeTruthy();
+ f.context.checks.pop();f.context.checks[0].status='completed';
+ expect(f.evidence().blocker).toBeTruthy();
+});
 for(const length of [39,...Array.from({length:23},(_,i)=>i+41),64,65])test(`unsupported commit length ${length} fails closed rather than becoming stale evidence`,()=>{
  const f=customFixture();f.review.commit_id='b'.repeat(length);f.context.checks=[];
  expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toBeTruthy();
