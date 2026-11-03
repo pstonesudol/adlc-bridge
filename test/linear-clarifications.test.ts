@@ -21,7 +21,7 @@ async function fixture(path=':memory:',planning=false){
  const w=new Workflow(s,t),spec=JSON.stringify({identifier:'DEV-18',title:'Listing',description}),id=s.enqueue('p','issue',spec),p=new Planning(s),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/isolated');
  const plan=planning?`Update src/a.ts. ${discovery}\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"needs-input","questions":[{"id":"q1","question":"What is the exact listing ID?","kind":"requirement"}],"dependencies":[],"risks":[]} -->`:'Update src/a.ts. <!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
  const hash=s.propose(id,plan);recordReadiness(s,id,plan,hash,digest(spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest(spec),'awaiting_approval','session','planning-message');
- e={session:{id:'session',projectId:'ao',branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
+ e={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',projectId:'ao',branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
  if(!planning){w.approve(id,hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);await w.executeApproved(id);}
  const block=async(questions=[{id:'q1',kind:'requirement',question:'What is the exact listing ID?'}],deps:any[]=[])=>{
   e.transcript.controller='ready';for(const turn of e.transcript.turns)turn.state='completed';

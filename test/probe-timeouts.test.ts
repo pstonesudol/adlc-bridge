@@ -18,7 +18,7 @@ for(const [name,read,message] of [['native feedback status',disableNativeFeedbac
 test('session evidence preserves valid output and rejects failed or mismatched receipts with a bounded spawn',async()=>{
  const output={session:{id:'worker'},transcript:{entries:[]}};let options:any;
  const spawn=((_args:any,opts:any)=>{options=opts;return {stdout:new Response(JSON.stringify(output)).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
- expect(await sessionEvidence('worker',spawn)).toEqual(output);expect(options.timeout).toBe(30000);await expect(sessionEvidence('other',spawn)).rejects.toThrow('Invalid session evidence');
+ expect(await sessionEvidence('worker',spawn)).toMatchObject({...output,receiptObservation:{complete:true}});expect(options.timeout).toBe(30000);await expect(sessionEvidence('other',spawn)).rejects.toThrow('Invalid session evidence');
 });
 for(const [name,run] of [['stack command',stackCommand],['service launch',serviceLaunch]] as const){
  test(`${name} timeout preserves failed output and releases its control fence`,async()=>{
