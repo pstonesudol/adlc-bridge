@@ -158,7 +158,7 @@ export class ReviewLoop{
    if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
     // A durable handoff marker survives later remediation states, so failed or
     // uncertain remediation after a revised handoff still reaches reconciliation.
-    return {state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'};
+    return this.record(job,{state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'});
    }
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   const observation=config?.conflictRecovery?.enabled?new RecoveryObservation(this.s):null;

@@ -20,8 +20,8 @@ export function installRevisions(s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS 
  revision TEXT PRIMARY KEY,job TEXT NOT NULL,snapshot TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS spec_revision_evidence (
  revision TEXT PRIMARY KEY,job TEXT NOT NULL,snapshot TEXT NOT NULL);
- CREATE TABLE IF NOT EXISTS spec_handoffs (
- job TEXT NOT NULL,plan_hash TEXT NOT NULL,pr INTEGER NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(job,plan_hash));
+ CREATE TABLE IF NOT EXISTS revision_handoffs (
+ job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,pr INTEGER NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(job,plan_hash,revision));
 `);}
 export function recordRevision(s:Store,old:any,spec:string){
  const id=randomUUID(),detail={id,oldHash:digest(old.spec),newHash:digest(spec),summary:revisionSummary(old.spec,spec),staleApproval:old.approved_hash};
@@ -49,10 +49,22 @@ export function latestRevision(s:Store,job:string):any{
 export function revisedExecution(s:Store,job:string){
  return !!(s.db.query("SELECT name FROM sqlite_master WHERE name='spec_execution_history'").get()&&s.db.query('SELECT 1 FROM spec_execution_history WHERE job=?').get(job));
 }
+/** The one open PR a recovered-delivery handoff belongs to. */
+export function handoffPr(result:any,openPrs:any[]){
+ return result.pr??(result.source==='delivery-recovery'&&openPrs.length===1?openPrs[0]:null);
+}
+/** Bind a handoff to the current requirement instance. A→B→A can reproduce an
+ * earlier plan hash, so a plan-hash-only marker would authorize stale evidence. */
+export function recordHandoff(s:Store,job:string,plan:string|null,pr:any,at=Date.now()){
+ if(!plan||!pr?.number)return;
+ const revision=latestRevision(s,job)?.id??'';
+ s.db.query('INSERT OR IGNORE INTO revision_handoffs VALUES (?,?,?,?,?)').run(job,plan,revision,pr.number,at);
+}
 export function revisedHandoff(s:Store,job:string){
  const plan=s.get(job).plan_hash;
- if(!plan||!revisedExecution(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='spec_handoffs'").get())return false;
- return !!s.db.query('SELECT 1 FROM spec_handoffs WHERE job=? AND plan_hash=?').get(job,plan);
+ if(!plan||!revisedExecution(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoffs'").get())return false;
+ const revision=latestRevision(s,job)?.id??'';
+ return !!s.db.query('SELECT 1 FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision);
 }
 export function observeLegacyRevision(s:Store,job:string){
  if(latestRevision(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get())return;

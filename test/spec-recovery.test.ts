@@ -3,7 +3,7 @@ import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
 import {SpecRecovery} from '../src/spec-recovery';
-import {latestRevision,revisionSummary,revisedExecution,revisedHandoff} from '../src/spec-revisions';
+import {latestRevision,revisionSummary,revisedExecution,revisedHandoff,handoffPr,recordHandoff} from '../src/spec-revisions';
 import {featureGit,ApprovalPolicyStore} from '../src/approval-policy';
 import {recordReadiness} from '../src/readiness';
 import {LinearLifecycle} from '../src/linear-lifecycle';
@@ -160,7 +160,13 @@ test('terminal failed replan is reconciled by exact receipt, then a fresh confir
   expect(await f.recovery.reconcile(f.job,config,failed.confirmation)).toMatchObject({action:'replan_failed_reconciled',state:'failed'});
   const fresh=await f.recovery.preview(f.job,config);expect(fresh.action).toBe('request_replanning');
   await f.recovery.reconcile(f.job,config,fresh.confirmation);
-  expect(f.sends).toHaveLength(3);expect(new Set(f.sends.map(x=>x.clientId)).size).toBe(3);
+  f.e.transcript.controller='ready';f.e.transcript.turns.at(-1).state='interrupted';
+  expect((await f.recovery.preview(f.job,config)).action).toBe('reconcile_failed_replan');
+  const second=await f.recovery.preview(f.job,config);
+  await f.recovery.reconcile(f.job,config,second.confirmation);
+  const third=await f.recovery.preview(f.job,config);expect(third.action).toBe('request_replanning');
+  await f.recovery.reconcile(f.job,config,third.confirmation);
+  expect(f.sends).toHaveLength(4);expect(new Set(f.sends.map(x=>x.clientId)).size).toBe(4);
   f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
@@ -177,8 +183,10 @@ test('prior PR stays historical until the revised handoff, then review reconcili
   f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
   expect(revisedExecution(f.s,f.job)).toBe(true);expect(revisedHandoff(f.s,f.job)).toBe(false);
   new ReviewLoop(f.s).register(f.job,'owner/repo',1,['CI'],['src/**']);
-  const gated=await new ReviewLoop(f.s,undefined,{sessionEvidence:async()=>{throw Error('unused');}}).tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
+  const gatedLoop=new ReviewLoop(f.s,undefined,{sessionEvidence:async()=>{throw Error('unused');}});
+  const gated=await gatedLoop.tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
   expect(gated?.state).toBe('waiting_for_revised_handoff');
+  expect(gatedLoop.get(f.job).state).toBe('waiting_for_revised_handoff');
   await f.w.executeApproved(f.job,config);
   f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
   await f.w.tick(config);
@@ -189,24 +197,57 @@ test('prior PR stays historical until the revised handoff, then review reconcili
   expect(after?.state).toBe('needs_reconciliation');expect(after?.reason).toContain('remediation delivery is uncertain');
  }finally{f.s.close();}
 });
+test('a handoff for the same plan hash from an earlier revision does not authorize the current one',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  const job=f.s.get(f.job),latest=latestRevision(f.s,f.job);
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  f.s.db.query('INSERT INTO revision_handoffs VALUES (?,?,?,?,?)').run(f.job,job.plan_hash,'earlier-authorization',1,Date.now());
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  f.s.db.query('INSERT INTO revision_handoffs VALUES (?,?,?,?,?)').run(f.job,job.plan_hash,latest.id,1,Date.now());
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
+ }finally{f.s.close();}
+});
+test('recovered delivery records the single open PR as the current revision handoff',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  expect(handoffPr({source:'delivery-recovery',state:'pr_handoff'},[{number:7}])).toEqual({number:7});
+  expect(handoffPr({state:'pr_handoff',pr:{number:3}},[{number:7}])).toEqual({number:3});
+  expect(handoffPr({source:'delivery-recovery'},[{number:7},{number:8}])).toBeNull();
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,handoffPr({source:'delivery-recovery',state:'pr_handoff'},[{number:7}]));
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
+ }finally{f.s.close();}
+});
 test('revision notices are bounded per poll and advance past failures',async()=>{
- const s=new Store(':memory:');const ids:string[]=[];
- const c:any={linear:{projectId:'p',teamId:'t'}};let reads=0;
+ const s=new Store(':memory:');
+ const c:any={linear:{projectId:'p',teamId:'t'}};let reads=0,failId:string|null='issue-1';
  const issueFor=(id:string)=>({id,identifier:'DEV-X',title:'T',description:'x',project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}});
  const api:any=async(q:string,v:any)=>{
   if(q.includes('commentCreate')){return {commentCreate:{success:true,comment:{id:v.input.id,body:v.input.body}}};}
   if(q.includes('comments('))return {issue:{id:v.id,comments:{nodes:[],pageInfo:{hasNextPage:false}}}};
-  reads++;return {issue:issueFor(v.id)};
+  reads++;if(v.id===failId)throw Error('Linear timeout');return {issue:issueFor(v.id)};
  };
  try{
   const spec=(n:number)=>JSON.stringify({identifier:`DEV-${n}`,title:'T',description:'one'});
-  for(let i=0;i<6;i++){const id=s.enqueue('p',`issue-${i}`,spec(i));ids.push(id);s.enqueue('p',`issue-${i}`,spec(i).replace('one','two'));}
+  for(let i=0;i<6;i++){s.enqueue('p',`issue-${i}`,spec(i));s.enqueue('p',`issue-${i}`,spec(i).replace('one','two'));}
   const linear=new LinearLifecycle(s,api);
-  expect((await linear.revisionNotices(c)).filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(5);
-  expect(reads).toBeLessThanOrEqual(5);
-  expect((await linear.revisionNotices(c)).filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(1);
+  const first=await linear.revisionNotices(c);
+  expect(first.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(4);
+  expect(first.filter((x:any)=>x.state==='requirements_notice_blocked')).toHaveLength(1);
+  expect(reads).toBe(5);
+  const second=await linear.revisionNotices(c);
+  expect(second.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(1);
+  expect(second.some((x:any)=>x.state==='requirements_notice_blocked')).toBe(false);
+  expect(reads).toBe(6);
+  failId=null;
+  const third=await linear.revisionNotices(c);
+  expect(third.filter((x:any)=>x.state==='requirements_notice_blocked')).toHaveLength(0);
+  expect(third.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(1);
+  expect(reads).toBe(7);
   expect(s.db.query('SELECT count(*) AS n FROM spec_notices WHERE state=?').get('posted')).toMatchObject({n:6});
-  await linear.revisionNotices(c);expect(reads).toBeLessThanOrEqual(6);
  }finally{s.close();}
 });
 test('a failed replan from an earlier revision is retired before the newer revision can proceed',async()=>{

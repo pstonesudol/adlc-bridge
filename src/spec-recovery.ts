@@ -78,7 +78,10 @@ export class SpecRecovery{
     return {...row,action:'replan_failed_reconciled',nextAction:'Run spec-reconcile again for a fresh preview; a new planning turn requires its own confirmation.'};
    }
    if(!preview.proof||preview.confirmation!==confirmation)throw Error('Preview changed or delivery already reserved; refresh evidence, never replay');
-   const proof=preview.proof,attempt=Number((this.s.db.query('SELECT count(*) AS n FROM spec_replans WHERE job=?').get(job) as any).n)+1,clientId=`adlc-spec-${proof.revision}-${attempt}`,marker=`<!-- ADLC_REVISED_PLAN:${proof.revision} -->`;
+   const proof=preview.proof,priorRow=this.s.db.query('SELECT client_id FROM spec_replans WHERE revision=?').get(preview.revision) as any;
+   // Attempts for one revision replace the row, so the job-wide count never grows.
+   // Derive the next suffix from this revision's recorded client ID.
+   const priorAttempt=priorRow?Number(String(priorRow.client_id).split('-').at(-1)):0,attempt=(Number.isSafeInteger(priorAttempt)&&priorAttempt>0?priorAttempt:0)+1,clientId=`adlc-spec-${proof.revision}-${attempt}`,marker=`<!-- ADLC_REVISED_PLAN:${proof.revision} -->`;
    const route=c.routing?.enabled?await this.w.router.choose(job,'planning',proof.spec,'Replan current requirements only: '+this.s.get(job).spec,c.routing,'planning'):undefined;
    if(route){if(!this.w.t.preflightRoute||!this.w.t.configureRoute)throw Error('Planning routing unavailable');await this.w.t.preflightRoute(route);await this.w.t.configureRoute(proof.session,route);}
    const fresh=await this.preview(job,c);if(fresh.confirmation!==confirmation)throw Error('Evidence changed before reservation');

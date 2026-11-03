@@ -8,6 +8,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
+import {revisedHandoff} from '../src/spec-revisions';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
@@ -155,7 +156,12 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL); CREATE TABLE continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL,proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL)');
   s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal','adopted','session-1','/worktrees/session-1',r.branch,r.branch,'owner/repo',1,'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
+  // Mark the job as revised so the recovery handoff must bind the current revision.
+  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a','b','Summary','authorized');
+  s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,'{}');
+  expect(revisedHandoff(s,id)).toBe(false);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
   // Missing worktree identity, remote-only divergence and wrong attachment URLs
