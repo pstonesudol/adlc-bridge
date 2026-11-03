@@ -1746,6 +1746,7 @@ recovery demonstration**. A separately authorized controlled run must verify
 the installed host version, real provider receipts and same-session behavior
 before claiming unattended recovery works. No such activation or end-to-end
 operation is performed by this coding change.
+
 # Worker delivery receipt reconciliation
 
 New implementation, remediation and guarded-continuation dispatches reserve an
@@ -1854,3 +1855,62 @@ hashes; unavailable historical text stays explicitly unknown. Use the same
 preview/confirmation path and inspect session history. No live SQL repair,
 automatic merge, deployment or runtime activation is part of this recovery.
 DEV-35/DEV-55 integrations are optional; this core command does not require them.
+
+# Everyday operator CLI
+
+Grouped commands coexist with all existing flat commands. No migration or
+installation activation is needed to use the source CLI:
+
+```sh
+adlc projects list
+adlc jobs list
+adlc jobs lookup DEV-31
+adlc jobs status DEV-31 --project LINEAR_PROJECT_ID
+adlc jobs status DEV-31 --project LINEAR_PROJECT_ID --json
+adlc jobs show-plan DEV-31 --project LINEAR_PROJECT_ID
+adlc services status
+adlc routing show PROJECT_JSON
+adlc routing preview PROJECT_JSON TASK_FILE
+adlc diagnostics doctor
+adlc jobs --help
+```
+
+Lookup accepts an exact job ID, stored issue ID, or ticket identifier from the
+ingested specification. It never queries Linear or picks the newest match.
+Ambiguity prints candidates and requires `--project PROJECT` (the stored project
+ID), or an exact job ID. Commands never prompt to resolve ambiguity.
+
+`jobs list/status/lookup` use read-only persisted evidence, never initialize
+engines, dispatch workers, change labels, fetch Git, or activate configuration.
+Worker activity and evidence freshness are explicitly `unknown`: a persisted
+dispatch is not proof a worker is currently working. The persisted update time,
+orchestration state, reason, and next supported inspection action are shown.
+
+Grouped `--json` success output is `{schemaVersion:1, command:GROUP, data:...}`;
+job inspection data is `{jobs:[...]}` with stable fields `job`, `project`, `issue`,
+`ticket`, `state`, `orchestrationState`, `reason`, `nextAction`, `worker`
+(`activity`, `session`, `dispatchState`, `outcome`), and `evidence`
+(`freshness`, `persistedUpdatedAt`, `note`). State is `working`, `approval_wait`,
+`dependency_wait`, `blocked`, or `complete`. JSON errors go to stderr as
+`{schemaVersion:1, command:GROUP, error:{code,message,candidates}}`.
+Exit codes: 0 successful inspection (including empty lists), 1 operational
+failure, 2 grouped usage error, 3 missing job, 4 ambiguous lookup. Errors never
+select a candidate or dispatch work. Legacy flat commands retain their existing
+JSON/text output and operational error behavior for scripts.
+
+Compatibility aliases: `projects list` → `projects`; `routing show/preview` →
+`routing`; `services start/stop/status/config` →
+`start/stop/service-status/service-config`; `diagnostics doctor/readiness/runtime-check/ao-status`
+→ the corresponding flat command. `jobs show-plan/approvals/recover/cleanup/resume/approve/dependency-status/review-status`
+map to `show-plan/approvals/recover/cleanup/resume-job/approve-job/dependency-status/review-status`.
+Their existing explicit authorization, confirmation and argument requirements
+still apply; grouped job commands accept ticket references in the job position.
+`status` remains the legacy detailed queue output; `jobs status` is the new
+read-only operator summary. See `help` for the full legacy command reference.
+
+Services control running processes only. Job approval/resume/recovery remains
+explicit and separate. Source updates remain operator-managed; no inspection
+updates source. `install` and `install-runtime` are separate preview-first
+installation commands, with activation requiring explicit `--apply`; service
+inspection does not install or activate anything. Merge and deployment remain
+outside the CLI's authority.

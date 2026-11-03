@@ -48,9 +48,13 @@ import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
 import {SpecRecovery} from './spec-recovery';
 import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revisions';
+import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
 
-const [command='help',...a]=process.argv.slice(2);
-const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
+let [command='help',...a]=process.argv.slice(2);
+const requested=command,json=a.includes('--json'),grouped=!!groups[command]&&(a.length>0||command!=='projects')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
+let groupHelp='';
+let project:string|undefined;
+const out=(x:unknown)=>console.log(JSON.stringify(grouped&&json?{schemaVersion:1,command:requested,data:x}:x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 // Ordinary intake edits are not blocking; every active revision needs reconciliation.
 const blockingRevision=(r:any)=>!!r&&r.state!=='preplanning';
@@ -111,6 +115,24 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
  });
 }
 async function main(){
+   if(command==='help'||a.includes('--help')||a.includes('-h')){groupHelp=operatorHelp(command==='help'?a[0]:groups[command]?command:undefined);command='help';}
+   else if(grouped){
+    const verbs=groups[command],verb=a.shift();
+    if(!verb||!verbs[verb])throw new OperatorError(`Unknown ${command} command. Use ${command} --help.`);
+    command=verbs[verb];
+    a=a.filter(x=>x!=='--json');
+    const pi=a.indexOf('--project');if(pi>=0){project=a[pi+1];if(!project||project.startsWith('-'))throw new OperatorError('--project requires a project ID');a.splice(pi,2);}
+    if(command.startsWith('@')){
+     if(a.some(x=>x.startsWith('-'))||a.length>1||command==='@list'&&a.length||command==='@lookup'&&!a.length)throw new OperatorError('Use jobs list | status [JOB/TICKET] | lookup JOB/TICKET [--project PROJECT] [--json]');
+     const jobs=jobViews(db,project,a[0]);
+     return json?out({jobs}):console.log(humanJobs(jobs));
+    }
+    if(requested==='jobs'&&a[0]&&!['approvals','dependency-status','review-status'].includes(verb))a[0]=resolveJob(db,a[0],project);
+    if(requested==='jobs'&&command==='show-plan'){
+     if(a.length!==1)throw new OperatorError('Use jobs show-plan JOB/TICKET [--project PROJECT]');
+     const store=Store.readonly(db);try{const j=store.get(a[0]);return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan});}finally{store.close();}
+    }
+   }
   if(command==='bind-controller'){
    const i=a.indexOf('--confirm');return out(await migrateController(req(a[0],'Project'),req(a[1],'Controller'),a.includes('--apply'),i>=0?req(a[i+1],'Confirmation hash'):undefined));
   }
@@ -147,7 +169,7 @@ async function main(){
     return out(await serviceControl(command,a[0],a.includes('--apply')));
   }
   if(command==='projects')return out(await registeredProjects());
-  if(command==='help')return console.log(`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
+   if(command==='help')return console.log(groupHelp+`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
   recover JOB                         inspect guarded recovery
     [--apply --confirm HASH]           apply only the exact inspected state
   cleanup JOB                         inspect completed cleanup (preview-only)
@@ -426,4 +448,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{console.error(e instanceof Error?e.message:'ADLC failed');process.exitCode=process.exitCode||1;});
+if(import.meta.main)main().catch(e=>{const message=e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[]}}):`${message}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});
