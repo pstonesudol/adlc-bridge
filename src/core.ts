@@ -13,7 +13,14 @@ export class Store {
   readonly: boolean;
   constructor(path: string, readonly=false) {
     this.readonly=readonly;
-    if(readonly){this.db=new Database(path,{readonly:true,create:false});return;}
+    if(readonly){
+      this.db=new Database(path,{readonly:true,create:false});
+      try {
+        const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
+        if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
+      } catch (error) { this.db.close(); throw error; }
+      return;
+    }
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });
     if (path !== ':memory:') chmodSync(path, 0o600);

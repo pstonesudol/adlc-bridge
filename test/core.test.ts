@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Database} from 'bun:sqlite';
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../src/core';
@@ -50,6 +50,22 @@ test('unsupported and failed upgrades preserve data and roll back DDL',()=>{
       expect(check.query('SELECT * FROM sqlite_master ORDER BY name').all()).toEqual(schema);
       expect(check.query('PRAGMA user_version').get()).toEqual(version);
     } finally {check.close();}
+  });
+});
+test('read-only stores reject future versions without changing database bytes',()=>{
+  for(const version of [1,2,99]) fixture(path=>{
+    const db=new Database(path);db.exec(legacy);db.exec(`PRAGMA user_version=${version}`);
+    const before=records(db);db.close();const bytes=readFileSync(path);
+    if(version===99) expect(()=>Store.readonly(path)).toThrow('Unsupported SQLite schema version: 99');
+    else {
+      const s=Store.readonly(path);
+      try {
+        expect(records(s.db)).toEqual(before);
+        expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:version});
+        expect(()=>s.db.exec("UPDATE jobs SET spec='changed'")).toThrow();
+      } finally {s.close();}
+    }
+    expect(readFileSync(path)).toEqual(bytes);
   });
 });
 test('SQLite backup and restore preserves committed WAL records and integrity',()=>fixture((path,dir)=>{
