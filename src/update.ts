@@ -327,7 +327,7 @@ export class UpdateManager{
      const runtimeRecovery=installAttempted&&plan.classification!=='hot';
      if(runtimeRecovery&&safe){
       // Never restore files or start a runtime underneath a candidate backend.
-      try{const backend=await this.io.stack.backend();if(backend.ready)await this.io.stack.backendStop();runtimeStopped=true;}catch(restore){recovery.push(new Error('Backend could not be stopped before safe restoration',{cause:restore}));}
+      try{const backend=await this.io.stack.backend();if(backend.ready||backend.loaded)await this.io.stack.backendStop();runtimeStopped=true;}catch(restore){recovery.push(new Error('Backend could not be stopped before safe restoration',{cause:restore}));}
      }
      if(installAttempted){
       if(!safe)recovery.push(new Error(`Rollback is unsafe: ${plan.migration?.detail??'schema migration evidence is missing'}; backups preserved`));
@@ -357,13 +357,14 @@ export class UpdateManager{
   }finally{release();}
  }
  async rollback(){
-  const state=this.io.state(),installed=readInstalledState(state);if(!installed)throw Error('No activated update is recorded; nothing to roll back');
-  if(!installed.rollbackSafe)throw Error(`Rollback is unsafe: ${installed.classification} changes require explicit migration restore evidence; backups preserved at ${join(state,'backups')}`);
-  if(installed.classification==='schema'&&installed.dbHash!==null&&this.io.dbHash()!==installed.dbHash)throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
+  const state=this.io.state();
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and follow operator recovery steps');
   const release=acquireLock(state),wasPaused=this.turns.isPaused();
   const startService=(project:string)=>wasPaused?this.io.stack.project('start',project):this.turns.run(()=>this.io.stack.project('start',project));
   try{
+   const installed=readInstalledState(state);if(!installed)throw Error('No activated update is recorded; nothing to roll back');
+   if(!installed.rollbackSafe)throw Error(`Rollback is unsafe: ${installed.classification} changes require explicit migration restore evidence; backups preserved at ${join(state,'backups')}`);
+   if(installed.classification==='schema'&&installed.dbHash!==null&&this.io.dbHash()!==installed.dbHash)throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; explicit operator recovery is required`);
    const source=installed.previousSource;if(typeof source!=='string'||!isAbsolute(source)||!source.startsWith(join(state,'versions')+'/')||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
    const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
