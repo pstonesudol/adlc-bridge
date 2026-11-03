@@ -45,6 +45,8 @@ import {recoveryRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
+import {SpecRecovery} from './spec-recovery';
+import {revisionStatus} from './spec-revisions';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -188,7 +190,8 @@ async function main(){
   ingest PROJECT ISSUE SPEC_FILE        local ingestion
   plan JOB PLAN_FILE                    submit plan
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
-  reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning only after a spec edit
   dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
   dependency-resume JOB CONFIG HASH    confirm unchanged evidence using existing continuation
   dependency-status                    durable waits, failed evidence and next action
@@ -256,6 +259,13 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
+   if(command==='spec-reconcile'){
+    if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-reconcile JOB CONFIG [--confirm HASH]');
+    const config=projectConfiguration(a[1]);validate(config);
+    if(!existsSync(db))throw Error('Existing database required');
+    const store=new Store(db,a.length===2);
+    try{return out(await new SpecRecovery(store,new Workflow(store,liveTransport,undefined,a.length===2)).reconcile(a[0],config,a[3]));}finally{store.close();}
+   }
    if(['dependency-preview','dependency-resume','dependency-status'].includes(command)){
     if(!existsSync(db))throw Error('Existing database required');
     const applying=command==='dependency-resume';
@@ -307,7 +317,8 @@ Registered approved review targets can request bounded in-scope fixes from their
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);const clarifications=new LinearClarifications(s,workflow,blockers);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
-    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
+    const revision=revisionStatus(s,t.job),stale=revision&&revision.state!=='authorized';
+    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
   });
    try{
     if(command==='retry-observation'){

@@ -15,6 +15,8 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
+import {latestRevision,revisionStatus} from './spec-revisions';
+import {SpecRecovery} from './spec-recovery';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
@@ -25,7 +27,7 @@ export interface WorkflowTransport{
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
  findPlans(project:string,branch:string,includeTerminated?:boolean):Promise<any[]>;
  evidence(session:string):Promise<any>;
- sendImplementation(session:string,prompt:string,clientId:string):Promise<void>;
+ sendImplementation(session:string,prompt:string,clientId:string,mode?:'idle-only'):Promise<void>;
  disableFeedback(session:string):Promise<void>;
  preflightRoute?(route:Route):Promise<void>;
   configureRoute?(session:string,route:Route):Promise<unknown>;
@@ -130,11 +132,15 @@ export class Workflow{
    return {state:'planning_finished',session};
   }).immediate();
  }
- async reconcilePlanning(job:string,c:WorkflowConfig){
-  const dispatch=this.planning(job);if(!dispatch)return;
-  if(dispatch.state==='planning_finished')return {state:'planning_finished'};
-  const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
-  if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
+  async reconcilePlanning(job:string,c:WorkflowConfig){
+   const dispatch=this.planning(job);if(!dispatch)return;
+   if(dispatch.state==='planning_finished')return {state:'planning_finished'};
+   const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
+   if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
+   if(j.state==='awaiting_plan'&&latestRevision(this.s,job)&&(dispatch.spec_hash!==digest(j.spec)||this.s.db.query('SELECT 1 FROM spec_replans WHERE revision=?').get(latestRevision(this.s,job).id))){
+    if(!r.session_id||!dispatch.session_id)return this.blockPlan(job,'Specification changed; reconcile previous planning session');
+    return new SpecRecovery(this.s,this).capture(job,c);
+   }
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');
   if(j.state==='awaiting_approval'){await this.prepareImplementationRoute(job,c);return {state:j.state};}
   if(j.state!=='awaiting_plan')return {state:j.state};
@@ -209,13 +215,25 @@ export class Workflow{
   return this.s.db.transaction(()=>{
    const j=this.s.get(job),r=new Planning(this.s).get(job),d=this.planning(job);
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
-   if(this.implementation(job)||new Lifecycle(this.s).run(job))throw Error('Existing execution requires reconciliation');
+    const revision=latestRevision(this.s,job),prior=this.implementation(job),run=new Lifecycle(this.s).run(job);
+    const revised=revision?.state==='awaiting_approval'&&revision.new_hash===digest(j.spec)&&(this.s.db.query("SELECT state FROM spec_replans WHERE revision=?").get(revision.id) as any)?.state==='captured';
+    if((prior||run)&&!revised)throw Error('Existing execution requires reconciliation');
+    if(revised){
+     if(prior&&prior.session_id!==r.session_id||run&&(run.session_id!==r.session_id||run.owner!=='orchestrator'))throw Error('Revised plan execution owner changed');
+     this.s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run(revision.id,job,JSON.stringify({prior,run,policy:new ApprovalPolicyStore(this.s).get(job),grant:this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job)}));
+     // These changes roll back if fresh readiness/policy checks below fail.
+     this.s.db.query('DELETE FROM policy_authorizations WHERE job=?').run(job);
+    }
    assertApprovalReadiness(this.s,job,actor,!!acknowledge?.readiness,!!standing);
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);
    const clientId=`adlc-implement-${job.slice(0,16)}-${hash.slice(0,16)}`;
-   this.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(job,hash,r.session_id,clientId,'approved_pending',JSON.stringify(paths),runtime,actor,null);
+    this.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET plan_hash=excluded.plan_hash,session_id=excluded.session_id,client_id=excluded.client_id,state=excluded.state,paths=excluded.paths,runtime=excluded.runtime,actor=excluded.actor,reason=NULL').run(job,hash,r.session_id,clientId,'approved_pending',JSON.stringify(paths),runtime,actor,null);
+    if(revised){
+     this.s.db.query("UPDATE spec_revisions SET state='authorized' WHERE id=?").run(revision.id);
+     if(run)this.s.db.query("UPDATE runs SET plan_hash=?,state='running',reason='Fresh revised-plan authorization; previous evidence is historical' WHERE job=?").run(hash,job);
+    }
    this.s.event(job,'plan_and_git_scope_approved',JSON.stringify({hash,paths,runtime,operations,actor}));
    return {job,state:'approved_pending',runtime,paths,mergeEnabled:false};
   })();
@@ -468,7 +486,7 @@ export class Workflow{
   const graceMs=c.workflow?.prGraceMs??120000,now=Date.now(),results:any[]=[];
   for(const row of rows){
    const d=this.implementation(row.job),j=this.s.get(row.job);let issue=null;try{issue=JSON.parse(j.spec).identifier??null;}catch{}
-   if(d.plan_hash!==j.plan_hash){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,state:'stale_plan',outcome:'needs_reconciliation',reason:'Dispatch belongs to a superseded plan; replan and reapprove',questions:[],dependencies:[],source:'plan',confidence:'high',applied:false});continue;}
+    if(d.plan_hash!==j.plan_hash){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,state:'stale_plan',outcome:'needs_reconciliation',reason:'Dispatch belongs to a superseded plan; replan and reapprove',revision:revisionStatus(this.s,row.job),historicalOutcome:this.outcomes(row.job),questions:[],dependencies:[],source:'plan',confidence:'high',applied:false});continue;}
    try{
     const e=await this.t.evidence(d.session_id);
     const result=await this.executionStatus(row.job,e,c,now,false);
@@ -631,5 +649,5 @@ export class Workflow{
     FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all(),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
   blockers:this.s.db.query(`SELECT w.job,j.issue,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.grace_deadline
-    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state NOT IN ('awaiting_plan','done') AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all()};}
+     FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all(),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
 }

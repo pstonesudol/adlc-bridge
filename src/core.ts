@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
+import {installRevisions,recordRevision,observeLegacyRevision} from './spec-revisions';
 
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
@@ -60,6 +61,7 @@ export class Store {
         CREATE INDEX approvals_job_seq ON approvals(job,seq);
         PRAGMA user_version=2;`);
     }).immediate();
+    installRevisions(this);
     } catch (error) { this.db.close(); throw error; }
   }
   event(id: string, kind: string, detail: string) {
@@ -75,10 +77,12 @@ export class Store {
           .run(id, project, issue, spec, 'awaiting_plan');
         this.event(id, 'ingested', digest(spec));
       } else if (old.spec !== spec || (old.state === 'blocked' && old.reason === 'No longer eligible in Linear')) {
+        if(old.spec!==spec)recordRevision(this,old,spec);
         this.db.query(`UPDATE jobs SET spec=?,state='awaiting_plan',plan=NULL,plan_hash=NULL,
           approved_hash=NULL,actor=NULL,reason=NULL,updated=CURRENT_TIMESTAMP WHERE id=?`).run(spec, id);
         this.event(id, 'spec_changed_approval_revoked', digest(spec));
       }
+      observeLegacyRevision(this,id);
       return id;
     })();
   }

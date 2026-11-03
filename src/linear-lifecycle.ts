@@ -2,13 +2,15 @@ import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
+import {latestRevision} from './spec-revisions';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 const driftBody=(reason:string)=>reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.';
 export class LinearLifecycle{
  constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));
   CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));
- CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,comment_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);
+  CREATE TABLE IF NOT EXISTS spec_notices(revision TEXT PRIMARY KEY,job TEXT NOT NULL,comment_id TEXT NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,comment_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);
   if(!(s.db.query('PRAGMA table_info(branch_drift_notices)').all() as any[]).some(x=>x.name==='comment_id'))s.db.exec('ALTER TABLE branch_drift_notices ADD COLUMN comment_id TEXT');}
  async driftComment(issueId:string,commentId:string,body:string){
   let after:string|null=null;
@@ -121,11 +123,46 @@ export class LinearLifecycle{
   this.assertSpecification(job,binding);
   this.s.db.query("UPDATE linear_transitions SET state='confirmed' WHERE job=? AND phase=?").run(job,phase);this.s.event(job,'linear_status_changed',JSON.stringify({phase,state:desired}));return {state:'confirmed'};
  }
- async sync(c:SyncConfig){
-  if(!c.statusSync?.enabled)return [];
+  async revisionNotices(c:SyncConfig){
+   const rows=this.s.db.query('SELECT r.* FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? ORDER BY r.rowid').all(c.linear.projectId) as any[],results:any[]=[];
+   for(const r of rows)try{
+    let n=this.s.db.query('SELECT * FROM spec_notices WHERE revision=?').get(r.id) as any;
+    if(n?.state==='posted')continue;
+    const j=this.s.get(r.job),issue=await readLinearIssue(j.issue,this.api);
+    if(issue?.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId)throw Error('Revision notice issue identity unavailable');
+    if(!n){
+     const p=this.s.db.query('SELECT session_id FROM planning_runs WHERE job=?').get(j.id) as any;
+     const pr=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(j.id) as any:null;
+     const body=[`## ADLC: requirements changed — authorization invalidated`,
+      `Revision: ${r.id}\nJob: ${j.id}\nSession: ${p?.session_id??'not yet reserved'}\nPR: ${pr?`https://github.com/${pr.repo}/pull/${pr.pr}`:'inspect attached PR in the existing session'}`,
+      `${r.old_hash} → ${r.new_hash}\n${r.summary}`,
+      `Stale plan approval: ${r.old_approved_hash??'none'}; previous Git/policy grants cannot authorize new dispatch.`,
+      'New work is stopped. Already-running work is not interrupted; wait for authoritative idle/completion evidence. Existing receipts and uncertain deliveries are retained. This is a requirements blocker, independent of dependency waits, manual approval and provider failures.',
+      `Next: run adlc spec-reconcile ${j.id} CONFIG for a read-only preview, then --confirm HASH to authorize planning only in the existing owner. Repeated edits coalesce to the latest revision; older notices do not authorize work. After capture, use the current fenced approval instruction or current standing-policy evaluation. No implementation, verification, push, PR edit, merge or deployment is authorized by this notice.`].join('\n\n');
+     this.s.db.query("INSERT OR IGNORE INTO spec_notices VALUES (?,?,?,?,'reserved')").run(r.id,j.id,randomUUID(),body);
+     n=this.s.db.query('SELECT * FROM spec_notices WHERE revision=?').get(r.id) as any;
+    }
+    const comments=await this.comments(j.issue),posted=comments.find(x=>x.id===n.comment_id);
+    if(posted){if(posted.body!==n.body)throw Error('Revision notice changed; reconcile delivery');}
+    else{
+     if(n.state!=='reserved')throw Error('Revision notice delivery uncertain; never replay');
+     if(!this.s.db.query("UPDATE spec_notices SET state='delivery_uncertain' WHERE revision=? AND state='reserved'").run(r.id).changes)continue;
+     const response=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body}});
+     if(!response.commentCreate?.success||response.commentCreate.comment?.id!==n.comment_id||response.commentCreate.comment?.body!==n.body)throw Error('Revision notice delivery uncertain; reconcile exact ID/body');
+    }
+    this.s.db.query("UPDATE spec_notices SET state='posted' WHERE revision=?").run(r.id);
+    results.push({job:j.id,revision:r.id,state:'requirements_notice_posted'});
+   }catch(e){results.push({job:r.job,revision:r.id,state:'requirements_notice_blocked',reason:e instanceof Error?e.message:'Notice unavailable'});}
+   return results;
+  }
+  async sync(c:SyncConfig){
+   const notices=await this.revisionNotices(c);
+   if(!c.statusSync?.enabled)return notices;
   const rows=this.s.db.query("SELECT j.id,j.state,p.spec_hash FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state IN ('awaiting_plan','awaiting_approval','approved','blocked')").all(c.linear.projectId) as any[];
-  const results=[];
-  for(const row of rows)try{
+   const results:any[]=[...notices];
+   for(const row of rows)try{
+    const revision=latestRevision(this.s,row.id);
+    if(revision&&revision.state!=='authorized'){results.push({job:row.id,state:'requirements_changed',reason:'Current requirements need replanning and fresh approval; PR state is historical'});continue;}
    if(row.state==='blocked'){
     try{
      const notice=await this.notifyBudgetBlocker(row.id,c);

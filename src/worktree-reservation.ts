@@ -12,7 +12,11 @@ export function recoveryRows(s:Store):any[]{
 export function worktreeReservation(s:Store,job:string,target?:string):any{
  const p=s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()?s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any:null;
  const run=s.db.query("SELECT name FROM sqlite_master WHERE name='runs'").get()?s.db.query('SELECT worktree FROM runs WHERE job=?').get(job) as any:null;
- const paths=[p?.worktree,run?.worktree,target].map(path=>path?canonicalWorktree(path):null);
+  const paths=[p?.worktree,run?.worktree,target].map(path=>path?canonicalWorktree(path):null);
+  if(s.db.query("SELECT name FROM sqlite_master WHERE name='spec_replans'").get()&&s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()){
+   const revision=s.db.query("SELECT r.revision AS id,r.job,r.state,p.worktree FROM spec_replans r JOIN planning_runs p ON p.job=r.job WHERE r.state IN ('accepted','delivery_uncertain') AND (r.job=? OR p.worktree IN (?,?,?)) LIMIT 1").get(job,...paths);
+   if(revision)return {...revision as any,specRevision:true};
+  }
  if(s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_updates'").get()){
   const dependency=s.db.query("SELECT * FROM dependency_updates WHERE state IN ('reserved','fetching','updating') AND (job=? OR worktree IN (?,?,?)) LIMIT 1").get(job,...paths);
   if(dependency)return {...dependency as any,dependency:true};
@@ -22,5 +26,5 @@ export function worktreeReservation(s:Store,job:string,target?:string):any{
 }
 export function assertWorktreeAvailable(s:Store,job:string,target?:string){
  const r=worktreeReservation(s,job,target);
- if(r)throw Error(`Worktree reserved by ${r.dependency?'dependency':'conflict'} recovery ${r.id} (${r.state}); inspect recovery-status/dependency-preview, never bypass or replay`);
+  if(r)throw Error(`Worktree reserved by ${r.specRevision?'specification':r.dependency?'dependency':'conflict'} recovery ${r.id} (${r.state}); inspect spec-reconcile/recovery-status/dependency-preview, never bypass or replay`);
 }

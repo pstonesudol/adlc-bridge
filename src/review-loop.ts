@@ -153,7 +153,11 @@ export class ReviewLoop{
   // not replace the check requirements for an already-running tick.
   if(policy!==undefined&&policy.project!==this.s.get(job).project)throw Error('Metadata policy configuration does not belong to the job project');
   const metadataChecks=[...metadataCheckNames(policy===undefined?this.metadataChecks(job):policy.checks)];
-  const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
+   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='spec_execution_history'").get()&&this.s.db.query('SELECT 1 FROM spec_execution_history WHERE job=?').get(job)){
+    const d=this.s.db.query('SELECT plan_hash,state FROM implementation_dispatch WHERE job=?').get(job) as any;
+    if(d?.plan_hash!==this.s.get(job).plan_hash||d.state!=='pr_handoff')return {state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'};
+   }
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   const observation=config?.conflictRecovery?.enabled?new RecoveryObservation(this.s):null;
   const wait=observation?.wait(job);if(wait)return this.record(job,wait);

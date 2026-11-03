@@ -1780,3 +1780,48 @@ separate from mutation uncertainty. No provider replay/idempotency guarantee is
 assumed or introduced. If complete authoritative receipts cannot be obtained,
 preserve the uncertain attempt and escalate the specific evidence gap. Human-only
 merges and no deployments remain mandatory.
+
+# Editing requirements of an active ticket
+
+Changing any byte of the executable specification (identifier, title or
+description, including formatting) invalidates the plan approval and scoped
+dispatch authority. This deterministic conservative policy uses no model to
+classify an edit as harmless. Provider timestamps and other fields outside that
+specification do not change its hash; labels, project, state and policy still
+undergo their independent eligibility/security checks. Revision notices expose
+field names and character counts, not ticket excerpts or secrets.
+
+Record future suggestions in a **separate follow-up ticket without agent-ready**,
+linked to the active ticket. Do not append them to its executable description or
+rely on an “ignore this” heading, comment or label to waive scope checks. Promoting
+follow-up scope into the active description requires a new plan and authority.
+
+New dispatch stops when the edit is observed. The bridge does not interrupt an
+active turn or Git operation: wait for authoritative idle/completed receipts.
+An already-running supervised-host process is not retroactively sandboxed or
+cancelled. Missing/failed/uncertain receipts require controlled reconciliation,
+not a resend or database repair. Existing PR/session/worktree identity, attempts,
+reservations and historical evidence remain intact.
+
+Use `adlc spec-reconcile JOB CONFIG` for a read-only preview. It refreshes Linear,
+owner, worktree and attached PR evidence. `--confirm HASH` authorizes **only a
+planning turn in the existing owner** when that exact evidence remains valid.
+It does not grant implementation, verification, commit/push or PR metadata edits.
+Do not create another worker/PR. A reserved send is never replayed; normal polling
+captures its exact completed reply, or retains its uncertainty. Repeated edits
+coalesce to the latest revision while preserving earlier delivery records.
+
+After capture, `plan-approval-required` tickets use the exact fenced command in
+the new Linear plan notice, from a configured human. Previous replies are stale.
+Standing-policy tickets pass through current eligibility/readiness/scope policy;
+an ineligible or unresolved plan stays blocked, without expanding permissions.
+Previous PR/verification evidence is historical until the revised implementation
+hands off. `status`, `review-status` and `reconcile-preview` retain independent
+provider/dependency blockers alongside the requirements blocker.
+
+Existing incidents are not automatically approved or resumed. A subsequent
+eligible intake can record a legacy planning/spec mismatch using its retained
+hashes; unavailable historical text stays explicitly unknown. Use the same
+preview/confirmation path and inspect session history. No live SQL repair,
+automatic merge, deployment or runtime activation is part of this recovery.
+DEV-35/DEV-55 integrations are optional; this core command does not require them.
