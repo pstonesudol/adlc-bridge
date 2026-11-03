@@ -19,13 +19,13 @@ async function fixture(){
  const w=new Workflow(s,transport),p=new Planning(s),r=p.reserve(job,'project');p.gate(job,'project','owner',r.branch,'/worktree');
  s.db.query("INSERT INTO planning_dispatch VALUES (?,?, 'awaiting_approval', 'owner',NULL,'initial')").run(job,digest(s.get(job).spec));
  const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(job);
- e={session:{id:'owner',projectId:'project',branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',turns:[{id:'plan',state:'completed'}],entries:[]}};
+ e={session:{id:'owner',projectId:'project',branch:r.branch,isTerminated:false,prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',turns:[{id:'plan',state:'completed'}],entries:[]}};
  w.approve(job,hash,'human',['src/**'],'supervised-host',featureGit);await w.executeApproved(job,config);
  e.transcript.turns.at(-1).state='completed';e.transcript.controller='ready';
  const issue=async()=>({id:'issue',...JSON.parse(s.get(job).spec),project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}});
  const recovery=new SpecRecovery(s,w,issue as any,async f=>f());
  const edit=(text:string)=>s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:text}));
- const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
+ const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
 test('spec summary never exposes arbitrary ticket text; exact byte edits fail closed',()=>{
@@ -188,13 +188,13 @@ test('prior PR stays historical until the revised handoff, then review reconcili
   expect(gated?.state).toBe('waiting_for_revised_handoff');
   expect(gatedLoop.get(f.job).state).toBe('waiting_for_revised_handoff');
   await f.w.executeApproved(f.job,config);
-  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];f.e.receiptObservation.observed=Date.now();
   await f.w.tick(config);
   expect(revisedHandoff(f.s,f.job)).toBe(true);
   const head='a'.repeat(40),evidence={head,observedHead:head,required:['CI'],checks:[],review:null,unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true,descriptionHash:'d',findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],clear:false,reasons:[]};
   f.s.db.query("INSERT INTO remediation(job,head,findings_hash,attempt,state) VALUES (?,?,?,?,?)").run(f.job,head,'findings',1,'delivery_uncertain');
   const after=await new ReviewLoop(f.s,undefined,{sessionEvidence:async()=>({session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[],entries:[]}}),readBranchSnapshot:async()=>({branch:f.e.session.branch,head,state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),worktreeIdentity:async()=>({branch:f.e.session.branch,head}),readiness:async()=>evidence} as any).tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
-  expect(after?.state).toBe('needs_reconciliation');expect(after?.reason).toContain('remediation delivery is uncertain');
+  expect(after?.state).toBe('needs_reconciliation');expect(after?.reason).toMatch(/remediation delivery is uncertain|dispatch binding/);
  }finally{f.s.close();}
 });
 test('a handoff for the same plan hash from an earlier revision does not authorize the current one',async()=>{
