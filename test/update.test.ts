@@ -1,0 +1,159 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,mkdirSync,writeFileSync,existsSync,readFileSync,rmSync} from 'node:fs';
+import {join,dirname} from 'node:path';
+import {tmpdir} from 'node:os';
+import {turnBarrier} from '../src/turn-submission';
+import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
+
+const repo='acme/adlc';
+const policy=(over:any={})=>validateUpdatePolicy({version:1,repository:repo,remote:'git@github.com:acme/adlc.git',ref:'main',refKind:'branch',mode:'manual',...over});
+function fixture(over:any={}){
+ const root=mkdtempSync(join(tmpdir(),'adlc-update-')),state=join(root,'state'),v1=join(state,'versions','v1');
+ mkdirSync(join(v1,'src'),{recursive:true});
+ writeFileSync(join(v1,'src/cli.ts'),'old cli');writeFileSync(join(v1,'manifest.json'),JSON.stringify({version:'v1',files:['src/cli.ts']}),{mode:0o600});
+ writeFileSync(join(state,'installation.json'),JSON.stringify({source:join(root,'source'),version:'v1',cli:join(v1,'src/cli.ts'),launcher:join(root,'adlc')}),{mode:0o600});
+ writeUpdatePolicy(policy(over.policy),state);
+ const services:Record<string,boolean>={one:true,two:false},calls:string[]=[],installs:string[]=[],notifications:string[]=[];
+ let blockers:{session:string;reason:string}[]=over.blockers??[],backendReady=true,managed=true,failInstall=false,candidate=over.candidate??'a'.repeat(40),checks=over.checks??{passed:true,names:['CI'],detail:'ok'},tests=over.tests??{passed:true,skipped:true,detail:'skipped'};
+ const stack:any={turns:turnBarrier(state),projects:async()=>Object.keys(services).map(project=>({project})),project:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {project:id,loaded:services[id]};if(action==='stop')services[id]=false;if(action==='start'){if(over.failStart)throw Error('start failed');services[id]=true;}return {project:id,loaded:services[id]};},backend:async()=>({ready:backendReady,loaded:true,managed,pid:1}),backendStart:async()=>{calls.push('backend:start');backendReady=true;},backendStop:async()=>{calls.push('backend:stop');backendReady=false;},blockers:async()=>{if(over.blockersError)throw new Error(over.blockersError);return blockers;}};
+ const io:UpdateIO={state:()=>state,resolve:async p=>({commit:typeof candidate==='function'?candidate():candidate,ref:'refs/heads/main',source:p.remote}),stage:async(p,c)=>{if(over.stageCommit)return {root:join(root,'stage'),commit:over.stageCommit,version:'v2',files:['src/cli.ts']};return {root:join(root,'stage'),commit:c.commit,version:over.version??'v2',files:over.files??['src/cli.ts']};},checks:async()=>checks,tests:async()=>tests,compatibility:()=>({compatible:over.incompatible?false:true,detail:over.incompatible?'incompatible candidate':'compatible'}),reattachment:async()=>({safe:over.reattachment??true,detail:over.reattachment===false?'controller attachment unverified':'reattachment verified'}),stack,install:async(_apply:boolean,source:string)=>{installs.push(source);if(failInstall){failInstall=false;throw Error('install failed');}return {installed:true};},launcher:()=>join(root,'adlc'),migrations:async()=>over.migration,dbHash:()=>over.dbHash??'db1',notify:(event,key)=>notifications.push(`${event}:${key}`),now:()=>over.now??1000};
+ return {root,state,services,calls,installs,notifications,io,manager:new UpdateManager(io,turnBarrier(state)),policy:policy(over.policy),setBlockers:(value:any)=>blockers=value,setBackend:(ready:boolean,isManaged=true)=>{backendReady=ready;managed=isManaged;},setFail:(value:boolean)=>failInstall=value,setCandidate:(value:any)=>candidate=value,setChecks:(value:any)=>checks=value,setTests:(value:any)=>tests=value,close:()=>rmSync(root,{recursive:true,force:true})};
+}
+test('update policy is manual by default and rejects credential or trust mismatches',()=>{
+ expect(policy().mode).toBe('manual');
+ expect(policy().maintenance.blockIntakeDuringActivation).toBe(true);
+ for(const bad of [{remote:'https://token@github.com/acme/adlc.git'},{remote:'https://github.com/other/adlc.git'},{ref:'-main'},{ref:'main..next'},{mode:'sometimes'},{remote:'git@example.com:acme/adlc.git'}])expect(()=>validateUpdatePolicy({version:1,repository:repo,remote:'git@github.com:acme/adlc.git',...bad})).toThrow();
+ expect(repositoryFromRemote('https://github.com/acme/adlc.git')).toBe(repo);
+});
+test('classification separates hot bridge, backend and schema changes',()=>{
+ expect(classifyChanges(['src/cli.ts'],['src/cli.ts','src/core.ts'])).toBe('hot');
+ expect(classifyChanges(['src/cli.ts'],['src/cli.ts','src/serve-orchestrator.py'])).toBe('backend');
+ expect(classifyChanges(['src/cli.ts'],['src/cli.ts','patches/001.sql'])).toBe('schema');
+});
+test('content-only backend changes are detected from snapshot bytes',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-update-diff-'));try{
+  const before=join(root,'before'),after=join(root,'after');for(const dir of [before,after])mkdirSync(join(dir,'src'),{recursive:true});
+  writeFileSync(join(before,'src/serve-orchestrator.py'),'old');writeFileSync(join(after,'src/serve-orchestrator.py'),'new');
+  writeFileSync(join(before,'src/cli.ts'),'same');writeFileSync(join(after,'src/cli.ts'),'same');
+  const changed=changedFiles(before,after,['src/cli.ts','src/serve-orchestrator.py'],['src/cli.ts','src/serve-orchestrator.py']);
+  expect(changed).toEqual(['src/serve-orchestrator.py']);expect(classifyChangedFiles(changed)).toBe('backend');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('check and preview pin the exact candidate without activating anything',async()=>{
+ const f=fixture();try{
+  const checked=await f.manager.check();expect(checked).toMatchObject({candidate:{commit:'a'.repeat(40)},updateAvailable:true,policyMode:'manual'});
+  const preview=await f.manager.preview();expect(preview.ready).toBe(true);expect(preview).toMatchObject({classification:'hot',installedVersion:'v1',checks:{passed:true},tests:{skipped:true}});
+  expect(f.installs).toEqual([]);expect(f.calls).toEqual([]);
+ }finally{f.close();}
+});
+test('active, queued and unknown worker activity defer the update and restore prior intake',async()=>{
+ const f=fixture({blockers:[{session:'worker',reason:'running turn'}]});try{
+  const deferred=await f.manager.apply();expect(deferred).toMatchObject({deferred:true});
+  expect(f.installs).toEqual([]);expect(f.services).toEqual({one:true,two:false});expect(f.calls).toEqual(['service-status:one','service-status:two','stop:one','start:one']);
+  const intent=JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8'));expect(intent.stage).toBe('deferred');
+  expect(f.manager.turns.isPaused()).toBe(false);expect(f.notifications.filter(x=>x.startsWith('waiting-for-idle:'))).toHaveLength(1);
+ }finally{f.close();}
+ const unknown=fixture({blockersError:'activity unavailable'});try{
+  const deferred=await unknown.manager.apply();expect(deferred.deferred).toBe(true);expect(deferred.reason).toContain('unknown');expect(unknown.installs).toEqual([]);expect(unknown.services.one).toBe(true);
+ }finally{unknown.close();}
+});
+test('failed checks, tests and dirty staging fail closed before activation',async()=>{
+ const f=fixture({checks:{passed:false,names:[],detail:'required check missing'}});try{
+  const preview=await f.manager.preview();expect(preview.ready).toBe(false);await expect(f.manager.apply()).rejects.toThrow('not ready');expect(f.installs).toEqual([]);
+  f.setChecks({passed:true,names:['CI'],detail:'ok'});f.setTests({passed:false,skipped:false,detail:'tests failed'});expect((await f.manager.preview()).ready).toBe(false);
+  f.setTests({passed:true,skipped:true,detail:'skipped'});f.io.stage=async()=>({root:join(f.root,'stage'),commit:'b'.repeat(40),version:'v2',files:['src/cli.ts']});
+  await expect(f.manager.preview()).rejects.toThrow('candidate is now ambiguous');
+ }finally{f.close();}
+});
+test('source changes between staging and activation are refused without installing',async()=>{
+ const f=fixture();try{
+  let calls=0;const first='a'.repeat(40),second='b'.repeat(40);f.setCandidate(()=>++calls===1?first:second);
+  await expect(f.manager.apply()).rejects.toThrow('changed during activation');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);
+ }finally{f.close();}
+});
+test('uncertain delivery and configuration incompatibility fail closed before activation',async()=>{
+ const f=fixture({blockers:[{session:'worker',reason:'uncertain delivery'}]});try{
+  const deferred=await f.manager.apply();expect(deferred).toMatchObject({deferred:true});expect(deferred.reason).toContain('uncertain delivery');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);
+ }finally{f.close();}
+ const incompatible=fixture({incompatible:true});try{const preview=await incompatible.manager.preview();expect(preview.ready).toBe(false);expect(preview.blockers).toContain('incompatible candidate');await expect(incompatible.manager.apply()).rejects.toThrow('not ready');expect(incompatible.installs).toEqual([]);}finally{incompatible.close();}
+});
+test('isolated staging pins the exact commit and refuses a modified checkout',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-update-git-'));try{
+  const remote=join(root,'remote'),state=join(root,'state');mkdirSync(join(remote,'src'),{recursive:true});writeFileSync(join(remote,'src/cli.ts'),'candidate bytes');
+  const git=(args:string[])=>Bun.spawnSync(['git',...args],{cwd:remote,stdout:'pipe',stderr:'pipe'});
+  expect(git(['init','--quiet']).exitCode).toBe(0);expect(git(['add','.']).exitCode).toBe(0);
+  expect(git(['-c','user.name=Test','-c','user.email=test@example.com','commit','--quiet','-m','candidate']).exitCode).toBe(0);
+  const commit=Bun.spawnSync(['git','rev-parse','HEAD'],{cwd:remote,stdout:'pipe'}).stdout.toString().trim();
+  const staged=await stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state);
+  expect(staged).toMatchObject({commit,files:['src/cli.ts']});expect(readFileSync(join(staged.root,'src/cli.ts'),'utf8')).toBe('candidate bytes');
+  expect(candidateCompatibility({...staged,files:['src/cli.ts']}).compatible).toBe(false);
+  writeFileSync(join(staged.root,'src/cli.ts'),'modified');await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('a deferral whose intake restoration fails remains paused for operator action',async()=>{
+ const f=fixture({blockers:[{session:'worker',reason:'running turn'}],failStart:true});try{
+  await expect(f.manager.apply()).rejects.toThrow('prior intake could not be fully restored');
+  expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8')).stage).toBe('operator-action-required');
+  expect(f.manager.turns.isPaused()).toBe(true);expect(f.notifications.some(x=>x.startsWith('operator-action-required:'))).toBe(true);
+ }finally{f.close();}
+});
+test('automatic adoption requires explicit opt-in and cadence, and never schedules itself',async()=>{
+ const f=fixture();try{
+  await expect(f.manager.apply({automatic:true})).rejects.toThrow('not enabled');expect(f.installs).toEqual([]);
+  rmSync(join(f.state,'update-policy.json'));writeUpdatePolicy(policy({mode:'automatic',cadenceSeconds:60}),f.state);
+  await f.manager.check();const skipped=await f.manager.apply({automatic:true});expect(skipped).toEqual({skipped:true,reason:'Update cadence has not elapsed'});
+  const later=fixture({now:Date.now()+3600000,policy:{mode:'automatic',cadenceSeconds:60}});try{writeFileSync(join(later.state,'update-check.json'),JSON.stringify({checkedAt:new Date(0).toISOString()}),{mode:0o600});expect((await later.manager.apply({automatic:true})).activated).toBe(true);}finally{later.close();}
+ }finally{f.close();}
+});
+test('concurrent polls and interrupted intents never double-activate',async()=>{
+ const f=fixture();try{
+  mkdirSync(join(f.state,'update.lock'));await expect(f.manager.apply()).rejects.toThrow('in progress');rmSync(join(f.state,'update.lock'),{recursive:true});
+  writeFileSync(join(f.state,'update-intent.json'),JSON.stringify({version:1,stage:'installing',candidate:'a'.repeat(40),fromVersion:'v1',classification:'hot',priorServices:[],backendStopped:false,installed:false,startedAt:'x',updatedAt:'x'}),{mode:0o600});
+  await expect(f.manager.apply()).rejects.toThrow('interrupted');expect(f.installs).toEqual([]);const status=await f.manager.status();expect(status.pending.reason).toContain('interrupted');
+ }finally{f.close();}
+});
+test('activation restores exact prior per-project service states and verifies backend readiness',async()=>{
+ const f=fixture();try{
+  const result=await f.manager.apply();expect(result).toMatchObject({activated:true,classification:'hot'});
+  expect(f.calls).toEqual(['service-status:one','service-status:two','stop:one','start:one','service-status:one']);expect(f.services).toEqual({one:true,two:false});
+  expect(f.installs).toEqual([join(f.root,'stage')]);expect(f.manager.turns.isPaused()).toBe(false);
+ }finally{f.close();}
+});
+test('backend changes use the supported graceful restart and verify it',async()=>{
+ const f=fixture({files:['src/cli.ts','src/serve-orchestrator.py']});try{
+  const result=await f.manager.apply();expect(result.classification).toBe('backend');expect(f.calls).toContain('backend:stop');expect(f.calls).toContain('backend:start');expect(f.calls.indexOf('backend:start')).toBeGreaterThan(f.calls.indexOf('backend:stop'));
+ }finally{f.close();}
+ const unverified=fixture({files:['src/cli.ts','src/serve-orchestrator.py'],reattachment:false});try{
+  const deferred=await unverified.manager.apply();expect(deferred).toMatchObject({deferred:true});expect(deferred.reason).toContain('unverified');expect(unverified.installs).toEqual([]);expect(unverified.services.one).toBe(true);
+ }finally{unverified.close();}
+ const shared=fixture({files:['src/cli.ts','src/serve-orchestrator.py']});try{shared.setBackend(true,false);await expect(shared.manager.apply()).rejects.toThrow('not ready for a guarded backend restart');expect(shared.installs).toEqual([]);expect(shared.services.one).toBe(true);}finally{shared.close();}
+});
+test('failed activation rolls back files and services, while unsafe rollback preserves evidence and blocks intake',async()=>{
+ const f=fixture();try{
+  f.setFail(true);await expect(f.manager.apply()).rejects.toThrow('Update failed');expect(f.installs).toEqual([join(f.root,'stage'),join(f.state,'versions','v1')]);expect(f.services.one).toBe(true);
+  expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8')).stage).toBe('rolled-back');expect(f.manager.turns.isPaused()).toBe(false);
+ }finally{f.close();}
+ const unsafe=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:false,detail:'irreversible migration'}});try{
+  unsafe.setFail(true);await expect(unsafe.manager.apply()).rejects.toThrow('Rollback is unsafe');expect(unsafe.manager.turns.isPaused()).toBe(true);expect(JSON.parse(readFileSync(join(unsafe.state,'update-intent.json'),'utf8')).stage).toBe('operator-action-required');
+ }finally{unsafe.close();}
+});
+test('schema changes require explicit compatible migration evidence',async()=>{
+ const missing=fixture({files:['src/cli.ts','patches/001.sql']});try{expect((await missing.manager.preview()).blockers.join(' ')).toContain('explicit migration compatibility');await expect(missing.manager.apply()).rejects.toThrow('not ready');}finally{missing.close();}
+ const incompatible=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:false,rollbackSafe:true,detail:'schema mismatch'}});try{expect((await incompatible.manager.preview()).blockers.join(' ')).toContain('not compatible');}finally{incompatible.close();}
+});
+test('rollback restores the prior verified snapshot and refuses after incompatible database work',async()=>{
+ const f=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'reversible'}});try{
+  await f.manager.apply();const before=f.notifications.length;const result=await f.manager.rollback();expect(result).toMatchObject({rolledBack:true,version:'v1'});
+  expect(f.installs.at(-1)).toBe(join(f.state,'versions','v1'));expect(f.services.one).toBe(true);expect(f.notifications.length).toBeGreaterThan(before);
+  expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8')).stage).toBe('rolled-back');
+ }finally{f.close();}
+ const changed=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'reversible'},dbHash:'db1'});try{
+  await changed.manager.apply();changed.io.dbHash=()=> 'db2';await expect(changed.manager.rollback()).rejects.toThrow('Database changed after activation');expect(changed.installs).toHaveLength(1);
+ }finally{changed.close();}
+});
+test('rollback of a hot update is allowed and an unavailable previous snapshot fails closed',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();rmSync(join(f.state,'versions','v1'),{recursive:true,force:true});await expect(f.manager.rollback()).rejects.toThrow('Previous verified snapshot is unavailable');
+ }finally{f.close();}
+ const schema=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:false,detail:'irreversible'}});try{schema.setFail(true);await expect(schema.manager.apply()).rejects.toThrow('Rollback is unsafe');expect(schema.installs).toEqual([join(schema.root,'stage')]);expect(schema.manager.turns.isPaused()).toBe(true);}finally{schema.close();}
+});

@@ -30,8 +30,11 @@ export function distributionFiles(root:string){
   files.push(...routingDependencyFiles(root));
  return files.sort();
 }
+export function distributionVersion(root:string,files=distributionFiles(root)){
+ const hash=createHash('sha256');for(const f of files)hash.update(f+'\0').update(readFileSync(join(root,f))).update('\0');return hash.digest('hex');
+}
 export function snapshot(root:string,destination:string,copy=copyFileSync){
- const files=distributionFiles(root),hash=createHash('sha256');for(const f of files)hash.update(f+'\0').update(readFileSync(join(root,f))).update('\0');const version=hash.digest('hex');
+ const files=distributionFiles(root),version=distributionVersion(root,files);
  const target=join(destination,version);
  if(!existsSync(target)){
   mkdirSync(destination,{recursive:true,mode:0o700});const stage=mkdtempSync(join(destination,'.snapshot-'));
