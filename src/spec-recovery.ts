@@ -114,7 +114,9 @@ export class SpecRecovery{
   }
   const r=latestRevision(this.s,job),j=this.s.get(job);
   const d=r&&this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(r.id) as any;
-  if(!d)return {state:'requirements_changed',...revisionStatus(this.s,job)};
+  // Keep the outcome after the status spread: revisionStatus carries a
+  // revision state (`pending`) that must not mask the reason no replan exists.
+  if(!d)return {...revisionStatus(this.s,job),state:'requirements_changed'};
   if(j.state!=='awaiting_plan')return {state:j.state};
   const proof=JSON.parse(d.proof),e=await this.w.t.evidence(d.session);
   if(e.session?.id!==d.session||e.session.projectId!==proof.project||e.session.branch!==proof.branch||e.session.isTerminated!==false)throw Error('Replan owner identity changed');

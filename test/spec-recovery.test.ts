@@ -15,7 +15,7 @@ const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',tea
 async function fixture(){
  const s=new Store(':memory:'),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
  let e:any,sends:any[]=[];
- const transport:any={evidence:async()=>e,worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40),tree:'/worktree'}),disableFeedback:async()=>{},branchSnapshot:async()=>({branch:e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),sendImplementation:async(session:string,text:string,clientId:string)=>{sends.push({session,text,clientId});e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:e.transcript.entries.length+1});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';}};
+ const transport:any={evidence:async()=>e,worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40),tree:'/worktree'}),disableFeedback:async()=>{},branchSnapshot:async()=>({branch:e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),sendImplementation:async(session:string,text:string,clientId:string,mode?:string)=>{sends.push({session,text,clientId,mode});e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:e.transcript.entries.length+1});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';}};
  const w=new Workflow(s,transport),p=new Planning(s),r=p.reserve(job,'project');p.gate(job,'project','owner',r.branch,'/worktree');
  s.db.query("INSERT INTO planning_dispatch VALUES (?,?, 'awaiting_approval', 'owner',NULL,'initial')").run(job,digest(s.get(job).spec));
  const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(job);
@@ -41,6 +41,8 @@ test('active edit preserves owner/history, blocks dispatch and requires a fresh 
   expect(f.w.implementation(f.job)).toEqual(before);
   const preview=await f.recovery.preview(f.job,config);expect(preview.action).toBe('request_replanning');
   await f.recovery.reconcile(f.job,config,preview.confirmation);expect(f.sends).toHaveLength(2);
+  // A planning prompt must never steer the busy owner; implementation may steer.
+  expect(f.sends[1].mode).toBe('idle-only');expect(f.sends[0].mode).toBeUndefined();
   f.complete();await f.recovery.capture(f.job,config);
   expect(f.s.get(f.job).state).toBe('awaiting_approval');
   expect(()=>f.w.approve(f.job,f.hash,'human',['src/**'],'supervised-host',featureGit)).toThrow('Stale plan or invalid state');
@@ -73,7 +75,7 @@ test('uncertain send and restart retain reservation; concurrent confirmation sen
 test('superseded reply is not captured; current standing policy renews only fresh readiness',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();f.edit('v3');
-  expect((await f.recovery.capture(f.job,config)).state).toBe('pending');expect(f.s.get(f.job).plan).toBeNull();
+  expect((await f.recovery.capture(f.job,config)).state).toBe('requirements_changed');expect(f.s.get(f.job).plan).toBeNull();
   const policy:any={mode:'ready-queue',id:'standing',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'},c={...config,approval:policy};
   await f.recovery.reconcile(f.job,c,(await f.recovery.preview(f.job,c)).confirmation);f.complete();await f.recovery.capture(f.job,c);
   const a=new ApprovalPolicyStore(f.s);expect(a.evaluate(f.job,'p',policy).allowed).toBe(false);
