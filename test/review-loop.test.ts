@@ -54,7 +54,7 @@ test('one project service cannot select another project’s PR targets',()=>{
 function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,metadataCheckEvidence:[{name:'PR body structure',checkId:1,sha:head,status:'completed',conclusion:'failure',descriptionHash:'old-body'}]};
- const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const session:any={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
@@ -309,7 +309,7 @@ test('an empty metadata policy skips wait creation and ignores historical metada
 test('removing metadata policy cannot bypass an uncertain description send or its fresh-review obligation',async()=>{
  const f=templateFixture();try{
   await f.loop.tick(f.id);f.loop.configureMetadataChecks('project',[]);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
-  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_worker');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   f.session.transcript.turns[0].state='completed';expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   f.e.descriptionHash='edited-after-policy-removal';f.e.botReviewSubmittedAt=Date.now()-1000;
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'completed'});expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual([]);
@@ -576,7 +576,7 @@ function threadFixture(){
  const head='a'.repeat(40),candidate={threadId:'T1',path:'src/workflow.ts',line:12,commentIds:['C1'],commentsHash:'d'.repeat(64),body:'Planning slot is not released on failure',originalCommit:'dcf66943',outdated:false};
  const finding={source:'github-review',kind:'review_thread',threadId:'T1',path:'src/workflow.ts',line:12,body:candidate.body,sha:head,originalCommit:'dcf66943',commentIds:['C1'],commentsHash:'d'.repeat(64),outdated:false};
  const e:any={clear:false,reasons:['Unresolved or unknown findings'],head,descriptionHash:'body',templateSignature:'sig',findings:[finding],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,coderabbitRateLimited:false,metadataCheckEvidence:[],reviewThreads:{unresolved:1,resolved:0,candidates:[candidate],stale:[],humanOnly:[]}};
- const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const session:any={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>({...e,findings:e.findings.map((f:any)=>({...f})),reviewThreads:{...e.reviewThreads,candidates:e.reviewThreads.candidates.map((c:any)=>({...c}))}}),sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
@@ -593,7 +593,7 @@ test('carried-forward review thread dispatches exactly one provenance-bound reme
   expect(f.s.db.query('SELECT thread_id,comments_hash,path,head,attempt,state FROM review_feedback').get()).toEqual({thread_id:'T1',comments_hash:f.candidate.commentsHash,path:'src/workflow.ts',head:f.head,attempt:1,state:'dispatched'});
   expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   // Uncertain delivery is reconciled, never resent.
-  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(1);
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_worker');expect(f.sends()).toBe(1);
   // Worker completes and pushes. The same thread remains unresolved and mapped,
   // so it is not sent again; a human must confirm the current code.
   f.session.transcript.turns[0].state='completed';const newer='c'.repeat(40);f.e.head=newer;f.e.findings[0].sha=newer;
