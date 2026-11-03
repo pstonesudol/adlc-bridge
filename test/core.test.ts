@@ -87,6 +87,13 @@ test('read-only stores reject unversioned nonempty databases but open empty file
     expect(readFileSync(path)).toEqual(bytes);
   });
 });
+test('literal sqlite_ prefix rejects unversioned sqliteCache tables in both modes',()=>fixture(path=>{
+  const db=new Database(path);db.exec("CREATE TABLE sqliteCache (value TEXT); INSERT INTO sqliteCache VALUES ('preserved');");db.close();
+  const inspect=()=>{const check=new Database(path,{readonly:true});try{return {rows:check.query('SELECT value FROM sqliteCache').all(),version:check.query('PRAGMA user_version').get(),jobs:check.query("SELECT name FROM sqlite_master WHERE name='jobs'").all()};}finally{check.close();}};
+  expect(()=>Store.readonly(path)).toThrow('Unversioned nonempty database; refusing read-only access');
+  expect(()=>new Store(path)).toThrow('Unversioned nonempty database; refusing initialization');
+  expect(inspect()).toEqual({rows:[{value:'preserved'}],version:{user_version:0},jobs:[]});
+}));
 test('SQLite backup and restore preserves committed WAL records and integrity',()=>fixture((path,dir)=>{
   const s=new Store(path);
   try {

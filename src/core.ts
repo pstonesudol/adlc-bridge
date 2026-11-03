@@ -18,7 +18,7 @@ export class Store {
       try {
         const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
         if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
-        if (version === 0 && this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error('Unversioned nonempty database; refusing read-only access');
+        if (version === 0 && this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").get()) throw Error('Unversioned nonempty database; refusing read-only access');
       } catch (error) { this.db.close(); throw error; }
       return;
     }
@@ -34,7 +34,7 @@ export class Store {
       const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
       if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
       if (version === 0) {
-        if (this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error('Unversioned nonempty database; refusing initialization');
+        if (this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").get()) throw Error('Unversioned nonempty database; refusing initialization');
         this.db.exec(`
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, project TEXT NOT NULL, issue TEXT NOT NULL,
