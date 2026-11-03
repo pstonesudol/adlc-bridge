@@ -68,6 +68,25 @@ test('read-only stores reject future versions without changing database bytes',(
     expect(readFileSync(path)).toEqual(bytes);
   });
 });
+test('read-only stores reject unversioned nonempty databases but open empty files',()=>{
+  fixture(path=>{
+    const db=new Database(path);db.exec("CREATE TABLE marker (value TEXT); INSERT INTO marker VALUES ('preserved');");db.close();
+    const bytes=readFileSync(path);
+    expect(()=>Store.readonly(path)).toThrow('Unversioned nonempty database; refusing read-only access');
+    const check=new Database(path,{readonly:true});
+    try {
+      expect(check.query('SELECT value FROM marker').all()).toEqual([{value:'preserved'}]);
+      expect(check.query('PRAGMA user_version').get()).toEqual({user_version:0});
+    } finally {check.close();}
+    expect(readFileSync(path)).toEqual(bytes);
+  });
+  fixture(path=>{
+    const db=new Database(path);db.close();const bytes=readFileSync(path);
+    const s=Store.readonly(path);
+    try {expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:0});} finally {s.close();}
+    expect(readFileSync(path)).toEqual(bytes);
+  });
+});
 test('SQLite backup and restore preserves committed WAL records and integrity',()=>fixture((path,dir)=>{
   const s=new Store(path);
   try {
