@@ -297,7 +297,9 @@ export class Workflow{
   const d=this.implementation(job);if(!d)return;
   let graceMs=c?.workflow?.prGraceMs??120000;
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
-  const cont=this.continuation(job);
+  const latestContinuation=this.continuation(job);
+  // Retained continuation history cannot satisfy a revised dispatch's receipt.
+  const cont=latestContinuation?.plan_hash===d.plan_hash?latestContinuation:null;
   const clientId=cont?cont.client_id:d.client_id;
   const ledger=new ReceiptReconciliation(this.s),binding=ledger.get(clientId);
   if(binding){

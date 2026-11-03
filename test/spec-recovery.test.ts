@@ -197,6 +197,36 @@ test('prior PR stays historical until the revised handoff, then review reconcili
   expect(after?.state).toBe('needs_reconciliation');expect(after?.reason).toMatch(/remediation delivery is uncertain|dispatch binding/);
  }finally{f.s.close();}
 });
+for(const receipt of ['missing','running'])test(`an old-plan continuation cannot hand off a revised implementation with a ${receipt} receipt`,async()=>{
+ const f=await fixture();try{
+  f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(f.job,f.hash,digest(f.s.get(f.job).spec),'old-resolution','old-continuation','owner','completed');
+  f.e.transcript.entries.push({clientMessageId:'old-continuation',turnId:'old-continuation',sequence:f.e.transcript.entries.length+1});
+  f.e.transcript.turns.push({id:'old-continuation',state:'completed'});
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  const historical=f.w.continuation(f.job);
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  await f.w.executeApproved(f.job,config);
+  const dispatch=f.w.implementation(f.job),entry=f.e.transcript.entries.at(-1),turn=f.e.transcript.turns.at(-1);
+  expect(dispatch.plan_hash).not.toBe(historical.plan_hash);
+  expect(entry.clientMessageId).toBe(dispatch.client_id);
+  if(receipt==='missing')f.e.transcript.entries.pop();
+  f.e.receiptObservation.observed=Date.now();
+  const pending=await f.w.executionStatus(f.job,f.e,config);
+  expect(pending.state).toBe('implementation_running');
+  expect(pending.delivery.client).toBe(dispatch.client_id);
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  expect(f.s.db.query('SELECT * FROM revision_handoffs WHERE job=?').all(f.job)).toHaveLength(0);
+  const loop=new ReviewLoop(f.s);loop.register(f.job,'owner/repo',1,['CI'],['src/**']);
+  expect((await loop.tick(f.job,undefined,undefined,{project:'p',checks:[]},config))?.state).toBe('waiting_for_revised_handoff');
+  // Only completion of the revised dispatch can release the historical PR.
+  if(receipt==='missing')f.e.transcript.entries.push(entry);
+  turn.state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  expect((await f.w.executionStatus(f.job,f.e,config)).state).toBe('pr_handoff');
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
+  expect(f.w.continuation(f.job)).toEqual(historical);
+ }finally{f.s.close();}
+});
 test('a handoff for the same plan hash from an earlier revision does not authorize the current one',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
