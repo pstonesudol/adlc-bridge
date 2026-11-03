@@ -7,6 +7,48 @@ import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,
 import {installBridge} from '../src/install';
 
 const repo='acme/adlc';
+test('verification rejects malformed objects and automatic policies without named checks',()=>{
+ for(const verification of [null,[],42,'CI'])expect(()=>policy({verification})).toThrow('JSON object');
+ for(const verification of [{},{requiredCheck:['CI']},{requiredChecks:[]}])expect(()=>policy({mode:'automatic',verification})).toThrow('at least one');
+});
+test('schema rollback requires a baseline captured before intake restarts',async()=>{
+ for(const baseline of [null,'before']){
+  const f=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'compatible'}});try{
+   let db:string|null=baseline;f.io.dbHash=()=>db;
+   const project=f.io.stack.project;f.io.stack.project=async(action,id)=>{const result=await project(action,id);if(action==='start')db='after';return result;};
+   await f.manager.apply();const record=JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8'));
+   expect(record.dbHash).toBe(baseline);expect(record.rollbackSafe).toBe(baseline!==null);
+   await expect(f.manager.rollback()).rejects.toThrow(baseline===null?'Rollback is unsafe':'Database changed');
+  }finally{f.close();}
+ }
+});
+test('apply refuses staged content changed by candidate tests',async()=>{
+ const f=fixture();try{
+  let modified=false;const stage=f.io.stage;
+  f.io.stage=async(p,c)=>({...await stage(p,c),version:modified?'changed':'v2'});
+  f.io.tests=async()=>{modified=true;return {passed:true,skipped:false,detail:'passed'};};
+  await expect(f.manager.apply()).rejects.toThrow('Staged candidate changed');expect(f.installs).toEqual([]);
+ }finally{f.close();}
+});
+test('successful backend activation retains accumulated intent fields',async()=>{
+ const f=fixture({files:['src/cli.ts','src/serve-orchestrator.py']});try{
+  await f.manager.apply();expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8'))).toMatchObject({stage:'completed',installed:true,backendStopped:true,priorServices:[{project:'one',loaded:true},{project:'two',loaded:false}]});
+ }finally{f.close();}
+});
+test('rollback rejects a traversal path even when the external CLI exists',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();mkdirSync(join(f.root,'source','src'),{recursive:true});writeFileSync(join(f.root,'source','src/cli.ts'),'external');
+  const path=join(f.state,'update-state.json'),record=JSON.parse(readFileSync(path,'utf8'));
+  writeFileSync(path,JSON.stringify({...record,previousSource:join(f.state,'versions')+'/../../source'}),{mode:0o600});
+  await expect(f.manager.rollback()).rejects.toThrow('Previous verified snapshot is unavailable');expect(f.installs).toHaveLength(1);
+ }finally{f.close();}
+});
+test('hot rollback succeeds without stopping the backend',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();expect(await f.manager.rollback()).toMatchObject({rolledBack:true,version:'v1'});
+  expect(f.installs.at(-1)).toBe(join(f.state,'versions','v1'));expect(f.calls).not.toContain('backend:stop');
+ }finally{f.close();}
+});
 const policy=(over:any={})=>validateUpdatePolicy({version:1,repository:repo,remote:'git@github.com:acme/adlc.git',ref:'main',refKind:'branch',mode:'manual',...over});
 function fixture(over:any={}){
  const root=mkdtempSync(join(tmpdir(),'adlc-update-')),state=join(root,'ADLC Bridge'),v1=join(state,'versions','v1');
@@ -95,6 +137,9 @@ test('isolated staging pins the exact commit and refuses a modified checkout',as
   expect(staged).toMatchObject({commit,files:['src/cli.ts']});expect(readFileSync(join(staged.root,'src/cli.ts'),'utf8')).toBe('candidate bytes');
   expect(candidateCompatibility({...staged,files:['src/cli.ts']}).compatible).toBe(false);
   writeFileSync(join(staged.root,'src/cli.ts'),'modified');await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
+  writeFileSync(join(staged.root,'src/cli.ts'),'candidate bytes');
+  writeFileSync(join(staged.root,'.git/info/exclude'),'src/generated.ts\n');writeFileSync(join(staged.root,'src/generated.ts'),'ignored bytes');
+  await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('a deferral whose intake restoration fails remains paused for operator action',async()=>{
@@ -113,7 +158,7 @@ test('installation preserves explicit prior snapshot roots instead of redirectin
  }finally{f.close();}
 });
 test('an automatic attempt starts the cadence window even when it defers',async()=>{
- const f=fixture({policy:{mode:'automatic',cadenceSeconds:60},blockers:[{session:'s',reason:'busy'}]});try{
+ const f=fixture({policy:{mode:'automatic',cadenceSeconds:60,verification:{requiredChecks:['CI']}},blockers:[{session:'s',reason:'busy'}]});try{
   expect(await f.manager.apply({automatic:true})).toMatchObject({deferred:true});
   expect(existsSync(join(f.state,'update-auto.json'))).toBe(true);
   await f.manager.check();
@@ -124,10 +169,10 @@ test('an automatic attempt starts the cadence window even when it defers',async(
 test('automatic adoption requires explicit opt-in and cadence, and never schedules itself',async()=>{
  const f=fixture();try{
   await expect(f.manager.apply({automatic:true})).rejects.toThrow('not enabled');expect(f.installs).toEqual([]);
-  rmSync(join(f.state,'update-policy.json'));writeUpdatePolicy(policy({mode:'automatic',cadenceSeconds:60}),f.state);
+  rmSync(join(f.state,'update-policy.json'));writeUpdatePolicy(policy({mode:'automatic',cadenceSeconds:60,verification:{requiredChecks:['CI']}}),f.state);
   writeFileSync(join(f.state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(1000).toISOString()}),{mode:0o600});
   await f.manager.check();const skipped=await f.manager.apply({automatic:true});expect(skipped).toEqual({skipped:true,reason:'Update cadence has not elapsed'});
-  const later=fixture({now:Date.now()+3600000,policy:{mode:'automatic',cadenceSeconds:60}});try{writeFileSync(join(later.state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(0).toISOString()}),{mode:0o600});expect((await later.manager.apply({automatic:true})).activated).toBe(true);}finally{later.close();}
+  const later=fixture({now:Date.now()+3600000,policy:{mode:'automatic',cadenceSeconds:60,verification:{requiredChecks:['CI']}}});try{writeFileSync(join(later.state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(0).toISOString()}),{mode:0o600});expect((await later.manager.apply({automatic:true})).activated).toBe(true);}finally{later.close();}
  }finally{f.close();}
 });
 test('concurrent polls and interrupted intents never double-activate',async()=>{
