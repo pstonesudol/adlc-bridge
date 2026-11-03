@@ -91,6 +91,16 @@ test('custom Verification Evidence goes to the existing worker once, uses config
   expect(f.reviews()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
  }finally{f.s.close();}
 });
+test('a custom-check blocker without an obligation or wait baseline requests a fresh review',async()=>{
+ const f=customLoopFixture();try{
+  const reason='CodeRabbit custom-check failure: description changed after the bot review';
+  Object.assign(f.e,{descriptionHash:'edited-before-remediation',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,reasons:[reason],botReviewSubmittedAt:Date.now()-10000});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'Full CodeRabbit review requested for current commit and description'});
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
+  expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(1);
+  await f.loop.tick(f.id);expect(f.reviews()).toBe(1);
+ }finally{f.s.close();}
+});
 test('a fresh custom-check blocker on the first tick after an edit does not request another review',async()=>{
  const f=customLoopFixture();try{
   await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
