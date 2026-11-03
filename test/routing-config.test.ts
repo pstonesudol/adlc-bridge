@@ -1,0 +1,42 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,writeFileSync,readFileSync,rmSync,existsSync,unlinkSync,symlinkSync} from 'node:fs';
+import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {effectiveRouting,validateRouting,loadRouting,importRouting} from '../src/routing-config';
+import {TaskRouting,selectRoute} from '../src/task-routing';import {Store,digest} from '../src/core';
+import {routingConfig} from './routing-fixture';
+const document=()=>({...routingConfig,version:1,harness:'opencode-v2',classifier:{adapter:'off'}});
+function fixture(){const dir=mkdtempSync(join(tmpdir(),'adlc-owned-routing-'));const configFile=join(dir,'routing.json');writeFileSync(configFile,JSON.stringify(document()));return {dir,settings:{enabled:true,harness:'opencode-v2' as const,configFile}};}
+test('validated ADLC configuration works without OpenChamber and deterministic planning avoids classifier',async()=>{
+ const {dir,settings}=fixture(),s=new Store(':memory:');try{const id=s.enqueue('p','i','spec'),router=new TaskRouting(s);const route=await router.choose(id,'planning',digest('spec'),'plan',settings,'planning');expect(route.model).toBe('openai/luna');expect(route.mode).toBe('plan');const snapshot=await loadRouting(settings);await expect(snapshot.classify('task')).rejects.toThrow('disabled');expect((await router.choose(id,'implementation','binding','task',settings)).reason).toBe('classifier-unavailable');expect(existsSync(join(dir,'openchamber'))).toBe(false);}finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('explicit overrides replace whole fields with provenance and validate merged policy',()=>{
+ const {dir,settings}=fixture();try{const overridesFile=join(dir,'project.json');writeFileSync(overridesFile,JSON.stringify({version:1,minConfidence:0.95}));const result=effectiveRouting({...settings,overridesFile});expect(result.config.minConfidence).toBe(0.95);expect(result.provenance.minConfidence).toBe(overridesFile);expect(result.provenance.categories).toBe(settings.configFile);expect(selectRoute(result.config,{choice:'implement',confidence:0.9}).category).toBeNull();writeFileSync(overridesFile,'{"version":1,"token":"do not copy"}');expect(()=>effectiveRouting({...settings,overridesFile})).toThrow('unsupported field');}finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('missing malformed unsupported and invalid routing configs give diagnostics',()=>{
+ const {dir,settings}=fixture();try{for(const change of [{version:2},{harness:'codex'},{minConfidence:2},{enabled:'yes'},{classifier:{adapter:'custom',token:'secret'}},{categories:[routingConfig.categories[0],routingConfig.categories[0]]},{fallback:{model:{providerID:'openchamber',modelID:'auto'}}}])expect(()=>validateRouting({...document(),...change})).toThrow();writeFileSync(settings.configFile,'{');expect(()=>effectiveRouting(settings)).toThrow('valid version 1 JSON');expect(()=>effectiveRouting({...settings,configFile:join(dir,'missing')})).toThrow('Cannot read');}finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('import preview is read-only; explicit atomic apply backs up ADLC and preserves equivalent routes',()=>{
+ const {dir,settings}=fixture();try{const source=join(dir,'source.json'),raw=JSON.stringify({...routingConfig,classifierToken:'secret'});writeFileSync(source,raw);const before=readFileSync(settings.configFile,'utf8'),preview=importRouting(source,settings.configFile);expect(preview.unsupported).toEqual(['classifierToken']);expect(JSON.stringify(preview)).not.toContain('secret');expect(readFileSync(settings.configFile,'utf8')).toBe(before);const applied=importRouting(source,settings.configFile,true);expect(readFileSync(applied.backup!,'utf8')).toBe(before);expect(readFileSync(source,'utf8')).toBe(raw);for(const c of routingConfig.categories){const answer={choice:c.id,confidence:1};expect(selectRoute(applied.config,answer).model).toBe(selectRoute(routingConfig,answer).model);}expect(()=>importRouting(source,source,true)).toThrow('differ');}finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('existing route and approval hashes survive missing config and reconciliation is explicit',async()=>{
+ const {dir,settings}=fixture(),s=new Store(':memory:');try{const id=s.enqueue('p','i','spec'),router=new TaskRouting(s);await router.choose(id,'planning',digest('spec'),'plan',settings,'planning');const hash=s.propose(id,'plan');await router.choose(id,'implementation',digest(JSON.stringify(['spec',hash])),'task',settings);router.approve(id,hash);const before=router.approved(id,hash);writeFileSync(settings.configFile,JSON.stringify({...document(),fallback:{model:{providerID:'other',modelID:'new'}}}));expect(router.approved(id,hash)).toEqual(before);expect(await router.choose(id,'implementation',digest(JSON.stringify(['spec',hash])),'task',settings)).toEqual(before);const preview=await router.reconcile(id,settings);expect(preview.applied).toBe(false);expect(router.approved(id,hash)).toEqual(before);await router.reconcile(id,settings,preview.hash);expect(()=>router.approved(id,hash)).toThrow('approval');router.approve(id,hash);expect(router.approved(id,hash)?.model).toBe('other/new');s.approve(id,hash,'human');await expect(router.reconcile(id,settings)).rejects.toThrow('unapproved');}finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('pinned remediation needs neither current config nor OpenChamber runtime',async()=>{
+ const {dir,settings}=fixture(),s=new Store(':memory:');try{const id=s.enqueue('p','i','spec'),router=new TaskRouting(s);await router.choose(id,'implementation','binding','task',settings);unlinkSync(settings.configFile);const route=await router.choose(id,'remediation:head:findings','head','fix',settings);expect(route.model).toBe('opencode-go/flash');expect(route.reason).toBe('classifier-unavailable');}finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('import refuses a symlink alias of the source',()=>{
+ const {dir,settings}=fixture();try{const alias=join(dir,'alias.json');symlinkSync(settings.configFile,alias);expect(()=>importRouting(settings.configFile,alias,true)).toThrow('differ');expect(JSON.parse(readFileSync(settings.configFile,'utf8')).version).toBe(1);}finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('CLI previews and classifies through OpenCode protocol without OpenChamber or live inference',async()=>{
+ const {dir,settings}=fixture();try{
+  writeFileSync(settings.configFile,JSON.stringify({...document(),classifier:{adapter:'opencode',model:'authorized/classifier'}}));
+  const executable=join(dir,'opencode'),capture=join(dir,'capture.json'),project=join(dir,'project.json'),task=join(dir,'task.txt');
+  writeFileSync(executable,`#!${process.execPath}\nimport {writeFileSync} from 'node:fs';\nwriteFileSync(process.env.ADLC_TEST_CAPTURE,JSON.stringify({args:process.argv.slice(2),cwd:process.cwd(),config:JSON.parse(process.env.OPENCODE_CONFIG_CONTENT)}));\nif(process.env.ADLC_TEST_FAILURE==='exit')process.exit(1);\nconsole.log(JSON.stringify({type:'text',part:{text:process.env.ADLC_TEST_FAILURE==='malformed'?'not json':JSON.stringify({choice:'implement',confidence:0.99})}}));\n`,{mode:0o700});
+  writeFileSync(project,JSON.stringify({routing:settings}));writeFileSync(task,'implement this untrusted request');
+  const run=async(failure='',preview=false)=>{const p=Bun.spawn([process.execPath,join(import.meta.dir,'../src/cli.ts'),'routing',project,...(preview?[]:[task])],{cwd:dir,env:{...process.env,HOME:dir,PATH:dir+':'+process.env.PATH,ADLC_TEST_CAPTURE:capture,ADLC_TEST_FAILURE:failure},stdout:'pipe',stderr:'pipe'});const output=await new Response(p.stdout).text(),error=await new Response(p.stderr).text();expect(await p.exited).toBe(0);expect(error).toBe('');return JSON.parse(output);};
+  expect((await run('',true)).config.classifier.model).toBe('authorized/classifier');
+  expect((await run()).model).toBe('openai/sol');
+  const recorded=JSON.parse(readFileSync(capture,'utf8'));expect(recorded.args).toContain('--standalone');expect(recorded.args).toContain('authorized/classifier');expect(recorded.config.policies).toEqual([{action:'tool.use',resource:'*',effect:'deny'}]);expect(recorded.cwd).not.toBe(dir);
+  for(const failure of ['malformed','exit']){const result=await run(failure);expect(result.model).toBe('opencode-go/flash');expect(result.reason).toBe('classifier-unavailable');}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

@@ -199,7 +199,7 @@ and mocked container execution; these do not prove live Honey Summer, Docker,
 provider or launchd compatibility. Report live commands separately. Plan approval,
 scoped Git grants, human-only PR merging and no automatic deployment are unchanged.
 
-Local-first coordination between Linear, Agent Orchestrator, OpenChamber routing,
+Local-first coordination between Linear, Agent Orchestrator, ADLC-owned routing,
 GitHub CI, and CodeRabbit. Coding runs locally in isolated Orchestrator worktrees.
 Docker is used for supported verification, not for coding or the controller.
 
@@ -345,7 +345,7 @@ Install and configure these before enabling automation:
 - A local repository checkout registered as a project in Orchestrator.
 - Linear access to the intended project, team, statuses, and `agent-ready` label.
 - CodeRabbit installed on the GitHub repository and configured to review its PRs.
-- For shared routing: OpenChamber configuration and its local routing runtime
+- For routing: an ADLC routing document and optionally an authorized OpenCode classifier model
   source directory, plus an available Orchestrator OpenCode 2 harness.
 - Docker Desktop when using Docker verification. Project verification also needs
   the tools and configuration required by that repository.
@@ -359,7 +359,7 @@ bun test
 bun src/cli.ts help
 ```
 
-The adapters are coupled to the installed Orchestrator API and OpenChamber runtime.
+The adapters use the installed Orchestrator API and supported OpenCode CLI, not OpenChamber runtime modules.
 Validate them after upgrades; passing unit tests alone does not verify live access.
 
 ### 2. Make the CLI available
@@ -407,8 +407,8 @@ can override the stored key for a process; a Terminal export is not automaticall
 inherited by launchd, so the stored credential is the simplest service setup.
 
 Provider authentication is separate from Linear and GitHub. Sign in to the
-providers used by the worker harness in Orchestrator. OpenChamber and Orchestrator
-can have separate login stores; working OpenChamber routing does not prove that
+providers used by the worker harness in Orchestrator. The local CLI and Orchestrator
+can have separate login stores; working classifier inference does not prove that
 Orchestrator can make a model request. Use their native provider login controls,
 then verify an actual small request in Orchestrator. There is no automatic
 credential-copy command in this CLI. Preserve existing credentials and global rules.
@@ -432,7 +432,7 @@ and its placeholders must be replaced; it is not an executable configuration.
 | `linear` IDs | Verified project, team, Todo state, and `agent-ready` label UUIDs |
 | `requiredChecks` | Exact required GitHub Actions check names for this repository |
 | `reviewAllowedPaths` | Approved repository-relative review scope for explicit manual registration |
-| `routing` | Existing OpenChamber configuration and routing runtime directories; supported harness |
+| `routing` | ADLC routing `configFile`, optional `overridesFile`, and `opencode-v2` harness; see [routing setup](OPENCHAMBER-ROUTING.md) |
 | `statusSync` | Team-specific In Progress, In Review, and Done UUIDs |
 | `remediation.maxAttempts` | Positive per-job remediation budget; `null` enables explicit uncapped mode |
 | `remediation.maxNoProgress` | Consecutive attempts without verified progress before an explicit stop |
@@ -449,7 +449,7 @@ path `scope`, and `gitScope: "feature-pr"`. This is authorization for real edits
 commits, pushes, and PRs; copying another person's grant does not authorize yours.
 Protected secret files, Git metadata, and agent policy/config paths stay excluded.
 
-For the shared OpenChamber routing flow, configure its paths and set
+For ADLC-owned routing, configure `routing.configFile` and set
 `routing.enabled: true`. Routing chooses the task's provider/model/effort; it does
 not supply authentication. Optional status synchronization and feature planning
 must each be enabled explicitly after their IDs are verified.
@@ -673,7 +673,7 @@ no clone or Git setup.
 | --- | --- |
 | No tickets picked up | Service loaded, Mac awake, Orchestrator running, exact project/team/Todo/label IDs, log errors |
 | Worker setup exits 78 | Reserved branch/worktree and startup gate configuration; do not bypass the gate |
-| Provider request fails | Login in the actual worker harness; OpenChamber credentials may be separate |
+| Provider request fails | Login in the actual worker harness; classifier CLI credentials may be separate |
 | PR appears but bridge is blocked | Existing session/branch/PR and original authorization; investigate before guarded recovery |
 | Review says Changes requested but no inline threads | CodeRabbit may have a PR-description or pre-merge evidence finding |
 | Poll fails | Read `intake-error.log`; foreground `poll` also shows errors but can perform real work |

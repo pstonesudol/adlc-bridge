@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "harness": "opencode-v2",
+  "enabled": true,
+  "minConfidence": 0.6,
+  "classifier": {"adapter": "off"},
+  "fallback": null,
+  "categories": [
+    {"id": "planning", "enabled": false, "description": "Plan only", "model": null, "agent": "plan"},
+    {"id": "implement", "enabled": false, "description": "Ordinary implementation", "model": null, "agent": "build"},
+    {"id": "hard", "enabled": false, "description": "Exceptional engineering complexity", "model": null},
+    {"id": "testing", "enabled": false, "description": "Primarily testing work", "model": null}
+  ]
+}

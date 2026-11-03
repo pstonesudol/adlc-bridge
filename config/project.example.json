@@ -47,8 +47,7 @@
   },
   "routing": {
     "enabled": false,
-    "dataDir": "/absolute/path/to/.config/openchamber",
-    "runtimeDir": "/absolute/path/to/openchamber/packages/web/server/lib/routing",
+    "configFile": "/absolute/path/to/adlc-routing.json",
     "harness": "opencode-v2"
   },
   "statusSync": {

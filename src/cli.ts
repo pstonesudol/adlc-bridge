@@ -24,7 +24,8 @@ import {sessionEvidence,capturePlan} from './session-evidence';
 import {adoptPilot,observePilot} from './pilot';
 import {ReviewLoop,reviewDisplay} from './review-loop';
 import {disableNativeFeedback} from './ao-policy';
-import {TaskRouting,loadOpenChamber,selectRoute} from './task-routing';
+import {TaskRouting,selectRoute} from './task-routing';
+import {loadRouting,effectiveRouting,importRouting} from './routing-config';
 import {FeaturePlanning} from './feature-planning';
 import {featureAgents} from './feature-transport';
 import {FeaturePublish} from './feature-publish';
@@ -174,7 +175,9 @@ async function main(){
   feature-cancel ID                    stop owned planning agents; preserve created issues
   doctor | ao-status | ao-projects | ao-agents | ao-sessions
   auth-linear                          hidden local key entry (owner-only file)
-  routing CONFIG [TASK_FILE]           show OpenChamber routes or preview task classification
+  routing CONFIG [TASK_FILE]           show ADLC routes/provenance or preview classification
+  routing-import SOURCE DEST [--apply] preview or explicitly import OpenChamber routing JSON
+  routing-reconcile JOB CONFIG [--confirm HASH] preview/reselect an unstarted implementation route
   setup-workflow CONFIG                install registry-aware Orchestrator startup gate
   approvals                            list plans waiting for approval
   show-plan JOB                        show captured plan and approval hash
@@ -223,11 +226,16 @@ Registered approved review targets can request bounded in-scope fixes from their
     const p=Bun.spawn(['python3',join(import.meta.dir,'auth-linear.py')],{stdin:'inherit',stdout:'inherit',stderr:'inherit'});
     if(await p.exited!==0)throw Error('Credential entry did not complete');return;
   }
+  if(command==='routing-import')return out(importRouting(req(a[0],'Source JSON'),req(a[1],'ADLC destination JSON'),a.includes('--apply')));
+  if(command==='routing-reconcile'){
+   const c=JSON.parse(readFileSync(req(a[1],'Config'),'utf8')),s=new Store(db);
+   try{validate(c);if(s.get(req(a[0],'Job')).project!==c.linear.projectId)throw Error('Job belongs to a different project');if(!c.routing?.enabled)throw Error('Project routing must be enabled');const i=a.indexOf('--confirm');return out(await new TaskRouting(s).reconcile(req(a[0],'Job'),c.routing,i<0?undefined:req(a[i+1],'Preview hash')));}finally{s.close();}
+  }
   if(command==='routing'){
-    const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));if(!c.routing)throw Error('OpenChamber routing is not configured for this project');
-    const snapshot=await loadOpenChamber(c.routing);
+    const c=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));if(!c.routing)throw Error('ADLC routing is not configured for this project');
+    const snapshot=await loadRouting(c.routing);
     if(a[1]){let answer=null;try{answer=await snapshot.classify(readFileSync(a[1],'utf8'));}catch{}return out(selectRoute(snapshot.config,answer,answer?undefined:'classifier-unavailable'));}
-    return out({source:join(c.routing.dataDir,'routing.json'),harness:c.routing.harness,projectEnabled:c.routing.enabled,enabled:snapshot.config.enabled,minConfidence:snapshot.config.minConfidence,fallback:snapshot.config.fallback,categories:snapshot.config.categories.map(x=>({id:x.id,enabled:x.enabled,model:x.model,effort:x.variant,agent:x.agent}))});
+    return out({...effectiveRouting(c.routing),projectEnabled:c.routing.enabled});
   }
   if(command==='setup-workflow')return out(await installWorkflowHook(req(a[0],'Config')));
   if(command==='container-check'){const r=await containerCheck(req(a[0],'Worktree'));out(r);if(!r.passed)process.exitCode=1;return;}
