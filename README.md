@@ -1791,6 +1791,10 @@ specification do not change its hash; labels, project, state and policy still
 undergo their independent eligibility/security checks. Revision notices expose
 field names and character counts, not ticket excerpts or secrets.
 
+An edit made before any planning owner exists is ordinary intake: the first
+captured plan binds those requirements, so it is not a blocking revision.
+Edits once planning has started always invalidate the previous scope.
+
 Record future suggestions in a **separate follow-up ticket without agent-ready**,
 linked to the active ticket. Do not append them to its executable description or
 rely on an “ignore this” heading, comment or label to waive scope checks. Promoting
@@ -1816,7 +1820,10 @@ the new Linear plan notice, from a configured human. Previous replies are stale.
 Standing-policy tickets pass through current eligibility/readiness/scope policy;
 an ineligible or unresolved plan stays blocked, without expanding permissions.
 Previous PR/verification evidence is historical until the revised implementation
-hands off. `status`, `review-status` and `reconcile-preview` retain independent
+hands off; a merge of that old PR cannot mark the revised job Done. Terminal
+failed/cancelled replan turns are retired only by confirming their exact receipt
+(`spec-reconcile` preview), then a fresh preview/confirmation is required. Linear
+revision notices are published in bounded batches with a durable cursor. `status`, `review-status` and `reconcile-preview` retain independent
 provider/dependency blockers alongside the requirements blocker.
 
 Existing incidents are not automatically approved or resumed. A subsequent

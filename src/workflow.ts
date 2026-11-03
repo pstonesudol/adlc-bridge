@@ -315,6 +315,7 @@ export class Workflow{
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{
    if(!persist)return {...result,session:d.session_id};
+   if(result.state==='pr_handoff'&&result.pr)this.s.db.query('INSERT OR IGNORE INTO spec_handoffs VALUES (?,?,?,?)').run(job,this.s.get(job).plan_hash,result.pr.number,now);
    // A later remediation may be selected for the workflow outcome, but only
    // the continuation's own receipt can settle its durable delivery state.
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);

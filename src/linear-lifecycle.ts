@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
-import {latestRevision} from './spec-revisions';
+import {latestRevision,revisedExecution,revisedHandoff} from './spec-revisions';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 const driftBody=(reason:string)=>reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.';
@@ -10,6 +10,7 @@ export class LinearLifecycle{
  constructor(public s:Store,public api:LinearAPI=linearAPI,public pr=prLifecycle){s.db.exec(`CREATE TABLE IF NOT EXISTS linear_transitions(job TEXT NOT NULL REFERENCES jobs(id),phase TEXT NOT NULL,desired TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,PRIMARY KEY(job,phase));
   CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));
   CREATE TABLE IF NOT EXISTS spec_notices(revision TEXT PRIMARY KEY,job TEXT NOT NULL,comment_id TEXT NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS spec_notice_cursor(project TEXT PRIMARY KEY,last_rowid INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,comment_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);
   if(!(s.db.query('PRAGMA table_info(branch_drift_notices)').all() as any[]).some(x=>x.name==='comment_id'))s.db.exec('ALTER TABLE branch_drift_notices ADD COLUMN comment_id TEXT');}
  async driftComment(issueId:string,commentId:string,body:string){
@@ -124,21 +125,28 @@ export class LinearLifecycle{
   this.s.db.query("UPDATE linear_transitions SET state='confirmed' WHERE job=? AND phase=?").run(job,phase);this.s.event(job,'linear_status_changed',JSON.stringify({phase,state:desired}));return {state:'confirmed'};
  }
   async revisionNotices(c:SyncConfig){
-   const rows=this.s.db.query('SELECT r.* FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? ORDER BY r.rowid').all(c.linear.projectId) as any[],results:any[]=[];
+   const limit=5,cursor=this.s.db.query('SELECT last_rowid FROM spec_notice_cursor WHERE project=?').get(c.linear.projectId) as any,after=cursor?.last_rowid??0;
+   const page=(from:number)=>this.s.db.query(`SELECT r.*,r.rowid AS rid FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? AND r.rowid>? AND NOT EXISTS(SELECT 1 FROM spec_notices n WHERE n.revision=r.id AND n.state='posted') ORDER BY r.rowid LIMIT ?`).all(c.linear.projectId,from,limit) as any[];
+   let rows=page(after);
+   // A bounded batch prevents one failing revision from starving every later
+   // stage of the poll. The durable cursor advances past each attempted
+   // revision, including failures, and wraps to retry older ones next time.
+   if(!rows.length&&after>0)rows=page(0);
+   const results:any[]=[];
    for(const r of rows)try{
     let n=this.s.db.query('SELECT * FROM spec_notices WHERE revision=?').get(r.id) as any;
     if(n?.state==='posted')continue;
     const j=this.s.get(r.job),issue=await readLinearIssue(j.issue,this.api);
     if(issue?.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId)throw Error('Revision notice issue identity unavailable');
     if(!n){
-     const p=this.s.db.query('SELECT session_id FROM planning_runs WHERE job=?').get(j.id) as any;
+     const p=this.s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()?this.s.db.query('SELECT session_id FROM planning_runs WHERE job=?').get(j.id) as any:null;
      const pr=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(j.id) as any:null;
      const body=[`## ADLC: requirements changed — authorization invalidated`,
       `Revision: ${r.id}\nJob: ${j.id}\nSession: ${p?.session_id??'not yet reserved'}\nPR: ${pr?`https://github.com/${pr.repo}/pull/${pr.pr}`:'inspect attached PR in the existing session'}`,
       `${r.old_hash} → ${r.new_hash}\n${r.summary}`,
       `Stale plan approval: ${r.old_approved_hash??'none'}; previous Git/policy grants cannot authorize new dispatch.`,
-      'New work is stopped. Already-running work is not interrupted; wait for authoritative idle/completion evidence. Existing receipts and uncertain deliveries are retained. This is a requirements blocker, independent of dependency waits, manual approval and provider failures.',
-      `Next: run adlc spec-reconcile ${j.id} CONFIG for a read-only preview, then --confirm HASH to authorize planning only in the existing owner. Repeated edits coalesce to the latest revision; older notices do not authorize work. After capture, use the current fenced approval instruction or current standing-policy evaluation. No implementation, verification, push, PR edit, merge or deployment is authorized by this notice.`].join('\n\n');
+      'At the time this revision was recorded, new dispatch under the stale approval stopped. Already-running work was not interrupted; authoritative idle/completion evidence and every receipt were retained. This is a requirements blocker, independent of dependency waits, manual approval and provider failures.',
+      `Next, if this revision is still current: run adlc spec-reconcile ${j.id} CONFIG for a read-only preview, then --confirm HASH to authorize planning only in the existing owner. Repeated edits coalesce to the latest revision; older notices do not authorize work. After capture, use the current fenced approval instruction or current standing-policy evaluation. Check status/queue for the latest state. No implementation, verification, push, PR edit, merge or deployment is authorized by this notice.`].join('\n\n');
      this.s.db.query("INSERT OR IGNORE INTO spec_notices VALUES (?,?,?,?,'reserved')").run(r.id,j.id,randomUUID(),body);
      n=this.s.db.query('SELECT * FROM spec_notices WHERE revision=?').get(r.id) as any;
     }
@@ -153,6 +161,7 @@ export class LinearLifecycle{
     this.s.db.query("UPDATE spec_notices SET state='posted' WHERE revision=?").run(r.id);
     results.push({job:j.id,revision:r.id,state:'requirements_notice_posted'});
    }catch(e){results.push({job:r.job,revision:r.id,state:'requirements_notice_blocked',reason:e instanceof Error?e.message:'Notice unavailable'});}
+   if(rows.length)this.s.db.query('INSERT INTO spec_notice_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,rows[rows.length-1].rid);
    return results;
   }
   async sync(c:SyncConfig){
@@ -162,7 +171,7 @@ export class LinearLifecycle{
    const results:any[]=[...notices];
    for(const row of rows)try{
     const revision=latestRevision(this.s,row.id);
-    if(revision&&revision.state!=='authorized'){results.push({job:row.id,state:'requirements_changed',reason:'Current requirements need replanning and fresh approval; PR state is historical'});continue;}
+    if(revision&&!['authorized','preplanning'].includes(revision.state)){results.push({job:row.id,state:'requirements_changed',reason:'Current requirements need replanning and fresh approval; PR state is historical'});continue;}
    if(row.state==='blocked'){
     try{
      const notice=await this.notifyBudgetBlocker(row.id,c);
@@ -175,6 +184,11 @@ export class LinearLifecycle{
    const delivery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()
     ?this.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(row.id) as any:null;
    const review=this.s.db.query('SELECT repo,pr,state,reason FROM review_targets WHERE job=?').get(row.id) as any;
+   // A revised plan's prior PR is historical until that exact dispatch has a
+   // confirmed handoff. This gates In Review and Done alike: merging the old PR
+   // cannot complete a job whose fresh plan was never implemented.
+   const revisedExecutionJob=revisedExecution(this.s,row.id),revisedHandoffJob=revisedHandoff(this.s,row.id);
+   if(revisedExecutionJob&&!revisedHandoffJob){results.push({job:row.id,state:'revised_handoff_pending',reason:'Current revised plan has no confirmed handoff; prior PR state and merge are historical'});continue;}
    const reason=[delivery?.reason,review?.reason].find((r:any)=>r?.startsWith('Blocked — branch mismatch'));
    if(reason){
     branchMismatch=true;

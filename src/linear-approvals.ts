@@ -31,7 +31,7 @@ export class LinearApprovals{
   if(j.state!=='awaiting_approval'||!j.plan||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!q?.ready||q.project!==c.linear.projectId||q.spec_hash!==digest(j.spec)||Date.now()-q.observed>120000||q.observed>Date.now()+5000)throw Error('Fresh eligible captured plan required');
   if(c.approval?.mode==='ready-queue'&&!p.requiresManual(job))throw Error('Ticket no longer requires manual approval');
   const issue=await readLinearIssue(j.issue,this.api);
-   if(issue?.id!==j.issue||issue.team?.id!==c.linear.teamId||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((x:any)=>x.id===c.linear.readyLabelId)||![c.linear.readyStateId,c.statusSync?.inProgress,c.statusSync?.inReview].includes(issue.state?.id))throw Error('Ticket is no longer eligible for plan approval');
+   if(issue?.id!==j.issue||issue.team?.id!==c.linear.teamId||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((x:any)=>x.id===c.linear.readyLabelId)||!issue.state?.id||![c.linear.readyStateId,c.statusSync?.inProgress,c.statusSync?.inReview].includes(issue.state.id))throw Error('Ticket is no longer eligible for plan approval');
   if(j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Ticket requirements changed; approval refused');
   if(c.approval?.mode==='ready-queue'&&!issue.labels.nodes.some((l:any)=>l.name?.trim().toLowerCase()==='plan-approval-required'))throw Error('Approval label removed; refresh intake before proceeding');
   return {j,issue};
