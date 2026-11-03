@@ -6,6 +6,19 @@ import {TaskRouting,selectRoute} from '../src/task-routing';import {Store,digest
 import {routingConfig} from './routing-fixture';
 const document=()=>({...routingConfig,version:1,harness:'opencode-v2',classifier:{adapter:'off'}});
 function fixture(){const dir=mkdtempSync(join(tmpdir(),'adlc-owned-routing-'));const configFile=join(dir,'routing.json');writeFileSync(configFile,JSON.stringify(document()));return {dir,settings:{enabled:true,harness:'opencode-v2' as const,configFile}};}
+test('routing example remains disabled even after targets are configured',()=>{
+ const example=validateRouting(JSON.parse(readFileSync(join(import.meta.dir,'../config/routing.example.json'),'utf8')));
+ expect(example.enabled).toBe(false);
+ const configured=validateRouting({...example,fallback:routingConfig.fallback,categories:routingConfig.categories});
+ expect(()=>selectRoute(configured,{choice:'implement',confidence:1})).toThrow('disabled');
+});
+test('fallback rejects agent fields while categories retain supported agents',()=>{
+ for(const agent of ['plan','build',null])expect(()=>validateRouting({...document(),fallback:{...routingConfig.fallback,agent}})).toThrow('routing.fallback.agent: unsupported field');
+ for(const agent of ['plan','build']){
+  const config=validateRouting({...document(),categories:[{...routingConfig.categories[1],agent}]});
+  const route=selectRoute(config,{choice:'implement',confidence:1});expect(route.agent).toBe(agent);expect(route.mode).toBe(agent);
+ }
+});
 test('validated ADLC configuration works without OpenChamber and deterministic planning avoids classifier',async()=>{
  const {dir,settings}=fixture(),s=new Store(':memory:');try{const id=s.enqueue('p','i','spec'),router=new TaskRouting(s);const route=await router.choose(id,'planning',digest('spec'),'plan',settings,'planning');expect(route.model).toBe('openai/luna');expect(route.mode).toBe('plan');const snapshot=await loadRouting(settings);await expect(snapshot.classify('task')).rejects.toThrow('disabled');expect((await router.choose(id,'implementation','binding','task',settings)).reason).toBe('classifier-unavailable');expect(existsSync(join(dir,'openchamber'))).toBe(false);}finally{s.close();rmSync(dir,{recursive:true,force:true});}
 });

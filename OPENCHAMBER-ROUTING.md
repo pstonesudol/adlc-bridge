@@ -14,6 +14,9 @@ and set the project's routing section:
 {"enabled":true,"harness":"opencode-v2","configFile":"/absolute/path/adlc-routing.json","overridesFile":"/absolute/path/project-routing.json"}
 ```
 
+The example document is disabled. After configuring its targets, explicitly set
+the document's `enabled` to true as well as enabling routing in the project.
+
 `configFile` is the shared defaults document. The optional `overridesFile` is a
 versioned partial document. Paths resolve from the process working directory;
 use absolute paths in services. Precedence is shared document, then explicit
@@ -32,6 +35,7 @@ model `{providerID,modelID}` or null, optional `variant` (reasoning effort), and
 optional `agent` (`build` or `plan`). Targets support the same model and effort
 fields. Only the OpenCode 2 harness is supported; live worker controls must also
 advertise the selected model/effort. No silent harness/provider substitution occurs.
+Fallback targets are build-only and reject the `agent` field.
 
 ## Classification and authentication
 

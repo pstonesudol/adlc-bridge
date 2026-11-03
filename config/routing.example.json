@@ -1,7 +1,7 @@
 {
   "version": 1,
   "harness": "opencode-v2",
-  "enabled": true,
+  "enabled": false,
   "minConfidence": 0.6,
   "classifier": {"adapter": "off"},
   "fallback": null,
