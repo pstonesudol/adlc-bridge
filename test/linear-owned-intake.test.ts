@@ -1,7 +1,31 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {FeaturePlanning} from '../src/feature-planning';import {poll} from '../src/linear';import {featureConfig,Agents} from './feature-fixture';
+import {digest} from '../src/core';
+import {recordReadiness} from '../src/readiness';
 const c={version:1 as const,...featureConfig,requiredChecks:['CI'],statusSync:{enabled:true,inProgress:'00000000-0000-0000-0000-000000000006',inReview:'00000000-0000-0000-0000-000000000007',done:'00000000-0000-0000-0000-000000000008'}};
 function issue(id:string,state:string){return {id,identifier:'DEV-1',title:'Task',description:'Requirements',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{id:state},labels:{nodes:[{id:c.linear.readyLabelId}],pageInfo:{hasNextPage:false}}};}
 const response=(nodes:any[])=>new Response(JSON.stringify({data:{issues:{nodes,pageInfo:{hasNextPage:false}}}}));
+for(const readiness of ['blocked-by-dependency','ready','needs-input','missing','invalid','stale-plan','stale-spec','legacy'])test(`planning intake exemption fails closed except current dependency receipt: ${readiness}`,async()=>{
+ const old=globalThis.fetch,s=new Store(':memory:');const w=new Workflow(s,{} as any);new FeaturePlanning(s,new Agents());
+ try{
+  const source=issue('11111111-1111-1111-1111-111111111111',c.linear.readyStateId),spec=JSON.stringify({identifier:source.identifier,title:source.title,description:source.description}),id=s.enqueue(c.linear.projectId,source.id,spec),p=new Planning(s);
+  p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');
+  const state=readiness==='ready'?'ready':readiness==='needs-input'?'needs-input':'blocked-by-dependency';
+  const plan=`Plan\n<!-- ADLC_PLAN_STATUS ${JSON.stringify({version:1,readiness:state,questions:state==='needs-input'?[{id:'q1',question:'Which scope?',kind:'security-scope'}]:[],dependencies:state==='blocked-by-dependency'?[{ref:'DEV-32',reason:'foundation'}]:[]})} -->`;
+  const hash=s.propose(id,plan);recordReadiness(s,id,plan,hash,digest(spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);
+  if(readiness==='missing')s.db.query('DELETE FROM plan_readiness WHERE job=?').run(id);
+  if(readiness==='invalid')s.db.query('UPDATE plan_readiness SET valid=0 WHERE job=?').run(id);
+  if(readiness==='stale-plan')s.db.query("UPDATE plan_readiness SET plan_hash='old' WHERE job=?").run(id);
+  if(readiness==='stale-spec')s.db.query("UPDATE plan_readiness SET spec_hash='old' WHERE job=?").run(id);
+  if(readiness==='legacy')s.db.query("UPDATE plan_readiness SET source='plan-text' WHERE job=?").run(id);
+  s.db.query('INSERT INTO feature_dependencies VALUES (?,?)').run(source.id,'prerequisite');
+  let prerequisiteReads=0;
+  globalThis.fetch=(async(_url:any,init:any)=>{const b=JSON.parse(init.body);if(b.variables.ids){prerequisiteReads++;return response([{id:'prerequisite',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{type:'started'}}]);}return response([source]);}) as any;
+  await poll({...c,githubRepo:'owner/repo',statusSync:undefined,dependencyRecovery:{enabled:true,baseBranch:'main',jobs:[{issue:source.id,stage:'planning',project:c.linear.projectId,planHash:hash,specHash:digest(spec),contractReview:{actor:'reviewer',compatibility:'Same plan contract'},prerequisites:[{issue:'22222222-2222-2222-2222-222222222222',ref:'DEV-32',repo:'owner/repo',pr:32,kind:'source',headSha:'a'.repeat(40),capabilities:[{path:'src/cli.ts',sha256:'b'.repeat(64)}]}]}]}},s,'test');
+  const exempt=readiness==='blocked-by-dependency';expect(s.get(id).state).toBe(exempt?'awaiting_approval':'blocked');expect(prerequisiteReads).toBe(exempt?0:1);
+  expect((s.db.query('SELECT ready FROM queue_eligibility WHERE job=?').get(id) as any).ready).toBe(exempt?1:0);
+  expect(w.implementation(id)).toBeNull();expect(s.db.query('SELECT * FROM git_grants').all()).toEqual([]);
+ }finally{globalThis.fetch=old;s.close();}
+});
 for(const state of ['approved_pending','unknown','delivery_accepted'])test(`dependency intake exemption checks started dispatch: ${state}`,async()=>{
  const old=globalThis.fetch,s=new Store(':memory:');new Workflow(s,{} as any);new FeaturePlanning(s,new Agents());
  try{
