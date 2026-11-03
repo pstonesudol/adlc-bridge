@@ -17,7 +17,17 @@ export class Store {
     if (path !== ':memory:') { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); }
     this.db = new Database(path, { create: true });
     if (path !== ':memory:') chmodSync(path, 0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+    try {
+    this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    const initialVersion = (this.db.query('PRAGMA user_version').get() as any).user_version;
+    if (initialVersion > 2) throw Error(`Unsupported SQLite schema version: ${initialVersion}`);
+    this.db.exec('PRAGMA journal_mode=WAL;');
+    this.db.transaction(() => {
+      const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
+      if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
+      if (version === 0) {
+        if (this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").get()) throw Error('Unversioned nonempty database; refusing initialization');
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, project TEXT NOT NULL, issue TEXT NOT NULL,
         spec TEXT NOT NULL, state TEXT NOT NULL, plan TEXT, plan_hash TEXT,
@@ -31,6 +41,18 @@ export class Store {
         seq INTEGER PRIMARY KEY, job TEXT NOT NULL REFERENCES jobs(id),
         plan_hash TEXT NOT NULL, actor TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       PRAGMA user_version=1;`);
+      }
+      // Validate the legacy contract before advancing its version. Extra module tables
+      // are intentionally retained: their initialization remains owned by each module.
+      this.db.query('SELECT id,project,issue,spec,state,plan,plan_hash,approved_hash,actor,attempts,reason,updated FROM jobs LIMIT 0').all();
+      this.db.query('SELECT seq,job,kind,detail,at FROM events LIMIT 0').all();
+      this.db.query('SELECT seq,job,plan_hash,actor,at FROM approvals LIMIT 0').all();
+      if (version < 2) this.db.exec(`
+        CREATE INDEX events_job_seq ON events(job,seq);
+        CREATE INDEX approvals_job_seq ON approvals(job,seq);
+        PRAGMA user_version=2;`);
+    }).immediate();
+    } catch (error) { this.db.close(); throw error; }
   }
   event(id: string, kind: string, detail: string) {
     this.db.query('INSERT INTO events(job,kind,detail) VALUES (?,?,?)').run(id, kind, detail);
