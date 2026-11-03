@@ -98,7 +98,12 @@ test('a custom-check blocker without an obligation or wait baseline requests a f
   expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'Full CodeRabbit review requested for current commit and description'});
   expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
   expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(1);
-  await f.loop.tick(f.id);expect(f.reviews()).toBe(1);
+  // A poll before the bot starts must not publish the pre-request blocker.
+  const pending=await f.loop.tick(f.id);
+  expect(pending.state).toBe('waiting_for_coderabbit');expect(pending.reason.startsWith('CodeRabbit custom-check')).toBe(false);
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
+  f.e.botReviewSubmittedAt=Date.now()+10000;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
  }finally{f.s.close();}
 });
 test('a fresh custom-check blocker on the first tick after an edit does not request another review',async()=>{

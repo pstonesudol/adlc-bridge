@@ -290,6 +290,12 @@ export class ReviewLoop{
    const surfaceBlocker=freshBlocker&&e.botReviewSubmittedAt>sinceReview;
    if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
+  // An accepted request must produce its own review before old custom evidence
+  // is judged; otherwise a poll that arrives before the bot starts would report
+  // the pre-request blocker as current.
+  const pendingReview=this.s.db.query("SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=? AND state='accepted'").get(job,e.head,reviewBodyKey) as any;
+  if(!blockerAlreadyFresh&&pendingReview&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=pendingReview.requested)&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length)
+   return this.record(job,{state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence'});
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
   // as dispatched.
