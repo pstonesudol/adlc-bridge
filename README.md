@@ -359,7 +359,7 @@ bun test
 bun src/cli.ts help
 ```
 
-The adapters use the installed Orchestrator API and supported OpenCode CLI, not OpenChamber runtime modules.
+The adapters use the installed Orchestrator API and OpenCode's supported client/service API, not OpenChamber runtime modules.
 Validate them after upgrades; passing unit tests alone does not verify live access.
 
 ### 2. Make the CLI available
@@ -407,7 +407,7 @@ can override the stored key for a process; a Terminal export is not automaticall
 inherited by launchd, so the stored credential is the simplest service setup.
 
 Provider authentication is separate from Linear and GitHub. Sign in to the
-providers used by the worker harness in Orchestrator. The local CLI and Orchestrator
+providers used by the worker harness in Orchestrator. The local OpenCode service and Orchestrator
 can have separate login stores; working classifier inference does not prove that
 Orchestrator can make a model request. Use their native provider login controls,
 then verify an actual small request in Orchestrator. There is no automatic
@@ -673,7 +673,7 @@ no clone or Git setup.
 | --- | --- |
 | No tickets picked up | Service loaded, Mac awake, Orchestrator running, exact project/team/Todo/label IDs, log errors |
 | Worker setup exits 78 | Reserved branch/worktree and startup gate configuration; do not bypass the gate |
-| Provider request fails | Login in the actual worker harness; classifier CLI credentials may be separate |
+| Provider request fails | Login in the actual worker harness; classifier service credentials may be separate |
 | PR appears but bridge is blocked | Existing session/branch/PR and original authorization; investigate before guarded recovery |
 | Review says Changes requested but no inline threads | CodeRabbit may have a PR-description or pre-merge evidence finding |
 | Poll fails | Read `intake-error.log`; foreground `poll` also shows errors but can perform real work |

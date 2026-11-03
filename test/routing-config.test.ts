@@ -12,6 +12,13 @@ test('routing example remains disabled even after targets are configured',()=>{
  const configured=validateRouting({...example,fallback:routingConfig.fallback,categories:routingConfig.categories});
  expect(()=>selectRoute(configured,{choice:'implement',confidence:1})).toThrow('disabled');
 });
+test('setup must enable intended categories as well as the document',()=>{
+ const example=JSON.parse(readFileSync(join(import.meta.dir,'../config/routing.example.json'),'utf8'));
+ const config=validateRouting({...example,enabled:true,categories:example.categories.map((c:any)=>({...c,model:routingConfig.categories[0].model}))});
+ expect(()=>selectRoute(config,{choice:'planning',confidence:1})).toThrow('no configured fallback');
+ const enabled=validateRouting({...config,categories:config.categories.map(c=>({...c,enabled:true}))});
+ expect(selectRoute(enabled,{choice:'planning',confidence:1}).category).toBe('planning');
+});
 test('fallback rejects agent fields while categories retain supported agents',()=>{
  for(const agent of ['plan','build',null])expect(()=>validateRouting({...document(),fallback:{...routingConfig.fallback,agent}})).toThrow('routing.fallback.agent: unsupported field');
  for(const agent of ['plan','build']){
@@ -40,16 +47,11 @@ test('pinned remediation needs neither current config nor OpenChamber runtime',a
 test('import refuses a symlink alias of the source',()=>{
  const {dir,settings}=fixture();try{const alias=join(dir,'alias.json');symlinkSync(settings.configFile,alias);expect(()=>importRouting(settings.configFile,alias,true)).toThrow('differ');expect(JSON.parse(readFileSync(settings.configFile,'utf8')).version).toBe(1);}finally{rmSync(dir,{recursive:true,force:true});}
 });
-test('CLI previews and classifies through OpenCode protocol without OpenChamber or live inference',async()=>{
+test('CLI previews classifier configuration without starting inference or OpenChamber',async()=>{
  const {dir,settings}=fixture();try{
   writeFileSync(settings.configFile,JSON.stringify({...document(),classifier:{adapter:'opencode',model:'authorized/classifier'}}));
-  const executable=join(dir,'opencode'),capture=join(dir,'capture.json'),project=join(dir,'project.json'),task=join(dir,'task.txt');
-  writeFileSync(executable,`#!${process.execPath}\nimport {writeFileSync} from 'node:fs';\nwriteFileSync(process.env.ADLC_TEST_CAPTURE,JSON.stringify({args:process.argv.slice(2),cwd:process.cwd(),config:JSON.parse(process.env.OPENCODE_CONFIG_CONTENT)}));\nif(process.env.ADLC_TEST_FAILURE==='exit')process.exit(1);\nconsole.log(JSON.stringify({type:'text',part:{text:process.env.ADLC_TEST_FAILURE==='malformed'?'not json':JSON.stringify({choice:'implement',confidence:0.99})}}));\n`,{mode:0o700});
-  writeFileSync(project,JSON.stringify({routing:settings}));writeFileSync(task,'implement this untrusted request');
-  const run=async(failure='',preview=false)=>{const p=Bun.spawn([process.execPath,join(import.meta.dir,'../src/cli.ts'),'routing',project,...(preview?[]:[task])],{cwd:dir,env:{...process.env,HOME:dir,PATH:dir+':'+process.env.PATH,ADLC_TEST_CAPTURE:capture,ADLC_TEST_FAILURE:failure},stdout:'pipe',stderr:'pipe'});const output=await new Response(p.stdout).text(),error=await new Response(p.stderr).text();expect(await p.exited).toBe(0);expect(error).toBe('');return JSON.parse(output);};
-  expect((await run('',true)).config.classifier.model).toBe('authorized/classifier');
-  expect((await run()).model).toBe('openai/sol');
-  const recorded=JSON.parse(readFileSync(capture,'utf8'));expect(recorded.args).toContain('--standalone');expect(recorded.args).toContain('authorized/classifier');expect(recorded.config.policies).toEqual([{action:'tool.use',resource:'*',effect:'deny'}]);expect(recorded.cwd).not.toBe(dir);
-  for(const failure of ['malformed','exit']){const result=await run(failure);expect(result.model).toBe('opencode-go/flash');expect(result.reason).toBe('classifier-unavailable');}
+  const project=join(dir,'project.json');writeFileSync(project,JSON.stringify({routing:settings}));
+  const p=Bun.spawn([process.execPath,join(import.meta.dir,'../src/cli.ts'),'routing',project],{cwd:dir,env:{...process.env,HOME:dir},stdout:'pipe',stderr:'pipe'});
+  const output=await new Response(p.stdout).text(),error=await new Response(p.stderr).text();expect(await p.exited).toBe(0);expect(error).toBe('');expect(JSON.parse(output).config.classifier.model).toBe('authorized/classifier');
  }finally{rmSync(dir,{recursive:true,force:true});}
 });

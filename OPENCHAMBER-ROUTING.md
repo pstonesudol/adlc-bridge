@@ -14,8 +14,11 @@ and set the project's routing section:
 {"enabled":true,"harness":"opencode-v2","configFile":"/absolute/path/adlc-routing.json","overridesFile":"/absolute/path/project-routing.json"}
 ```
 
-The example document is disabled. After configuring its targets, explicitly set
-the document's `enabled` to true as well as enabling routing in the project.
+The example document and every category are disabled. Configure model targets and
+set `enabled: true` on each category you intend to use, including `planning` for
+deterministic planning. Then explicitly enable the document and project routing.
+Classification and planning use a category's target only when that category is
+enabled; otherwise selection uses the fallback, or blocks if no fallback exists.
 
 `configFile` is the shared defaults document. The optional `overridesFile` is a
 versioned partial document. Paths resolve from the process working directory;
@@ -44,20 +47,31 @@ Planning selects the enabled `planning` category deterministically without infer
 To enable classification, explicitly configure
 `{"adapter":"opencode","model":"AUTHORIZED_PROVIDER/MODEL"}`. This authorizes
 classification requests to that model under its normal billing terms; ADLC does
-not choose a classifier model automatically. The adapter uses `opencode run`
-in a temporary empty directory, a standalone server, Plan agent, and deny-all
-tool permissions/policy. It expects JSON choice/confidence from JSON text events
-and bounds requests to 30 seconds. No automatic inference retries occur.
+not choose a classifier model automatically. The adapter uses the pinned
+`@opencode/client` dependency for supported discovery/authentication of an already
+running, authorized OpenCode V2 service. Install project dependencies with Bun as
+part of setup; activation of installed snapshots remains an operator action.
+ADLC does not start or stop that service. It posts task data in the HTTP body to
+`/api/experimental/generate/text`, a stateless text-generation endpoint with no
+agent/session/tools or tool-execution loop. Agent/managed permission overrides
+cannot grant tool access to this request. There is no `run`/session fallback if
+the endpoint is unavailable. JSON choice/confidence is parsed from `data.text`.
+An independent 30-second deadline bounds discovery, the request and body reads,
+aborts HTTP and cancels the response stream even if a transport fails to settle.
+Response bodies are limited to 1 MiB. No classifier child process is created, so
+there is no child process tree to terminate or inherited stdout to keep open.
+Task data is never placed in process arguments. No automatic inference retries occur.
 Malformed/unknown/disabled categories, low confidence and classifier failures use
 only the configured fallback and record the reason; a missing fallback blocks.
 
-The OpenCode CLI owns provider login and account selection. Authenticate through
+OpenCode owns provider login and account selection. Authenticate through
 its supported interface before enabling classification; the AO worker's OpenCode
 store may be different and must also be authorized. ADLC neither reads/copies login
 stores nor exports tokens or creates provider access. Routing documents accept no
 credential fields. Provider output/error payloads are not persisted as route errors.
-Global/managed OpenCode configuration remains operator-controlled; verify its
-policies and integrations before enabling the adapter. Classification is not a
+Global/managed provider configuration remains operator-controlled. The one-shot
+endpoint can select only the configured classifier model; tool-bearing model
+output is treated as invalid JSON, never executed. Classification is not a
 container or an authorization to execute the task.
 
 ```sh
