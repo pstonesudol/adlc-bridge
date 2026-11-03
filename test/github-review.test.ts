@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {effectiveBotReview,metadataFindings,coderabbitRateLimited,normalizeReviewThread,reviewThreadEvidence,reviewThreadFindings} from '../src/github';
 import {digest} from '../src/core';
+import {customFixture} from './coderabbit-fixture';
 const bot=(id:string,body:string,oid='dcf66943',login='coderabbitai[bot]',type='Bot')=>({id,body,author:{login,__typename:type},originalCommit:{oid}});
 const thread=(over:any={})=>({id:'T1',isResolved:false,isOutdated:false,path:'src/workflow.ts',line:12,startLine:null,comments:{nodes:[bot('C1','Planning slot is not released on failure')],pageInfo:{hasNextPage:false}},...over});
 test('unresolved non-outdated CodeRabbit threads are candidates even when originalCommit differs from the head',()=>{
@@ -62,10 +63,14 @@ test('informational reviews preserve approval while later change requests supers
  expect(effectiveBotReview([{...approval,user:{login:'other'}}])).toBeUndefined();
 });
 test('failed verification evidence is metadata-only and tied to current bot change request',()=>{
- const review={state:'CHANGES_REQUESTED',commit_id:'head',body:'Pre-merge checks failed.'};
- const comments=[{user:{login:'coderabbitai[bot]'},updated_at:'2026-10-31T01:00:00Z',body:'| Verification Evidence | ![Error](error.svg) | Missing exact commands |\n<summary><strong>Full details: Verification Evidence</strong></summary><p>List exact verified commands.</p></details>'}];
- expect(metadataFindings(review,'head',comments)[0]).toMatchObject({kind:'pr_description',path:null,sha:'head'});
- expect(metadataFindings(review,'newhead',comments)).toEqual([]);
- expect(metadataFindings({...review,state:'COMMENTED'},'head',comments)).toEqual([]);
- expect(metadataFindings(review,'head',[{...comments[0],user:{login:'other'}}])).toEqual([]);
+ const {review,head,comments,context}=customFixture();
+ const findings=metadataFindings(review,head,comments,context);
+ expect(findings).toHaveLength(1);
+ expect(findings[0]).toMatchObject({kind:'pr_description',path:null,sha:head});
+ // Each negative changes one input from the otherwise valid positive fixture.
+ expect(metadataFindings(review,head,comments)).toEqual([]);
+ expect(metadataFindings(review,'b'.repeat(40),comments,context)).toEqual([]);
+ expect(metadataFindings({...review,state:'COMMENTED'},head,comments,context)).toEqual([]);
+ expect(metadataFindings(review,head,[{...comments[0],user:{...comments[0].user,login:'other'}}],context)).toEqual([]);
+ expect(metadataFindings({...review,user:{...review.user,login:'other'}},head,comments,context)).toEqual([]);
 });

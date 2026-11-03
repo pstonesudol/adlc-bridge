@@ -7,6 +7,7 @@ import {sendPilotRemediation} from '../src/pilot';
 import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
+import {customFixture} from './coderabbit-fixture';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -66,6 +67,141 @@ function templateFixture(){
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+function customLoopFixture(){
+ const f=templateFixture(),custom=customFixture();
+ f.loop.configureMetadataChecks('project',[]);
+ Object.assign(f.e,{...custom.evidence(),descriptionVersion:'version-original',descriptionHash:custom.evidence().findings[0].descriptionHash,failedChecks:[],reasons:['Explicit latest-SHA CodeRabbit approval missing'],coderabbitBodyReviewed:true});
+ f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});
+ return f;
+}
+test('custom Verification Evidence goes to the existing worker once, uses configured checks and gates the edited description',async()=>{
+ const f=customLoopFixture();try{
+  let prompt='';const spawn=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return spawn(args);};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(prompt).toContain('current-head CI');expect(prompt).toContain('["bun","test"]');expect(prompt).toContain('working directory');expect(prompt).toContain('ADLC_WORKER_STATUS');expect(prompt).toContain('Do not modify application files');
+  await f.loop.tick(f.id);expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  f.session.transcript.turns[0].state='completed';Object.assign(f.e,{descriptionHash:'edited-body',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:'CodeRabbit custom-check failure: description changed outside the run'});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+  // Same-head approval alone cannot clear a new body. These are mocked collector
+  // results, not a fabricated production CI attestation.
+  Object.assign(f.e,{clear:true,customCheckBlocker:null,botReviewSubmittedAt:Date.now()+10000});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  f.e.coderabbitBodyReviewed=true;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+  expect(f.reviews()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a custom-check blocker without an obligation or wait baseline requests a fresh review',async()=>{
+ const f=customLoopFixture();try{
+  const reason='CodeRabbit custom-check failure: description changed after the bot review';
+  Object.assign(f.e,{descriptionHash:'edited-before-remediation',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,reasons:[reason],botReviewSubmittedAt:Date.now()-10000});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'Full CodeRabbit review requested for current commit and description'});
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
+  expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(1);
+  // A poll before the bot starts must not publish the pre-request blocker.
+  const pending=await f.loop.tick(f.id);
+  expect(pending.state).toBe('waiting_for_coderabbit');expect(pending.reason.startsWith('CodeRabbit custom-check')).toBe(false);
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
+  f.e.botReviewSubmittedAt=Date.now()+10000;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+ }finally{f.s.close();}
+});
+test('a fresh custom-check blocker on the first tick after an edit does not request another review',async()=>{
+ const f=customLoopFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
+  const reason='CodeRabbit custom-check failure: pre-merge row is unclassifiable';
+  Object.assign(f.e,{descriptionHash:'edited-body',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,reasons:[reason],botReviewSubmittedAt:Date.now()+10000});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.reviews()).toBe(0);expect(f.sends()).toBe(1);
+  expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(0);
+ }finally{f.s.close();}
+});
+test('fresh custom-check blockers retain their reason after a description edit; stale and pending reviews wait',async()=>{
+ const f=customLoopFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
+  const reason='CodeRabbit custom-check failure: pre-merge row is unclassifiable';
+  Object.assign(f.e,{descriptionHash:'edited-body',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,botReviewSubmittedAt:0});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);
+  Object.assign(f.e,{botReviewSubmittedAt:Date.now()+10000,coderabbitPending:true});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  f.e.coderabbitPending=false;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('custom finding is revalidated at dispatch; edits cannot spend an attempt or send stale instructions',async()=>{
+ const f=customLoopFixture();try{
+  let reads=0;f.io.readiness=async()=>{if(++reads===2)f.e.findings=[{...f.e.findings[0],evidenceHash:'changed'}];return f.e;};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Custom-check evidence');expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+test('custom finding is rejected at dispatch when the description changes after the poll',async()=>{
+ const f=customLoopFixture();try{
+  let reads=0;f.io.readiness=async()=>{if(++reads===2)f.e.descriptionHash='edited-before-dispatch';return f.e;};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('Custom-check evidence');expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.s.db.query('SELECT * FROM custom_description_obligations').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+test('receipt-sourced failure is blocked while an unrecovered continuation exists',async()=>{
+ const f=templateFixture();try{
+  f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT); CREATE TABLE IF NOT EXISTS continuations(id INTEGER PRIMARY KEY,job TEXT,plan_hash TEXT,state TEXT)');
+  const hash=f.s.get(f.id).plan_hash;
+  f.s.db.query('INSERT INTO continuations VALUES (?,?,?,?)').run(1,f.id,hash,'failed');
+  f.s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,hash,'session','failed','Continuation failed','[]','[]','receipt','high',Date.now(),null,Date.now(),null);
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE continuations SET state='recovered' WHERE job=?").run(f.id);
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('durable failed continuation blocks delivery-evidence failures; stale outcomes do not outlive recovery',async()=>{
+ const f=templateFixture();try{
+  f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT); CREATE TABLE IF NOT EXISTS continuations(id INTEGER PRIMARY KEY,job TEXT,plan_hash TEXT,state TEXT)');
+  const hash=f.s.get(f.id).plan_hash;
+  f.s.db.query('INSERT INTO continuations VALUES (?,?,?,?)').run(1,f.id,hash,'failed');
+  f.s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,hash,'session','failed','Delivery evidence unavailable','[]','[]','delivery-evidence','high',Date.now(),null,Date.now(),null);
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE continuations SET state='recovered' WHERE job=?").run(f.id);
+  f.s.db.query("UPDATE worker_outcomes SET source='continuation' WHERE job=?").run(f.id);
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('failed continuation outcome blocks review dispatch until durable recovery settles it',async()=>{
+ const f=templateFixture();try{
+  f.s.db.exec('CREATE TABLE IF NOT EXISTS worker_outcomes(job TEXT PRIMARY KEY,plan_hash TEXT,session_id TEXT,outcome TEXT,reason TEXT,questions TEXT,dependencies TEXT,source TEXT,confidence TEXT,first_observed INTEGER,grace_deadline INTEGER,observed INTEGER,discovery TEXT); CREATE TABLE IF NOT EXISTS continuations(id INTEGER PRIMARY KEY,job TEXT,plan_hash TEXT,state TEXT)');
+  const j=f.s.get(f.id),hash=j.plan_hash;
+  f.s.db.query('INSERT INTO continuations VALUES (?,?,?,?)').run(1,f.id,hash,'failed');
+  f.s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(f.id,hash,'session','failed','Continuation failed','[]','[]','continuation','high',Date.now(),null,Date.now(),null);
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE continuations SET state='recovered' WHERE job=?").run(f.id);
+  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('custom verification runtime prerequisites are requested through the existing worker, not guessed',async()=>{
+ const f=customLoopFixture();try{
+  f.loop.setVerification(f.id,{version:1,mode:'container',steps:[{cwd:'src',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}});
+  let prompt='';const spawn=f.io.spawn;f.io.spawn=(args:string[])=>{prompt=args[args.indexOf('--message')+1];return spawn(args);};
+  expect((await f.loop.tick(f.id)).send).toBe(true);expect(prompt).toContain('STOP before container verification');expect(prompt).toContain('ADLC_DISCOVERY');expect(prompt).toContain('never guess a --runtime path');
+ }finally{f.s.close();}
+});
+test('custom description review reservation survives lost receipts and subsequent description versions',async()=>{
+ const f=customLoopFixture();try{
+  await f.loop.tick(f.id);f.session.transcript.turns[0].state='completed';
+  Object.assign(f.e,{descriptionHash:'edited',descriptionVersion:'edit-2',findings:[],coderabbitBodyReviewed:false});
+  let requests=0;f.loop.postReview=async()=>{requests++;throw Error('lost reply');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('lost reply');
+  f.e.descriptionVersion='edit-3';expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+  expect(requests).toBe(1);expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a fresh custom failure after an edit uses the same durable attempt ceiling',async()=>{
+ const f=customLoopFixture();try{
+  const policy={...DEFAULT_REMEDIATION_POLICY,maxAttempts:1};
+  await f.loop.tick(f.id,undefined,policy);f.session.transcript.turns[0].state='completed';
+  Object.assign(f.e,{descriptionHash:'edited',descriptionVersion:'edit-2',findings:[{...f.e.findings[0],descriptionHash:'edited',evidenceHash:'fresh-review'}]});
+  expect(await f.loop.tick(f.id,undefined,policy)).toMatchObject({state:'blocked',send:false});
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
 test('second branch read failure invalidates stale readiness and enters durable read backoff',async()=>{
  const f=templateFixture();try{
   f.s.db.query("UPDATE review_targets SET state='ready_for_human' WHERE job=?").run(f.id);

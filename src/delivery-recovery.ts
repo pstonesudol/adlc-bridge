@@ -12,7 +12,8 @@ export type DeliveryFacts={session:string;project:string;reserved:string;worktre
 export type RecoveryTransport={inspect(job:string,c:any):Promise<DeliveryFacts>;claim(session:string,url:string):Promise<void>;attached(session:string,url:string):Promise<boolean>};
 export class DeliveryRecovery{
  constructor(public s:Store,public t:RecoveryTransport){}
- install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS delivery_adoptions(job TEXT PRIMARY KEY REFERENCES jobs(id),proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL);`);}
+ install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS delivery_adoptions(job TEXT PRIMARY KEY REFERENCES jobs(id),proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL);`);}
  authorization(job:string,c:any){
   const j=this.s.get(job),d=this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=this.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any,run=this.s.db.query('SELECT * FROM runs WHERE job=?').get(job) as any,g=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
   if(!d||!r||!run||!g||j.project!==c.linear.projectId||j.state!=='approved'||!j.actor||j.approved_hash!==j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||d.plan_hash!==j.plan_hash||run.plan_hash!==j.plan_hash||g.plan_hash!==j.plan_hash||run.owner!=='orchestrator'||r.spec_hash!==digest(j.spec)||r.session_id!==d.session_id||run.session_id!==d.session_id||canonical(run.worktree)!==canonical(r.worktree))throw Error('Current unchanged execution approval and reservation required');
@@ -70,28 +71,40 @@ export class DeliveryRecovery{
     assertWorktreeAvailable(this.s,job);
     this.authorization(job,c);
    const changed=this.s.db.query("UPDATE delivery_adoptions SET state='adopted' WHERE job=? AND proposal=? AND state='claim_uncertain'").run(job,hash);
-   if(changed.changes){
-    this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
-    // Only the dispatch states written before handoff may be repaired. An
-    // already-recorded handoff is a no-op; any other zero-row result is a
-    // reconciliation condition rather than permission to overwrite state.
-    const handoff=this.s.db.query("UPDATE implementation_dispatch SET state='pr_handoff',reason=NULL WHERE job=? AND state IN ('approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr')").run(job);
+   const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
+   if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
+   if(changed.changes)this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
+   // A confirmation can settle only the failed continuation it observed. An
+   // adoption that predates that failure has no row here and stays blocked.
+   const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()
+    ?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,adopted.plan_hash) as any
+    :null;
+   // Only a row created by this confirmation can repair a failed dispatch.
+   // A stale row must not re-open a later failure reached for another reason.
+   const recorded=failed?this.s.db.query("INSERT OR IGNORE INTO continuation_recoveries(continuation,job,proposal,head,at) VALUES (?,?,?,?,?)").run(failed.id,job,adopted.proposal,adopted.head,Date.now()).changes>0:false;
+   const recovery=failed&&this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head);
+   const repair=changed.changes?['approved_pending','delivery_uncertain','delivery_accepted','needs_reconciliation','blocked','awaiting_pr',...(recorded?['failed']:[])]:recorded?['failed','needs_reconciliation']:[];
+   if(repair.length){
+    // Only dispatch states written before handoff may be repaired. A later
+    // blocker is not overwritten, and handoff is an idempotent no-op.
+    const handoff=this.s.db.query(`UPDATE implementation_dispatch SET state='pr_handoff',reason=NULL WHERE job=? AND state IN (${repair.map(()=>'?').join(',')})`).run(job,...repair);
     if(!handoff.changes){
      const current=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
      if(current?.state!=='pr_handoff')throw Error('Dispatch state cannot be repaired automatically; reconciliation required');
     }
-    // Adoption makes the verified delivery branch authoritative, so any older
-    // review-stage branch-mismatch reason refers to the superseded reservation.
-    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get())this.s.db.query("UPDATE review_targets SET reason=NULL WHERE job=? AND reason LIKE 'Blocked — branch mismatch%'").run(job);
    }else{
-    const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
-    if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
     // Repeated confirmation preserves any later dispatch state, but it must not
     // report handoff while a later blocker is in force.
     const current=this.s.db.query('SELECT state,reason FROM implementation_dispatch WHERE job=?').get(job) as any;
     if(current?.state!=='pr_handoff')throw Error(`Delivery dispatch is ${current?.state??'missing'}; reconciliation required${current?.reason?`: ${current.reason}`:''}`);
    }
-   return {job,state:'pr_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash};
+   // Only a fresh, continuation-bound confirmation settles that failure. The
+   // continuation then remains recovered across later legitimate head changes.
+   if(recorded)this.s.db.query("UPDATE continuations SET state='recovered',reason=NULL WHERE id=? AND state='failed'").run(failed.id);
+   // Adoption makes the verified delivery branch authoritative, so any older
+   // review-stage branch-mismatch reason refers to the superseded reservation.
+   if(changed.changes&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get())this.s.db.query("UPDATE review_targets SET reason=NULL WHERE job=? AND reason LIKE 'Blocked — branch mismatch%'").run(job);
+   return {job,state:'pr_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash,continuationRecovery:recovery?failed.id:null};
   }).immediate();
  }
 }

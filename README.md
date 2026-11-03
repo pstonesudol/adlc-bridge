@@ -1086,6 +1086,63 @@ reports the bridge gate used for automation.
 
 ## Remediation budget
 
+### CodeRabbit custom Verification Evidence failures
+
+A successful CodeRabbit check is not approval. Readiness also collects the full
+bot-authored pre-merge summary, independently of inline threads. A failing
+**Verification Evidence** row can become a description-only finding for the
+existing approved worker. Optional warnings and older `NEEDS_EVIDENCE` prose in
+the walkthrough do not become failures when the pre-merge row passes.
+
+The collector requires the reserved bot identity, the exact PR and head in the
+summary's recent-run section, a current bot change request, and one unambiguous
+completed CodeRabbit run. The summary update and review must fall within that
+run. GitHub GraphQL supplies the actual description and `lastEditedAt`; that
+description must have existed unchanged throughout the run and still match the
+observed REST body/head. Full Explanation and Resolution details are preserved,
+not silently truncated. Missing details, ambiguous runs, stale summaries or
+post-review edits fail closed with a concrete blocker. Unknown custom errors
+are not automatically treated as permission to change code.
+
+This establishes **relevance for remediation**, not a GitHub CI attestation.
+It never manufactures `metadataCheckEvidence.descriptionHash`, overrides a
+configured metadata check, or replaces explicit current-head CodeRabbit approval.
+Unsupported provider formats require inspection; the parser deliberately does
+not guess provenance. Read-only `adlc readiness OWNER/REPO PR CONFIG` previews
+the collector without sending remediation or requesting a review.
+For closed historical PRs, `bun scripts/preview-coderabbit.ts OWNER/REPO PR`
+previews only custom-check evidence; it explicitly does not evaluate readiness.
+
+The worker first inspects existing session artifacts and current-head CI. Any
+additional checks use the merged project `verification` configuration (host or
+container as configured), with actual commands, working directory/runtime,
+tested SHA, exit codes, browser surface/mocks and limitations. Historical checks
+remain historical; not-run evidence is not a substitute for a valid requirement.
+Description-only work cannot edit application files, commit or push. Mixed code
+findings still require approved paths and the corresponding Git grants.
+
+If verification prerequisites are unavailable, the delivered remediation turn
+reports the existing `ADLC_WORKER_STATUS` and truthful `ADLC_DISCOVERY` receipts.
+An already attached PR does not hide that blocker. Enabled Linear clarification
+sync publishes the question and uses its existing human-answer, scope-confirmation
+and guarded-continuation machinery. Only the exact owned PR and reconciled
+remediation attempt may continue; this does not grant new permissions or reset
+the attempt budget. Unparseable provider evidence instead uses the existing
+deduplicated blocker publisher for human inspection. These surfaces require the
+project's configured blocker/clarification settings; disabled settings do not
+authorize unsolicited Linear changes.
+
+A delivered description edit retains a durable fresh-review obligation. Full
+review requests use the existing uncertainty reservation and, for custom-check
+remediation, the GitHub description edit version as well as its content hash.
+Concurrent polls, restarts and lost replies never blindly replay a request.
+Old evidence cannot clear the edited description; returning to earlier text is
+still a new edit version. Existing body-bound metadata-check gates remain intact.
+No check weakening, review dismissal, automatic approval, merging or deployment
+is added.
+
+### Budget configuration
+
 Remediation budgeting is a per-project setting:
 
 ```json
@@ -1226,8 +1283,23 @@ Only a tracked bridge-applied needs-human label is removed, with additive/remova
 label mutations preserving unrelated human labels and other unresolved blockers.
 Uncertain sends or comments reconcile their existing receipts and never replay the
 original implementation request, spawn another worker, or resend an uncertain
-continuation. Tests cover the real merged foundation with fake provider/session
-evidence; they do not exercise live Linear, install code or activate services.
+continuation. A continuation whose own transcript turn failed, was cancelled or
+was interrupted remains a durable failed state. A later completed remediation
+turn cannot turn that failure into a PR handoff, and another clarification answer
+cannot resume it. Recovery requires the existing explicit `recover-handoff`
+delivery adoption plus a confirmation made after that failure. Confirmation
+records recovery against that specific continuation, and only an `adopted` record
+matching the same job, plan, requirements, session, repository, PR, worktree
+branch and exact current head settles it. An adoption that predates a later
+failure has no such record and cannot recover it; that dispatch repairs only the
+guarded `failed` or masked `needs_reconciliation` state to handoff. Once settled,
+the continuation remains recovered across later legitimate head changes, while
+handoff still requires the exact attached PR and current local/remote head
+agreement. Until then, workflow handoff and review
+dispatch remain blocked with a concrete reconciliation reason; review settlement
+re-reads the adopted evidence and never repairs or fabricates it. Tests cover the real merged foundation with
+fake provider/session evidence; they do not exercise live Linear, install code or
+activate services.
 
 ### Legacy exhausted jobs from pre-budget databases
 

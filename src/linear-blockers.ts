@@ -2,6 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
+import {Lifecycle} from './lifecycle';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -142,9 +143,24 @@ export class LinearBlockers{
     const notice=stopped?`Conflict recovery ${recovery.id} has an independent reconciliation gate at stage ${recovery.state}; inspect recovery-status for local diagnostics`:null;
     rows.push({job:recovery.job,plan_hash:recovery.plan,outcome:stopped?'needs_reconciliation':'running',reason:notice,questions:JSON.stringify(stopped?[{id:recovery.id,kind:'reconciliation',question:`Inspect recovery-status for stage ${recovery.state}, files and evidence. Resolve the stated blocker without replaying delivery or discarding work; explicit operator reconciliation is required.`}]:[]),dependencies:'[]'});
    }
-   for(const outcome of rows){
-    handled.add(outcome.job);
-    try{
+  // A provenance gap is not an approval timeout or permission to fabricate an
+  // attestation. Reuse the existing publisher/receipts for the concrete blocker.
+  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()){
+   const reviews=this.s.db.query("SELECT t.job,t.reason,j.plan_hash FROM review_targets t JOIN jobs j ON j.id=t.job JOIN runs r ON r.job=j.id WHERE j.project=? AND t.state='blocked' AND t.reason LIKE 'CodeRabbit custom-check%' AND j.state='approved' AND j.approved_hash=j.plan_hash AND r.plan_hash=j.plan_hash AND r.owner='orchestrator'").all(c.linear.projectId) as any[];
+   for(const review of reviews){
+    // Match ReviewLoop's execution gate, including the recomputed plan/spec
+    // hash and standing-policy eligibility. Old targets survive specification
+    // resets for audit purposes; they cannot label a new planning cycle.
+    try{new Lifecycle(this.s).current(review.job);}catch{continue;}
+    const prior=rows.findIndex(r=>r.job===review.job);
+    if(prior>=0&&blockerOutcome(rows[prior].outcome))continue;
+    if(prior>=0)rows.splice(prior,1);
+    rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason:review.reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
+   }
+  }
+  for(const outcome of rows){
+   handled.add(outcome.job);
+   try{
     if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query('SELECT 1 FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash))continue;
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.
