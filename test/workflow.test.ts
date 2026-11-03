@@ -24,7 +24,7 @@ class Fake implements WorkflowTransport{
   if(this.loseSpawn)throw Error('Receipt lost');return {id};
  }
  async findPlans(project:string,branch:string){return [...this.sessions.values()].map(e=>e.session).filter(s=>s.projectId===project&&s.branch===branch);}
- async evidence(id:string){return this.sessions.get(id);}
+ async evidence(id:string){const e=this.sessions.get(id);e.receiptObservation={complete:true,observed:Date.now()};return e;}
  async disableFeedback(_id:string){}
  completePlan(id='session-1',readiness='{"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":["Ordinary non-blocking risk"]}'){
   const e=this.sessions.get(id),r=this.starts.find(r=>r.branch===e.session.branch);
@@ -67,8 +67,8 @@ test('a remediation receipt cannot substitute for a missing original delivery re
   e.transcript.entries=e.transcript.entries.filter((x:any)=>x.clientMessageId!==w.implementation(id).client_id);
   e.transcript.entries.push({sequence:4,clientMessageId:`adlc-fix-${id.slice(0,12)}-${attempt.attempt}`,turnId:'fix'});
   e.transcript.turns.push({id:'fix',state:'completed'});
-  expect(await w.executionStatus(id,e,config)).toMatchObject({state:'needs_reconciliation',reason:'No authoritative delivery receipt; never resend'});
-  expect(w.implementation(id).state).toBe('needs_reconciliation');expect(f.sends).toHaveLength(1);
+  expect(await w.executionStatus(id,e,config)).toMatchObject({state:'implementation_running',delivery:{state:'accepted'},reason:'Host accepted send; provider confirmation delayed; wait without resending'});
+  expect(w.implementation(id).state).not.toBe('pr_handoff');expect(f.sends).toHaveLength(1);
  }finally{s.close();}
 });
 test('an existing PR does not hide a delivered remediation blocker; only the reconciled owned target can continue',async()=>{

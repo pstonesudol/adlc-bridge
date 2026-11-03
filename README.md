@@ -1746,3 +1746,37 @@ recovery demonstration**. A separately authorized controlled run must verify
 the installed host version, real provider receipts and same-session behavior
 before claiming unattended recovery works. No such activation or end-to-end
 operation is performed by this coding change.
+# Worker delivery receipt reconciliation
+
+New implementation, remediation and guarded-continuation dispatches reserve an
+exact job/spec/plan/session/client-message/attempt binding before sending. The
+delivery ledger is separate from worker outcomes, remediation budgets and PR
+identity. Host acceptance is not provider confirmation. Queued/running native
+turns mean **wait for the existing worker**, never send a competing turn.
+Completion proves only delivery; existing scope, requirement, dependency,
+approval, implementation-outcome and current-head CI/review gates still apply.
+
+`reconcile-preview CONFIG` evaluates the same receipt rules without writing state
+and includes per-attempt delivery results. Workflow status includes durable
+delivery observations and exact `ageMs` (null when never observed). Polling audits
+state/turn changes once rather than emitting an event for every evidence refresh.
+
+The AO collector exhausts sequence-cursor pages (100 entries per page, bounded to
+100 pages), rejects inconsistent turn snapshots and requires evidence no older
+than two minutes for automatic reconciliation. Each page timeout is bounded by
+the remaining freshness window, and a final page returned after that window is
+rejected as incomplete. Missing/duplicate client receipts,
+unknown turn states, mismatched identities, incomplete pagination, contradictory
+terminal results and changed specifications remain uncertain. The native AO turn
+ID is the execution receipt; prompt prose, timestamps alone and branch-head changes
+are never substitutes. A send accepted by the host without a native turn remains
+accepted-but-not-provider-confirmed.
+
+Legacy remediation attempts without a durable binding cannot be automatically
+settled by this ledger. Inspect the original session and attempt through supported
+operator previews; do not backfill guessed identities, repair live SQL, reset
+attempts, replace the worker/PR or resend. Provider-read recovery/backoff remains
+separate from mutation uncertainty. No provider replay/idempotency guarantee is
+assumed or introduced. If complete authoritative receipts cannot be obtained,
+preserve the uncertain attempt and escalate the specific evidence gap. Human-only
+merges and no deployments remain mandatory.

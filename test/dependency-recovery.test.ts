@@ -18,7 +18,7 @@ async function fixture(){
  const c:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project'}};
  const t:any={
   async startPlan(r:any){const row=s.db.query('SELECT job FROM planning_runs WHERE branch=?').get(r.branch) as any;new Planning(s).gate(row.job,r.project,'session',r.branch,'/worktrees/session');e={session:{id:'session',projectId:r.project,branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};return {id:'session'};},
-  async findPlans(){return [e.session];},async evidence(){return e;},async disableFeedback(){},async worktree(){return {branch:e.session.branch,head};},
+ async findPlans(){return [e.session];},async evidence(){e.receiptObservation={complete:true,observed:Date.now()};return e;},async disableFeedback(){},async worktree(){return {branch:e.session.branch,head};},
   async sendImplementation(session:string,prompt:string,clientId:string){sends.push({session,prompt,clientId});if(receipt){const id=`turn-${sends.length}`;e.transcript.entries.push({sequence:sends.length*10,kind:'message',role:'user',clientMessageId:clientId,turnId:id});e.transcript.turns.push({id,state:'running'});}if(lose)throw Error('lost receipt');},
  };
  const w=new Workflow(s,t),job=s.enqueue('p',root,JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description}));

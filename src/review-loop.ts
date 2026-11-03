@@ -1,6 +1,7 @@
 import {BranchUpdates,BranchObservationFailure,branchTransport,type BranchPolicy} from './branch-updates';
 import {scopeAllows} from './file-scope';
 import {Store,digest} from './core';
+import {ReceiptReconciliation} from './receipt-reconciliation';
 import {Lifecycle} from './lifecycle';
 import {sessionEvidence} from './session-evidence';
 import {readiness} from './github';
@@ -103,14 +104,15 @@ export class ReviewLoop{
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'}:undefined;
    }
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
-  private reconcileRemediation(job:string,head:string,session:any){
+  private reconcileRemediation(job:string,head:string,session:any,activeOnly=false){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
    if(!pending)return;
    const recovery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get()?this.s.db.query('SELECT id,detail,client_id FROM conflict_recoveries WHERE job=? AND attempt=?').get(job,pending.attempt) as any:null;
    const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
-   const entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle);
-   const turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
-   if(!turn||turn.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Previous remediation delivery is uncertain or incomplete; never resend'});
+    const run=new Lifecycle(this.s).run(job),j=this.s.get(job);
+    const receipt=new ReceiptReconciliation(this.s).inspect({job,plan:run.plan_hash,spec:digest(j.spec),session:run.session_id,client:handle,attempt:`remediation:${pending.attempt}`},session);
+    if(receipt.state!=='completed')return this.record(job,{state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:receipt.reason,delivery:receipt});
+    if(activeOnly)return;
    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
    if(recovery){const detail=JSON.parse(recovery.detail);if(detail.message==='uncertain')this.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=? AND detail=?').run(JSON.stringify({...detail,message:'completed'}),recovery.id,recovery.detail);}
    if(pending.head===head)return this.record(job,{state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
@@ -174,6 +176,7 @@ export class ReviewLoop{
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
+   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return activeDelivery;
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;

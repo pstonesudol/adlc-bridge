@@ -11,7 +11,7 @@ class Fake implements WorkflowTransport{
  async preflightRoute(_route:Route){}
  async startPlan(r:any){this.start=r;const row=this.s.db.query('SELECT job FROM planning_runs WHERE branch=?').get(r.branch) as any;new Planning(this.s).gate(row.job,r.project,'session',r.branch,'/worktree');this.session={session:{id:'session',projectId:r.project,branch:r.branch,harness:r.route.harness,isTerminated:false},transcript:{controller:'ready',entries:[],turns:[]}};return {id:'session'};}
  async findPlans(){return [this.session.session];}
- async evidence(){return this.session;}
+ async evidence(){this.session.receiptObservation={complete:true,observed:Date.now()};return this.session;}
  async disableFeedback(){}
  async configureRoute(_id:string,route:Route){if(this.failControl)throw Error('Setting unsupported');this.configured.push(route);}
  async sendImplementation(id:string,prompt:string,clientId:string){
