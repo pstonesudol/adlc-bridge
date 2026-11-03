@@ -6,6 +6,19 @@ import {validScopes} from './file-scope';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 export type ApprovalSurface={enabled:boolean;approverIds:string[];scope:string[]};
 export type ApprovalConfig=WorkflowConfig&{linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};statusSync?:{inProgress:string;inReview:string};planApproval?:ApprovalSurface};
+// Only presentation whitespace at the outside is ignored (including NBSP).
+// Internal spaces, case and token bytes are exact; lone CR and other Unicode
+// whitespace are not normalized. Fences support only an empty tag or `text`.
+export function parsePlanApproval(body:unknown):string|null{
+ if(typeof body!=='string')return null;
+ let text=body.replace(/\r\n/g,'\n').replace(/^[ \t\n\u00a0]+|[ \t\n\u00a0]+$/g,'');
+ if(text.startsWith('```')){
+  const fence=/^```(?:text)?\n([^\n]+)\n```$/.exec(text);if(!fence)return null;text=fence[1];
+ }else if(text.startsWith('`')){
+  const inline=/^`([^`\n]+)`$/.exec(text);if(!inline)return null;text=inline[1];
+ }
+ return /^Approve ADLC plan [a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(text)?text:null;
+}
 export class LinearApprovals{
  constructor(public s:Store,public workflow:Workflow,public api:LinearAPI=linearAPI){s.db.exec(`CREATE TABLE IF NOT EXISTS plan_approval_notices(
   job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,plan_hash TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,token TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,created TEXT,approval_comment TEXT,reason TEXT,PRIMARY KEY(job,binding));`);}
@@ -41,7 +54,7 @@ export class LinearApprovals{
    const token=randomUUID(),commentId=randomUUID();
    const body=[`## ADLC: awaiting your plan approval — ${issue.identifier}`,`Plan version: \`${j.plan_hash}\``,j.plan,
     `### Approve this exact plan`,`Review the plan above. To authorize implementation, verification, feature-branch commit/push, and PR creation within \`${c.planApproval!.scope.join(', ')}\`, post a **new comment** containing only:`,
-    ['```text',`Approve ADLC plan ${token}`,'```'].join('\n'),`Only configured human approvers can release this gate. The reply applies only to this plan version. PR merges and deployment are not authorized. Requirements or plan changes invalidate it. Do not send the approval to the coding worker; reply on this Linear ticket.`].join('\n\n');
+     ['```text',`Approve ADLC plan ${token}`,'```'].join('\n'),`Copy only the command above into a new comment on this issue or a reply in this notice's thread. Plain text, one inline-code wrapper, or one fenced block (no tag or text) are accepted. Outer spaces, tabs, newlines and non-breaking spaces are ignored; internal command spaces and token must remain exact. CRLF newlines are supported. Do not add prose, quotes or edit an existing comment; submit a new reply instead.`, `Only configured human approvers can release this gate. The reply applies only to this plan version. PR merges and deployment are not authorized. Requirements or plan changes invalidate it. Do not send the approval to the coding worker; reply on this Linear ticket.`].join('\n\n');
    this.s.db.query('INSERT OR IGNORE INTO plan_approval_notices(job,binding,plan_hash,comment_id,token,body,state) VALUES (?,?,?,?,?,?,?)').run(job,binding,j.plan_hash,commentId,token,body,'reserved');
    n=this.s.db.query('SELECT * FROM plan_approval_notices WHERE job=? AND binding=?').get(job,binding) as any;
   }
@@ -62,8 +75,15 @@ export class LinearApprovals{
    return {state:'awaiting_human_approval',issue:issue.identifier};
   }
   const command=`Approve ADLC plan ${n.token}`;
-  const approval=comments.find(x=>x.id!==n.comment_id&&x.body?.trim()===command&&c.planApproval!.approverIds.includes(x.user?.id)&&x.user?.app===false&&x.botActor===null&&x.editedAt===null&&Date.parse(x.createdAt)>Date.parse(posted.createdAt));
-  if(!approval)return {state:'awaiting_human_approval',issue:issue.identifier};
+   const human=comments.filter(x=>x.id!==n.comment_id&&c.planApproval!.approverIds.includes(x.user?.id)&&x.user?.app===false&&x.botActor===null&&Date.parse(x.createdAt)>Date.parse(posted.createdAt));
+   const approval=human.find(x=>x.editedAt===null&&parsePlanApproval(x.body)===command);
+   if(!approval){
+    // Classification is diagnostic only: never extract a token from prose to approve.
+    const attempted=human.some(x=>typeof x.body==='string'&&x.body.includes('Approve ADLC plan'));
+    const reason=attempted?'Approval reply not accepted. Post a new, unedited comment on this issue containing only the exact command from the current plan notice (plain text, single inline-code wrapper, or single fenced block with no tag or text). Old tokens, quotes and extra prose cannot approve this plan.':null;
+    this.s.db.query("UPDATE plan_approval_notices SET reason=? WHERE job=? AND binding=? AND state='posted'").run(reason,job,binding);
+    return {state:'awaiting_human_approval',issue:issue.identifier,...(reason?{reason}:{})};
+   }
   await this.current(job,c);if(this.binding(job,c)!==binding)throw Error('Plan changed before approval');
   return this.s.db.transaction(()=>{
    const row=this.s.db.query('SELECT state FROM plan_approval_notices WHERE job=? AND binding=?').get(job,binding) as any;
