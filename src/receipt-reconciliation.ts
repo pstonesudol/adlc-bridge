@@ -2,24 +2,26 @@ import {Store,digest} from './core';
 
 export type DeliveryBinding={job:string;plan:string;spec:string;session:string;client:string;attempt:string};
 export type DeliveryState='reserved'|'accepted'|'queued'|'running'|'completed'|'failed'|'cancelled'|'unknown';
+export type ReceiptCode='session_mismatch'|'observation_stale_or_incomplete'|'transcript_missing'|'client_receipt_conflict'|'receipt_absent'|'client_accepted_unconfirmed'|'turn_missing_or_conflict'|'turn_state_unknown'|'turn_queued'|'turn_running'|'turn_completed'|'turn_failed'|'turn_cancelled'|'binding_mismatch'|'turn_identity_conflict'|'observation_out_of_order'|'terminal_contradiction'|'concurrent_update';
+export const RECEIPT_FRESHNESS_MS=120000;
 export function evaluateReceipt(binding:DeliveryBinding,e:any,now=Date.now()){
  const observed=e?.receiptObservation?.observed;
  const age=Number.isFinite(observed)?now-observed:null;
- const result=(state:DeliveryState,reason:string,turn:string|null=null)=>({state,reason,turn,observed:observed??null,ageMs:age,client:binding.client,attempt:binding.attempt});
- if(e?.session?.id!==binding.session)return result('unknown','Session identity mismatch; inspect the original worker');
- if(!e.receiptObservation?.complete||age===null||age<0||age>120000)return result('unknown','Incomplete or stale receipt inventory; refresh the original worker transcript');
+ const result=(state:DeliveryState,code:ReceiptCode,reason:string,turn:string|null=null)=>({state,code,reason,turn,observed:observed??null,ageMs:age,client:binding.client,attempt:binding.attempt});
+ if(e?.session?.id!==binding.session)return result('unknown','session_mismatch','Session identity mismatch; inspect the original worker');
+ if(!e.receiptObservation?.complete||age===null||age<0||age>RECEIPT_FRESHNESS_MS)return result('unknown','observation_stale_or_incomplete','Incomplete or stale receipt inventory; refresh the original worker transcript');
  const entries=e.transcript?.entries,turns=e.transcript?.turns;
- if(!Array.isArray(entries)||!Array.isArray(turns))return result('unknown','Missing authoritative transcript or turns');
+ if(!Array.isArray(entries)||!Array.isArray(turns))return result('unknown','transcript_missing','Missing authoritative transcript or turns');
  const matches=entries.filter((x:any)=>x.clientMessageId===binding.client);
- if(matches.length!==1)return result('unknown',matches.length?'Contradictory client-message receipts; inspect original dispatch':'Exact client-message receipt absent; never resend');
+ if(matches.length!==1)return matches.length?result('unknown','client_receipt_conflict','Contradictory client-message receipts; inspect original dispatch'):result('unknown','receipt_absent','Exact client-message receipt absent; never resend');
  const entry=matches[0];
- if(!entry.turnId)return result('accepted','Accepted message has no provider turn confirmation; wait without resending');
+ if(!entry.turnId)return result('accepted','client_accepted_unconfirmed','Accepted message has no provider turn confirmation; wait without resending');
  const matched=turns.filter((x:any)=>x.id===entry.turnId);
- if(matched.length!==1)return result('unknown','Missing or contradictory turn receipt; refresh without resending');
+ if(matched.length!==1)return result('unknown','turn_missing_or_conflict','Missing or contradictory turn receipt; refresh without resending');
  const turn=matched[0];
- if(!['queued','running','completed','failed','cancelled','interrupted'].includes(turn.state))return result('unknown','Unrecognized provider turn state; inspect without resending');
+ if(!['queued','running','completed','failed','cancelled','interrupted'].includes(turn.state))return result('unknown','turn_state_unknown','Unrecognized provider turn state; inspect without resending');
  const state=turn.state==='interrupted'?'cancelled':turn.state;
- return result(state,state==='completed'?'Delivery completed; outcome and current-head review gates still apply':state==='queued'||state==='running'?`Exact turn ${state}; waiting for existing worker`:`Exact turn ${state}; explicit recovery required`,turn.id);
+ return result(state,`turn_${state}` as ReceiptCode,state==='completed'?'Delivery completed; outcome and current-head review gates still apply':state==='queued'||state==='running'?`Exact turn ${state}; waiting for existing worker`:`Exact turn ${state}; explicit recovery required`,turn.id);
 }
 
 // A separate ledger records delivery facts, never implementation success. Legacy
@@ -34,15 +36,15 @@ export class ReceiptReconciliation{
  inspect(b:DeliveryBinding,e:any,persist=true){
   const previous=this.get(b.client),j=this.s.get(b.job);
   let result=evaluateReceipt(b,e);
-  if(previous?.state==='accepted'&&result.reason==='Exact client-message receipt absent; never resend')result={...result,state:'accepted',reason:'Host accepted send; provider confirmation delayed; wait without resending'};
-  if(!previous||['job','plan','spec','session','attempt'].some(k=>previous[k]!==b[k as keyof DeliveryBinding])||j.plan_hash!==b.plan||digest(j.spec)!==b.spec)result={...result,state:'unknown',reason:'Missing or changed dispatch binding; inspect original attempt without replay'};
-  if(previous?.turn&&result.turn&&previous.turn!==result.turn)result={...result,state:'unknown',reason:'Conflicting native turn identity; inspect original attempt'};
-  if(previous?.observed&&result.observed&&previous.observed>result.observed)result={...result,state:'unknown',reason:'Out-of-order receipt observation; refresh before proceeding'};
-  if(['completed','failed','cancelled'].includes(previous?.state)&&result.state!==previous.state)result={...result,state:'unknown',reason:'Contradictory terminal receipt; preserve original evidence and inspect'};
+  if(previous?.state==='accepted'&&result.code==='receipt_absent')result={...result,state:'accepted',reason:'Host accepted send; provider confirmation delayed; wait without resending'};
+  if(!previous||['job','plan','spec','session','attempt'].some(k=>previous[k]!==b[k as keyof DeliveryBinding])||j.plan_hash!==b.plan||digest(j.spec)!==b.spec)result={...result,state:'unknown',code:'binding_mismatch',reason:'Missing or changed dispatch binding; inspect original attempt without replay'};
+  if(previous?.turn&&result.turn&&previous.turn!==result.turn)result={...result,state:'unknown',code:'turn_identity_conflict',reason:'Conflicting native turn identity; inspect original attempt'};
+  if(previous?.observed&&result.observed&&previous.observed>result.observed)result={...result,state:'unknown',code:'observation_out_of_order',reason:'Out-of-order receipt observation; refresh before proceeding'};
+  if(['completed','failed','cancelled'].includes(previous?.state)&&result.state!==previous.state)result={...result,state:'unknown',code:'terminal_contradiction',reason:'Contradictory terminal receipt; preserve original evidence and inspect'};
   if(persist&&previous&&result.state!=='unknown')this.s.db.transaction(()=>{
    const changed=this.s.db.query('UPDATE delivery_receipts SET state=?,turn=COALESCE(turn,?),observed=?,reason=? WHERE client=? AND state=? AND observed IS ?').run(result.state,result.turn,result.observed,result.reason,b.client,previous.state,previous.observed);
    if(changed.changes&&(previous.state!==result.state||previous.turn!==result.turn))this.s.event(b.job,'delivery_receipt_reconciled',JSON.stringify({...b,...result}));
-   if(!changed.changes)result={...result,state:'unknown',reason:'Concurrent receipt update; refresh before proceeding'};
+   if(!changed.changes)result={...result,state:'unknown',code:'concurrent_update',reason:'Concurrent receipt update; refresh before proceeding'};
   }).immediate();
   return result;
  }

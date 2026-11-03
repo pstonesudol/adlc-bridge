@@ -1763,7 +1763,9 @@ state/turn changes once rather than emitting an event for every evidence refresh
 
 The AO collector exhausts sequence-cursor pages (100 entries per page, bounded to
 100 pages), rejects inconsistent turn snapshots and requires evidence no older
-than two minutes for automatic reconciliation. Missing/duplicate client receipts,
+than two minutes for automatic reconciliation. Each page timeout is bounded by
+the remaining freshness window, and a final page returned after that window is
+rejected as incomplete. Missing/duplicate client receipts,
 unknown turn states, mismatched identities, incomplete pagination, contradictory
 terminal results and changed specifications remain uncertain. The native AO turn
 ID is the execution receipt; prompt prose, timestamps alone and branch-head changes

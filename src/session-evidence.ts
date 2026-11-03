@@ -1,13 +1,19 @@
 import {AO} from './orchestrator';
 import {Store,digest} from './core';
 import {recordReadiness} from './readiness';
+import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 
-export async function sessionEvidence(session:string,spawn=Bun.spawn){
+// Receipt evidence is valid only while the whole collection remains fresh. Bound
+// each page by the remaining window so a hung page cannot outlive the evidence.
+export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs=RECEIPT_FRESHNESS_MS){
  if(!/^[a-zA-Z0-9_-]+$/.test(session))throw Error('Session ID required');
- const started=Date.now();let before:number|undefined,first:any;const entries:any[]=[];
+ if(!Number.isSafeInteger(freshnessMs)||freshnessMs<1)throw Error('Positive receipt freshness window required');
+ const started=Date.now(),deadline=started+freshnessMs;let before:number|undefined,first:any;const entries:any[]=[];
  for(let page=0;page<100;page++){
- const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:30000});
+ const remaining=deadline-Date.now();if(remaining<1)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
+ const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:Math.min(30000,remaining)});
  const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ if(Date.now()>=deadline)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
  if(code!==0)throw Error('Orchestrator session inspection failed');
  const r=JSON.parse(text);
  if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw Error('Invalid session evidence');

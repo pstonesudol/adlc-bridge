@@ -45,6 +45,16 @@ test('host acceptance is not provider completion; lost send reply can reconcile 
   expect(ledger.inspect(b,e).state).toBe('unknown');expect(ledger.get(b.client).turn).toBe('native-turn');
  }finally{s.close();}
 });
+test('competing update after the previous read forces unknown without a duplicate audit event',()=>{
+ const {s,b,ledger,e}=fixture();try{
+  ledger.accepted(b.client);const read=ledger.get.bind(ledger);let exchanged=false;
+  ledger.get=(client:string)=>{const row=read(client);if(!exchanged){exchanged=true;s.db.query("UPDATE delivery_receipts SET state='running',turn='native-turn',observed=?,reason='competing' WHERE client=?").run(e.receiptObservation.observed,b.client);}return row;};
+  const before=s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='delivery_receipt_reconciled'").get(b.job) as any;
+  expect(ledger.inspect(b,e)).toMatchObject({state:'unknown',code:'concurrent_update'});
+  const after=s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='delivery_receipt_reconciled'").get(b.job) as any;
+  expect(after.n).toBe(before.n);expect(ledger.get(b.client).state).toBe('running');
+ }finally{s.close();}
+});
 test('late nonterminal and contradictory terminal receipts do not erase cancellation',()=>{
  const {s,b,ledger,e}=fixture();try{
   e.transcript.turns[0].state='cancelled';ledger.inspect(b,e);
@@ -63,6 +73,10 @@ test('collector exhausts sequence pages before proving receipt completeness',asy
 test('collector rejects repeated cursor evidence',async()=>{
  const spawn=(()=>({stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:Array.from({length:100},(_,i)=>({sequence:i+1})),turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)})) as typeof Bun.spawn;
  await expect(sessionEvidence('worker',spawn)).rejects.toThrow('pagination');
+});
+test('collector rejects a final page returned after the whole freshness deadline',async()=>{
+ let options:any;const spawn=((_args:string[],opts:any)=>{options=opts;return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:[{sequence:1}],turns:[]}})).body,stderr:new Response('').body,exited:Bun.sleep(20).then(()=>0)};}) as typeof Bun.spawn;
+ await expect(sessionEvidence('worker',spawn,5)).rejects.toThrow('freshness deadline');expect(options.timeout).toBeLessThanOrEqual(5);
 });
 test('restart and competing store observations retain exact attempt and terminal evidence',()=>{
  const dir=mkdtempSync(join(tmpdir(),'receipt-test-')),path=join(dir,'state.sqlite');
