@@ -95,7 +95,13 @@ test('invalid human attempts persist actionable reasons across surface restarts 
    f.approve(undefined,{body});const result=(await f.surface.sync(f.c))[0];expect(result.reason).toContain('new, unedited');
    expect((f.s.db.query('SELECT reason FROM plan_approval_notices').get() as any).reason).toBe(result.reason);
   }
-  await new LinearApprovals(f.s,f.w,f.surface.api).sync(f.c);expect(f.counts()).toEqual({sends:0,creates:1});expect(f.s.get(f.id).state).toBe('awaiting_approval');
+  const reason=(f.s.db.query('SELECT reason FROM plan_approval_notices').get() as any).reason;
+  expect(reason).toContain('new, unedited');
+  const restarted=new LinearApprovals(f.s,f.w,f.surface.api);
+  expect((f.s.db.query('SELECT reason FROM plan_approval_notices').get() as any).reason).toBe(reason);
+  await restarted.sync(f.c);
+  expect((f.s.db.query('SELECT reason FROM plan_approval_notices').get() as any).reason).toBe(reason);
+  expect(f.counts()).toEqual({sends:0,creates:1});expect(f.s.get(f.id).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
 test('formatted replies retain author, bot, edit, timestamp and issue-inventory checks',async()=>{
