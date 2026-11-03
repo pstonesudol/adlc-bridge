@@ -95,6 +95,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   io.out(await io.poll(c,s,io.linearToken()));
   await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  if(blockers&&(workflow as Workflow).planningDependencies)io.out({planningDependencyNotices:await (workflow as Workflow).planningDependencies.notices(c,blockers as LinearBlockers)});
   if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)io.out({dependencyNotices:await dependencies.notices(c,blockers as LinearBlockers)});}
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
   const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
@@ -313,7 +314,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,!applying);
     try{
      const workflow=new Workflow(store,liveTransport,undefined,!applying),dependencies=new DependencyRecovery(store,workflow);
-     if(command==='dependency-status')return out(dependencies.status());
+     if(command==='dependency-status')return out({...dependencies.status(),planningWaits:workflow.planningDependencies.rows()});
      const config=projectConfiguration(req(a[1],'Config'));validate(config);
      return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
     }finally{store.close();}

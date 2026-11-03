@@ -17,6 +17,7 @@ import {ensureReadinessStore,activeReadinessResolution,applicableResolution,asse
 import {effectiveSettings} from './project-settings';
 import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
+import {PlanningDependencies} from './planning-dependencies';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
@@ -35,8 +36,10 @@ export interface WorkflowTransport{
   branchSnapshot?(repo:string,pr:number):Promise<any>;
 }
 export class Workflow{
+ planningDependencies:PlanningDependencies;
  router:TaskRouting;
  constructor(public s:Store,public t:WorkflowTransport,router?:TaskRouting,readonly=false){
+  this.planningDependencies=new PlanningDependencies(s,this);
   if(readonly){this.router=router??({} as TaskRouting);return;}
   this.router=router??new TaskRouting(s);
   new Planning(s);new Lifecycle(s);new ApprovalPolicyStore(s);ensureReadinessStore(s);
@@ -282,6 +285,8 @@ export class Workflow{
   if(e.transcript?.controller!=='ready')return {state:'waiting_for_worker'};
   const route=this.router.approved(job,j.plan_hash);
   if(route){if(!this.t.configureRoute)throw Error('Routing controls are unavailable');await this.t.configureRoute(d.session_id,route);this.router.verified(job,'implementation');}
+  l.current(job);
+  await this.planningDependencies.guard(job,c);
   l.current(job);
    const claimed=this.s.db.transaction(()=>{assertWorktreeAvailable(this.s,job);return this.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=? AND state='approved_pending'").run(job);}).immediate();
   if(!claimed.changes)return {state:'delivery_uncertain'};
@@ -667,6 +672,7 @@ export class Workflow{
   // Recover existing planning/delivery first. One uncertain session consumes a slot.
   const planning=this.s.db.query("SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND (j.state IN ('awaiting_plan','awaiting_approval') OR (j.state='blocked' AND d.state IN ('planning','dispatch_uncertain','needs_reconciliation')))").all(c.linear.projectId) as any[];
   for(const d of planning)try{results.push({job:d.job,...await this.reconcilePlanning(d.job,c)});}catch(e){results.push({job:d.job,error:e instanceof Error?e.message:'Planning reconcile failed'});}
+  results.push(...await this.planningDependencies.sync(c));
   if(c.approval?.mode==='ready-queue'){
    const waiting=this.s.db.query("SELECT id FROM jobs WHERE project=? AND state='awaiting_approval'").all(c.linear.projectId) as any[];
    for(const row of waiting)try{

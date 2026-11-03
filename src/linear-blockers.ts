@@ -90,6 +90,7 @@ export class LinearBlockers{
  }
   async retract(job:string,c:BlockerConfig){
    if(c.blockerSync?.enabled!==true)return {state:'disabled'};
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='planning_dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM planning_dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state!='resolved' AND j.state='awaiting_approval'").get(job))return {state:'retained',reason:'Planning dependency evidence remains unresolved'};
    settleDependencyWait(this.s,job);
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state NOT IN ('resumed','settled')").get(job))return {state:'retained',reason:'Dependency evidence or delivery remains unresolved'};
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&this.s.db.query("SELECT job FROM clarification_receipts WHERE job=? AND state IN ('waiting','partial','confirmed','replan','needs_review')").get(job))return {state:'retained',reason:'Another unresolved clarification remains'};

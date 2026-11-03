@@ -31,7 +31,8 @@ export function dependencyIO(s:Store,run:ProcessRunner=command,api:LinearAPI=lin
    const dependencies=[];
    for(const d of definition.prerequisites){
     const p=await gh(`repos/${repo}/pulls/${d.pr}`);
-    if(p.number!==d.pr||p.html_url!==`https://github.com/${repo}/pull/${d.pr}`||p.base?.repo?.full_name!==repo||p.base?.ref!==baseBranch)throw Error(`Repository/base mismatch for ${d.ref}`);
+     if(p.number!==d.pr||p.html_url!==`https://github.com/${repo}/pull/${d.pr}`||p.base?.repo?.full_name!==repo||p.base?.ref!==baseBranch)throw Error(`Repository/base mismatch for ${d.ref}`);
+     if(d.headSha&&p.head?.sha!==d.headSha)throw Error(`${d.ref}: reviewed prerequisite head changed; review contract and same-plan compatibility before updating pins`);
     if(p.merged!==true||!p.merged_at||p.state!=='closed'||! /^[a-f0-9]{40,64}$/.test(p.merge_commit_sha??''))throw Error(`${d.ref}: PR #${d.pr} is ${p.state}, not a verified merge; closed-unmerged/replaced PRs require reconciliation`);
     const compare=await gh(`repos/${repo}/compare/${p.merge_commit_sha}...${base.commit.sha}`);
     if(!['ahead','identical'].includes(compare.status)||compare.merge_base_commit?.sha!==p.merge_commit_sha)throw Error(`${d.ref}: merged changes are not included in target base`);
