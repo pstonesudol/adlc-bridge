@@ -4,7 +4,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {definitionXML} from './project-services';
 import {join,resolve,dirname,isAbsolute} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
-import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
+import {appState,installedCLI,verifiedInstallationSource,installationRecord} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
 function assertMovableStatePaths(def:any){
  const controller=def.ProgramArguments?.[1];
  if(typeof controller!=='string'||def.WorkingDirectory!==dirname(controller))return;
@@ -61,7 +61,7 @@ function runtimeMigration(state:string,home:string,io:typeof installIO){
 export async function installBridge(apply=false,root=resolve(import.meta.dir,'..'),bin?:string,io=installIO){
   const turns=turnBarrier(io.state());
   const inspectAndInstall=async()=>{
-  if(root.includes('/ADLC Bridge/versions/'))root=verifiedInstallationSource(io.state())??root;
+  if(root.includes('/ADLC Bridge/versions/')){const installed=installationRecord(io.state());if(installed?.cli&&resolve(root)===resolve(dirname(dirname(installed.cli))))root=verifiedInstallationSource(io.state())??root;}
  const projects=await io.registeredProjects(!apply);
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}

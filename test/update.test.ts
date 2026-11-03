@@ -3,20 +3,22 @@ import {mkdtempSync,mkdirSync,writeFileSync,existsSync,readFileSync,rmSync} from
 import {join,dirname} from 'node:path';
 import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
-import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
+import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,evaluateCheckRuns,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
+import {installBridge} from '../src/install';
 
 const repo='acme/adlc';
 const policy=(over:any={})=>validateUpdatePolicy({version:1,repository:repo,remote:'git@github.com:acme/adlc.git',ref:'main',refKind:'branch',mode:'manual',...over});
 function fixture(over:any={}){
- const root=mkdtempSync(join(tmpdir(),'adlc-update-')),state=join(root,'state'),v1=join(state,'versions','v1');
+ const root=mkdtempSync(join(tmpdir(),'adlc-update-')),state=join(root,'ADLC Bridge'),v1=join(state,'versions','v1');
  mkdirSync(join(v1,'src'),{recursive:true});
  writeFileSync(join(v1,'src/cli.ts'),'old cli');writeFileSync(join(v1,'manifest.json'),JSON.stringify({version:'v1',files:['src/cli.ts']}),{mode:0o600});
  writeFileSync(join(state,'installation.json'),JSON.stringify({source:join(root,'source'),version:'v1',cli:join(v1,'src/cli.ts'),launcher:join(root,'adlc')}),{mode:0o600});
  writeUpdatePolicy(policy(over.policy),state);
  const services:Record<string,boolean>={one:true,two:false},calls:string[]=[],installs:string[]=[],notifications:string[]=[];
- let blockers:{session:string;reason:string}[]=over.blockers??[],backendReady=true,managed=true,failInstall=false,candidate=over.candidate??'a'.repeat(40),checks=over.checks??{passed:true,names:['CI'],detail:'ok'},tests=over.tests??{passed:true,skipped:true,detail:'skipped'};
- const stack:any={turns:turnBarrier(state),projects:async()=>Object.keys(services).map(project=>({project})),project:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {project:id,loaded:services[id]};if(action==='stop')services[id]=false;if(action==='start'){if(over.failStart)throw Error('start failed');services[id]=true;}return {project:id,loaded:services[id]};},backend:async()=>({ready:backendReady,loaded:true,managed,pid:1}),backendStart:async()=>{calls.push('backend:start');backendReady=true;},backendStop:async()=>{calls.push('backend:stop');backendReady=false;},blockers:async()=>{if(over.blockersError)throw new Error(over.blockersError);return blockers;}};
- const io:UpdateIO={state:()=>state,resolve:async p=>({commit:typeof candidate==='function'?candidate():candidate,ref:'refs/heads/main',source:p.remote}),stage:async(p,c)=>{if(over.stageCommit)return {root:join(root,'stage'),commit:over.stageCommit,version:'v2',files:['src/cli.ts']};return {root:join(root,'stage'),commit:c.commit,version:over.version??'v2',files:over.files??['src/cli.ts']};},checks:async()=>checks,tests:async()=>tests,compatibility:()=>({compatible:over.incompatible?false:true,detail:over.incompatible?'incompatible candidate':'compatible'}),reattachment:async()=>({safe:over.reattachment??true,detail:over.reattachment===false?'controller attachment unverified':'reattachment verified'}),stack,install:async(_apply:boolean,source:string)=>{installs.push(source);if(failInstall){failInstall=false;throw Error('install failed');}return {installed:true};},launcher:()=>join(root,'adlc'),migrations:async()=>over.migration,dbHash:()=>over.dbHash??'db1',notify:(event,key)=>notifications.push(`${event}:${key}`),now:()=>over.now??1000};
+ let blockers:{session:string;reason:string}[]=over.blockers??[],backendReady=true,managed=true,failInstall=false,backendStartFailures=over.failBackendStarts??0,serviceStartFailures=over.failServiceStartOnce?1:0,candidate=over.candidate??'a'.repeat(40),checks=over.checks??{passed:true,names:['CI'],detail:'ok'},tests=over.tests??{passed:true,skipped:true,detail:'skipped'};
+ const turns=turnBarrier(state);
+ const stack:any={turns,projects:async()=>Object.keys(services).map(project=>({project})),project:async(action:string,id:string)=>{calls.push(`${action}:${id}`);if(action==='service-status')return {project:id,loaded:services[id]};if(action==='stop')services[id]=false;if(action==='start'){await turns.run(async()=>{},'start');if(over.failStart||serviceStartFailures-->0)throw Error('start failed');services[id]=true;}return {project:id,loaded:services[id]};},backend:async()=>({ready:backendReady,loaded:true,managed,pid:1}),backendStart:async()=>{calls.push('backend:start');if(backendStartFailures-->0)throw Error('backend start failed');backendReady=true;},backendStop:async()=>{calls.push('backend:stop');backendReady=false;},blockers:async()=>{if(over.blockersError)throw new Error(over.blockersError);return blockers;}};
+ const io:UpdateIO={state:()=>state,resolve:async p=>({commit:typeof candidate==='function'?candidate():candidate,ref:'refs/heads/main',source:p.remote}),stage:async(p,c)=>{if(over.stageCommit)return {root:join(root,'stage'),commit:over.stageCommit,version:'v2',files:['src/cli.ts']};return {root:join(root,'stage'),commit:c.commit,version:over.version??'v2',files:over.files??['src/cli.ts']};},checks:async()=>checks,tests:async()=>tests,compatibility:()=>({compatible:over.incompatible?false:true,detail:over.incompatible?'incompatible candidate':'compatible'}),reattachment:async()=>({safe:over.reattachment??true,detail:over.reattachment===false?'controller attachment unverified':'reattachment verified'}),stack,install:async(_apply:boolean,source:string)=>{installs.push(source);calls.push(`install:${source}`);if(failInstall){failInstall=false;throw Error('install failed');}return {installed:true};},launcher:()=>join(root,'adlc'),migrations:async()=>over.migration,dbHash:()=>over.dbHash??'db1',notify:(event,key)=>notifications.push(`${event}:${key}`),now:()=>over.now??1000};
  return {root,state,services,calls,installs,notifications,io,manager:new UpdateManager(io,turnBarrier(state)),policy:policy(over.policy),setBlockers:(value:any)=>blockers=value,setBackend:(ready:boolean,isManaged=true)=>{backendReady=ready;managed=isManaged;},setFail:(value:boolean)=>failInstall=value,setCandidate:(value:any)=>candidate=value,setChecks:(value:any)=>checks=value,setTests:(value:any)=>tests=value,close:()=>rmSync(root,{recursive:true,force:true})};
 }
 test('update policy is manual by default and rejects credential or trust mismatches',()=>{
@@ -29,6 +31,11 @@ test('classification separates hot bridge, backend and schema changes',()=>{
  expect(classifyChanges(['src/cli.ts'],['src/cli.ts','src/core.ts'])).toBe('hot');
  expect(classifyChanges(['src/cli.ts'],['src/cli.ts','src/serve-orchestrator.py'])).toBe('backend');
  expect(classifyChanges(['src/cli.ts'],['src/cli.ts','patches/001.sql'])).toBe('schema');
+});
+test('incomplete check-run pages fail closed',()=>{
+ const incomplete=evaluateCheckRuns(policy(),{total_count:2,check_runs:[{name:'CI',status:'completed',conclusion:'success'}]});
+ expect(incomplete).toMatchObject({passed:false,detail:'Check evidence is incomplete for the exact candidate'});
+ expect(evaluateCheckRuns(policy(),{total_count:1,check_runs:[{name:'CI',status:'completed',conclusion:'success'}]}).passed).toBe(true);
 });
 test('content-only backend changes are detected from snapshot bytes',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-update-diff-'));try{
@@ -97,12 +104,21 @@ test('a deferral whose intake restoration fails remains paused for operator acti
   expect(f.manager.turns.isPaused()).toBe(true);expect(f.notifications.some(x=>x.startsWith('operator-action-required:'))).toBe(true);
  }finally{f.close();}
 });
+test('installation preserves explicit prior snapshot roots instead of redirecting',async()=>{
+ const f=fixture();try{
+  const v2=join(f.state,'versions','v2');mkdirSync(join(v2,'src'),{recursive:true});writeFileSync(join(v2,'src/cli.ts'),'v2');writeFileSync(join(v2,'manifest.json'),JSON.stringify({version:'v2',files:['src/cli.ts']}),{mode:0o600});
+  writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:join(f.root,'source'),version:'v2',cli:join(v2,'src/cli.ts'),launcher:join(f.root,'adlc')}),{mode:0o600});
+  const result=await installBridge(false,join(f.state,'versions','v1'),join(f.root,'adlc'),{state:()=>f.state,home:()=>f.root,registeredProjects:async()=>[]});
+  expect(result.source).toBe(join(f.state,'versions','v1'));
+ }finally{f.close();}
+});
 test('automatic adoption requires explicit opt-in and cadence, and never schedules itself',async()=>{
  const f=fixture();try{
   await expect(f.manager.apply({automatic:true})).rejects.toThrow('not enabled');expect(f.installs).toEqual([]);
   rmSync(join(f.state,'update-policy.json'));writeUpdatePolicy(policy({mode:'automatic',cadenceSeconds:60}),f.state);
+  writeFileSync(join(f.state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(1000).toISOString()}),{mode:0o600});
   await f.manager.check();const skipped=await f.manager.apply({automatic:true});expect(skipped).toEqual({skipped:true,reason:'Update cadence has not elapsed'});
-  const later=fixture({now:Date.now()+3600000,policy:{mode:'automatic',cadenceSeconds:60}});try{writeFileSync(join(later.state,'update-check.json'),JSON.stringify({checkedAt:new Date(0).toISOString()}),{mode:0o600});expect((await later.manager.apply({automatic:true})).activated).toBe(true);}finally{later.close();}
+  const later=fixture({now:Date.now()+3600000,policy:{mode:'automatic',cadenceSeconds:60}});try{writeFileSync(join(later.state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(0).toISOString()}),{mode:0o600});expect((await later.manager.apply({automatic:true})).activated).toBe(true);}finally{later.close();}
  }finally{f.close();}
 });
 test('concurrent polls and interrupted intents never double-activate',async()=>{
@@ -112,10 +128,20 @@ test('concurrent polls and interrupted intents never double-activate',async()=>{
   await expect(f.manager.apply()).rejects.toThrow('interrupted');expect(f.installs).toEqual([]);const status=await f.manager.status();expect(status.pending.reason).toContain('interrupted');
  }finally{f.close();}
 });
+test('installed version changes after preview are rejected under the update lock',async()=>{
+ const f=fixture();try{
+  f.io.checks=async()=>{
+   const v2=join(f.state,'versions','v2');mkdirSync(join(v2,'src'),{recursive:true});writeFileSync(join(v2,'src/cli.ts'),'v2');writeFileSync(join(v2,'manifest.json'),JSON.stringify({version:'v2',files:['src/cli.ts']}),{mode:0o600});
+   writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:join(f.root,'source'),version:'v2',cli:join(v2,'src/cli.ts'),launcher:join(f.root,'adlc')}),{mode:0o600});
+   return {passed:true,names:['CI'],detail:'ok'};
+  };
+  await expect(f.manager.apply()).rejects.toThrow('Installed version changed after preview');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);
+ }finally{f.close();}
+});
 test('activation restores exact prior per-project service states and verifies backend readiness',async()=>{
  const f=fixture();try{
   const result=await f.manager.apply();expect(result).toMatchObject({activated:true,classification:'hot'});
-  expect(f.calls).toEqual(['service-status:one','service-status:two','stop:one','start:one','service-status:one']);expect(f.services).toEqual({one:true,two:false});
+  expect(f.calls).toEqual(['service-status:one','service-status:two','stop:one',`install:${join(f.root,'stage')}`,'start:one','service-status:one']);expect(f.services).toEqual({one:true,two:false});
   expect(f.installs).toEqual([join(f.root,'stage')]);expect(f.manager.turns.isPaused()).toBe(false);
  }finally{f.close();}
 });
@@ -127,6 +153,27 @@ test('backend changes use the supported graceful restart and verify it',async()=
   const deferred=await unverified.manager.apply();expect(deferred).toMatchObject({deferred:true});expect(deferred.reason).toContain('unverified');expect(unverified.installs).toEqual([]);expect(unverified.services.one).toBe(true);
  }finally{unverified.close();}
  const shared=fixture({files:['src/cli.ts','src/serve-orchestrator.py']});try{shared.setBackend(true,false);await expect(shared.manager.apply()).rejects.toThrow('not ready for a guarded backend restart');expect(shared.installs).toEqual([]);expect(shared.services.one).toBe(true);}finally{shared.close();}
+});
+test('backend recovery stops before restoring files and starts afterwards',async()=>{
+ const f=fixture({files:['src/cli.ts','src/serve-orchestrator.py'],failBackendStarts:1});try{
+  await expect(f.manager.apply()).rejects.toThrow('Update failed');
+  const installedStage=`install:${join(f.root,'stage')}`,installedPrior=`install:${join(f.state,'versions','v1')}`;
+  expect(f.installs).toEqual([join(f.root,'stage'),join(f.state,'versions','v1')]);
+  expect(f.calls.indexOf('backend:stop')).toBeLessThan(f.calls.indexOf(installedStage));
+  expect(f.calls.indexOf('backend:start')).toBeGreaterThan(f.calls.indexOf(installedStage));
+  expect(f.calls.lastIndexOf('backend:start')).toBeGreaterThan(f.calls.indexOf(installedPrior));
+  expect(f.services.one).toBe(true);
+ }finally{f.close();}
+});
+test('backend recovery stops the candidate before restoring and starts the prior runtime',async()=>{
+ const f=fixture({files:['src/cli.ts','src/serve-orchestrator.py'],failServiceStartOnce:true});try{
+  await expect(f.manager.apply()).rejects.toThrow('Update failed');
+  const stops=f.calls.filter(x=>x==='backend:stop'),starts=f.calls.filter(x=>x==='backend:start');
+  expect(stops).toHaveLength(2);expect(starts).toHaveLength(2);
+  expect(f.calls.lastIndexOf('backend:stop')).toBeLessThan(f.calls.indexOf(`install:${join(f.state,'versions','v1')}`));
+  expect(f.calls.lastIndexOf('backend:start')).toBeGreaterThan(f.calls.indexOf(`install:${join(f.state,'versions','v1')}`));
+  expect(f.services.one).toBe(true);expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8')).stage).toBe('rolled-back');
+ }finally{f.close();}
 });
 test('failed activation rolls back files and services, while unsafe rollback preserves evidence and blocks intake',async()=>{
  const f=fixture();try{
@@ -146,10 +193,19 @@ test('rollback restores the prior verified snapshot and refuses after incompatib
   await f.manager.apply();const before=f.notifications.length;const result=await f.manager.rollback();expect(result).toMatchObject({rolledBack:true,version:'v1'});
   expect(f.installs.at(-1)).toBe(join(f.state,'versions','v1'));expect(f.services.one).toBe(true);expect(f.notifications.length).toBeGreaterThan(before);
   expect(JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8')).stage).toBe('rolled-back');
+  const installations=f.installs.length;await expect(f.manager.rollback()).rejects.toThrow('No activated update');expect(f.installs).toHaveLength(installations);
  }finally{f.close();}
  const changed=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'reversible'},dbHash:'db1'});try{
   await changed.manager.apply();changed.io.dbHash=()=> 'db2';await expect(changed.manager.rollback()).rejects.toThrow('Database changed after activation');expect(changed.installs).toHaveLength(1);
  }finally{changed.close();}
+});
+test('rollback rejects an empty or foreign previous source',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();const path=join(f.state,'update-state.json'),state=JSON.parse(readFileSync(path,'utf8'));
+  writeFileSync(path,JSON.stringify({...state,previousSource:''}),{mode:0o600});await expect(f.manager.rollback()).rejects.toThrow('Previous verified snapshot is unavailable');
+  writeFileSync(path,JSON.stringify({...state,previousSource:f.root}),{mode:0o600});await expect(f.manager.rollback()).rejects.toThrow('Previous verified snapshot is unavailable');
+  expect(f.installs).toHaveLength(1);
+ }finally{f.close();}
 });
 test('rollback of a hot update is allowed and an unavailable previous snapshot fails closed',async()=>{
  const f=fixture();try{
