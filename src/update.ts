@@ -1,5 +1,5 @@
 import {existsSync,lstatSync,readFileSync,mkdirSync,rmSync,renameSync,unlinkSync} from 'node:fs';
-import {join,dirname} from 'node:path';
+import {join,dirname,isAbsolute} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {appState,installationRecord} from './install-state';
@@ -132,10 +132,14 @@ export async function stageCandidate(policy:UpdatePolicy,candidate:Candidate,sta
  return inspect();
 }
 export async function githubChecks(policy:UpdatePolicy,candidate:Candidate):Promise<CheckEvidence>{
- const result=Bun.spawnSync(['gh','api','--method','GET',`repos/${policy.repository}/commits/${candidate.commit}/check-runs`],{stdout:'pipe',stderr:'pipe',timeout:60000,env:{...Bun.env,GH_PROMPT_DISABLED:'1'}});
+ const result=Bun.spawnSync(['gh','api','--method','GET',`repos/${policy.repository}/commits/${candidate.commit}/check-runs?per_page=100`],{stdout:'pipe',stderr:'pipe',timeout:60000,env:{...Bun.env,GH_PROMPT_DISABLED:'1'}});
  if(result.exitCode!==0)return {passed:false,names:[],detail:'Required check evidence is unavailable for the exact candidate'};
  let body:any;try{body=JSON.parse(result.stdout.toString());}catch{return {passed:false,names:[],detail:'Required check evidence was not readable'};}
+ return evaluateCheckRuns(policy,body);
+}
+export function evaluateCheckRuns(policy:Pick<UpdatePolicy,'verification'>,body:any):CheckEvidence{
  const runs=Array.isArray(body?.check_runs)?body.check_runs:null;if(!runs||!Number.isSafeInteger(body.total_count)||body.total_count<1)return {passed:false,names:[],detail:'No required checks were reported for the exact candidate'};
+ if(runs.length<body.total_count)return {passed:false,names:[],detail:'Check evidence is incomplete for the exact candidate'};
  const names=runs.map((run:any)=>String(run?.name??'')).filter(Boolean);
  const accepted=new Set(['success','skipped','neutral']);
  const passed=runs.every((run:any)=>run?.status==='completed'&&accepted.has(run?.conclusion))&&policy.verification.requiredChecks.every(name=>names.includes(name));
@@ -217,6 +221,8 @@ export function liveUpdateIO(state=appState()):UpdateIO{
  };
 }
 function readCheckRecord(state:string){const path=join(state,'update-check.json');return existsSync(path)?readJson(path):undefined;}
+function readAutoRecord(state:string){const path=join(state,'update-auto.json');return existsSync(path)?readJson(path):undefined;}
+function writeAutoAttempt(state:string,now:number){atomicFile(join(state,'update-auto.json'),JSON.stringify({attemptedAt:new Date(now).toISOString()},null,2)+'\n');}
 
 export class UpdateManager{
  constructor(public io:UpdateIO,public turns:TurnBarrier=turnBarrier(io.state())){}
@@ -270,14 +276,16 @@ export class UpdateManager{
  async apply(options:{automatic?:boolean}={}){
   const policy=this.policy(),state=this.io.state();
   if(options.automatic&&policy.mode!=='automatic')throw Error('Automatic update adoption is not enabled; apply updates explicitly');
-  if(options.automatic){const last=readCheckRecord(state);if(last?.checkedAt&&this.io.now()-Date.parse(last.checkedAt)<policy.cadenceSeconds*1000)return {skipped:true,reason:'Update cadence has not elapsed'};}
+  if(options.automatic){const last=readAutoRecord(state);if(last?.attemptedAt&&this.io.now()-Date.parse(last.attemptedAt)<policy.cadenceSeconds*1000)return {skipped:true,reason:'Update cadence has not elapsed'};writeAutoAttempt(state,this.io.now());}
   const plan=await this.preview();if(plan.upToDate)return {upToDate:true};
   if(plan.blockers.length)throw Error(`Update is not ready: ${plan.blockers.join('; ')}`);
   this.notify('update-available',plan.candidate.commit,{ref:plan.candidate.ref,classification:plan.classification});
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and inspect it before updating');
   const release=acquireLock(state);
   const wasPaused=this.turns.isPaused();
+  const startService=(project:string)=>wasPaused?this.io.stack.project('start',project):this.turns.run(()=>this.io.stack.project('start',project));
   try{
+   if(installedVersion(state).record.version!==plan.installedVersion)throw Error('Installed version changed after preview; re-run the update');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; inspect services and update-intent.json, then use update-rollback or explicit operator recovery`);
    if(existing?.stage==='operator-action-required')throw Error('A prior update requires explicit operator recovery; inspect services and update-intent.json before retrying');
    const intent=writeIntent(state,{version:1,stage:'staged',candidate:plan.candidate.commit,fromVersion:plan.installedVersion,classification:plan.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
@@ -299,9 +307,10 @@ export class UpdateManager{
     advance(state,intent,'installing');
     const confirmed=await this.io.resolve(policy);if(confirmed.commit!==plan.candidate.commit)throw Error('Authoritative candidate changed during activation; no installation attempted');
     installAttempted=true;
-    const result=await this.io.install(true,plan.staged.root,this.io.launcher());    advance(state,intent,'starting',{installed:true});
+    const result=await this.io.install(true,plan.staged.root,this.io.launcher());
+    advance(state,intent,'starting',{installed:true});
     if(backendStopped)await this.io.stack.backendStart();
-    for(const service of prior)if(service.loaded){await this.io.stack.project('start',service.project);}
+    for(const service of prior)if(service.loaded){await startService(service.project);}
     advance(state,intent,'verifying');
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Activated runtime is not healthy');
     for(const service of prior)if(service.loaded){const status=await this.io.stack.project('service-status',service.project);if(!status?.loaded)throw Error(`Project ${service.project} did not restore after activation`);}
@@ -312,13 +321,21 @@ export class UpdateManager{
     return {activated:true,candidate:plan.candidate.commit,version:plan.staged.version,classification:plan.classification,restoredServices:prior,install:result};
    }catch(error){
     const deferred=error instanceof UpdateDeferred;
-    const recovery:Error[]=[];let rolledBack=false;
+    const recovery:Error[]=[];let rolledBack=false,runtimeStopped=false;
     if(!deferred){
      const installedState=readInstalledState(state),safe=plan.migration?.rollbackSafe??installedState?.rollbackSafe??true;
-     if(backendStopped)try{await this.io.stack.backendStart();}catch(restore){recovery.push(new Error('Backend restart during recovery failed',{cause:restore}));}
-     if(installAttempted){if(safe)try{await this.io.install(true,join(state,'versions',plan.installedVersion),launcher);rolledBack=true;}catch(restore){recovery.push(new Error('Runtime files could not be restored',{cause:restore}));}else recovery.push(new Error(`Rollback is unsafe: ${plan.migration?.detail??'schema migration evidence is missing'}; backups preserved`));}
+     const runtimeRecovery=installAttempted&&plan.classification!=='hot';
+     if(runtimeRecovery&&safe){
+      // Never restore files or start a runtime underneath a candidate backend.
+      try{const backend=await this.io.stack.backend();if(backend.ready)await this.io.stack.backendStop();runtimeStopped=true;}catch(restore){recovery.push(new Error('Backend could not be stopped before safe restoration',{cause:restore}));}
+     }
+     if(installAttempted){
+      if(!safe)recovery.push(new Error(`Rollback is unsafe: ${plan.migration?.detail??'schema migration evidence is missing'}; backups preserved`));
+      else if(!recovery.length)try{await this.io.install(true,join(state,'versions',plan.installedVersion),launcher);rolledBack=true;}catch(restore){recovery.push(new Error('Runtime files could not be restored',{cause:restore}));}
+     }
+     if(!recovery.length&&(backendStopped||runtimeStopped))try{await this.io.stack.backendStart();}catch(restore){recovery.push(new Error('Backend restart during recovery failed',{cause:restore}));}
     }
-    for(const service of prior)if(service.loaded)try{await this.io.stack.project('start',service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
+    if(deferred||!recovery.length)for(const service of prior)if(service.loaded)try{await startService(service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
     if(deferred){
      if(recovery.length){
       advance(state,intent,'operator-action-required',{error:error instanceof Error?error.message:String(error)});leavePaused=true;
@@ -345,9 +362,10 @@ export class UpdateManager{
   if(installed.classification==='schema'&&installed.dbHash!==null&&this.io.dbHash()!==installed.dbHash)throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and follow operator recovery steps');
   const release=acquireLock(state),wasPaused=this.turns.isPaused();
+  const startService=(project:string)=>wasPaused?this.io.stack.project('start',project):this.turns.run(()=>this.io.stack.project('start',project));
   try{
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; explicit operator recovery is required`);
-   const source=installed.previousSource;if(!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
+   const source=installed.previousSource;if(typeof source!=='string'||!isAbsolute(source)||!source.startsWith(join(state,'versions')+'/')||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
    const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
    if(!wasPaused)this.turns.pause();
    let prior:PriorService[]=[];let leavePaused=false,backendStopped=false;
@@ -364,18 +382,19 @@ export class UpdateManager{
     await this.io.install(true,source,launcher);
     advance(state,intent,'starting');
     if(backendStopped)await this.io.stack.backendStart();
-    for(const service of prior)if(service.loaded)await this.io.stack.project('start',service.project);
+    for(const service of prior)if(service.loaded)await startService(service.project);
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Restored runtime is not healthy');
-    if(installed.previousCommit!==null)atomicFile(join(state,'update-state.json'),JSON.stringify({...installed,commit:installed.previousCommit,restartRequired:false,previousSource:'',previousVersion:'',previousCommit:null,dbHash:this.io.dbHash(),activatedAt:new Date().toISOString()},null,2)+'\n');
-    else if(existsSync(join(state,'update-state.json')))unlinkSync(join(state,'update-state.json'));
+    // A successful rollback is terminal for this record; never leave metadata
+    // that could authorize another restore from an empty or stale source.
+    if(existsSync(join(state,'update-state.json')))unlinkSync(join(state,'update-state.json'));
     advance(state,intent,'rolled-back');
     this.notify('rolled-back',installed.commit,{version:installed.previousVersion});
     if(!wasPaused)this.turns.resume();
     return {rolledBack:true,version:installed.previousVersion,restoredServices:prior};
    }catch(error){
-    const recovery:Error=[];
-    if(backendStopped)try{await this.io.stack.backendStart();}catch(restore){recovery.push(new Error('Backend restart during rollback failed',{cause:restore}));}
-    for(const service of prior)if(service.loaded)try{await this.io.stack.project('start',service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
+    const recovery:Error[]=[];
+    if(backendStopped)recovery.push(new Error('Backend remains stopped after rollback failure; operator action required'));
+    else for(const service of prior)if(service.loaded)try{await startService(service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
     advance(state,intent,recovery.length?'operator-action-required':'failed',{error:error instanceof Error?error.message:String(error)});leavePaused=recovery.length>0;
     if(!leavePaused&&!wasPaused)this.turns.resume();
     throw new Error(`Rollback failed (${error instanceof Error?error.message:String(error)}). Inspect update-intent.json and service-status`,{cause:error});
