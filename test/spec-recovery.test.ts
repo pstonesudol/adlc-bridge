@@ -54,6 +54,40 @@ test('active edit preserves owner/history, blocks dispatch and requires a fresh 
   await f.w.executeApproved(f.job,config);expect(f.sends).toHaveLength(3);
  }finally{f.s.close();}
 });
+for(const binding of ['client','plan','revision','spec'])for(const outcome of ['handoff','failure'])test(`in-flight ${outcome} cannot overwrite a changed ${binding} binding`,async()=>{
+ const f=await fixture();try{
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  const snapshot=f.w.t.branchSnapshot!;let expected:any;
+  f.w.t.branchSnapshot=async(...args)=>{
+   const result=await snapshot(...args);
+   if(binding==='client')f.s.db.query("UPDATE implementation_dispatch SET client_id='new-dispatch',state='approved_pending' WHERE job=?").run(f.job);
+   if(binding==='plan')f.s.db.query("UPDATE implementation_dispatch SET plan_hash='new-plan',state='approved_pending' WHERE job=?").run(f.job);
+   if(binding==='revision')f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('new-revision',f.job,digest(f.s.get(f.job).spec),digest(f.s.get(f.job).spec),'New instance','pending');
+   if(binding==='spec')f.edit('Changed during provider observation');
+   expected={dispatch:f.w.implementation(f.job),outcomes:f.w.outcomes(f.job),handoffs:f.s.db.query('SELECT * FROM revision_handoffs').all()};
+   if(outcome==='failure')throw Error('Provider failed after binding changed');
+   return result;
+  };
+  const result=await f.w.executionStatus(f.job,f.e,config);
+  expect(result).toMatchObject({state:'stale_execution',applied:false});
+  expect(f.w.implementation(f.job)).toEqual(expected.dispatch);
+  expect(f.w.outcomes(f.job)).toEqual(expected.outcomes);
+  expect(f.s.db.query('SELECT * FROM revision_handoffs').all()).toEqual(expected.handoffs);
+ }finally{f.s.close();}
+});
+test('status excludes superseded blockers but retains historical outcomes and independent dependency evidence',async()=>{
+ const f=await fixture();try{
+  await f.w.executionStatus(f.job,f.e,config);
+  f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency',reason='Waiting for dependency' WHERE job=?").run(f.job);
+  f.s.db.exec('CREATE TABLE dependency_waits(job TEXT,reason TEXT)');
+  f.s.db.query('INSERT INTO dependency_waits VALUES (?,?)').run(f.job,'Independent dependency evidence');
+  expect(f.w.status().blockers).toHaveLength(1);
+  f.edit('New requirements');
+  const status=f.w.status();expect(status.blockers).toHaveLength(0);
+  expect(status.outcomes).toEqual(expect.arrayContaining([expect.objectContaining({job:f.job,plan_hash:f.hash,outcome:'blocked_dependency'})]));
+  expect(status.dependencies).toHaveLength(1);expect(status.requirementRevisions).toHaveLength(1);
+ }finally{f.s.close();}
+});
 test('busy owner, repeated edits and stale preview never inject a competing turn',async()=>{
  const f=await fixture();try{
   f.edit('v2');const p=await f.recovery.preview(f.job,config);

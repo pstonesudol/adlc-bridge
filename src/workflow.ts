@@ -297,6 +297,7 @@ export class Workflow{
   }
  async executionStatus(job:string,e:any,c?:WorkflowConfig,now=Date.now(),persist=true){
   const d=this.implementation(job);if(!d)return;
+  const observedJob=this.s.get(job);
   let graceMs=c?.workflow?.prGraceMs??120000;
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
   const latestContinuation=this.continuation(job);
@@ -320,8 +321,13 @@ export class Workflow{
   }
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{
+   const apply=()=>{
+   const current=this.implementation(job),j=this.s.get(job);
+   if(current?.client_id!==d.client_id||current?.plan_hash!==d.plan_hash||current?.session_id!==d.session_id||j.plan_hash!==d.plan_hash||
+    (latestRevision(this.s,job)?.id??null)!==(revision?.id??null)||j.plan_hash!==observedJob.plan_hash||j.spec!==observedJob.spec||j.approved_hash!==observedJob.approved_hash||j.state!==observedJob.state)
+    return {state:'stale_execution',applied:false,session:d.session_id,reason:'Execution binding changed while evidence was awaited; stale outcome discarded'};
    if(!persist)return {...result,session:d.session_id};
-   if(result.state==='pr_handoff')recordHandoff(this.s,job,this.s.get(job).plan_hash,handoffPr(result,prs),now);
+   if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now);
    // A later remediation may be selected for the workflow outcome, but only
    // the continuation's own receipt can settle its durable delivery state.
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
@@ -336,6 +342,8 @@ export class Workflow{
    }
    this.s.db.query('UPDATE implementation_dispatch SET state=?,reason=? WHERE job=?').run(result.state,result.reason??null,job);
    return {...this.saveOutcome(job,d,result,graceMs,now,this.outcomes(job)),session:d.session_id};
+   };
+   return persist?this.s.db.transaction(apply).immediate():apply();
   };
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   const contEntry=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()&&cont?e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id):null;
@@ -663,5 +671,5 @@ export class Workflow{
     FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all(),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
   blockers:this.s.db.query(`SELECT w.job,j.issue,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.grace_deadline
-     FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all(),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
+      FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.plan_hash=j.plan_hash AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all(),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
 }
