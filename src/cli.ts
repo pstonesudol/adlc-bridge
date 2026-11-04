@@ -317,7 +317,7 @@ Registered approved review targets can request bounded in-scope fixes from their
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);const clarifications=new LinearClarifications(s,workflow,blockers);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
-    const revision=revisionStatus(s,t.job),stale=revision&&revision.state!=='authorized';
+    const revision=revisionStatus(s,t.job),stale=revision?.blocking===true;
     return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
   });
    try{

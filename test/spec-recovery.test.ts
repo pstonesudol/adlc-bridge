@@ -1,4 +1,5 @@
 import {test,expect} from 'bun:test';
+import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
@@ -151,6 +152,30 @@ test('an edit before planning starts is intake, not a blocking requirement revis
   expect(r.state).toBe('preplanning');expect(s.get(job).state).toBe('awaiting_plan');
   expect(r.new_hash).toBe(digest(s.get(job).spec));
  }finally{s.close();}
+});
+test('review-status keeps the review state for a settled preplanning revision',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-preplanning-status-')),db=join(dir,'state.db');
+ try{
+  const s=new Store(db),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
+  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('preplanning-revision',job,'old','new','description changed (8 → 8 characters; content redacted)','preplanning');
+  new ReviewLoop(s);
+  s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)').run(job,'owner/repo',3,JSON.stringify(['CI']),JSON.stringify(['src/**']),0,Date.now());
+  s.close();
+  const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
+  const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'review-status'],{env});
+  expect(result.exitCode).toBe(0);
+  const row=JSON.parse(result.stdout.toString())[0];
+  expect(row).toMatchObject({state:'waiting_for_review',displayStatus:'Waiting for CodeRabbit',reviewState:'waiting_for_review'});
+  expect(row.revision).toMatchObject({state:'preplanning',blocking:false});
+  // A blocking revision must still surface the changed requirements.
+  const second=new Store(db);
+  second.db.query("UPDATE spec_revisions SET state='pending' WHERE id=?").run('preplanning-revision');second.close();
+  const changed=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'review-status'],{env});
+  expect(changed.exitCode).toBe(0);
+  const pending=JSON.parse(changed.stdout.toString())[0];
+  expect(pending).toMatchObject({state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required',reviewState:'waiting_for_review'});
+  expect(pending.revision).toMatchObject({state:'pending',blocking:true});
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });
 test('terminal failed replan is reconciled by exact receipt, then a fresh confirmed attempt replaces it',async()=>{
  const f=await fixture();try{
