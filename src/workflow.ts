@@ -220,7 +220,8 @@ export class Workflow{
     if((prior||run)&&!revised)throw Error('Existing execution requires reconciliation');
     if(revised){
      if(prior&&prior.session_id!==r.session_id||run&&(run.session_id!==r.session_id||run.owner!=='orchestrator'))throw Error('Revised plan execution owner changed');
-     this.s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run(revision.id,job,JSON.stringify({prior,run,policy:new ApprovalPolicyStore(this.s).get(job),grant:this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job)}));
+     const continuationMaxId=(this.s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(job) as any)?.id??0;
+     this.s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run(revision.id,job,JSON.stringify({prior,run,continuationMaxId,policy:new ApprovalPolicyStore(this.s).get(job),grant:this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job)}));
      // These changes roll back if fresh readiness/policy checks below fail.
      this.s.db.query('DELETE FROM policy_authorizations WHERE job=?').run(job);
     }
@@ -228,7 +229,7 @@ export class Workflow{
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);
-   const clientId=`adlc-implement-${job.slice(0,16)}-${hash.slice(0,16)}`;
+   const clientId=`adlc-implement-${job.slice(0,16)}-${hash.slice(0,16)}${revised?`-${revision.id}`:''}`;
     this.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET plan_hash=excluded.plan_hash,session_id=excluded.session_id,client_id=excluded.client_id,state=excluded.state,paths=excluded.paths,runtime=excluded.runtime,actor=excluded.actor,reason=NULL').run(job,hash,r.session_id,clientId,'approved_pending',JSON.stringify(paths),runtime,actor,null);
     if(revised){
      this.s.db.query("UPDATE spec_revisions SET state='authorized' WHERE id=?").run(revision.id);
@@ -299,7 +300,9 @@ export class Workflow{
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
   const latestContinuation=this.continuation(job);
   // Retained continuation history cannot satisfy a revised dispatch's receipt.
-  const cont=latestContinuation?.plan_hash===d.plan_hash?latestContinuation:null;
+  const revision=latestRevision(this.s,job),history=revision&&this.s.db.query('SELECT snapshot FROM spec_execution_history WHERE revision=? AND job=?').get(revision.id,job) as any;
+  const boundary=history?JSON.parse(history.snapshot).continuationMaxId:undefined;
+  const cont=latestContinuation?.plan_hash===d.plan_hash&&(!history||(Number.isSafeInteger(boundary)&&latestContinuation.id>boundary))?latestContinuation:null;
   const clientId=cont?cont.client_id:d.client_id;
   const ledger=new ReceiptReconciliation(this.s),binding=ledger.get(clientId);
   if(binding){
@@ -399,7 +402,14 @@ export class Workflow{
   if(!failed||!['failed','recovered'].includes(failed.state))return false;
   const settled=failed.state==='recovered';
   const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec)) as any;
-  if(!adopted||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
+   if(!adopted||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
+   // Plan/spec hashes can recur after A→B→A. The immutable confirmation
+   // proposal must also belong to this dispatch and requirement instance.
+   const revision=latestRevision(this.s,job);
+   if(revision){
+    let auth;try{auth=JSON.parse(adopted.detail).auth;}catch{return false;}
+    if(auth?.revision!==revision.id||auth?.delivery!==d.client_id)return false;
+   }
   if(!settled&&local.head!==adopted.head)return false;
   if(!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head))return false;
   // A recovered handoff is still a handoff: the open PR must remain the exact

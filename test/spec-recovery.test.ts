@@ -254,6 +254,29 @@ for(const receipt of ['missing','running'])test(`an old-plan continuation cannot
   expect(f.w.continuation(f.job)).toEqual(historical);
  }finally{f.s.close();}
 });
+test('restoring a plan hash uses a new dispatch receipt and ignores historical completed continuations',async()=>{
+ const f=await fixture();try{
+  const original=f.s.get(f.job),oldDispatch=f.w.implementation(f.job);
+  f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(f.job,f.hash,digest(original.spec),'historical','old-same-plan','owner','completed');
+  f.e.transcript.entries.push({clientMessageId:'old-same-plan',turnId:'old-same-plan',sequence:10});
+  f.e.transcript.turns.push({id:'old-same-plan',state:'completed'});
+  f.edit('v2');f.edit('Original');
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  // Reproduce an identical approved plan to exercise hash reuse independently
+  // of the provider's revised-plan marker formatting.
+  const hash=f.s.propose(f.job,original.plan);expect(hash).toBe(f.hash);
+  recordReadiness(f.s,f.job,original.plan,hash,digest(original.spec));
+  f.w.approve(f.job,hash,'human',['src/**'],'supervised-host',featureGit);
+  expect(f.w.implementation(f.job).client_id).not.toBe(oldDispatch.client_id);
+  await f.w.executeApproved(f.job,config);
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  expect((await f.w.executionStatus(f.job,f.e,config)).state).toBe('implementation_running');
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  expect((await f.w.executionStatus(f.job,f.e,config)).state).toBe('pr_handoff');
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
+ }finally{f.s.close();}
+});
 test('a handoff for the same plan hash from an earlier revision does not authorize the current one',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);

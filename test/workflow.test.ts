@@ -158,9 +158,17 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
   // Mark the job as revised so the recovery handoff must bind the current revision.
   s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a','b','Summary','authorized');
-  s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,'{}');
-  expect(revisedHandoff(s,id)).toBe(false);
-  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+   s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,JSON.stringify({continuationMaxId:0}));
+   expect(revisedHandoff(s,id)).toBe(false);
+   // Restored spec/plan hashes alone cannot renew an old recovery confirmation.
+   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   const bind=(revision:string,delivery:string)=>s.db.query('UPDATE delivery_adoptions SET detail=? WHERE job=?').run(JSON.stringify({auth:{revision,delivery}}),id);
+   bind('earlier-revision',w.implementation(id).client_id);
+   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   bind('revision-recovery','earlier-dispatch');
+   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   bind('revision-recovery',w.implementation(id).client_id);
+   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
