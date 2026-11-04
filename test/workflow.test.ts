@@ -143,11 +143,12 @@ test('a failed continuation hands off only with exact adopted-delivery recovery 
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
  }finally{s.close();}
 });
-test('an actually failed continuation turn is recovered before the failed-turn early return',async()=>{
+for(const historical of [false,true])test(`failed continuation recovery respects the revision boundary (${historical?'historical':'current'} continuation)`,async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
   const r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any,e=f.sessions.get('session-1');
-  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','delivery_accepted');
+   const beforeContinuation=Number((s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(id) as any)?.id??0);
+   s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','delivery_accepted');
   e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'});
   e.transcript.turns.push({id:'continue-turn',state:'failed'});
   expect((await w.executionStatus(id,e,config)).state).toBe('failed');
@@ -158,7 +159,8 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
   // Mark the job as revised so the recovery handoff must bind the current revision.
   s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a','b','Summary','authorized');
-   s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,JSON.stringify({continuationMaxId:0}));
+   const continuationMaxId=Number((s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(id) as any)?.id??0);
+   s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,JSON.stringify({continuationMaxId:historical?continuationMaxId:beforeContinuation}));
    expect(revisedHandoff(s,id)).toBe(false);
    // Restored spec/plan hashes alone cannot renew an old recovery confirmation.
    expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
@@ -171,7 +173,10 @@ test('an actually failed continuation turn is recovered before the failed-turn e
    expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
-  expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
+   expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe(historical?'failed':'recovered');
+   // A prior-revision continuation stays historical: the current implementation
+   // receipt may hand off after fresh recovery, but cannot rewrite that turn.
+   if(historical)return;
   // Missing worktree identity, remote-only divergence and wrong attachment URLs
   // fail closed without regressing the settled state.
   const worktree=(f as any).worktree.bind(f),snapshot=f.branchSnapshot.bind(f);

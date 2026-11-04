@@ -137,7 +137,8 @@ export class Workflow{
    if(dispatch.state==='planning_finished')return {state:'planning_finished'};
    const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
    if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
-   if(j.state==='awaiting_plan'&&latestRevision(this.s,job)&&(dispatch.spec_hash!==digest(j.spec)||this.s.db.query('SELECT 1 FROM spec_replans WHERE revision=?').get(latestRevision(this.s,job).id))){
+   const revision=latestRevision(this.s,job);
+   if(j.state==='awaiting_plan'&&revision&&(revision.state==='pending'||dispatch.spec_hash!==digest(j.spec)||this.s.db.query('SELECT 1 FROM spec_replans WHERE revision=?').get(revision.id))){
     if(!r.session_id||!dispatch.session_id)return this.blockPlan(job,'Specification changed; reconcile previous planning session');
     return new SpecRecovery(this.s,this).capture(job,c);
    }

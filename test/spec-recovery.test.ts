@@ -261,6 +261,8 @@ test('restoring a plan hash uses a new dispatch receipt and ignores historical c
   f.e.transcript.entries.push({clientMessageId:'old-same-plan',turnId:'old-same-plan',sequence:10});
   f.e.transcript.turns.push({id:'old-same-plan',state:'completed'});
   f.edit('v2');f.edit('Original');
+  expect((await f.w.reconcilePlanning(f.job,config)).state).toBe('requirements_changed');
+  expect(f.s.get(f.job).state).toBe('awaiting_plan');expect(f.s.get(f.job).plan).toBeNull();
   await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
   // Reproduce an identical approved plan to exercise hash reuse independently
   // of the provider's revised-plan marker formatting.
