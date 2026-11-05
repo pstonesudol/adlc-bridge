@@ -79,11 +79,20 @@ test('stale worker outcomes from an earlier revision never reach the generic pub
   expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
   // A binding change between the row scan and the external write aborts it.
   f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?' ).run('blocker-revision',dispatch,f.id);
-  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='second-comment' WHERE job=?").run(f.id);
+  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='second-comment' WHERE job=? AND state='posted'").run(f.id);
   const blockers=f.blockers();const api=(blockers as any).api;let mutated=false;
   (blockers as any).api=async(q:string,v:any)=>{if(!mutated&&q.includes('comments(first:100')){mutated=true;f.s.db.query("UPDATE worker_outcomes SET dispatch_id='changed-during-write' WHERE job=?").run(f.id);}return api(q,v);};
   const result=await blockers.sync(f.config);
   expect(result.some((r:any)=>r.state==='blocked'&&r.reason==='Worker blocker binding changed before Linear write')).toBe(true);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+  // A same-instance outcome change (worker becomes running) also aborts the write.
+  f.s.db.query("UPDATE worker_outcomes SET dispatch_id=?,reason='Worker stopped before edits',dependencies='[{\"ref\":\"DEV-9\",\"reason\":\"Approved sourcing wording\"}]' WHERE job=?").run(dispatch,f.id);
+  f.s.db.query("DELETE FROM blocker_notices WHERE job=? AND state!='posted'").run(f.id);
+  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='third-comment' WHERE job=? AND state='posted'").run(f.id);
+  const second=f.blockers();const api2=(second as any).api;let changed=false;
+  (second as any).api=async(q:string,v:any)=>{if(!changed&&q.includes('comments(first:100')){changed=true;f.s.db.query("UPDATE worker_outcomes SET outcome='running' WHERE job=?").run(f.id);}return api2(q,v);};
+  const running=await second.sync(f.config);
+  expect(running.some((r:any)=>r.state==='blocked'&&r.reason==='Worker blocker changed before Linear write')).toBe(true);
   expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
  }finally{f.s.close();}
 });

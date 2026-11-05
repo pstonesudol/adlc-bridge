@@ -176,7 +176,7 @@ export class LinearBlockers{
     if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;
     // Worker blocker writes revalidate their instance immediately before each
     // external mutation; synthetic recovery/review rows keep their prior flow.
-    const bound=outcome.worker&&(outcome.revision_id||outcome.dispatch_id||latestRevision(this.s,outcome.job)),guard=bound?()=>{const worker=this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(outcome.job);if(!currentOutcome(this.s,outcome.job,worker))throw Error('Worker blocker binding changed before Linear write');}:undefined;
+    const bound=outcome.worker&&(outcome.revision_id||outcome.dispatch_id||latestRevision(this.s,outcome.job)),fields=['plan_hash','outcome','reason','questions','dependencies'],guard=bound?()=>{const worker=this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(outcome.job) as any;if(!currentOutcome(this.s,outcome.job,worker))throw Error('Worker blocker binding changed before Linear write');if(fields.some(k=>worker?.[k]!==outcome[k]))throw Error('Worker blocker changed before Linear write');}:undefined;
     if(blockerOutcome(outcome.outcome)){results.push(await this.leave(outcome.job,outcome,c,guard?{guard}:undefined));}
     else results.push(await this.retract(outcome.job,c));
    }catch(error){results.push({job:outcome.job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
