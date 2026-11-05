@@ -64,6 +64,20 @@ function fixture(){
   blockers:()=>new LinearBlockers(s,api)
  };
 }
+test('stale worker outcomes from an earlier revision never reach the generic publisher',async()=>{
+ const f=fixture();try{
+  const j=f.s.get(f.id),dispatch='current-dispatch';
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('blocker-revision',f.id,digest(j.spec),digest(j.spec),'Revision','authorized');
+  f.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,j.plan_hash,'session',dispatch,'approved_pending','["src/**"]','supervised-host','human',null);
+  // A current receipt publishes...
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('blocker-revision',dispatch,f.id);
+  expect((await f.blockers().sync(f.config))[0].state).toBe('posted');expect(f.creates).toBe(1);
+  // ...but a later receipt bound to an earlier dispatch is historical.
+  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run('old-dispatch',f.id);
+  await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+ }finally{f.s.close();}
+});
 test('blocker comment and label are idempotent across polls and restarts',async()=>{
  const f=fixture();try{
   const first=await f.blockers().sync(f.config);expect(first[0].state).toBe('posted');

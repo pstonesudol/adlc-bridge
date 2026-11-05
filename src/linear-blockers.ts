@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
-import {settleDependencyWait,revisionBoundWait} from './spec-revisions';
+import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} from './spec-revisions';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -120,8 +120,8 @@ export class LinearBlockers{
   if(c.blockerSync?.enabled!==true)return [];
   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(c.blockerSync.labelId??''))throw Error('Verified blocker label UUID required');
   if(c.linear.readyLabelId&&c.blockerSync.labelId!.toLowerCase()===c.linear.readyLabelId.toLowerCase())throw Error('Blocker label must differ from the queue label');
-  const rows=this.s.db.query(`SELECT w.job,w.plan_hash,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
-   FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[];
+  const rows=(this.s.db.query(`SELECT w.job,w.plan_hash,w.session_id,w.revision_id,w.dispatch_id,w.outcome,w.reason,w.questions,w.dependencies,w.first_observed,w.grace_deadline
+   FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[]).map(r=>({...r,worker:true}));
    const results:any[]=[];
     const recoveries=recoveryRows(this.s);
     const handled=new Set<string>();
@@ -164,6 +164,9 @@ export class LinearBlockers{
   for(const outcome of rows){
    handled.add(outcome.job);
    try{
+     // Worker receipts from a superseded revision or dispatch never drive the
+     // generic publisher; synthetic recovery/review rows are unaffected.
+     if(outcome.worker&&(outcome.revision_id||outcome.dispatch_id||latestRevision(this.s,outcome.job))&&!currentOutcome(this.s,outcome.job,outcome))continue;
      if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()){
       const wait=this.s.db.query('SELECT * FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash) as any;
       if(wait&&wait.state!=='settled'&&revisionBoundWait(this.s,outcome.job,wait))continue;

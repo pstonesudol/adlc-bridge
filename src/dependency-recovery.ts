@@ -164,8 +164,12 @@ export class DependencyRecovery{
    }catch(e){if(!currentOutcome(this.s,job,this.workflow.outcomes(job)))return {job,state:'stale_dependencies',reason:'Worker blocker changed during dependency observation; stale wait not recorded'};const saved=this.rows().find(r=>r.job===job),evidence=saved&&JSON.parse(saved.evidence);return this.save(job,'waiting_for_dependencies',e instanceof Error?e.message:'Dependency evidence unavailable',evidence?.clientId?evidence:preview??{definition:c.dependencyRecovery?.jobs?.find((d:DependencyJob)=>d.issue===this.s.get(job).issue)});}
  });}
   save(job:string,state:string,reason:string|null,evidence:any){
-   const prior=this.rows().find(r=>r.job===job),instance=prior&&JSON.parse(prior.evidence).waitInstance;
+   const prior=this.rows().find(r=>r.job===job),saved=prior&&JSON.parse(prior.evidence),instance=saved?.waitInstance;
    if(instance)evidence={...evidence,waitInstance:instance};
+   // Persist the instance that created this wait; later saves never rebind it.
+   const revision=saved?.waitRevision!==undefined?saved.waitRevision:latestRevision(this.s,job)?.id??null;
+   const dispatch=saved?.waitDispatch!==undefined?saved.waitDispatch:this.workflow.implementation(job)?.client_id??null;
+   evidence={...evidence,waitRevision:revision,waitDispatch:dispatch};
   this.s.db.query('INSERT INTO dependency_waits VALUES (?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET plan=excluded.plan,state=excluded.state,reason=excluded.reason,evidence=excluded.evidence').run(job,this.s.get(job).plan_hash,state,reason,JSON.stringify(evidence));
   return {job,state,displayStatus:state==='waiting_for_dependencies'?'Waiting for dependencies':state,reason,nextAction:state==='waiting_for_dependencies'?'Inspect dependency-preview; provide missing proof or reconcile safely, then explicitly confirm dependency-resume. Never replay uncertain delivery.':null};
  }

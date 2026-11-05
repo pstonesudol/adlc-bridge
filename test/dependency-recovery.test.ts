@@ -99,9 +99,16 @@ test('revision-bound dependency wait retries after a provider failure before pro
   expect(f.fetches()).toBe(0);expect(f.sends).toHaveLength(1);
   // An unproven wait can never excuse a prior uncertain send or stale blocker.
   expect(f.r.currentWait({...row,evidence:JSON.stringify({clientId:'uncertain'})})).toBe(false);
+  // A saved wait keeps its creating instance; only a new dispatch makes it stale.
+  const dispatch=f.w.implementation(f.job).client_id;
+  expect(JSON.parse(row.evidence)).toMatchObject({waitRevision:'current-revision',waitDispatch:dispatch});
   f.s.db.query("UPDATE worker_outcomes SET dispatch_id='old-dispatch' WHERE job=?").run(f.job);
+  expect(f.r.currentWait(row)).toBe(true);
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='revised-dispatch' WHERE job=?").run(f.job);
   expect(f.r.currentWait(row)).toBe(false);
-  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run(f.w.implementation(f.job).client_id,f.job);
+  f.s.db.query("UPDATE implementation_dispatch SET client_id=? WHERE job=?").run(dispatch,f.job);
+  expect(f.r.currentWait(row)).toBe(true);
+  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run(dispatch,f.job);
   f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
   expect(f.fetches()).toBe(1);expect(f.updates()).toBe(1);expect(f.sends).toHaveLength(2);
  }finally{f.s.close();}
@@ -133,6 +140,30 @@ for(const proof of [false,true])for(const entry of ['tick','notices','retract'])
   const after=f.r.rows()[0];expect(after.state).toBe('settled');expect(after.evidence).toBe(before.evidence);
   expect(notices).toBe(0);expect(f.fetches()).toBe(0);expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
   expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+ }finally{f.s.close();}
+});
+test('a proof-less wait from a historical revision is retired before the current notice',async()=>{
+ const f=await fixture();try{
+  const j=f.s.get(f.job),dispatch=f.w.implementation(f.job).client_id;
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('wait-rev-a',f.job,digest(j.spec),digest(j.spec),'Revision A','authorized');
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('wait-rev-a',dispatch,f.job);
+  f.setMerged(1);
+  expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  const historical=f.r.rows()[0];expect(JSON.parse(historical.evidence).waitRevision).toBe('wait-rev-a');
+  const surface=linearSurface(f);await f.r.notices(f.c,surface.blockers);expect(surface.counts()).toEqual({creates:1,adds:1});
+  // A new revision and dispatch must not inherit the older proof-less wait.
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('wait-rev-b',f.job,digest(j.spec),digest(j.spec),'Revision B','authorized');
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='revised-dispatch' WHERE job=?").run(f.job);
+  f.s.db.query("UPDATE worker_outcomes SET revision_id='wait-rev-b',dispatch_id='revised-dispatch' WHERE job=?").run(f.job);
+  expect(f.r.currentWait(historical)).toBe(false);
+  expect(await f.r.notices(f.c,surface.blockers)).toEqual([]);
+  const settled=f.r.rows()[0];expect(settled).toMatchObject({state:'settled',evidence:historical.evidence});
+  expect(JSON.parse((f.s.db.query("SELECT detail FROM events WHERE kind='dependency_wait_settled' AND job=?").get(f.job) as any).detail).historical).toBe(true);
+  // The current blocker still reaches Linear through the generic publisher.
+  await surface.blockers.sync(f.c);
+  // The label is already present from the earlier notice; only one add is needed.
+  expect(surface.counts()).toEqual({creates:2,adds:1});expect(surface.comments[1].body).toContain('blocked dependency');
+  expect(f.sends).toHaveLength(1);expect(f.updates()).toBe(0);
  }finally{f.s.close();}
 });
 for(const proof of [false,true])for(const entry of ['tick','notices'])test(`a later dependency blocker reopens a settled ${proof?'proof-bearing':'proof-less'} wait through ${entry}`,async()=>{

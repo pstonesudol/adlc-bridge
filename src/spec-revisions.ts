@@ -58,8 +58,10 @@ export function revisionBoundWait(s:Store,job:string,wait:any,worker?:any){
  const r=latestRevision(s,job);
  if(!r)return true;
  const p=JSON.parse(wait.evidence),d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
- return p.proof?.auth?p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id
-  :!p.clientId&&currentOutcome(s,job,worker??s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job));
+ if(p.proof?.auth)return p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id;
+ // A saved wait keeps the instance that created it; never rebind to a later one.
+ if(p.waitRevision!==undefined&&p.waitRevision!==null)return p.waitRevision===r.id&&p.waitDispatch===d?.client_id;
+ return !p.clientId&&currentOutcome(s,job,worker??s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job));
 }
 /** A fresh same-instance outcome can retire a dependency wait, but not a
  * historical or unbound receipt. Resumed notices retain their retraction flow. */
@@ -74,20 +76,20 @@ export function settleDependencyWait(s:Store,job:string){
  const evidence=JSON.parse(row.evidence),client=evidence.clientId;
  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
   const bound=row.plan===s.get(job).plan_hash&&(!r?(!o?.dispatch_id||o.dispatch_id===d?.client_id):revisionBoundWait(s,job,row,o));
-  if(!fresh){
-   // Historical waits cannot retain a label for a new authorization instance.
-   // Keep the exact evidence and record retirement without interpreting it anew.
-   if(!bound&&row.state!=='settled'){
-    const changed=s.db.query("UPDATE dependency_waits SET state='settled',reason='Dependency wait belongs to a superseded revision or dispatch' WHERE job=? AND plan=? AND state=? AND evidence=?").run(job,row.plan,row.state,row.evidence).changes;
-    if(changed)s.event(job,'dependency_wait_settled',JSON.stringify({historical:true,previous:row}));
-   }
+  // Historical waits cannot retain a label for a new authorization instance,
+  // whether or not a fresh outcome already exists. Keep the exact evidence and
+  // record retirement without interpreting it again.
+  if(!bound&&row.state!=='settled'){
+   const changed=s.db.query("UPDATE dependency_waits SET state='settled',reason='Dependency wait belongs to a superseded revision or dispatch' WHERE job=? AND plan=? AND state=? AND evidence=?").run(job,row.plan,row.state,row.evidence).changes;
+   if(changed)s.event(job,'dependency_wait_settled',JSON.stringify({historical:true,previous:row}));
    return;
   }
+  if(!fresh)return;
  if(o.outcome==='blocked_dependency'&&(row.state==='settled'||!bound)){
   // A historical proof/continuation cannot suppress a new authorized blocker.
   // Archive it in full; an unproven new wait must collect fresh evidence.
   const next=bound?evidence:{workerDependencies:JSON.parse(o.dependencies)};
-   const changed=s.db.query("UPDATE dependency_waits SET plan=?,state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement or revision; re-evaluate evidence without replay',evidence=? WHERE job=? AND plan=? AND state=? AND evidence=?").run(o.plan_hash,JSON.stringify({...next,waitInstance:randomUUID()}),job,row.plan,row.state,row.evidence).changes;
+   const changed=s.db.query("UPDATE dependency_waits SET plan=?,state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement or revision; re-evaluate evidence without replay',evidence=? WHERE job=? AND plan=? AND state=? AND evidence=?").run(o.plan_hash,JSON.stringify({...next,waitInstance:randomUUID(),waitRevision:latestRevision(s,job)?.id??null,waitDispatch:d?.client_id??null}),job,row.plan,row.state,row.evidence).changes;
    if(changed){s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));return 'reopened';}
    return;
  }
