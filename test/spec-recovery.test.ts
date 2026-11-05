@@ -374,6 +374,48 @@ test('an unmarked confirmation cannot retire a different turn or a subsequently 
   await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
+for(const invalid of ['incomplete','stale','future','busy','active-turn','owner','branch','terminated','project','duplicate-entry'])test(`unmarked replans do not qualify for retirement with ${invalid} evidence`,async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  f.e.transcript.entries.at(-1).text='Reply without the revised-plan marker';
+  const preview=await f.recovery.preview(f.job,config);expect(preview.action).toBe('reconcile_unmarked_replan');
+  if(invalid==='incomplete')f.e.receiptObservation.complete=false;
+  if(invalid==='stale')f.e.receiptObservation.observed=Date.now()-120001;
+  if(invalid==='future')f.e.receiptObservation.observed=Date.now()+10000;
+  if(invalid==='busy')f.e.transcript.controller='busy';
+  if(invalid==='active-turn')f.e.transcript.turns.push({id:'still-running',state:'running'});
+  if(invalid==='owner')f.e.session.id='different-owner';
+  if(invalid==='branch')f.e.session.branch='different-branch';
+  if(invalid==='terminated')f.e.session.isTerminated=true;
+  if(invalid==='project')f.e.session.projectId='different-project';
+  if(invalid==='duplicate-entry'){
+   const d=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+   f.e.transcript.entries.push({clientMessageId:d.client_id,turnId:d.client_id,sequence:99});
+  }
+  expect((await f.recovery.preview(f.job,config)).action).toBe('refresh_evidence');
+  await expect(f.recovery.reconcile(f.job,config,preview.confirmation)).rejects.toThrow('Preview changed or delivery already reserved');
+  expect((f.s.db.query('SELECT state FROM spec_replans').get() as any).state).toBe('accepted');
+  expect(f.sends).toHaveLength(2);expect(f.s.get(f.job).plan).toBeNull();
+ }finally{f.s.close();}
+});
+test('an earlier unmarked replan is retired before the newer revision can proceed',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  f.e.transcript.entries.at(-1).text='Earlier revision reply without marker';
+  const old=await f.recovery.preview(f.job,config);expect(old.action).toBe('reconcile_unmarked_replan');
+  f.edit('v3');
+  await expect(f.recovery.reconcile(f.job,config,old.confirmation)).rejects.toThrow('Unmarked-plan evidence changed');
+  const prior=await f.recovery.preview(f.job,config);expect(prior.action).toBe('reconcile_unmarked_replan');expect(prior.revision).toBe(old.revision);
+  expect(await f.recovery.reconcile(f.job,config,prior.confirmation)).toMatchObject({action:'replan_unmarked_reconciled',state:'failed'});
+  expect(f.sends).toHaveLength(2);
+  // The newer revision is still awaiting a fresh planning turn, not auto-resumed.
+  expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
+  expect(f.sends).toHaveLength(3);
+  expect((f.s.db.query('SELECT state FROM spec_replans WHERE revision=?').get(old.revision) as any).state).toBe('failed');
+  f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
+ }finally{f.s.close();}
+});
 test('capture refuses a plan when approval policy or scope changed after the reservation',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
