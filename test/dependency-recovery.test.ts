@@ -112,6 +112,30 @@ for(const proof of [false,true])for(const entry of ['tick','notices','retract'])
   expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
  }finally{f.s.close();}
 });
+for(const proof of [false,true])for(const entry of ['tick','notices'])test(`a later dependency blocker reopens a settled ${proof?'proof-bearing':'proof-less'} wait through ${entry}`,async()=>{
+ const f=await fixture();try{
+  f.setMerged(proof?2:1);
+  if(proof)f.r.io.fetch=async()=>{throw Error('Fetch unavailable');};
+  expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  f.c.blockerSync={enabled:true};let originalBinding:string|undefined;
+  await f.r.notices(f.c,{leave:async(_job:any,_outcome:any,_config:any,options:any)=>{originalBinding=options.binding;}} as any);
+  f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+  expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+  const settled=f.r.rows()[0];
+  f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency' WHERE job=?").run(f.job);
+  if(entry==='tick')expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  f.c.blockerSync={enabled:true};const notices:any[]=[];
+  await f.r.notices(f.c,{leave:async(...args:any[])=>{notices.push(args);}} as any);
+  expect(notices).toHaveLength(1);expect(notices[0][1].outcome).toBe('waiting_for_dependencies');
+  expect(notices[0][3].applyLabel).toBe(true);
+  expect(notices[0][3].binding).not.toBe(originalBinding);
+  expect(JSON.parse(f.r.rows()[0].evidence).waitInstance).toBeString();
+  const history=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='dependency_wait_reopened'").all(f.job) as any[];
+  expect(history).toHaveLength(1);expect(JSON.parse(history[0].detail).settled).toEqual(settled);
+  expect(f.r.rows()[0].state).toBe('waiting_for_dependencies');
+  expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
 test('resumed dependency notices still publish and retract their owned blocker label',async()=>{
  const f=await fixture();try{
   f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');

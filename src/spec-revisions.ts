@@ -58,10 +58,21 @@ export function settleDependencyWait(s:Store,job:string){
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get())return;
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return;
  const row=s.db.query('SELECT * FROM dependency_waits WHERE job=?').get(job) as any;
- if(!row||['resumed','settled'].includes(row.state)||row.plan!==s.get(job).plan_hash)return;
+ if(!row||row.state==='resumed'||row.plan!==s.get(job).plan_hash)return;
  const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
- if(!currentOutcome(s,job,o)||o.outcome==='blocked_dependency')return;
+ if(!currentOutcome(s,job,o))return;
  const evidence=JSON.parse(row.evidence),client=evidence.clientId;
+ if(row.state==='settled'){
+  if(o.outcome!=='blocked_dependency')return;
+  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
+  if(r&&(evidence.proof?.auth?evidence.proof.auth.revision!==r.id||evidence.proof.auth.delivery!==d?.client_id:!!client))return;
+  s.db.transaction(()=>{
+   s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));
+   s.db.query("UPDATE dependency_waits SET state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement; re-evaluate evidence without replay',evidence=? WHERE job=?").run(JSON.stringify({...evidence,waitInstance:randomUUID()}),job);
+  }).immediate();
+  return 'reopened';
+ }
+ if(o.outcome==='blocked_dependency')return;
  if(client&&s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()){
   const cont=s.db.query('SELECT * FROM continuations WHERE client_id=? AND job=? AND plan_hash=?').get(client,job,row.plan) as any;
   const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
