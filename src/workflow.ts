@@ -140,7 +140,22 @@ export class Workflow{
    if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
    const revision=latestRevision(this.s,job);
    if(j.state==='awaiting_plan'&&revision&&(revision.state==='pending'||dispatch.spec_hash!==digest(j.spec)||this.s.db.query('SELECT 1 FROM spec_replans WHERE revision=?').get(revision.id))){
-    if(!r.session_id||!dispatch.session_id)return this.blockPlan(job,'Specification changed; reconcile previous planning session');
+     if(!r.session_id||!dispatch.session_id){
+      const matches=await this.t.findPlans(r.project,r.branch);
+      if(matches.length!==1)return this.blockPlan(job,matches.length?'Ambiguous matching sessions':'No authoritative session receipt; manual recovery required');
+      const session=matches[0].id,e=await this.t.evidence(session);
+      if(!session||e.session?.id!==session||e.session.projectId!==r.project||e.session.branch!==r.branch||e.session.isTerminated!==false||r.session_id&&r.session_id!==session||dispatch.session_id&&dispatch.session_id!==session)return this.blockPlan(job,'Planning session identity changed or terminated');
+      const attached=this.s.db.transaction(()=>{
+       // Discovery awaits provider evidence; do not replace an owner or dispatch
+       // established by another poll while that evidence was being collected.
+       if(JSON.stringify(this.planning(job))!==JSON.stringify(dispatch)||JSON.stringify(p.get(job))!==JSON.stringify(r)||this.s.get(job).state!=='awaiting_plan'||latestRevision(this.s,job)?.id!==revision.id)return false;
+       this.s.db.query("UPDATE planning_dispatch SET session_id=?,state='planning',reason=NULL WHERE job=?").run(session,job);
+       this.s.db.query('UPDATE planning_runs SET session_id=? WHERE job=?').run(session,job);
+       this.s.event(job,'revision_planning_owner_recovered',session);
+       return true;
+      }).immediate();
+      if(!attached)return {state:'needs_reconciliation',reason:'Planning reservation changed during owner discovery'};
+     }
     return new SpecRecovery(this.s,this).capture(job,c);
    }
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');

@@ -78,6 +78,31 @@ test('default SpecRecovery submission binding refuses a held lock before reserva
   expect(JSON.parse(child.stdout.toString())).toEqual({blocked:true,sends:0,reservations:0});
  }finally{rmSync(home,{recursive:true,force:true});}
 });
+for(const discovery of ['one','zero','ambiguous','wrong-project','wrong-branch','terminated'])test(`pending revision owner discovery: ${discovery}`,async()=>{
+ const f=await fixture();try{
+  f.s.db.query("UPDATE planning_dispatch SET session_id=NULL,state='dispatch_uncertain' WHERE job=?").run(f.job);
+  f.s.db.query('UPDATE planning_runs SET session_id=NULL WHERE job=?').run(f.job);
+  f.edit('v2');expect(latestRevision(f.s,f.job).state).toBe('pending');
+  let finds=0;const reservedBranch=new Planning(f.s).get(f.job).branch;
+  f.w.t.findPlans=async(project,branch)=>{finds++;expect(project).toBe('project');expect(branch).toBe(reservedBranch);return discovery==='zero'?[]:discovery==='ambiguous'?[{id:'owner'},{id:'other'}]:[{id:'owner'}];};
+  if(discovery==='wrong-project')f.e.session.projectId='other';
+  if(discovery==='wrong-branch')f.e.session.branch='other';
+  if(discovery==='terminated')f.e.session.isTerminated=true;
+  const result=await f.w.reconcilePlanning(f.job,config);
+  expect(finds).toBe(1);expect(f.sends).toHaveLength(1);
+  expect(f.s.get(f.job).plan).toBeNull();expect(f.s.get(f.job).approved_hash).toBeNull();
+  if(discovery==='one'){
+   expect(result.state).toBe('requirements_changed');
+   expect(f.w.planning(f.job).session_id).toBe('owner');
+   expect(new Planning(f.s).get(f.job).session_id).toBe('owner');
+   expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
+  }else{
+   expect(result.state).toBe('needs_reconciliation');
+   expect(f.w.planning(f.job).session_id).toBeNull();
+   expect(new Planning(f.s).get(f.job).session_id).toBeNull();
+  }
+ }finally{f.s.close();}
+});
 test('spec summary never exposes arbitrary ticket text; exact byte edits fail closed',()=>{
  expect(revisionSummary('{"description":"secret old"}','{"description":"secret new"}')).toBe('description changed (10 → 10 characters; content redacted)');
  expect(revisionSummary('secret','other secret')).not.toContain('other secret');

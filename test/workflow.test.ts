@@ -321,8 +321,11 @@ test('manual proposal after an uncertain or reconciliation-blocked spawn keeps i
   try{
    const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
    expect((await w.startPlanning(first,config)).state).toBe('dispatch_uncertain');
-   if(blocked){
-    s.enqueue('p','first','changed specification');await w.tick(config);
+    if(blocked){
+     // Keep this case genuinely unresolved; an exact-one verified owner is
+     // now recoverable even after the specification changes.
+     f.findPlans=async()=>[];
+     s.enqueue('p','first','changed specification');await w.tick(config);
     expect(w.planning(first).state).toBe('needs_reconciliation');
    }
    expect(f.starts.length).toBe(1);
