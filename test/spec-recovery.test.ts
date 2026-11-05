@@ -31,6 +31,53 @@ async function fixture(){
  const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
+test('a late send acknowledgement cannot downgrade a captured revised plan',async()=>{
+ const f=await fixture();let release!:()=>void;
+ try{
+  f.edit('v2');
+  const send=f.w.t.sendImplementation.bind(f.w.t),gate=new Promise<void>(resolve=>release=resolve);
+  let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
+  f.w.t.sendImplementation=async(...args:any[])=>{await (send as any)(...args);entered();await gate;};
+  const preview=await f.recovery.preview(f.job,config);
+  const pending=f.recovery.reconcile(f.job,config,preview.confirmation);
+  await started;f.complete();
+  expect(await f.recovery.capture(f.job,config)).toEqual({state:'awaiting_approval'});
+  const captured=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+  expect(captured.state).toBe('captured');
+  release();await pending;
+  expect(f.s.db.query('SELECT * FROM spec_replans').get()).toEqual(captured);
+  expect(f.s.get(f.job).state).toBe('awaiting_approval');
+  expect(latestRevision(f.s,f.job).state).toBe('awaiting_approval');
+  expect(JSON.parse(captured.proof).capturedPlanHash).toBe(f.s.get(f.job).plan_hash);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  expect(f.s.get(f.job).state).toBe('approved');
+ }finally{release?.();f.s.close();}
+});
+test('default SpecRecovery submission binding refuses a held lock before reservation or send',()=>{
+ const home=mkdtempSync(join(tmpdir(),'adlc-default-reconcile-'));
+ try{
+  const state=join(home,'Library','Application Support','ADLC Bridge');mkdirSync(state,{recursive:true});
+  mkdirSync(join(state,'turn-submission.lock'));
+  const script=`
+   import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+   import {Workflow} from ${JSON.stringify(join(import.meta.dir,'../src/workflow.ts'))};
+   import {SpecRecovery} from ${JSON.stringify(join(import.meta.dir,'../src/spec-recovery.ts'))};
+   import {TurnSubmissionBlocked} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};
+   const s=new Store(':memory:');let sends=0;
+   const w=new Workflow(s,{sendImplementation:async()=>{sends++;}});
+   const job=s.enqueue('p','issue','Original');
+   const recovery=new SpecRecovery(s,w);
+   let blocked=false;
+   try{await recovery.reconcile(job,${JSON.stringify(config)},'confirmation');}
+   catch(error){if(!(error instanceof TurnSubmissionBlocked))throw error;blocked=true;}
+   console.log(JSON.stringify({blocked,sends,reservations:s.db.query('SELECT * FROM spec_replans').all().length}));
+   s.close();
+  `;
+  const child=Bun.spawnSync([process.execPath,'--eval',script],{env:{...process.env,HOME:home}});
+  expect(child.stderr.toString()).toBe('');expect(child.exitCode).toBe(0);
+  expect(JSON.parse(child.stdout.toString())).toEqual({blocked:true,sends:0,reservations:0});
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
 test('spec summary never exposes arbitrary ticket text; exact byte edits fail closed',()=>{
  expect(revisionSummary('{"description":"secret old"}','{"description":"secret new"}')).toBe('description changed (10 → 10 characters; content redacted)');
  expect(revisionSummary('secret','other secret')).not.toContain('other secret');
