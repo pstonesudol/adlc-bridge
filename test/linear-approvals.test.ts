@@ -7,8 +7,11 @@ import {LinearApprovals,parsePlanApproval} from '../src/linear-approvals';
 import {recordReadiness} from '../src/readiness';
 import {SpecRecovery} from '../src/spec-recovery';
 import {latestRevision} from '../src/spec-revisions';
-function fixture(){
- const s=new Store(':memory:'),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
+import {mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+function fixture(path=':memory:'){
+ const s=new Store(path),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
  const issue:any={id:'issue',identifier:'DEV-12',title:'Task',description:'Requirement',team:{id:'t'},project:{id:'p'},state:{id:'todo'},labels:{nodes:[{id:'ready'},{id:'gate',name:'plan-approval-required'}],pageInfo:{hasNextPage:false}}};
  const spec=JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description});
@@ -33,14 +36,22 @@ test('publishes one plan; exact human reply approves once, implementation starts
  }finally{f.s.close();}
 });
 test('unrevised plans preserve the legacy approval notice binding and pending token',async()=>{
- const f=fixture();try{
-  const j=f.s.get(f.id),route=f.w.router.get(f.id,'implementation');
-  const legacy=digest(JSON.stringify([j.spec,j.plan_hash,route?.route??null,f.c.planApproval,f.c.approval??{mode:'manual'}]));
-  expect(f.surface.binding(f.id,f.c)).toBe(legacy);
-  await f.surface.sync(f.c);f.approve();
-  expect((await new LinearApprovals(f.s,f.w,f.surface.api).sync(f.c))[0].state).toBe('approved');
-  expect(f.counts().creates).toBe(1);
- }finally{f.s.close();}
+ const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-approval-')),path=join(dir,'state.db'),f=fixture(path);let reopened:Store|undefined,closed=false;
+ try{
+   const j=f.s.get(f.id),route=f.w.router.get(f.id,'implementation');
+   const legacy=digest(JSON.stringify([j.spec,j.plan_hash,route?.route??null,f.c.planApproval,f.c.approval??{mode:'manual'}]));
+   const token='33333333-3333-3333-3333-333333333333',comment='22222222-2222-2222-2222-222222222222',created=new Date(Date.now()-10000).toISOString(),body=`Legacy plan notice\n\n\`\`\`text\nApprove ADLC plan ${token}\n\`\`\``;
+   // Seed the pre-upgrade digest and persisted notice independently of binding().
+   f.s.db.query("INSERT INTO plan_approval_notices(job,binding,plan_hash,comment_id,token,body,state,created) VALUES (?,?,?,?,?,?,'posted',?)").run(f.id,legacy,j.plan_hash,comment,token,body,created);
+   f.comments.push({id:comment,body,createdAt:created,editedAt:null,user:{id:f.c.planApproval.approverIds[0],app:false},botActor:null});
+   f.s.close();closed=true;reopened=new Store(path);
+   f.comments.push({id:'original-token-reply',body:`Approve ADLC plan ${token}`,createdAt:new Date().toISOString(),editedAt:null,user:{id:f.c.planApproval.approverIds[0],app:false},botActor:null});
+   const surface=new LinearApprovals(reopened,new Workflow(reopened,f.w.t),f.surface.api);
+   expect(surface.binding(f.id,f.c)).toBe(legacy);
+   expect((await surface.sync(f.c))[0].state).toBe('approved');
+   expect(f.counts().creates).toBe(0);expect(f.comments).toHaveLength(2);
+   expect(reopened.db.query('SELECT token,state,approval_comment FROM plan_approval_notices WHERE job=?').get(f.id)).toEqual({token,state:'approved',approval_comment:'original-token-reply'});
+ }finally{reopened?.close();if(!closed)f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
 test('unauthorized, bot-authored, edited, and quoted approvals cannot release gate',async()=>{
  const f=fixture();try{await f.surface.sync(f.c);f.approve('outsider');f.approve(undefined,{botActor:{id:'bot'}});f.approve(undefined,{editedAt:new Date().toISOString()});f.approve(undefined,{user:{id:f.c.planApproval.approverIds[0],app:true}});f.approve(undefined,{body:'> Approve ADLC plan quoted'});

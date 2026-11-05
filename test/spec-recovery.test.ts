@@ -211,7 +211,7 @@ test('throwing replan send with no receipt needs confirmed fresh absence and nev
   f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
-for(const invalid of ['incomplete','stale','pre-send','future','busy','active-turn','owner','branch','accepted-entry'])test(`uncertain replan absence cannot retire ${invalid} evidence`,async()=>{
+for(const invalid of ['incomplete','stale','pre-send','future','busy','active-turn','owner','branch','terminated','project','non-idle','accepted-entry'])test(`uncertain replan absence cannot retire ${invalid} evidence`,async()=>{
  const f=await fixture();try{
   f.edit('v2');f.w.t.sendImplementation=async()=>{throw Error('No receipt');};
   await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
@@ -225,6 +225,9 @@ for(const invalid of ['incomplete','stale','pre-send','future','busy','active-tu
   if(invalid==='active-turn')f.e.transcript.turns.push({id:'competing',state:'running'});
   if(invalid==='owner')f.e.session.id='different-owner';
   if(invalid==='branch')f.e.session.branch='different-branch';
+  if(invalid==='terminated')f.e.session.isTerminated=true;
+  if(invalid==='project')f.e.session.projectId='different-project';
+  if(invalid==='non-idle')f.e.session.activity={state:'running'};
   if(invalid==='accepted-entry'){
    const d=f.s.db.query('SELECT * FROM spec_replans').get() as any;
    f.e.transcript.entries.push({clientMessageId:d.client_id});
@@ -233,6 +236,24 @@ for(const invalid of ['incomplete','stale','pre-send','future','busy','active-tu
   await expect(f.recovery.reconcile(f.job,config,absent.confirmation)).rejects.toThrow('Preview changed or delivery already reserved');
   expect((f.s.db.query('SELECT state FROM spec_replans').get() as any).state).toBe('delivery_uncertain');
   expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+test('an earlier uncertain absent replan is explicitly retired before the newer revision proceeds',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');const send=f.w.t.sendImplementation;f.w.t.sendImplementation=async()=>{throw Error('No receipt');};
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
+  f.e.receiptObservation.observed=Date.now();
+  const old=await f.recovery.preview(f.job,config);expect(old.action).toBe('reconcile_absent_replan');
+  f.edit('v3');
+  await expect(f.recovery.reconcile(f.job,config,old.confirmation)).rejects.toThrow('Absence evidence changed');
+  const prior=await f.recovery.preview(f.job,config);expect(prior.action).toBe('reconcile_absent_replan');expect(prior.revision).toBe(old.revision);
+  expect(await f.recovery.reconcile(f.job,config,prior.confirmation)).toMatchObject({action:'replan_absence_reconciled',state:'failed'});
+  expect(f.sends).toHaveLength(1);
+  const fresh=await f.recovery.preview(f.job,config);expect(fresh.action).toBe('request_replanning');expect(fresh.revision).not.toBe(old.revision);
+  f.w.t.sendImplementation=send;await f.recovery.reconcile(f.job,config,fresh.confirmation);
+  expect(f.sends).toHaveLength(2);
+  expect((f.s.db.query('SELECT state FROM spec_replans WHERE revision=?').get(old.revision) as any).state).toBe('failed');
+  f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
 test('unsupported plan scope stays blocked and retains the previous grant',async()=>{

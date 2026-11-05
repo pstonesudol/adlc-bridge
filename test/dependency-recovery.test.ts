@@ -327,6 +327,25 @@ test('waits without an instance retain and reuse their legacy notice binding',as
   expect(surface.counts()).toEqual({creates:1,adds:1});
  }finally{f.s.close();}
 });
+test('a resumed wait reuses its seeded legacy notice using the generated reason, not row.reason',async()=>{
+ const f=await fixture();try{
+  f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
+  const row=f.r.rows()[0],p=JSON.parse(row.evidence),definition=p.proof?.definition??p.definition;
+  expect(p.waitInstance).toBeUndefined();expect(row.reason).toBe('continuation_delivery_accepted');
+  const generated=`Verified dependency evidence ${p.id}; continuation accepted in the existing session. No new authorization or runtime activation.`;
+  const legacy=digest(JSON.stringify([row.job,row.plan,row.state,generated,p.id??definition]));
+  expect(legacy).not.toBe(digest(JSON.stringify([row.job,row.plan,row.state,row.reason,p.id??definition])));
+  const dependencies=JSON.stringify(definition.prerequisites.map((d:any)=>({ref:d.ref,reason:`${d.repo}#${d.pr}; ${d.kind}; capabilities ${d.capabilities.map((x:any)=>x.path).join(', ')}`})));
+  const body=`## ADLC: resumed\n\n${generated}\n\nPrerequisites: ${dependencies}\n\nPlan: ${row.plan}\nNext action: Wait for the existing worker; do not resend. No new authorization or runtime activation.`;
+  const surface=linearSurface(f),comment='legacy-resumed-comment',created=new Date(Date.now()-10000).toISOString();
+  f.s.db.query("INSERT INTO blocker_notices(job,binding,comment_id,body,state,created) VALUES (?,?,?,?,'posted',?)").run(f.job,legacy,comment,body,created);
+  surface.comments.push({id:comment,body,createdAt:created});
+  const restarted=new DependencyRecovery(f.s,f.w,f.r.io,async fn=>fn());
+  await restarted.sync(f.c);await restarted.notices(f.c,surface.blockers);await restarted.notices(f.c,surface.blockers);
+  expect(surface.counts()).toEqual({creates:0,adds:0});expect(surface.comments).toHaveLength(1);
+  expect(f.s.db.query('SELECT binding FROM blocker_notices WHERE job=?').all(f.job)).toEqual([{binding:legacy}]);
+ }finally{f.s.close();}
+});
 test('concurrent polls reserve only one update and continuation',async()=>{
  const f=await fixture();try{f.setMerged(2);await Promise.all([f.r.tick(f.job,f.c),f.r.tick(f.job,f.c)]);expect(f.updates()).toBe(1);expect(f.sends.length).toBe(2);}finally{f.s.close();}
 });
