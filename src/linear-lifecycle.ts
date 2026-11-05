@@ -126,7 +126,7 @@ export class LinearLifecycle{
  }
   async revisionNotices(c:SyncConfig){
    const limit=5,cursor=this.s.db.query('SELECT last_rowid FROM spec_notice_cursor WHERE project=?').get(c.linear.projectId) as any,after=cursor?.last_rowid??0;
-   const page=(from:number)=>this.s.db.query(`SELECT r.*,r.rowid AS rid FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? AND r.rowid>? AND NOT EXISTS(SELECT 1 FROM spec_notices n WHERE n.revision=r.id AND n.state='posted') ORDER BY r.rowid LIMIT ?`).all(c.linear.projectId,from,limit) as any[];
+   const page=(from:number)=>this.s.db.query(`SELECT r.*,r.rowid AS rid FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? AND r.rowid>? AND r.state!='preplanning' AND NOT EXISTS(SELECT 1 FROM spec_notices n WHERE n.revision=r.id AND n.state='posted') ORDER BY r.rowid LIMIT ?`).all(c.linear.projectId,from,limit) as any[];
    let rows=page(after);
    // A bounded batch prevents one failing revision from starving every later
    // stage of the poll. The durable cursor advances past each attempted

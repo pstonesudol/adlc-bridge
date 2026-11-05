@@ -41,7 +41,7 @@ export class SpecRecovery{
   // Retain and resolve ALL prior deliveries, including a superseded revision.
   const requests:any[]=[];
   const d=this.w.implementation(job);if(d&&d.state!=='approved_pending')requests.push({client_id:d.client_id,session:d.session_id});
-  for(const table of ['continuations','spec_replans'])if(this.s.db.query('SELECT name FROM sqlite_master WHERE name=?').get(table))requests.push(...(this.s.db.query(`SELECT * FROM ${table} WHERE job=?`).all(job) as any[]).filter(x=>x.revision!==r.id&&x.state!=='failed'));
+  for(const table of ['continuations','spec_replans'])if(this.s.db.query('SELECT name FROM sqlite_master WHERE name=?').get(table))requests.push(...(this.s.db.query(`SELECT * FROM ${table} WHERE job=?`).all(job) as any[]).filter(x=>x.revision!==r.id&&!(table==='continuations'?['failed','recovered']:['failed']).includes(x.state)));
   for(const request of requests){
    const entry=e.transcript.entries?.find((x:any)=>x.clientMessageId===request.client_id);
    if(!entry||!turns.some((t:any)=>t.id===entry.turnId&&t.state==='completed'))throw Error('Prior delivery lacks a completed receipt; reconcile uncertainty/provider failure before replanning');

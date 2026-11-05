@@ -148,6 +148,18 @@ test('revision notices deduplicate lost replies without replay and redact conten
   expect(comments[0].body).toContain('spec-reconcile');expect(comments[0].body).toContain('owner');
  }finally{f.s.close();}
 });
+test('a recovered continuation remains settled when previewing a later requirement revision',async()=>{
+ const f=await fixture();try{
+  f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(f.job,f.hash,digest(f.s.get(f.job).spec),'settled','recovered-continuation','owner','recovered');
+  f.e.transcript.entries.push({clientMessageId:'recovered-continuation',turnId:'recovered-turn',sequence:10});
+  f.e.transcript.turns.push({id:'recovered-turn',state:'failed'});
+  f.edit('Later requirements');
+  expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
+  // An uncertain continuation still needs its completed delivery receipt.
+  f.s.db.query("UPDATE continuations SET state='delivery_uncertain' WHERE client_id='recovered-continuation'").run();
+  await expect(f.recovery.preview(f.job,config)).rejects.toThrow('Prior delivery lacks a completed receipt');
+ }finally{f.s.close();}
+});
 test('missing uncertain delivery receipt cannot be cleared by an existing PR or idle worker',async()=>{
  const f=await fixture();try{
   f.edit('v2');f.e.transcript.entries=[];f.e.session.prs=[{number:7,url:'https://github.com/owner/repo/pull/7',state:'open'}];
@@ -352,6 +364,8 @@ test('revision notices are bounded per poll and advance past failures',async()=>
  try{
   const spec=(n:number)=>JSON.stringify({identifier:`DEV-${n}`,title:'T',description:'one'});
   for(let i=0;i<6;i++){s.enqueue('p',`issue-${i}`,spec(i));s.enqueue('p',`issue-${i}`,spec(i).replace('one','two'));}
+  // This batch models active revisions; ordinary intake edits are not notices.
+  s.db.query("UPDATE spec_revisions SET state='pending'").run();
   const linear=new LinearLifecycle(s,api);
   const first=await linear.revisionNotices(c);
   expect(first.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(4);
@@ -367,6 +381,14 @@ test('revision notices are bounded per poll and advance past failures',async()=>
   expect(third.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(1);
   expect(reads).toBe(7);
   expect(s.db.query('SELECT count(*) AS n FROM spec_notices WHERE state=?').get('posted')).toMatchObject({n:6});
+ }finally{s.close();}
+});
+test('preplanning edits do not publish authorization-invalidated notices',async()=>{
+ const s=new Store(':memory:');try{
+  s.enqueue('p','early','before');s.enqueue('p','early','after');
+  let calls=0;const api:any=async()=>{calls++;throw Error('Preplanning must not access Linear');};
+  expect(await new LinearLifecycle(s,api).revisionNotices({linear:{projectId:'p',teamId:'t'}} as any)).toEqual([]);
+  expect(calls).toBe(0);expect(s.db.query('SELECT * FROM spec_notices').all()).toHaveLength(0);
  }finally{s.close();}
 });
 test('a failed replan from an earlier revision is retired before the newer revision can proceed',async()=>{

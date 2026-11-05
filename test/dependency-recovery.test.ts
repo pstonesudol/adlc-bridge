@@ -65,6 +65,24 @@ for(const restored of [false,true])test(`superseded dependency receipt cannot dr
   if(restored)expect((await f.r.preview(f.job,f.c)).proof.auth.revision).toBe(revision.id);
  }finally{f.s.close();}
 });
+test('revision-bound dependency wait retries after a provider failure before proof exists',async()=>{
+ const f=await fixture();try{
+  const j=f.s.get(f.job);
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('current-revision',f.job,digest(j.spec),digest(j.spec),'Revised instance','authorized');
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('current-revision',f.w.implementation(f.job).client_id,f.job);
+  f.setMerged(1);
+  expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  const row=f.r.rows()[0];expect(JSON.parse(row.evidence).proof).toBeUndefined();expect(f.r.currentWait(row)).toBe(true);
+  expect(f.fetches()).toBe(0);expect(f.sends).toHaveLength(1);
+  // An unproven wait can never excuse a prior uncertain send or stale blocker.
+  expect(f.r.currentWait({...row,evidence:JSON.stringify({clientId:'uncertain'})})).toBe(false);
+  f.s.db.query("UPDATE worker_outcomes SET dispatch_id='old-dispatch' WHERE job=?").run(f.job);
+  expect(f.r.currentWait(row)).toBe(false);
+  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run(f.w.implementation(f.job).client_id,f.job);
+  f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
+  expect(f.fetches()).toBe(1);expect(f.updates()).toBe(1);expect(f.sends).toHaveLength(2);
+ }finally{f.s.close();}
+});
 test('DEV-19: first merge waits; second verifies/updates and sends exactly once to original session',async()=>{
  const f=await fixture();try{
   f.setMerged(1);expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
