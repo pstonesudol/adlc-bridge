@@ -169,6 +169,8 @@ for(const historical of [false,true])test(`failed continuation recovery respects
     expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
     expect((await w.executionStatus(id,e,config)).state).not.toBe('pr_handoff');
     expect(s.db.query('SELECT * FROM revision_handoffs WHERE job=? AND revision=?').all(id,latestRevision(s,id).id)).toHaveLength(0);
+    // The current continuation stays failed across stale status checks.
+    expect((s.db.query('SELECT state FROM continuations WHERE job=? AND failed_at IS NOT NULL ORDER BY id DESC LIMIT 1').get(id) as any).state).toBe('failed');
    };
    bind('earlier-revision',w.implementation(id).client_id);
    await stale();

@@ -622,13 +622,16 @@ test('a revised handoff must belong to the registered review target PR',async()=
   expect(revisedHandoff(f.s,f.job)).toBe(false);
   // The registered target still cannot be released by the other PR.
   expect(await new ReviewLoop(f.s).tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).toMatchObject({state:'waiting_for_revised_handoff'});
-  // An explicit operator reconciliation moves both records together.
+  // The recorded handoff is authoritative: aligning the target to it succeeds,
+  // but substituting a different PR is refused.
   const loop=new ReviewLoop(f.s);
+  expect(()=>loop.rebind(f.job,'owner/repo',7)).toThrow('Requested PR differs from the recorded revision handoff');
+  expect(loop.get(f.job).pr).toBe(7);expect(revisedHandoff(f.s,f.job)).toBe(false);
   expect(loop.rebind(f.job,'owner/repo',9)).toMatchObject({state:'rebound',pr:9});
   expect(loop.get(f.job).pr).toBe(9);
   expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
   expect(revisedHandoff(f.s,f.job)).toBe(true);
-  expect((f.s.db.query("SELECT detail FROM events WHERE kind='review_target_rebound'").get() as any).detail).toContain('"handoffFrom":9');
+  expect((f.s.db.query("SELECT detail FROM events WHERE kind='review_target_rebound'").get() as any).detail).toContain('"handoff":9');
   // Reconciliation without a recorded handoff fails closed and changes nothing.
   f.s.db.query('DELETE FROM revision_handoffs WHERE job=?').run(f.job);
   expect(()=>loop.rebind(f.job,'owner/repo',11)).toThrow('Current revision handoff required before target reconciliation');

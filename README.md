@@ -1838,9 +1838,10 @@ revisions require approval of the exact captured revised-plan hash, even before
 the first implementation. A manually submitted plan cannot bypass that capture.
 Direct `plan` and `capture-plan` refuse while an active revision is pending; use
 `spec-reconcile` instead. A revised handoff must be the PR the review target
-registered. If the recorded handoff used another open PR, `adlc
-rebind-review-target JOB REPO PR` reconciles both records in one transaction or
-leaves progression blocked.
+registered. The recorded revision handoff is authoritative: if the target points
+at another PR, `adlc rebind-review-target JOB REPO PR` (with the handoff's PR)
+aligns the target atomically or leaves progression blocked. It cannot substitute
+a different PR for the recorded handoff.
 Linear revision notices require enabled status synchronization and are
 published in bounded batches with durable forward and older-retry cursors.
 `status`, `review-status` and `reconcile-preview` retain independent

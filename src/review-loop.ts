@@ -109,11 +109,14 @@ export class ReviewLoop{
     const j=this.s.get(job),plan=j.plan_hash,revision=latestRevision(this.s,job)?.id??'';
     const handoff=this.s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoffs'").get()?this.s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any:null;
     if(!handoff)throw Error('Current revision handoff required before target reconciliation');
-    if(t.pr===pr&&handoff.pr===pr)return {state:'unchanged',job,repo,pr};
+    // The recorded handoff is authoritative; reconciliation can align the
+    // review target to it but never substitute a different PR for that evidence.
+    if(pr!==handoff.pr)throw Error('Requested PR differs from the recorded revision handoff; reconcile the handoff first');
+    if(t.pr===pr)return {state:'unchanged',job,repo,pr};
     const target=this.s.db.query('UPDATE review_targets SET pr=?,reason=NULL WHERE job=? AND pr=?').run(pr,job,t.pr);
-    const evidence=this.s.db.query('UPDATE revision_handoffs SET pr=? WHERE job=? AND plan_hash=? AND revision=? AND pr=?').run(pr,job,plan,revision,handoff.pr);
-    if(!target.changes||!evidence.changes)throw Error('Review target or handoff changed; both must reconcile together');
-    this.s.event(job,'review_target_rebound',JSON.stringify({repo,from:t.pr,to:pr,handoffFrom:handoff.pr}));
+    const evidence=this.s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=? AND pr=?').get(job,plan,revision,handoff.pr) as any;
+    if(!target.changes||!evidence)throw Error('Review target or handoff changed; both must reconcile together');
+    this.s.event(job,'review_target_rebound',JSON.stringify({repo,from:t.pr,to:pr,handoff:handoff.pr}));
     return {state:'rebound',job,repo,pr};
    }).immediate();
   }
