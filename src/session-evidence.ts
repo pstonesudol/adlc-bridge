@@ -29,7 +29,7 @@ export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs
 }
 // Capturing an agent plan never approves it. The caller selects a concrete entry;
 // human approval remains bound to the specification+plan hash in Store.approve.
-export function capturePlan(s:Store,job:string,r:any,sequence:number){
+export function capturePlan(s:Store,job:string,r:any,sequence:number,expectRevision?:string|null){
  const reservation=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
  const j=s.get(job);
  if(!reservation||reservation.spec_hash!==digest(j.spec)||reservation.project!==r.session?.projectId||reservation.branch!==r.session?.branch||reservation.session_id&&reservation.session_id!==r.session?.id)throw Error('Planning reservation does not match session');
@@ -38,7 +38,7 @@ export function capturePlan(s:Store,job:string,r:any,sequence:number){
  if(j.plan===entry.text&&j.plan_hash===digest(JSON.stringify([j.spec,entry.text])))return {hash:j.plan_hash,approved:j.state==='approved',session:r.session.id,sequence,readiness:recordReadiness(s,job,entry.text,j.plan_hash,digest(j.spec))};
  if(j.state!=='awaiting_plan')throw Error('Existing plan requires explicit reconciliation before replacement');
  return s.db.transaction(()=>{
- const hash=s.propose(job,entry.text);
+ const hash=s.propose(job,entry.text,expectRevision);
  s.db.query("UPDATE planning_runs SET session_id=?,state='plan_captured' WHERE job=?").run(r.session.id,job);
  s.event(job,'plan_captured_from_orchestrator',JSON.stringify({session:r.session.id,sequence,hash}));
  const readiness=recordReadiness(s,job,entry.text,hash,digest(j.spec));

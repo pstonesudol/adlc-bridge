@@ -22,6 +22,7 @@ import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
+import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
@@ -71,10 +72,22 @@ export class ReviewLoop{
   CREATE TABLE IF NOT EXISTS metadata_baselines(job TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(job,attempt));
    CREATE TABLE IF NOT EXISTS metadata_waits(job TEXT NOT NULL,head TEXT NOT NULL,body TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(job,head,body));
    CREATE TABLE IF NOT EXISTS description_delivery_gates(job TEXT PRIMARY KEY,head TEXT NOT NULL,body TEXT NOT NULL,started INTEGER NOT NULL);
-  CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash));
+  CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
   CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS custom_description_obligations(job TEXT PRIMARY KEY REFERENCES jobs(id),baseline_body_hash TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);}
+  CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);
+  // Existing databases keep their PR receipts under an unknown-PR key; the
+  // request key now also scopes by PR so a rebound target cannot inherit them.
+  this.s.db.transaction(()=>{
+   const requestColumns=this.s.db.query('PRAGMA table_info(full_review_requests)').all() as any[];
+   if(requestColumns.some(c=>c.name==='pr'))return;
+   this.s.db.exec(`ALTER TABLE full_review_requests RENAME TO full_review_requests_legacy;
+    CREATE TABLE full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
+    INSERT OR IGNORE INTO full_review_requests(job,pr,head,body_hash,state,requested)
+     SELECT l.job,COALESCE((SELECT t.pr FROM review_targets t WHERE t.job=l.job),0),l.head,l.body_hash,l.state,l.requested FROM full_review_requests_legacy l;
+    DROP TABLE full_review_requests_legacy;`);
+  }).immediate();
+ }
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
   this.s.db.query('INSERT INTO metadata_check_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET checks=excluded.checks').run(project,JSON.stringify([...new Set(names)]));
@@ -98,9 +111,32 @@ export class ReviewLoop{
   })();
  }
   get(job:string):any{return this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job);}
+  /** Operator reconciliation for a revised handoff recorded on a different PR
+   * than the registered target. Both records move together or neither does. */
+  rebind(job:string,repo:string,pr:number){
+   const l=new Lifecycle(this.s);l.current(job);if(!l.run(job))throw Error('Existing approved run required');
+   if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||!Number.isSafeInteger(pr)||pr<1)throw Error('Invalid review target');
+   return this.s.db.transaction(()=>{
+    const t=this.get(job);if(!t||t.repo!==repo)throw Error('Existing review target for this repository required');
+    const j=this.s.get(job),plan=j.plan_hash,revision=latestRevision(this.s,job)?.id??'';
+    const handoff=this.s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoffs'").get()?this.s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any:null;
+    if(!handoff)throw Error('Current revision handoff required before target reconciliation');
+    // The recorded handoff is authoritative; reconciliation can align the
+    // review target to it but never substitute a different PR for that evidence.
+    if(pr!==handoff.pr)throw Error('Requested PR differs from the recorded revision handoff; reconcile the handoff first');
+    if(t.pr===pr)return {state:'unchanged',job,repo,pr};
+    // The new PR has no verified evidence yet: clear the old target state/head
+    // and require a fresh review cycle instead of reporting it ready.
+    const target=this.s.db.query("UPDATE review_targets SET pr=?,state='waiting_for_review',reason=NULL,head=NULL,last_signature=NULL,head_since=?,updated=CURRENT_TIMESTAMP WHERE job=? AND pr=?").run(pr,Date.now(),job,t.pr);
+    const evidence=this.s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=? AND pr=?').get(job,plan,revision,handoff.pr) as any;
+    if(!target.changes||!evidence)throw Error('Review target or handoff changed; both must reconcile together');
+    this.s.event(job,'review_target_rebound',JSON.stringify({repo,from:t.pr,to:pr,handoff:handoff.pr}));
+    return {state:'rebound',job,repo,pr};
+   }).immediate();
+  }
    private completed(job:string){const t=this.get(job);return t?.state==='completed'?{state:'completed',send:false,head:t.head,reason:t.reason}:undefined;}
-   private uncertainReview(job:string,head:string){
-    const request=this.s.db.query("SELECT state FROM full_review_requests WHERE job=? AND head=? AND state='delivery_uncertain' LIMIT 1").get(job,head) as any;
+   private uncertainReview(job:string,pr:number,head:string){
+    const request=this.s.db.query("SELECT state FROM full_review_requests WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain' LIMIT 1").get(job,pr,head) as any;
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'}:undefined;
    }
  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
@@ -111,40 +147,46 @@ export class ReviewLoop{
    const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
     const run=new Lifecycle(this.s).run(job),j=this.s.get(job);
     const receipt=new ReceiptReconciliation(this.s).inspect({job,plan:run.plan_hash,spec:digest(j.spec),session:run.session_id,client:handle,attempt:`remediation:${pending.attempt}`},session);
-    if(receipt.state!=='completed')return this.record(job,{state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:receipt.reason,delivery:receipt});
+     if(receipt.state!=='completed')return {state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:receipt.reason,delivery:receipt};
     if(activeOnly)return;
    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
    if(recovery){const detail=JSON.parse(recovery.detail);if(detail.message==='uncertain')this.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=? AND detail=?').run(JSON.stringify({...detail,message:'completed'}),recovery.id,recovery.detail);}
-   if(pending.head===head)return this.record(job,{state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
+    if(pending.head===head)return {state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'};
   }
-  record(job:string,result:any){
+  record(job:string,result:any,pr?:number){
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
   return this.s.db.transaction(()=>{
    const t=this.get(job);
    if(t.state==='completed')return {state:'completed',send:false,head:t.head,reason:t.reason};
-   this.s.db.query("UPDATE review_targets SET state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND state!='completed'").run(result.state,result.reason,signature,job);
+   // A target rebound during this evaluation keeps its own state; a stale PR
+   // decision is never written and never reported as progress.
+   const update=this.s.db.query("UPDATE review_targets SET state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND pr=? AND state!='completed'").run(result.state,result.reason,signature,job,pr??t.pr);
+   if(!update.changes)return false;
    if(t.last_signature!==signature)this.s.event(job,'review_state_changed',JSON.stringify(result));
    return result;
   }).immediate();
  }
-   async requestReview(job:string,head:string,bodyHash:string){
+   async requestReview(job:string,pr:number,head:string,bodyHash:string){
     const t=this.get(job);if(this.completed(job))return false;
-    const unresolved=this.uncertainReview(job,head);if(unresolved){this.record(job,unresolved);return false;}
+    const unresolved=this.uncertainReview(job,pr,head);if(unresolved){this.record(job,unresolved,pr);return false;}
    try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
     const reserved=this.s.db.transaction(()=>{
      if(this.completed(job))return false;
-     if(this.uncertainReview(job,head))return false;
-   const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?)').run(job,head,bodyHash,'delivery_uncertain',Date.now());
+     // The caller's PR may have been rebound while it awaited evidence; never
+     // request or reserve a review for a PR that is no longer registered.
+     const target=this.get(job);if(!target||target.pr!==pr)return false;
+     if(this.uncertainReview(job,pr,head))return false;
+   const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
-    this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason='Full review request delivery uncertain; reconcile before retry' WHERE job=? AND state!='completed'").run(Date.now(),job);
+    this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason='Full review request delivery uncertain; reconcile before retry' WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),job,pr);
    return true;
   }).immediate();
-   if(!reserved){const unresolved=this.uncertainReview(job,head);if(unresolved)this.record(job,unresolved);return false;}
+   if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
-   try{await this.postReview(t.repo,t.pr);}
-   catch(error){this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'});throw error;}
-  this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(job,head,bodyHash);
-  this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({head,bodyHash}));
+   try{await this.postReview(t.repo,pr);}
+   catch(error){this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'},pr);throw error;}
+  this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
+  this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({pr,head,bodyHash}));
   return true;
  }
   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
@@ -153,70 +195,85 @@ export class ReviewLoop{
   // not replace the check requirements for an already-running tick.
   if(policy!==undefined&&policy.project!==this.s.get(job).project)throw Error('Metadata policy configuration does not belong to the job project');
   const metadataChecks=[...metadataCheckNames(policy===undefined?this.metadataChecks(job):policy.checks)];
-  const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
+   const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
+   // Every write in this tick is scoped to the PR captured here; a rebound
+   // target must not receive this PR's decisions.
+   const record=(result:any)=>{
+    const stored=this.record(job,result,t.pr);
+    if(stored)return stored;
+    const current=this.get(job);
+    return current&&current.pr!==t.pr
+     ?{state:'blocked',send:false,head:result.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}
+     :{state:'completed',send:false,head:current?.head??result.head,reason:current?.reason??'Review target completed during collection'};
+   };
+   if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
+    // A durable handoff marker survives later remediation states, so failed or
+    // uncertain remediation after a revised handoff still reaches reconciliation.
+    return record({state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'});
+   }
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   const observation=config?.conflictRecovery?.enabled?new RecoveryObservation(this.s):null;
-  const wait=observation?.wait(job);if(wait)return this.record(job,wait);
+  const wait=observation?.wait(job);if(wait)return record(wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
    if(recovery){
-    if(recovery.job!==job||!config)return this.record(job,{state:'blocked',send:false,reason:'Worktree has a durable conflict reservation; inspect recovery-status with its original config'});
-    try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
-    catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
+    if(recovery.job!==job||!config)return record({state:'blocked',send:false,reason:'Worktree has a durable conflict reservation; inspect recovery-status with its original config'});
+    try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
+    catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
    }
   let session,snapshot;
   try{
    session=await this.io.sessionEvidence(run.session_id);
    snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);
-  }catch(e){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
+  }catch(e){observation?.failed(job);return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
    const local=await this.io.worktreeIdentity(this.s,job);
    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
-  }catch(e){return this.record(job,{state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
+  }catch(e){return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
-   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return activeDelivery;
+   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return record(activeDelivery);
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
     try{snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);}
-    catch(error){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
-    if(snapshot.behind>0&&snapshot.mergeable===null){observation?.failed(job);return this.record(job,{state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; bounded provider observation only, no remediation attempt'});}
+    catch(error){observation?.failed(job);return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
+    if(snapshot.behind>0&&snapshot.mergeable===null){observation?.failed(job);return record({state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; bounded provider observation only, no remediation attempt'});}
     if(snapshot.mergeable===false&&snapshot.behind>0){
      try{await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).observeAccepted(job,t.repo,t.pr,snapshot);}
-     catch(error){if(error instanceof BranchObservationFailure)observation?.failed(job);return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
+     catch(error){if(error instanceof BranchObservationFailure)observation?.failed(job);return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
      observation?.clear(job);
-     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return this.record(job,result);}
-     catch(error){return this.record(job,{state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
+     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
+     catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
    }
    try{branch=await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
-   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){observation?.failed(job);return this.record(job,{state:'blocked',send:false,reason:error.message});}throw error;}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){observation?.failed(job);return record({state:'blocked',send:false,reason:error.message});}throw error;}
    observation?.clear(job);
-   if(branch)return this.record(job,branch);
+   if(branch)return record(branch);
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
   try{e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);}
-  catch(error){return this.record(job,{state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
+  catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
    const reviewed=this.completed(job);if(reviewed)return reviewed;
    // Completed jobs no longer satisfy execution approval; handle that terminal
    // observation here rather than relaxing Lifecycle.current's authorization.
    try{if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');}
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
-   const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
+   const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
    const outcome=this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get()?this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any:null;
    // Durable continuation state is authoritative across workflow and review
    // polling. A stale failed outcome must not block a recovered continuation,
    // and any failure source must be blocked while one remains unrecovered.
    const failedContinuation=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT id FROM continuations WHERE job=? AND plan_hash=? AND state='failed' LIMIT 1").get(job,run.plan_hash) as any:null;
-   if(outcome?.plan_hash===run.plan_hash&&outcome.outcome==='failed'&&failedContinuation)return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous guarded continuation failed without reviewed delivery recovery; no handoff or remediation'});
+   if(outcome?.plan_hash===run.plan_hash&&outcome.outcome==='failed'&&failedContinuation)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Previous guarded continuation failed without reviewed delivery recovery; no handoff or remediation'});
    if(outcome?.plan_hash===run.plan_hash&&typeof outcome.source==='string'&&outcome.source.startsWith('remediation:')&&['needs_input','blocked_dependency','failed','uncertain'].includes(outcome.outcome)){
     const handle=outcome.source.slice('remediation:'.length),entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
     if(turn?.state==='completed')this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state='delivery_uncertain'").run(job,Number(handle.split('-').at(-1)));
-    return this.record(job,{state:'blocked',send:false,head:e.head,reason:`Verification remediation ${outcome.outcome}: ${outcome.reason}; see the scoped Linear clarification/blocker flow`});
+    return record({state:'blocked',send:false,head:e.head,reason:`Verification remediation ${outcome.outcome}: ${outcome.reason}; see the scoped Linear clarification/blocker flow`});
    }
    const customObligation=this.s.db.query('SELECT * FROM custom_description_obligations WHERE job=?').get(job) as any;
    const reviewBodyKey=customObligation&&e.descriptionVersion?e.descriptionVersion:e.descriptionHash;
@@ -225,8 +282,8 @@ export class ReviewLoop{
   const metadataPending=this.s.db.query("SELECT r.*,c.baseline_body_hash FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.state='delivery_uncertain' AND c.kind='pr_description' ORDER BY r.attempt DESC LIMIT 1").get(job) as any;
    if(metadataPending){
     const handle=`adlc-fix-${job.slice(0,12)}-${metadataPending.attempt}`,entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
-    if(turn?.state!=='completed')return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Previous metadata remediation is uncertain or incomplete; never infer completion'});
-    if(metadataPending.baseline_body_hash===e.descriptionHash)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'Metadata worker completed without an observed description change; inspect before clearing delivery'});
+    if(turn?.state!=='completed')return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Previous metadata remediation is uncertain or incomplete; never infer completion'});
+    if(metadataPending.baseline_body_hash===e.descriptionHash)return record({state:'blocked',send:false,head:e.head,reason:'Metadata worker completed without an observed description change; inspect before clearing delivery'});
     const baseline=this.s.db.query('SELECT signature FROM metadata_baselines WHERE job=? AND attempt=?').get(job,metadataPending.attempt) as any;
     this.s.db.transaction(()=>{
      this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,metadataPending.attempt);
@@ -262,9 +319,9 @@ export class ReviewLoop{
     return {...prior,body:e.descriptionHash,started};
    }).immediate();
    const waiting=checkWait??deliveryWait;
-   if(waiting&&customObligation&&!e.descriptionVersion)return this.record(job,{state:'blocked',send:false,head:e.head,reason:'CodeRabbit custom-check failure: current description edit version is unavailable; restore GitHub body-version access before requesting review'});
+   if(waiting&&customObligation&&!e.descriptionVersion)return record({state:'blocked',send:false,head:e.head,reason:'CodeRabbit custom-check failure: current description edit version is unavailable; restore GitHub body-version access before requesting review'});
     if(needsBodyEvidence){
-     return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'Missing body-bound success evidence for every configured metadata check'});
+     return record({state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'Missing body-bound success evidence for every configured metadata check'});
    }
    // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.
@@ -273,37 +330,40 @@ export class ReviewLoop{
   // the zero fallback is not evidence that an existing review covers an edit.
   const blockerAlreadyFresh=!!(customObligation&&waiting&&waitStart>0&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
   if(!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
-   const requested=await this.requestReview(job,e.head,reviewBodyKey);
-   const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
+   const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey);
+   const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    if(requested){
-     this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND state!='completed'").run(e.head,job);
-    return this.record(job,{state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
+     const headUpdate=this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,job,t.pr);
+     // A concurrent completion keeps its terminal result; only a rebound target
+     // makes this evidence stale.
+     if(!headUpdate.changes&&this.get(job)?.pr!==t.pr)return {state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'};
+    return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
    }
   }
    if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){
-   return this.record(job,{state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
+   return record({state:Date.now()-waiting.started>5*60*1000?'blocked':'waiting_for_ci',send:false,head:e.head,reason:'PR description updated; awaiting a fresh template-check result (no duplicate remediation)'});
   }
    if(waiting&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
     const freshBlocker=customObligation&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>reviewStarted;
-    if(!freshBlocker&&!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,e.head,reviewBodyKey);
-    const unresolved=this.uncertainReview(job,e.head);if(unresolved)return this.record(job,unresolved);
-   const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=?').get(job,e.head,reviewBodyKey) as any;
+    if(!freshBlocker&&!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,t.pr,e.head,reviewBodyKey);
+    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
+   const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=?').get(job,t.pr,e.head,reviewBodyKey) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
    const surfaceBlocker=freshBlocker&&e.botReviewSubmittedAt>sinceReview;
-   if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return this.record(job,{state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
+   if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return record({state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
   }
   // An accepted request must produce its own review before old custom evidence
   // is judged; otherwise a poll that arrives before the bot starts would report
   // the pre-request blocker as current.
-  const pendingReview=this.s.db.query("SELECT * FROM full_review_requests WHERE job=? AND head=? AND body_hash=? AND state='accepted'").get(job,e.head,reviewBodyKey) as any;
+  const pendingReview=this.s.db.query("SELECT * FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='accepted'").get(job,t.pr,e.head,reviewBodyKey) as any;
   if(!blockerAlreadyFresh&&pendingReview&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=pendingReview.requested)&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length)
-   return this.record(job,{state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence'});
+   return record({state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence'});
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
-  // as dispatched.
-  const reconciliation=this.reconcileRemediation(job,e.head,session);
-  if(reconciliation)return reconciliation;
+   // as dispatched.
+   const reconciliation=this.reconcileRemediation(job,e.head,session);
+   if(reconciliation)return record(reconciliation);
   const dispatched=dispatchedFeedback(this.s,job);
   const threadFindings=e.findings.filter((f:any)=>f.kind==='review_thread');
   const freshThreadFindings=threadFindings.filter((f:any)=>!dispatched.has(feedbackKey(f.threadId,f.commentsHash)));
@@ -318,15 +378,15 @@ export class ReviewLoop{
   const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
   const stored=this.s.db.transaction(()=>{
-   const update=this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND state!='completed'").run(e.head,since,d.state,d.reason,signature,job);
+   const update=this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND pr=? AND state!='completed'").run(e.head,since,d.state,d.reason,signature,job,t.pr);
    if(!update.changes)return false;
    if(t.last_signature!==signature)this.s.event(job,'review_state_changed',JSON.stringify({repo:t.repo,pr:t.pr,head:e.head,...d}));
    return true;
   }).immediate();
-  if(!stored)return {state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
+  if(!stored)return this.get(job)?.pr!==t.pr?{state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}:{state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
   if(d.send&&t.remediate){
    const reconciliation=this.reconcileRemediation(job,e.head,session);
-   if(reconciliation)return reconciliation;
+   if(reconciliation)return record(reconciliation);
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
@@ -334,8 +394,8 @@ export class ReviewLoop{
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
    await this.io.disableNativeFeedback(run.session_id);
    const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
-   if(result.blocked)return this.record(job,{state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
-   if(result.reused)return this.record(job,{state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
+   if(result.blocked)return record({state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
+   if(result.reused)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
    return {...d,head:e.head,delivery:result};
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};

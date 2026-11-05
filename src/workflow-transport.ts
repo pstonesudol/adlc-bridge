@@ -54,9 +54,9 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
  evidence:sessionEvidence,
  preflightRoute,
  configureRoute:configureSessionRoute,
-  async sendImplementation(session,prompt,clientId){
+   async sendImplementation(session,prompt,clientId,mode){
    return submit(async()=>{
-   const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
+    const p=spawn([AO,'send','--session',session,...mode==='idle-only'?[]:['--steer'],'--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
   const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
    if(code!==0)throw Error('Implementation delivery uncertain');
    });

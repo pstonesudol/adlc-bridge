@@ -5,8 +5,13 @@ import {Planning} from '../src/planning';
 import {ApprovalPolicyStore} from '../src/approval-policy';
 import {LinearApprovals,parsePlanApproval} from '../src/linear-approvals';
 import {recordReadiness} from '../src/readiness';
-function fixture(){
- const s=new Store(':memory:'),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
+import {SpecRecovery} from '../src/spec-recovery';
+import {latestRevision} from '../src/spec-revisions';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+function fixture(path=':memory:'){
+ const s=new Store(path),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
  const issue:any={id:'issue',identifier:'DEV-12',title:'Task',description:'Requirement',team:{id:'t'},project:{id:'p'},state:{id:'todo'},labels:{nodes:[{id:'ready'},{id:'gate',name:'plan-approval-required'}],pageInfo:{hasNextPage:false}}};
  const spec=JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description});
@@ -30,9 +35,60 @@ test('publishes one plan; exact human reply approves once, implementation starts
  await f.surface.sync(f.c);await f.w.tick(f.c);expect(f.counts().sends).toBe(1);
  }finally{f.s.close();}
 });
+test('unrevised plans preserve the legacy approval notice binding and pending token',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-approval-')),path=join(dir,'state.db'),f=fixture(path);let reopened:Store|undefined,closed=false;
+ try{
+   const j=f.s.get(f.id),route=f.w.router.get(f.id,'implementation');
+   const legacy=digest(JSON.stringify([j.spec,j.plan_hash,route?.route??null,f.c.planApproval,f.c.approval??{mode:'manual'}]));
+   const token='33333333-3333-3333-3333-333333333333',comment='22222222-2222-2222-2222-222222222222',created=new Date(Date.now()-10000).toISOString(),body=`Legacy plan notice\n\n\`\`\`text\nApprove ADLC plan ${token}\n\`\`\``;
+   // Seed the pre-upgrade digest and persisted notice independently of binding().
+   f.s.db.query("INSERT INTO plan_approval_notices(job,binding,plan_hash,comment_id,token,body,state,created) VALUES (?,?,?,?,?,?,'posted',?)").run(f.id,legacy,j.plan_hash,comment,token,body,created);
+   f.comments.push({id:comment,body,createdAt:created,editedAt:null,user:{id:f.c.planApproval.approverIds[0],app:false},botActor:null});
+   f.s.close();closed=true;reopened=new Store(path);
+   f.comments.push({id:'original-token-reply',body:`Approve ADLC plan ${token}`,createdAt:new Date().toISOString(),editedAt:null,user:{id:f.c.planApproval.approverIds[0],app:false},botActor:null});
+   const surface=new LinearApprovals(reopened,new Workflow(reopened,f.w.t),f.surface.api);
+   expect(surface.binding(f.id,f.c)).toBe(legacy);
+   expect((await surface.sync(f.c))[0].state).toBe('approved');
+   expect(f.counts().creates).toBe(0);expect(f.comments).toHaveLength(2);
+   expect(reopened.db.query('SELECT token,state,approval_comment FROM plan_approval_notices WHERE job=?').get(f.id)).toEqual({token,state:'approved',approval_comment:'original-token-reply'});
+ }finally{reopened?.close();if(!closed)f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
 test('unauthorized, bot-authored, edited, and quoted approvals cannot release gate',async()=>{
  const f=fixture();try{await f.surface.sync(f.c);f.approve('outsider');f.approve(undefined,{botActor:{id:'bot'}});f.approve(undefined,{editedAt:new Date().toISOString()});f.approve(undefined,{user:{id:f.c.planApproval.approverIds[0],app:true}});f.approve(undefined,{body:'> Approve ADLC plan quoted'});
  await f.surface.sync(f.c);expect(f.s.get(f.id).state).toBe('awaiting_approval');expect(f.counts().sends).toBe(0);
+ }finally{f.s.close();}
+});
+test('restored spec and plan hashes publish a revision-specific notice and reject the old token',async()=>{
+ const f=fixture();try{
+  const original=f.s.get(f.id);await f.surface.sync(f.c);
+  const before=f.surface.binding(f.id,f.c);
+  f.s.enqueue('p','issue','Changed requirements');f.approve();
+  f.s.enqueue('p','issue',original.spec);f.s.propose(f.id,original.plan);
+  expect(f.s.get(f.id).plan_hash).toBe(original.plan_hash);
+  expect(f.surface.binding(f.id,f.c)).not.toBe(before);
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
+  expect(f.counts().creates).toBe(2);
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
+  expect(f.s.get(f.id).approved_hash).toBeNull();
+  f.approve();expect((await f.surface.sync(f.c))[0]).toMatchObject({state:'approval_blocked',reason:'Exact captured replan for the current requirement revision required'});
+  expect(f.w.implementation(f.id)).toBeNull();expect(f.s.get(f.id).approved_hash).toBeNull();
+  // A fresh notice alone cannot replace capture, even before first execution.
+  // Start a real same-owner revised planning turn and capture its exact reply.
+  f.issue.description='Requirement v2';f.s.enqueue('p','issue',JSON.stringify({identifier:f.issue.identifier,title:f.issue.title,description:f.issue.description}));
+  f.c.automation.planningEnabled=true;
+  const p=new Planning(f.s).get(f.id),e:any={session:{id:'worker',projectId:'ao',branch:p.branch,isTerminated:false,prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[],turns:[{id:'initial-plan',state:'completed'}]}};
+  f.w.t.evidence=async()=>e;f.w.t.worktree=async()=>({branch:p.branch,head:'a'.repeat(40),tree:'/worktree'});
+  f.w.t.sendImplementation=async(_session,_text,clientId)=>{
+   e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:1});
+   e.transcript.turns.push({id:clientId,state:'completed'});
+   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
+  };
+  const recovery=new SpecRecovery(f.s,f.w,async()=>f.issue,async fn=>fn());
+  await recovery.reconcile(f.id,f.c,(await recovery.preview(f.id,f.c)).confirmation);await recovery.capture(f.id,f.c);
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']),Date.now(),new Set(['issue']));
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
+  f.approve();expect((await f.surface.sync(f.c))[0].state).toBe('approved');
+  expect(f.w.implementation(f.id).session_id).toBe('worker');expect(f.counts().creates).toBe(3);
  }finally{f.s.close();}
 });
 test('requirements changes and removed eligibility reject a previously issued approval',async()=>{

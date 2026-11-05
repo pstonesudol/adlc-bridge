@@ -41,6 +41,30 @@ test('preview is read only; exact adoption preserves reservation, budget, and po
  expect(()=>assertDeliveryTarget(f.s,f.id,session,'owner/repo',8,snapshot)).toThrow('mismatched');
  }finally{f.s.close();}
 });
+test('recovery fingerprints omit revision evidence until a revision exists',async()=>{
+ const f=fixture();try{
+  const before=await f.recovery.preview(f.id,f.c);
+  expect('revision' in before.proposal.auth).toBe(false);
+  const j=f.s.get(f.id);
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('fingerprint-revision',f.id,digest(j.spec),digest(j.spec),'Same bytes','authorized');
+  const after=await f.recovery.preview(f.id,f.c);
+  expect(after.proposal.auth.revision).toBe('fingerprint-revision');
+  expect(after.hash).not.toBe(before.hash);
+ }finally{f.s.close();}
+});
+test('recovery confirmation persists the active revision and dispatch in immutable evidence',async()=>{
+ const f=fixture();try{
+  const before=await f.recovery.preview(f.id,f.c),j=f.s.get(f.id);
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('current-revision',f.id,digest(j.spec),digest(j.spec),'Restored requirements','authorized');
+  const current=await f.recovery.preview(f.id,f.c);
+  expect(current.hash).not.toBe(before.hash);
+  await expect(f.recovery.confirm(f.id,f.c,before.hash)).rejects.toThrow('Proposal changed');
+  expect(f.calls()).toBe(0);
+  await f.recovery.confirm(f.id,f.c,current.hash);
+  const row=f.s.db.query('SELECT detail FROM delivery_adoptions WHERE job=?').get(f.id) as any;
+  expect(JSON.parse(row.detail).auth).toMatchObject({revision:'current-revision',delivery:f.w.implementation(f.id).client_id});
+ }finally{f.s.close();}
+});
 test('canonical worktree comparison accepts equivalent paths and persists the raw authorization',async()=>{
  const f=fixture();try{
   f.s.db.query("UPDATE planning_runs SET worktree='/worktree/' WHERE job=?").run(f.id);
