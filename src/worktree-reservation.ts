@@ -13,16 +13,19 @@ export function worktreeReservation(s:Store,job:string,target?:string):any{
  const p=s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()?s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any:null;
  const run=s.db.query("SELECT name FROM sqlite_master WHERE name='runs'").get()?s.db.query('SELECT worktree FROM runs WHERE job=?').get(job) as any:null;
   const paths=[p?.worktree,run?.worktree,target].map(path=>path?canonicalWorktree(path):null);
+  // Stored rows may hold an alias (symlink) of a reserved path, so compare the
+  // canonical forms in JavaScript rather than raw SQL text equality.
+  const aliases=(path:string|null|undefined)=>!!path&&paths.includes(canonicalWorktree(path));
   if(s.db.query("SELECT name FROM sqlite_master WHERE name='spec_replans'").get()&&s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()){
-   const revision=s.db.query("SELECT r.revision AS id,r.job,r.state,p.worktree FROM spec_replans r JOIN planning_runs p ON p.job=r.job WHERE r.state IN ('accepted','delivery_uncertain') AND (r.job=? OR p.worktree IN (?,?,?)) LIMIT 1").get(job,...paths);
-   if(revision)return {...revision as any,specRevision:true};
+   const revision=(s.db.query("SELECT r.revision AS id,r.job,r.state,p.worktree FROM spec_replans r JOIN planning_runs p ON p.job=r.job WHERE r.state IN ('accepted','delivery_uncertain')").all() as any[]).find(r=>r.job===job||aliases(r.worktree));
+   if(revision)return {...revision,specRevision:true};
   }
  if(s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_updates'").get()){
-  const dependency=s.db.query("SELECT * FROM dependency_updates WHERE state IN ('reserved','fetching','updating') AND (job=? OR worktree IN (?,?,?)) LIMIT 1").get(job,...paths);
-  if(dependency)return {...dependency as any,dependency:true};
+  const dependency=(s.db.query("SELECT * FROM dependency_updates WHERE state IN ('reserved','fetching','updating')").all() as any[]).find(r=>r.job===job||aliases(r.worktree));
+  if(dependency)return {...dependency,dependency:true};
  }
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get())return;
- return s.db.query("SELECT * FROM conflict_recoveries WHERE state!='completed' AND (job=? OR worktree IN (?,?,?)) LIMIT 1").get(job,...paths);
+ return (s.db.query("SELECT * FROM conflict_recoveries WHERE state!='completed'").all() as any[]).find(r=>r.job===job||aliases(r.worktree));
 }
 export function assertWorktreeAvailable(s:Store,job:string,target?:string){
  const r=worktreeReservation(s,job,target);

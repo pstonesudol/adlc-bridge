@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,writeFileSync,mkdirSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
@@ -10,6 +10,7 @@ import {recordReadiness} from '../src/readiness';
 import {LinearLifecycle} from '../src/linear-lifecycle';
 import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
+import {worktreeReservation} from '../src/worktree-reservation';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -774,4 +775,23 @@ test('a failed replan from an earlier revision is retired before the newer revis
   expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
   expect(f.sends).toHaveLength(2);
  }finally{f.s.close();}
+});
+test('worktree reservations are detected through alias paths',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-alias-'));try{
+  const tree=join(dir,'tree'),link=join(dir,'link');mkdirSync(tree);symlinkSync(tree,link);
+  const s=new Store(':memory:');new Workflow(s,{} as any);new Planning(s);
+  const job=s.enqueue('p','issue','spec'),p=new Planning(s),r=p.reserve(job,'p');p.gate(job,'p','owner',r.branch,link);
+  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('alias-revision',job,'old','new','Alias','pending');
+  s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,'binding','accepted','{}',NULL)").run('alias-revision',job,'client','owner');
+  expect(worktreeReservation(s,'unrelated',tree)).toMatchObject({specRevision:true,state:'accepted'});
+  s.db.query('DELETE FROM spec_replans').run();
+  s.db.exec('CREATE TABLE dependency_updates(id TEXT PRIMARY KEY,job TEXT NOT NULL,plan TEXT NOT NULL,worktree TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL)');
+  s.db.query('INSERT INTO dependency_updates VALUES (?,?,?,?,?,?)').run('update-1','other','plan',link,'reserved','{}');
+  expect(worktreeReservation(s,'unrelated',tree)).toMatchObject({dependency:true,id:'update-1'});
+  s.db.query('DELETE FROM dependency_updates').run();
+  s.db.exec(`CREATE TABLE conflict_recoveries(id TEXT PRIMARY KEY,job TEXT NOT NULL,plan TEXT NOT NULL,worktree TEXT NOT NULL,session TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,branch TEXT NOT NULL,base_branch TEXT NOT NULL,head TEXT NOT NULL,base TEXT NOT NULL,policy TEXT NOT NULL,state TEXT NOT NULL,client_id TEXT NOT NULL UNIQUE,attempt INTEGER NOT NULL,detail TEXT NOT NULL,reason TEXT,created INTEGER NOT NULL)`);
+  s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery-1','other','plan',link,'session','owner/repo',1,'b','main','h','base','{}','waiting','client-1',1,'{}',null,Date.now());
+  expect(worktreeReservation(s,'unrelated',tree)).toMatchObject({id:'recovery-1'});
+  expect(worktreeReservation(s,job)).toMatchObject({id:'recovery-1'});
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });

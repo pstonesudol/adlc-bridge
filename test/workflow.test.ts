@@ -8,7 +8,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
-import {revisedHandoff} from '../src/spec-revisions';
+import {revisedHandoff,latestRevision} from '../src/spec-revisions';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
@@ -165,10 +165,15 @@ for(const historical of [false,true])test(`failed continuation recovery respects
    // Restored spec/plan hashes alone cannot renew an old recovery confirmation.
    expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
    const bind=(revision:string,delivery:string)=>s.db.query('UPDATE delivery_adoptions SET detail=? WHERE job=?').run(JSON.stringify({auth:{revision,delivery}}),id);
+   const stale=async()=>{
+    expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+    expect((await w.executionStatus(id,e,config)).state).not.toBe('pr_handoff');
+    expect(s.db.query('SELECT * FROM revision_handoffs WHERE job=? AND revision=?').all(id,latestRevision(s,id).id)).toHaveLength(0);
+   };
    bind('earlier-revision',w.implementation(id).client_id);
-   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   await stale();
    bind('revision-recovery','earlier-dispatch');
-   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   await stale();
    bind('revision-recovery',w.implementation(id).client_id);
    expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
   expect(revisedHandoff(s,id)).toBe(true);
