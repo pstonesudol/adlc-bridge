@@ -104,6 +104,8 @@ export class SpecRecovery{
      if(current?.state==='failed')return {revision:preview.revision,state:'failed',alreadyReconciled:true};
      if(!current||!['accepted','delivery_uncertain'].includes(current.state)||JSON.stringify(current)!==JSON.stringify(preview.delivery))throw Error('Replan reservation changed; refresh preview');
      this.s.db.query("UPDATE spec_replans SET state='failed',reason=? WHERE revision=?").run(absent?'Complete fresh idle inventory confirmed absence; no replay':unmarked?'Completed unmarked replan reconciled; no replay':'Terminal replan turn reconciled; no replay',preview.revision);
+     // Retirement must not leave the job consuming a planning slot.
+     this.s.db.query("UPDATE planning_dispatch SET state='planning_finished',reason='Replan retired; a new planning turn requires explicit spec-reconcile' WHERE job=?").run(job);
      this.s.event(job,absent?'spec_replan_absence_reconciled':unmarked?'spec_replan_unmarked_reconciled':'spec_replan_terminal_failure_reconciled',absent?JSON.stringify({delivery:current,absence:preview.absence}):unmarked?JSON.stringify({delivery:current,unmarked:preview.unmarked}):preview.delivery.client_id);
      return {revision:preview.revision,state:'failed',alreadyReconciled:false};
     }).immediate();

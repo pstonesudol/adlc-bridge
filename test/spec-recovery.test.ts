@@ -437,12 +437,14 @@ test('manual plan submission and capture refuse a pending requirement revision',
   expect(blockedCapture.exitCode).not.toBe(0);
   expect(blockedCapture.stderr.toString()).toContain('Active requirement revision requires spec-reconcile before manual plan capture');
   expect(s.get(job).plan).toBeNull();
-  // An active uncaptured revision is equally blocking for both manual paths.
-  s.db.query("UPDATE spec_revisions SET state='awaiting_approval' WHERE job=?").run(job);
-  for(const args of [['plan',job,planFile],['capture-plan',job,'owner','1']]){
-   const blocked=Bun.spawnSync([process.execPath,cli,...args],{env});
-   expect(blocked.exitCode).not.toBe(0);
-   expect(blocked.stderr.toString()).toContain('Active requirement revision requires spec-reconcile');
+  // Every post-revision state is equally blocking for both manual paths.
+  for(const state of ['awaiting_approval','authorized']){
+   s.db.query('UPDATE spec_revisions SET state=? WHERE job=?').run(state,job);
+   for(const args of [['plan',job,planFile],['capture-plan',job,'owner','1']]){
+    const blocked=Bun.spawnSync([process.execPath,cli,...args],{env});
+    expect(blocked.exitCode).not.toBe(0);
+    expect(blocked.stderr.toString()).toContain('Active requirement revision requires spec-reconcile');
+   }
   }
   expect(s.get(job).plan).toBeNull();
   s.close();
@@ -477,6 +479,27 @@ test('approve-plan refuses an active revision without its captured replan',()=>{
   expect(s.get(job).approved_hash).toBeNull();
   s.close();
  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('retiring a replan releases its planning slot for another job',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  f.e.transcript.entries.at(-1).text='Unmarked reply';
+  f.w.t.startPlan=async()=>({id:'planner'});
+  const limited={...config,automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
+  const other=f.s.enqueue('p','other','Second job');
+  expect(f.s.get(other).state).toBe('awaiting_plan');
+  // The unreconciled replan still occupies the single planning slot.
+  const blocked=await f.w.tick(limited);
+  // With no free slot the other job is not even dispatched.
+  expect(blocked.some((r:any)=>r.job===other)).toBe(false);
+  expect(f.w.planning(other)).toBeNull();
+  const pending=await f.recovery.preview(f.job,config);expect(pending.action).toBe('reconcile_unmarked_replan');
+  await f.recovery.reconcile(f.job,config,pending.confirmation);
+  expect(f.w.planning(f.job).state).toBe('planning_finished');
+  const started=await f.w.tick(limited);
+  expect(started.some((r:any)=>r.job===other&&r.state==='planning')).toBe(true);
+  expect(f.w.planning(other)).toMatchObject({state:'planning',session_id:'planner'});
+ }finally{f.s.close();}
 });
 test('capture refuses a plan when approval policy or scope changed after the reservation',async()=>{
  const f=await fixture();try{

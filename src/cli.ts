@@ -53,7 +53,7 @@ const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
 // Ordinary intake edits are not blocking; every active revision needs reconciliation.
-const blockingRevision=(r:any)=>!!r&&!['preplanning','authorized'].includes(r.state);
+const blockingRevision=(r:any)=>!!r&&r.state!=='preplanning';
 export function authorizeBaseMerge(lifecycle:Pick<Lifecycle,'grantBaseMerge'>,args:string[]){
  if(args.length!==3||args.some(v=>!v.trim()||v.trim().startsWith('-')))throw Error('Use authorize-base-merge JOB HASH HUMAN with exactly three positional arguments');
  return lifecycle.grantBaseMerge(args[0],args[1],args[2]);
