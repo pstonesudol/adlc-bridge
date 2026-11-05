@@ -46,7 +46,7 @@ import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
 import {SpecRecovery} from './spec-recovery';
-import {revisionStatus} from './spec-revisions';
+import {revisionStatus,latestRevision} from './spec-revisions';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
@@ -384,9 +384,17 @@ Registered approved review targets can request bounded in-scope fixes from their
     }
     if(command==='adopt-pilot')return out(await adoptPilot(s,req(a[0],'Job'),req(a[1],'Session')));
     if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));validate(config);return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.prMetadataChecks??[]));}
-    if(command==='capture-plan')return out(capturePlan(s,req(a[0],'Job'),await sessionEvidence(req(a[1],'Session')),Number(a[2])));
+    if(command==='capture-plan'){
+      const job=req(a[0],'Job');
+      if(latestRevision(s,job)?.state==='pending')throw Error('Active requirement revision requires spec-reconcile before manual plan capture');
+      return out(capturePlan(s,job,await sessionEvidence(req(a[1],'Session')),Number(a[2])));
+    }
     if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
-    if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
+    if(command==='plan'){
+      const job=req(a[0],'Job');
+      if(latestRevision(s,job)?.state==='pending')throw Error('Active requirement revision requires spec-reconcile before manual plan submission');
+      return out({hash:s.propose(job,readFileSync(req(a[1],'Plan file'),'utf8'))});
+    }
     if(command==='approve-plan'){
       const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');

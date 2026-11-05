@@ -1836,6 +1836,8 @@ breaking polling. Confirming that exact completed turn retires it without replay
 a fresh planning attempt still needs separate preview/confirmation. Active
 revisions require approval of the exact captured revised-plan hash, even before
 the first implementation. A manually submitted plan cannot bypass that capture.
+Direct `plan` and `capture-plan` refuse while an active revision is pending; use
+`spec-reconcile` instead.
 Linear revision notices require enabled status synchronization and are
 published in bounded batches with durable forward and older-retry cursors.
 `status`, `review-status` and `reconcile-preview` retain independent

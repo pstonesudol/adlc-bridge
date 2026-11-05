@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
@@ -374,11 +374,12 @@ test('an unmarked confirmation cannot retire a different turn or a subsequently 
   await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
-for(const invalid of ['incomplete','stale','future','busy','active-turn','owner','branch','terminated','project','duplicate-entry'])test(`unmarked replans do not qualify for retirement with ${invalid} evidence`,async()=>{
+for(const invalid of ['incomplete','stale','future','busy','active-turn','owner','branch','terminated','project','duplicate-entry','marked'])test(`unmarked replans do not qualify for retirement with ${invalid} evidence`,async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
   f.e.transcript.entries.at(-1).text='Reply without the revised-plan marker';
   const preview=await f.recovery.preview(f.job,config);expect(preview.action).toBe('reconcile_unmarked_replan');
+  if(invalid==='marked')f.e.transcript.entries.at(-1).text=`<!-- ADLC_REVISED_PLAN:${preview.revision} -->\nNow marked\n${ready}`;
   if(invalid==='incomplete')f.e.receiptObservation.complete=false;
   if(invalid==='stale')f.e.receiptObservation.observed=Date.now()-120001;
   if(invalid==='future')f.e.receiptObservation.observed=Date.now()+10000;
@@ -415,6 +416,29 @@ test('an earlier unmarked replan is retired before the newer revision can procee
   expect((f.s.db.query('SELECT state FROM spec_replans WHERE revision=?').get(old.revision) as any).state).toBe('failed');
   f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
+});
+test('manual plan submission and capture refuse a pending requirement revision',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-cli-revision-')),db=join(dir,'state.db'),planFile=join(dir,'plan.md');
+ try{
+  writeFileSync(planFile,'Plan: edit src/a.ts');
+  const s=new Store(db),job=s.enqueue('p','issue','Original'),planning=new Planning(s),run=planning.reserve(job,'project');
+  planning.gate(job,'project','owner',run.branch,'/worktree');
+  const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
+  const cli=join(import.meta.dir,'../src/cli.ts');
+  const direct=Bun.spawnSync([process.execPath,cli,'plan',job,planFile],{env});
+  expect(direct.exitCode).toBe(0);
+  s.db.query("UPDATE jobs SET plan=NULL,plan_hash=NULL,state='awaiting_plan',approved_hash=NULL,actor=NULL WHERE id=?").run(job);
+  s.enqueue('p','issue','Changed requirements');
+  expect(latestRevision(s,job).state).toBe('pending');
+  const blockedPlan=Bun.spawnSync([process.execPath,cli,'plan',job,planFile],{env});
+  expect(blockedPlan.exitCode).not.toBe(0);
+  expect(blockedPlan.stderr.toString()).toContain('Active requirement revision requires spec-reconcile before manual plan submission');
+  const blockedCapture=Bun.spawnSync([process.execPath,cli,'capture-plan',job,'owner','1'],{env});
+  expect(blockedCapture.exitCode).not.toBe(0);
+  expect(blockedCapture.stderr.toString()).toContain('Active requirement revision requires spec-reconcile before manual plan capture');
+  expect(s.get(job).plan).toBeNull();
+  s.close();
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });
 test('capture refuses a plan when approval policy or scope changed after the reservation',async()=>{
  const f=await fixture();try{
