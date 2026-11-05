@@ -11,6 +11,7 @@ import {LinearLifecycle} from '../src/linear-lifecycle';
 import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
 import {worktreeReservation} from '../src/worktree-reservation';
+import {turnBarrier} from '../src/turn-submission';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -810,6 +811,23 @@ test('ingest respects the turn-submission pause',()=>{
   expect(accepted.exitCode).toBe(0);
   expect(JSON.parse(accepted.stdout.toString()).id).toBeString();
  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('reconcile holds the shared submission fence before writing recovery state',async()=>{
+ const f=await fixture(),state=mkdtempSync(join(tmpdir(),'adlc-reconcile-fence-'));try{
+  f.edit('v2');
+  const submit=(operation:any)=>turnBarrier(state).submit(operation);
+  const fenced=new SpecRecovery(f.s,f.w,f.recovery.issue as any,submit);
+  const preview=await fenced.preview(f.job,config);
+  const lock=join(state,'turn-submission.lock');
+  mkdirSync(lock,{mode:0o700});
+  await expect(fenced.reconcile(f.job,config,preview.confirmation)).rejects.toThrow('Turn submission or shutdown is in progress');
+  expect(f.s.db.query('SELECT * FROM spec_replans').all()).toHaveLength(0);
+  expect(f.sends).toHaveLength(1);
+  rmSync(lock,{recursive:true,force:true});
+  await fenced.reconcile(f.job,config,preview.confirmation);
+  expect(f.s.db.query('SELECT state FROM spec_replans').get()).toEqual({state:'accepted'});
+  expect(f.sends).toHaveLength(2);
+ }finally{f.s.close();rmSync(state,{recursive:true,force:true});}
 });
 test('held submission lock blocks specification intake without touching the job or revisions',()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-ingest-lock-')),db=join(dir,'state.db'),first=join(dir,'first.json'),second=join(dir,'second.json');

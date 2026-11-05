@@ -135,8 +135,7 @@ export class SpecRecovery{
    return {action:'refresh_evidence',revision:proof.revision,status:revisionStatus(this.s,job)};
   });
  }
- async capture(job:string,c:WorkflowConfig){return this.submit(()=>this.captureWithinBarrier(job,c));}
- private async captureWithinBarrier(job:string,c:WorkflowConfig){
+ async capture(job:string,c:WorkflowConfig){
   // A later edit does not erase a prior uncertain send. Retire that reservation
   // only from its exact owned completed turn, never from elapsed time.
   for(const old of this.s.db.query("SELECT * FROM spec_replans WHERE job=? AND revision!=? AND state IN ('accepted','delivery_uncertain')").all(job,latestRevision(this.s,job)?.id??'') as any[]){
