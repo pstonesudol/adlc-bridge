@@ -38,9 +38,21 @@ async function fixture(){
   async fetch(){fetches++;},async includes(){return true;},async capabilities(){},async update(){updates++;head=base;},
  };
  const r=new DependencyRecovery(s,w,io,async fn=>fn());
- return {s,w,r,c,job,e,sends,io,issue,setMerged:(n:number)=>merged=n,setHead:(v:string)=>head=v,setLost:(v:boolean,hasReceipt=true)=>{lose=v;receipt=hasReceipt;},updates:()=>updates,fetches:()=>fetches};
+  return {s,w,r,c,job,e,sends,io,issue,setMerged:(n:number)=>merged=n,setHead:(v:string)=>head=v,setLost:(v:boolean,hasReceipt=true)=>{lose=v;receipt=hasReceipt;},updates:()=>updates,fetches:()=>fetches};
 }
-for(const restored of [false,true])test(`superseded dependency receipt cannot drive revised recovery (${restored?'restored':'different'} plan hash)`,async()=>{
+function linearSurface(f:Awaited<ReturnType<typeof fixture>>,onRead?:(count:number)=>void){
+ const comments:any[]=[],labels=new Set<string>(['ready']);let creates=0,adds=0,reads=0;
+ f.c.blockerSync={enabled:true,labelId:'44444444-4444-4444-4444-444444444444'};
+ const issue=()=>({...f.issue,labels:{nodes:[...labels].map(id=>({id})),pageInfo:{hasNextPage:false}}});
+ const api:any=async(q:string,v:any)=>{
+  if(q.includes('commentCreate')){creates++;const comment={id:v.input.id,body:v.input.body,createdAt:new Date().toISOString()};comments.push(comment);return {commentCreate:{success:true,comment}};}
+  if(q.includes('issueUpdate')){for(const id of v.added??[]){adds++;labels.add(id);}for(const id of v.removed??[])labels.delete(id);return {issueUpdate:{success:true,issue:issue()}};}
+  if(q.includes('comments(first:'))return {issue:{id:root,comments:{nodes:comments,pageInfo:{hasNextPage:false}}}};
+  onRead?.(++reads);return {issue:issue()};
+ };
+ return {blockers:new LinearBlockers(f.s,api),comments,counts:()=>({creates,adds})};
+}
+ for(const restored of [false,true])test(`superseded dependency receipt cannot drive revised recovery (${restored?'restored':'different'} plan hash)`,async()=>{
  const f=await fixture();try{
   const original=f.s.get(f.job),outcome=f.w.outcomes(f.job);
   f.s.enqueue('p',root,'Revision B');f.s.enqueue('p',root,original.spec);
@@ -117,23 +129,62 @@ for(const proof of [false,true])for(const entry of ['tick','notices'])test(`a la
   f.setMerged(proof?2:1);
   if(proof)f.r.io.fetch=async()=>{throw Error('Fetch unavailable');};
   expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
-  f.c.blockerSync={enabled:true};let originalBinding:string|undefined;
-  await f.r.notices(f.c,{leave:async(_job:any,_outcome:any,_config:any,options:any)=>{originalBinding=options.binding;}} as any);
+  const surface=linearSurface(f);
+  await f.r.notices(f.c,surface.blockers);expect(surface.counts()).toEqual({creates:1,adds:1});
   f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
   expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+  expect((await surface.blockers.retract(f.job,f.c)).state).toBe('retracted');
   const settled=f.r.rows()[0];
   f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency' WHERE job=?").run(f.job);
   if(entry==='tick')expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
-  f.c.blockerSync={enabled:true};const notices:any[]=[];
-  await f.r.notices(f.c,{leave:async(...args:any[])=>{notices.push(args);}} as any);
-  expect(notices).toHaveLength(1);expect(notices[0][1].outcome).toBe('waiting_for_dependencies');
-  expect(notices[0][3].applyLabel).toBe(true);
-  expect(notices[0][3].binding).not.toBe(originalBinding);
+  const notices=await f.r.notices(f.c,surface.blockers);await f.r.notices(f.c,surface.blockers);
+  expect(notices).toHaveLength(1);expect(notices[0].state).toBe('posted');
+  expect(surface.counts()).toEqual({creates:2,adds:2});
+  expect(surface.comments[1].body).toContain('Waiting for dependencies');
   expect(JSON.parse(f.r.rows()[0].evidence).waitInstance).toBeString();
   const history=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='dependency_wait_reopened'").all(f.job) as any[];
   expect(history).toHaveLength(1);expect(JSON.parse(history[0].detail).settled).toEqual(settled);
   expect(f.r.rows()[0].state).toBe('waiting_for_dependencies');
   expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+for(const change of ['outcome','wait','binding'])test(`dependency notice rechecks ${change} immediately before comment publication`,async()=>{
+ const f=await fixture();try{
+  f.setMerged(1);await f.r.tick(f.job,f.c);
+  const surface=linearSurface(f,n=>{
+   if(n!==2)return;
+   if(change==='outcome')f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+   if(change==='wait')f.s.db.query("UPDATE dependency_waits SET state='settled' WHERE job=?").run(f.job);
+   if(change==='binding')f.s.db.query("UPDATE worker_outcomes SET dispatch_id='different-dispatch' WHERE job=?").run(f.job);
+  });
+  const result=await f.r.notices(f.c,surface.blockers);
+  expect(result[0]).toMatchObject({state:'blocked',reason:'Dependency wait or worker outcome changed before notice publication'});
+  expect(surface.counts()).toEqual({creates:0,adds:0});
+ }finally{f.s.close();}
+});
+test('historical settled proof cannot hide a current restored-hash dependency blocker',async()=>{
+ const f=await fixture();try{
+  f.setMerged(2);const original=f.s.get(f.job),preview=await f.r.preview(f.job,f.c);
+  f.r.install();f.r.save(f.job,'waiting_for_dependencies','Old blocker',{...preview,clientId:'old-continuation'});
+  f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+  expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+  const historical=f.r.rows()[0];
+  f.s.enqueue('p',root,'Revision B');f.s.enqueue('p',root,original.spec);f.s.propose(f.job,original.plan);
+  expect(f.s.get(f.job).plan_hash).toBe(original.plan_hash);
+  const revision=f.s.db.query('SELECT id FROM spec_revisions ORDER BY rowid DESC LIMIT 1').get() as any;
+  f.s.db.query("UPDATE jobs SET state='approved',approved_hash=plan_hash,actor='human' WHERE id=?").run(f.job);
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='new-revised-dispatch',state='blocked_dependency' WHERE job=?").run(f.job);
+  f.s.db.query("UPDATE worker_outcomes SET outcome='blocked_dependency',revision_id=?,dispatch_id='new-revised-dispatch' WHERE job=?").run(revision.id,f.job);
+  const surface=linearSurface(f);
+  // The generic publisher must not let a historical dependency wait suppress it.
+  await surface.blockers.sync(f.c);expect(surface.counts()).toEqual({creates:1,adds:1});
+  f.setMerged(1);expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  expect(JSON.parse(f.r.rows()[0].evidence).clientId).toBeUndefined();
+  expect(JSON.parse((f.s.db.query("SELECT detail FROM events WHERE kind='dependency_wait_reopened' AND job=?").get(f.job) as any).detail).settled).toEqual(historical);
+  await f.r.notices(f.c,surface.blockers);
+  expect(surface.counts().creates).toBe(2);expect(surface.comments[1].body).toContain('Waiting for dependencies');
+  f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
+  expect(f.sends).toHaveLength(2);expect(f.sends[1].clientId).not.toBe('old-continuation');
  }finally{f.s.close();}
 });
 test('resumed dependency notices still publish and retract their owned blocker label',async()=>{

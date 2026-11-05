@@ -58,26 +58,27 @@ export function settleDependencyWait(s:Store,job:string){
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get())return;
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return;
  const row=s.db.query('SELECT * FROM dependency_waits WHERE job=?').get(job) as any;
- if(!row||row.state==='resumed'||row.plan!==s.get(job).plan_hash)return;
+ if(!row)return;
  const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
  if(!currentOutcome(s,job,o))return;
  const evidence=JSON.parse(row.evidence),client=evidence.clientId;
- if(row.state==='settled'){
-  if(o.outcome!=='blocked_dependency')return;
-  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
-  if(r&&(evidence.proof?.auth?evidence.proof.auth.revision!==r.id||evidence.proof.auth.delivery!==d?.client_id:!!client))return;
+ const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
+ const bound=row.plan===s.get(job).plan_hash&&(!r||(evidence.proof?.auth?evidence.proof.auth.revision===r.id&&evidence.proof.auth.delivery===d?.client_id:!client));
+ if(o.outcome==='blocked_dependency'&&(row.state==='settled'||!bound)){
+  // A historical proof/continuation cannot suppress a new authorized blocker.
+  // Archive it in full; an unproven new wait must collect fresh evidence.
+  const next=bound?evidence:{workerDependencies:JSON.parse(o.dependencies)};
   s.db.transaction(()=>{
    s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));
-   s.db.query("UPDATE dependency_waits SET state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement; re-evaluate evidence without replay',evidence=? WHERE job=?").run(JSON.stringify({...evidence,waitInstance:randomUUID()}),job);
+   s.db.query("UPDATE dependency_waits SET plan=?,state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement or revision; re-evaluate evidence without replay',evidence=? WHERE job=?").run(o.plan_hash,JSON.stringify({...next,waitInstance:randomUUID()}),job);
   }).immediate();
   return 'reopened';
  }
+ if(row.state==='resumed'||row.state==='settled'||!bound)return;
  if(o.outcome==='blocked_dependency')return;
  if(client&&s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()){
   const cont=s.db.query('SELECT * FROM continuations WHERE client_id=? AND job=? AND plan_hash=?').get(client,job,row.plan) as any;
-  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
-  const bound=!r||(evidence.proof?.auth?.revision===r.id&&evidence.proof.auth.delivery===d?.client_id);
-  if(bound&&cont?.session_id===d?.session_id&&['delivery_accepted','completed'].includes(cont?.state)){
+   if(bound&&cont?.session_id===d?.session_id&&['delivery_accepted','completed'].includes(cont?.state)){
    s.db.query("UPDATE dependency_waits SET state='resumed',reason='Existing continuation accepted; no replay' WHERE job=?").run(job);
    return 'resumed';
   }

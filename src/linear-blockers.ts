@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
-import {settleDependencyWait} from './spec-revisions';
+import {settleDependencyWait,latestRevision,currentOutcome} from './spec-revisions';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -75,7 +75,8 @@ export class LinearBlockers{
   }
    if(outcome.outcome==='recovery_completed'||options?.applyLabel===false)return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:'unchanged'};
    let labelState='present';
-  if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
+   if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
+    options?.guard(issue);
    // Record ownership before the mutation so a lost reply or verification failure
    // still lets retract reconcile the bridge-applied label.
    this.s.db.query("UPDATE blocker_notices SET label_applied=1,applied_label_id=? WHERE job=? AND binding=?").run(labelId,job,binding);
@@ -163,7 +164,14 @@ export class LinearBlockers{
   for(const outcome of rows){
    handled.add(outcome.job);
    try{
-    if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query('SELECT 1 FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash))continue;
+     if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()){
+      const wait=this.s.db.query('SELECT * FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash) as any;
+      if(wait&&wait.state!=='settled'){
+       const p=JSON.parse(wait.evidence),r=latestRevision(this.s,outcome.job),d=this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(outcome.job) as any;
+       const worker=this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(outcome.job);
+       if(!r||(p.proof?.auth?p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id:!p.clientId&&currentOutcome(this.s,outcome.job,worker)))continue;
+      }
+     }
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.
     if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;
