@@ -4,8 +4,8 @@
 language: en-US
 
 reviews:
-  # Review substantive findings down to P2, not only blocking defects.
-  profile: assertive
+  # Prefer higher-confidence findings; retain the safety-focused path guidance below.
+  profile: chill
   request_changes_workflow: true
 
   high_level_summary: true
@@ -61,7 +61,8 @@ reviews:
 
   auto_review:
     enabled: true
-    auto_incremental_review: true
+    # Batch commits before requesting another review to reduce review churn.
+    auto_incremental_review: false
     drafts: false
     # Keep long-running remediation PRs under review until a decision is reached.
     auto_pause_after_reviewed_commits: 0

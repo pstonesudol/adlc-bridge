@@ -18,6 +18,7 @@ import {Bridge,inspectAO,handoffChecklist} from './orchestrator';
 import {readiness} from './github';
 import {linearToken,tokenPath} from './credential';
 import {Lifecycle} from './lifecycle';
+import {Planning} from './planning';
 import {runtimeCheck} from './runtime';
 import {containerCheck} from './container-check';
 import {sessionEvidence,capturePlan} from './session-evidence';
@@ -46,10 +47,14 @@ import {recoveryRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
+import {SpecRecovery} from './spec-recovery';
+import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revisions';
 
 const [command='help',...a]=process.argv.slice(2);
 const out=(x:unknown)=>console.log(JSON.stringify(x,null,2));
 const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
+// Ordinary intake edits are not blocking; every active revision needs reconciliation.
+const blockingRevision=(r:any)=>!!r&&r.state!=='preplanning';
 export function authorizeBaseMerge(lifecycle:Pick<Lifecycle,'grantBaseMerge'>,args:string[]){
  if(args.length!==3||args.some(v=>!v.trim()||v.trim().startsWith('-')))throw Error('Use authorize-base-merge JOB HASH HUMAN with exactly three positional arguments');
  return lifecycle.grantBaseMerge(args[0],args[1],args[2]);
@@ -191,7 +196,8 @@ async function main(){
   ingest PROJECT ISSUE SPEC_FILE        local ingestion
   plan JOB PLAN_FILE                    submit plan
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
-  reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
+spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning only after a spec edit
   dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
   dependency-resume JOB CONFIG HASH    confirm unchanged evidence using existing continuation
   dependency-status                    durable waits, failed evidence and next action
@@ -210,6 +216,7 @@ async function main(){
     [--confirm HASH --human NAME]      verify and release only proven completed recovery
   authorize-base-merge JOB HASH HUMAN  explicitly add merge-base-feature to current job grant
   register-review JOB REPO PR CONFIG    register bounded review target
+  rebind-review-target JOB REPO PR     reconcile a revised handoff recorded on another PR
   review-status                        show CI/review waits, blockers and remediation budget
   tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
@@ -264,6 +271,13 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
+   if(command==='spec-reconcile'){
+    if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-reconcile JOB CONFIG [--confirm HASH]');
+    const config=projectConfiguration(a[1]);validate(config);
+    if(!existsSync(db))throw Error('Existing database required');
+    const store=new Store(db,a.length===2);
+    try{return out(await new SpecRecovery(store,new Workflow(store,liveTransport,undefined,a.length===2)).reconcile(a[0],config,a[3]));}finally{store.close();}
+   }
    if(['dependency-preview','dependency-resume','dependency-status'].includes(command)){
     if(!existsSync(db))throw Error('Existing database required');
     const applying=command==='dependency-resume';
@@ -276,7 +290,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
@@ -315,7 +329,8 @@ Registered approved review targets can request bounded in-scope fixes from their
    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);const clarifications=new LinearClarifications(s,workflow,blockers);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
-    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),jobState:job.state,remediation};
+    const revision=revisionStatus(s,t.job),stale=revision?.blocking===true;
+    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
   });
    try{
     if(command==='retry-observation'){
@@ -381,15 +396,34 @@ Registered approved review targets can request bounded in-scope fixes from their
     }
     if(command==='adopt-pilot')return out(await adoptPilot(s,req(a[0],'Job'),req(a[1],'Session')));
     if(command==='observe-pilot'){const config=JSON.parse(readFileSync(req(a[3],'Config'),'utf8'));validate(config);return out(await observePilot(s,req(a[0],'Job'),req(a[1],'Repository'),Number(a[2]),config.requiredChecks,config.prMetadataChecks??[]));}
-    if(command==='capture-plan')return out(capturePlan(s,req(a[0],'Job'),await sessionEvidence(req(a[1],'Session')),Number(a[2])));
-    if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
-    if(command==='plan')return out({hash:s.propose(req(a[0],'Job'),readFileSync(req(a[1],'Plan file'),'utf8'))});
+    if(command==='capture-plan'){
+      const job=req(a[0],'Job'),revision=latestRevision(s,job);
+      if(blockingRevision(revision))throw Error('Active requirement revision requires spec-reconcile before manual plan capture');
+      return out(capturePlan(s,job,await sessionEvidence(req(a[1],'Session')),Number(a[2]),revision?.id??null));
+    }
+    if(command==='ingest'){
+      const project=req(a[0],'Project'),issue=req(a[1],'Issue'),specification=readFileSync(req(a[2],'Specification file'),'utf8');
+      // Intake shares the submission fence: a reconcile reservation must make
+      // ingestion fail closed rather than add work mid-reservation.
+      return out({id:await withTurnSubmission(async()=>s.enqueue(project,issue,specification))});
+    }
+    if(command==='plan'){
+      const job=req(a[0],'Job'),revision=latestRevision(s,job);
+      if(blockingRevision(revision))throw Error('Active requirement revision requires spec-reconcile before manual plan submission');
+      const plan=readFileSync(req(a[1],'Plan file'),'utf8');
+      return out({hash:s.propose(job,plan,revision?.id??null)});
+    }
     if(command==='approve-plan'){
       const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
+      assertCapturedRevision(s,job,hash,new Planning(s).get(job)?.session_id??null);
+      if(latestRevision(s,job)?.state==='awaiting_approval'){
+        throw Error('Revised plan requires approve-job to atomically rebind implementation authorization');
+      }
       assertApprovalReadiness(s,job,req(a[2],'Human'),a.includes('--acknowledge-readiness'));
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }
+    if(command==='rebind-review-target')return out(reviewLoop.rebind(req(a[0],'Job'),req(a[1],'Repository'),Number(req(a[2],'Pull request'))));
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
     const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));

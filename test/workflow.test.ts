@@ -8,6 +8,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
+import {revisedHandoff,latestRevision} from '../src/spec-revisions';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
@@ -142,11 +143,12 @@ test('a failed continuation hands off only with exact adopted-delivery recovery 
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
  }finally{s.close();}
 });
-test('an actually failed continuation turn is recovered before the failed-turn early return',async()=>{
+for(const historical of [false,true])test(`failed continuation recovery respects the revision boundary (${historical?'historical':'current'} continuation)`,async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();await w.tick(config);
   const r=s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any,e=f.sessions.get('session-1');
-  s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','delivery_accepted');
+   const beforeContinuation=Number((s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(id) as any)?.id??0);
+   s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(id,hash,digest(s.get(id).spec),'resolution','continue-owned','session-1','delivery_accepted');
   e.transcript.entries.push({sequence:4,clientMessageId:'continue-owned',turnId:'continue-turn'});
   e.transcript.turns.push({id:'continue-turn',state:'failed'});
   expect((await w.executionStatus(id,e,config)).state).toBe('failed');
@@ -155,9 +157,33 @@ test('an actually failed continuation turn is recovered before the failed-turn e
   s.db.exec('CREATE TABLE delivery_adoptions(job TEXT PRIMARY KEY,proposal TEXT NOT NULL,state TEXT NOT NULL,session TEXT NOT NULL,worktree TEXT NOT NULL,reserved TEXT NOT NULL,branch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,anchor TEXT NOT NULL,plan_hash TEXT NOT NULL,spec_hash TEXT NOT NULL,detail TEXT NOT NULL); CREATE TABLE continuation_recoveries(continuation INTEGER PRIMARY KEY,job TEXT NOT NULL,proposal TEXT NOT NULL,head TEXT NOT NULL,at INTEGER NOT NULL)');
   s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal','adopted','session-1','/worktrees/session-1',r.branch,r.branch,'owner/repo',1,'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
+  // Mark the job as revised so the recovery handoff must bind the current revision.
+  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a','b','Summary','authorized');
+   const continuationMaxId=Number((s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(id) as any)?.id??0);
+   s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,JSON.stringify({continuationMaxId:historical?continuationMaxId:beforeContinuation}));
+   expect(revisedHandoff(s,id)).toBe(false);
+   // Restored spec/plan hashes alone cannot renew an old recovery confirmation.
+   expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+   const bind=(revision:string,delivery:string)=>s.db.query('UPDATE delivery_adoptions SET detail=? WHERE job=?').run(JSON.stringify({auth:{revision,delivery}}),id);
+   const stale=async()=>{
+    expect(await w.recoveredDelivery(id,config,e,e.session.prs,w.implementation(id),failed.id)).toBe(false);
+    expect((await w.executionStatus(id,e,config)).state).not.toBe('pr_handoff');
+    expect(s.db.query('SELECT * FROM revision_handoffs WHERE job=? AND revision=?').all(id,latestRevision(s,id).id)).toHaveLength(0);
+    // The current continuation stays failed across stale status checks.
+    expect((s.db.query('SELECT state FROM continuations WHERE job=? AND failed_at IS NOT NULL ORDER BY id DESC LIMIT 1').get(id) as any).state).toBe('failed');
+   };
+   bind('earlier-revision',w.implementation(id).client_id);
+   await stale();
+   bind('revision-recovery','earlier-dispatch');
+   await stale();
+   bind('revision-recovery',w.implementation(id).client_id);
+   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+  expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
-  expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
-  expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe('recovered');
+   expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe(historical?'failed':'recovered');
+   // A prior-revision continuation stays historical: the current implementation
+   // receipt may hand off after fresh recovery, but cannot rewrite that turn.
+   if(historical)return;
   // Missing worktree identity, remote-only divergence and wrong attachment URLs
   // fail closed without regressing the settled state.
   const worktree=(f as any).worktree.bind(f),snapshot=f.branchSnapshot.bind(f);
@@ -295,8 +321,11 @@ test('manual proposal after an uncertain or reconciliation-blocked spawn keeps i
   try{
    const first=s.enqueue('p','first','spec'),next=s.enqueue('p','next','spec');
    expect((await w.startPlanning(first,config)).state).toBe('dispatch_uncertain');
-   if(blocked){
-    s.enqueue('p','first','changed specification');await w.tick(config);
+    if(blocked){
+     // Keep this case genuinely unresolved; an exact-one verified owner is
+     // now recoverable even after the specification changes.
+     f.findPlans=async()=>[];
+     s.enqueue('p','first','changed specification');await w.tick(config);
     expect(w.planning(first).state).toBe('needs_reconciliation');
    }
    expect(f.starts.length).toBe(1);

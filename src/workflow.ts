@@ -15,6 +15,8 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
+import {SpecRecovery} from './spec-recovery';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
@@ -25,7 +27,7 @@ export interface WorkflowTransport{
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
  findPlans(project:string,branch:string,includeTerminated?:boolean):Promise<any[]>;
  evidence(session:string):Promise<any>;
- sendImplementation(session:string,prompt:string,clientId:string):Promise<void>;
+ sendImplementation(session:string,prompt:string,clientId:string,mode?:'idle-only'):Promise<void>;
  disableFeedback(session:string):Promise<void>;
  preflightRoute?(route:Route):Promise<void>;
   configureRoute?(session:string,route:Route):Promise<unknown>;
@@ -57,7 +59,8 @@ export class Workflow{
     job TEXT PRIMARY KEY REFERENCES jobs(id),plan_hash TEXT NOT NULL,session_id TEXT NOT NULL,
     client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,paths TEXT NOT NULL,runtime TEXT NOT NULL,
     actor TEXT NOT NULL,reason TEXT);`);
-  if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
+   if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
+   for(const name of ['revision_id','dispatch_id'])if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name===name))s.db.exec(`ALTER TABLE worker_outcomes ADD COLUMN ${name} TEXT`);
   if(!(s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))s.db.exec('ALTER TABLE continuations ADD COLUMN failed_at INTEGER');
  }
  planning(job:string):any{return this.s.db.query('SELECT * FROM planning_dispatch WHERE job=?').get(job);}
@@ -130,11 +133,31 @@ export class Workflow{
    return {state:'planning_finished',session};
   }).immediate();
  }
- async reconcilePlanning(job:string,c:WorkflowConfig){
-  const dispatch=this.planning(job);if(!dispatch)return;
-  if(dispatch.state==='planning_finished')return {state:'planning_finished'};
-  const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
-  if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
+  async reconcilePlanning(job:string,c:WorkflowConfig){
+   const dispatch=this.planning(job);if(!dispatch)return;
+   if(dispatch.state==='planning_finished')return {state:'planning_finished'};
+   const p=new Planning(this.s),r=p.get(job),j=this.s.get(job);
+   if(j.state==='blocked')return this.reconcileBlockedPlanning(job);
+   const revision=latestRevision(this.s,job);
+   if(j.state==='awaiting_plan'&&revision&&(revision.state==='pending'||dispatch.spec_hash!==digest(j.spec)||this.s.db.query('SELECT 1 FROM spec_replans WHERE revision=?').get(revision.id))){
+     if(!r.session_id||!dispatch.session_id){
+      const matches=await this.t.findPlans(r.project,r.branch);
+      if(matches.length!==1)return this.blockPlan(job,matches.length?'Ambiguous matching sessions':'No authoritative session receipt; manual recovery required');
+      const session=matches[0].id,e=await this.t.evidence(session);
+      if(!session||e.session?.id!==session||e.session.projectId!==r.project||e.session.branch!==r.branch||e.session.isTerminated!==false||r.session_id&&r.session_id!==session||dispatch.session_id&&dispatch.session_id!==session)return this.blockPlan(job,'Planning session identity changed or terminated');
+      const attached=this.s.db.transaction(()=>{
+       // Discovery awaits provider evidence; do not replace an owner or dispatch
+       // established by another poll while that evidence was being collected.
+       if(JSON.stringify(this.planning(job))!==JSON.stringify(dispatch)||JSON.stringify(p.get(job))!==JSON.stringify(r)||this.s.get(job).state!=='awaiting_plan'||latestRevision(this.s,job)?.id!==revision.id)return false;
+       this.s.db.query("UPDATE planning_dispatch SET session_id=?,state='planning',reason=NULL WHERE job=?").run(session,job);
+       this.s.db.query('UPDATE planning_runs SET session_id=? WHERE job=?').run(session,job);
+       this.s.event(job,'revision_planning_owner_recovered',session);
+       return true;
+      }).immediate();
+      if(!attached)return {state:'needs_reconciliation',reason:'Planning reservation changed during owner discovery'};
+     }
+    return new SpecRecovery(this.s,this).capture(job,c);
+   }
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');
   if(j.state==='awaiting_approval'){await this.prepareImplementationRoute(job,c);return {state:j.state};}
   if(j.state!=='awaiting_plan')return {state:j.state};
@@ -209,13 +232,27 @@ export class Workflow{
   return this.s.db.transaction(()=>{
    const j=this.s.get(job),r=new Planning(this.s).get(job),d=this.planning(job);
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
-   if(this.implementation(job)||new Lifecycle(this.s).run(job))throw Error('Existing execution requires reconciliation');
+    const revision=latestRevision(this.s,job),prior=this.implementation(job),run=new Lifecycle(this.s).run(job);
+     if(!capturedRevision(this.s,job,j.plan_hash,r.session_id).captured)throw Error('Exact captured replan for the current requirement revision required');
+     const revised=!!(revision&&revision.state==='awaiting_approval');
+    if((prior||run)&&!revised)throw Error('Existing execution requires reconciliation');
+    if(revised){
+     if(prior&&prior.session_id!==r.session_id||run&&(run.session_id!==r.session_id||run.owner!=='orchestrator'))throw Error('Revised plan execution owner changed');
+     const continuationMaxId=(this.s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(job) as any)?.id??0;
+     this.s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run(revision.id,job,JSON.stringify({prior,run,continuationMaxId,policy:new ApprovalPolicyStore(this.s).get(job),grant:this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job)}));
+     // These changes roll back if fresh readiness/policy checks below fail.
+     this.s.db.query('DELETE FROM policy_authorizations WHERE job=?').run(job);
+    }
    assertApprovalReadiness(this.s,job,actor,!!acknowledge?.readiness,!!standing);
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);
-   const clientId=`adlc-implement-${job.slice(0,16)}-${hash.slice(0,16)}`;
-   this.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(job,hash,r.session_id,clientId,'approved_pending',JSON.stringify(paths),runtime,actor,null);
+   const clientId=`adlc-implement-${job.slice(0,16)}-${hash.slice(0,16)}${revised?`-${revision.id}`:''}`;
+    this.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET plan_hash=excluded.plan_hash,session_id=excluded.session_id,client_id=excluded.client_id,state=excluded.state,paths=excluded.paths,runtime=excluded.runtime,actor=excluded.actor,reason=NULL').run(job,hash,r.session_id,clientId,'approved_pending',JSON.stringify(paths),runtime,actor,null);
+    if(revised){
+     this.s.db.query("UPDATE spec_revisions SET state='authorized' WHERE id=?").run(revision.id);
+     if(run)this.s.db.query("UPDATE runs SET plan_hash=?,state='running',reason='Fresh revised-plan authorization; previous evidence is historical' WHERE job=?").run(hash,job);
+    }
    this.s.event(job,'plan_and_git_scope_approved',JSON.stringify({hash,paths,runtime,operations,actor}));
    return {job,state:'approved_pending',runtime,paths,mergeEnabled:false};
   })();
@@ -227,6 +264,8 @@ export class Workflow{
   const d=this.implementation(job);if(!d)return;
   const l=new Lifecycle(this.s),j=l.current(job),r=new Planning(this.s).get(job);
   if(j.plan_hash!==d.plan_hash||r?.session_id!==d.session_id)throw Error('Execution approval is stale');
+  // A restored plan hash must still carry this revision's captured evidence.
+  if(!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured)throw Error('Exact captured replan for the current requirement revision required');
   if(new ApprovalPolicyStore(this.s).get(job)){if(!c)throw Error('Project policy required for automatic execution');new ApprovalPolicyStore(this.s).verify(job,c.linear.projectId,c.approval);}
   let e;
   try{
@@ -277,9 +316,14 @@ export class Workflow{
   }
  async executionStatus(job:string,e:any,c?:WorkflowConfig,now=Date.now(),persist=true){
   const d=this.implementation(job);if(!d)return;
+  const observedJob=this.s.get(job);
   let graceMs=c?.workflow?.prGraceMs??120000;
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
-  const cont=this.continuation(job);
+  const latestContinuation=this.continuation(job);
+  // Retained continuation history cannot satisfy a revised dispatch's receipt.
+  const revision=latestRevision(this.s,job),history=revision&&this.s.db.query('SELECT snapshot FROM spec_execution_history WHERE revision=? AND job=?').get(revision.id,job) as any;
+  const boundary=history?JSON.parse(history.snapshot).continuationMaxId:undefined;
+  const cont=latestContinuation?.plan_hash===d.plan_hash&&(!history||(Number.isSafeInteger(boundary)&&latestContinuation.id>boundary))?latestContinuation:null;
   const clientId=cont?cont.client_id:d.client_id;
   const ledger=new ReceiptReconciliation(this.s),binding=ledger.get(clientId);
   if(binding){
@@ -296,7 +340,13 @@ export class Workflow{
   }
   const turn=entry&&e.transcript?.turns?.find((t:any)=>t.id===entry.turnId);
   const finish=(result:any)=>{
+   const apply=()=>{
+   const current=this.implementation(job),j=this.s.get(job);
+   if(current?.client_id!==d.client_id||current?.plan_hash!==d.plan_hash||current?.session_id!==d.session_id||j.plan_hash!==d.plan_hash||
+    (latestRevision(this.s,job)?.id??null)!==(revision?.id??null)||j.plan_hash!==observedJob.plan_hash||j.spec!==observedJob.spec||j.approved_hash!==observedJob.approved_hash||j.state!==observedJob.state)
+    return {state:'stale_execution',applied:false,session:d.session_id,reason:'Execution binding changed while evidence was awaited; stale outcome discarded'};
    if(!persist)return {...result,session:d.session_id};
+   if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now);
    // A later remediation may be selected for the workflow outcome, but only
    // the continuation's own receipt can settle its durable delivery state.
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
@@ -311,6 +361,8 @@ export class Workflow{
    }
    this.s.db.query('UPDATE implementation_dispatch SET state=?,reason=? WHERE job=?').run(result.state,result.reason??null,job);
    return {...this.saveOutcome(job,d,result,graceMs,now,this.outcomes(job)),session:d.session_id};
+   };
+   return persist?this.s.db.transaction(apply).immediate():apply();
   };
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
   const contEntry=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()&&cont?e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id):null;
@@ -378,7 +430,14 @@ export class Workflow{
   if(!failed||!['failed','recovered'].includes(failed.state))return false;
   const settled=failed.state==='recovered';
   const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND state='adopted' AND session=? AND repo=? AND pr=? AND plan_hash=? AND spec_hash=?").get(job,e.session.id,c.githubRepo,prs[0].number,d.plan_hash,digest(this.s.get(job).spec)) as any;
-  if(!adopted||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
+   if(!adopted||(local as any).branch!==adopted.branch||canonicalWorktree(adopted.worktree)!==canonicalWorktree(localTree))return false;
+   // Plan/spec hashes can recur after A→B→A. The immutable confirmation
+   // proposal must also belong to this dispatch and requirement instance.
+   const revision=latestRevision(this.s,job);
+   if(revision){
+    let auth;try{auth=JSON.parse(adopted.detail).auth;}catch{return false;}
+    if(auth?.revision!==revision.id||auth?.delivery!==d.client_id)return false;
+   }
   if(!settled&&local.head!==adopted.head)return false;
   if(!this.s.db.query("SELECT 1 FROM continuation_recoveries WHERE continuation=? AND job=? AND proposal=? AND head=?").get(failed.id,job,adopted.proposal,adopted.head))return false;
   // A recovered handoff is still a handoff: the open PR must remain the exact
@@ -413,7 +472,7 @@ export class Workflow{
    first_observed=excluded.first_observed,grace_deadline=excluded.grace_deadline,observed=excluded.observed`)
    .run(job,d.plan_hash,d.session_id,result.outcome,result.reason??null,JSON.stringify(result.questions??[]),
      JSON.stringify(result.dependencies??[]),result.source,result.confidence,first,deadline,now);
-  this.s.db.query('UPDATE worker_outcomes SET discovery=? WHERE job=?').run(result.discovery?JSON.stringify(result.discovery):null,job);
+   this.s.db.query('UPDATE worker_outcomes SET discovery=?,revision_id=?,dispatch_id=? WHERE job=?').run(result.discovery?JSON.stringify(result.discovery):null,latestRevision(this.s,job)?.id??null,d.client_id,job);
   return {...result,graceDeadline:deadline};
  }
  private completedOutcome(job:string,d:any,e:any,entry:any,graceMs:number,now:number){
@@ -468,7 +527,7 @@ export class Workflow{
   const graceMs=c.workflow?.prGraceMs??120000,now=Date.now(),results:any[]=[];
   for(const row of rows){
    const d=this.implementation(row.job),j=this.s.get(row.job);let issue=null;try{issue=JSON.parse(j.spec).identifier??null;}catch{}
-   if(d.plan_hash!==j.plan_hash){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,state:'stale_plan',outcome:'needs_reconciliation',reason:'Dispatch belongs to a superseded plan; replan and reapprove',questions:[],dependencies:[],source:'plan',confidence:'high',applied:false});continue;}
+    if(d.plan_hash!==j.plan_hash){results.push({job:row.job,issue,jobState:j.state,session:d.session_id,plan_hash:d.plan_hash,state:'stale_plan',outcome:'needs_reconciliation',reason:'Dispatch belongs to a superseded plan; replan and reapprove',revision:revisionStatus(this.s,row.job),historicalOutcome:this.outcomes(row.job),questions:[],dependencies:[],source:'plan',confidence:'high',applied:false});continue;}
    try{
     const e=await this.t.evidence(d.session_id);
     const result=await this.executionStatus(row.job,e,c,now,false);
@@ -487,7 +546,8 @@ export class Workflow{
   if(!d||!r||!run)throw Error('Existing owned worker and delivery required');
   if(j.state!=='approved'||j.approved_hash!==j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))throw Error('Current unchanged plan approval required; replan after material changes');
   if(d.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))throw Error('Material plan or requirement change invalidates the previous authorization');
-  const outcome=this.outcomes(job);
+   const outcome=this.outcomes(job);
+   if(!currentOutcome(this.s,job,outcome))throw Error('Worker outcome belongs to a superseded revision or dispatch; await current implementation evidence');
    if(!outcome||!['needs_input','blocked_dependency'].includes(outcome.outcome))throw Error('Only a worker stopped on needs-input or a blocked dependency can resume');
    if(outcome.outcome==='blocked_dependency'&&(c as any).dependencyRecovery?.enabled&&!dependencyEvidence)throw Error('Dependency verification enabled; use dependency-preview/dependency-resume, not a prose resolution');
   if(outcome.plan_hash!==d.plan_hash)throw Error('Worker outcome belongs to a different plan');
@@ -565,7 +625,8 @@ export class Workflow{
     if(current.state!=='approved'||current.approved_hash!==j.plan_hash||current.actor!==j.actor)throw Error('Plan approval revoked or changed during resume reservation');
     const latestGrant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
     if(!latestGrant||JSON.stringify(latestGrant)!==JSON.stringify(grant)||latestGrant.plan_hash!==j.plan_hash||featureGit.some(op=>!JSON.parse(latestGrant.operations).includes(op)))throw Error('Scoped Git authorization changed during resume');
-    if(JSON.stringify(this.implementation(job))!==JSON.stringify(d))throw Error('Implementation scope or delivery changed during resume');
+     if(JSON.stringify(this.implementation(job))!==JSON.stringify(d))throw Error('Implementation scope or delivery changed during resume');
+     if(!currentOutcome(this.s,job,this.outcomes(job)))throw Error('Worker outcome revision or dispatch changed during resume');
     if(proof)policy.verify(job,c.linear.projectId,c.approval);
     const currentRun=new Lifecycle(this.s).run(job);
     if(currentRun?.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(currentRun.state)||currentRun.session_id!==run.session_id||currentRun.worktree!==run.worktree||currentRun.plan_hash!==j.plan_hash)throw Error('Worker ownership changed during resume');
@@ -627,9 +688,9 @@ export class Workflow{
  status(){return {deliveries:new ReceiptReconciliation(this.s).list(),dependencies:this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()?this.s.db.query('SELECT * FROM dependency_waits').all():[],policyAuthorizations:new ApprovalPolicyStore(this.s).list(),runtimePolicy:this.s.db.query('SELECT project,runtime FROM project_execution_policy').all(),routing:this.router.list(),planning:this.s.db.query('SELECT * FROM planning_dispatch').all(),implementation:this.s.db.query('SELECT job,plan_hash,session_id,state,paths,runtime,reason FROM implementation_dispatch').all(),
   readiness:this.s.db.query('SELECT job,plan_hash,state,valid,source,reason,questions,dependencies,risks,observed FROM plan_readiness').all(),
   resolutions:this.s.db.query('SELECT job,plan_hash,binding,source,actor,detail,state,at FROM plan_resolutions WHERE state=?').all('active'),
-  outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
-    FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all(),
+   outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.revision_id,w.dispatch_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
+     FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all().map((o:any)=>({...o,historical:!currentOutcome(this.s,o.job,o)})),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
   blockers:this.s.db.query(`SELECT w.job,j.issue,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.grace_deadline
-    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state NOT IN ('awaiting_plan','done') AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all()};}
+      FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.plan_hash=j.plan_hash AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all().filter((o:any)=>currentOutcome(this.s,o.job,this.outcomes(o.job))),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
 }

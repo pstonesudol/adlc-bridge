@@ -64,6 +64,57 @@ function fixture(){
   blockers:()=>new LinearBlockers(s,api)
  };
 }
+test('stale worker outcomes from an earlier revision never reach the generic publisher',async()=>{
+ const f=fixture();try{
+  const j=f.s.get(f.id),dispatch='current-dispatch';
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('blocker-revision',f.id,digest(j.spec),digest(j.spec),'Revision','authorized');
+  f.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,j.plan_hash,'session',dispatch,'approved_pending','["src/**"]','supervised-host','human',null);
+  // A current receipt publishes...
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('blocker-revision',dispatch,f.id);
+  expect((await f.blockers().sync(f.config))[0].state).toBe('posted');expect(f.creates).toBe(1);
+  // ...but a later receipt bound to an earlier dispatch and different evidence
+  // is historical.
+  f.s.db.query("UPDATE worker_outcomes SET dispatch_id='old-dispatch',reason='Superseded receipt',dependencies='[]' WHERE job=?").run(f.id);
+  await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+  // A binding change between the row scan and the external write aborts it.
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?' ).run('blocker-revision',dispatch,f.id);
+  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='second-comment' WHERE job=? AND state='posted'").run(f.id);
+  const blockers=f.blockers();const api=(blockers as any).api;let mutated=false;
+  (blockers as any).api=async(q:string,v:any)=>{if(!mutated&&q.includes('comments(first:100')){mutated=true;f.s.db.query("UPDATE worker_outcomes SET dispatch_id='changed-during-write' WHERE job=?").run(f.id);}return api(q,v);};
+  const result=await blockers.sync(f.config);
+  expect(result.some((r:any)=>r.state==='blocked'&&r.reason==='Worker blocker binding changed before Linear write')).toBe(true);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+  // A same-instance outcome change (worker becomes running) also aborts the write.
+  f.s.db.query("UPDATE worker_outcomes SET dispatch_id=?,reason='Worker stopped before edits',dependencies='[{\"ref\":\"DEV-9\",\"reason\":\"Approved sourcing wording\"}]' WHERE job=?").run(dispatch,f.id);
+  f.s.db.query("DELETE FROM blocker_notices WHERE job=? AND state!='posted'").run(f.id);
+  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='third-comment' WHERE job=? AND state='posted'").run(f.id);
+  const second=f.blockers();const api2=(second as any).api;let changed=false;
+  (second as any).api=async(q:string,v:any)=>{if(!changed&&q.includes('comments(first:100')){changed=true;f.s.db.query("UPDATE worker_outcomes SET outcome='running' WHERE job=?").run(f.id);}return api2(q,v);};
+  const running=await second.sync(f.config);
+  expect(running.some((r:any)=>r.state==='blocked'&&r.reason==='Worker blocker changed before Linear write')).toBe(true);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+ }finally{f.s.close();}
+});
+test('a worker change after the comment is written blocks the label update',async()=>{
+ const f=fixture();try{
+  const j=f.s.get(f.id),dispatch='current-dispatch';
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('late-revision',f.id,digest(j.spec),digest(j.spec),'Revision','authorized');
+  f.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(f.id,j.plan_hash,'session',dispatch,'approved_pending','["src/**"]','supervised-host','human',null);
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('late-revision',dispatch,f.id);
+  expect(f.labels).not.toContain(labelId);
+  const blockers=f.blockers(),api=(blockers as any).api;let mutated=false;
+  (blockers as any).api=async(q:string,v:any)=>{
+   const result=await api(q,v);
+   if(!mutated&&q.includes('commentCreate')){mutated=true;f.s.db.query("UPDATE worker_outcomes SET outcome='running' WHERE job=?").run(f.id);}
+   return result;
+  };
+  const result=await blockers.sync(f.config);
+  expect(result[0]).toMatchObject({state:'blocked',reason:'Worker blocker changed before Linear write'});
+  // The comment was already delivered, but no label mutation follows it.
+  expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.labels).not.toContain(labelId);
+ }finally{f.s.close();}
+});
 test('blocker comment and label are idempotent across polls and restarts',async()=>{
  const f=fixture();try{
   const first=await f.blockers().sync(f.config);expect(first[0].state).toBe('posted');
