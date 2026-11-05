@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,rmSync,writeFileSync,mkdirSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,writeFileSync,mkdirSync,symlinkSync,unlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
@@ -793,6 +793,23 @@ test('a failed replan from an earlier revision is retired before the newer revis
   expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
   expect(f.sends).toHaveLength(2);
  }finally{f.s.close();}
+});
+test('ingest respects the turn-submission pause',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-ingest-fence-')),db=join(dir,'state.db'),specFile=join(dir,'spec.json');
+ try{
+  writeFileSync(specFile,JSON.stringify({identifier:'DEV-1',title:'Task',description:'Original'}));
+  const state=join(dir,'Library','Application Support','ADLC Bridge');mkdirSync(state,{recursive:true});
+  const paused=join(state,'turn-submissions.paused');writeFileSync(paused,'Paused\n');
+  const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'},cli=join(import.meta.dir,'../src/cli.ts');
+  const blocked=Bun.spawnSync([process.execPath,cli,'ingest','p','issue',specFile],{env});
+  expect(blocked.exitCode).not.toBe(0);
+  expect(blocked.stderr.toString()).toContain('Turn submissions paused');
+  const s=new Store(db);try{expect(s.list()).toHaveLength(0);}finally{s.close();}
+  unlinkSync(paused);
+  const accepted=Bun.spawnSync([process.execPath,cli,'ingest','p','issue',specFile],{env});
+  expect(accepted.exitCode).toBe(0);
+  expect(JSON.parse(accepted.stdout.toString()).id).toBeString();
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });
 test('worktree reservations are detected through alias paths',()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-alias-'));try{

@@ -393,7 +393,12 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(blockingRevision(revision))throw Error('Active requirement revision requires spec-reconcile before manual plan capture');
       return out(capturePlan(s,job,await sessionEvidence(req(a[1],'Session')),Number(a[2]),revision?.id??null));
     }
-    if(command==='ingest')return out({id:s.enqueue(req(a[0],'Project'),req(a[1],'Issue'),readFileSync(req(a[2],'Specification file'),'utf8'))});
+    if(command==='ingest'){
+      const project=req(a[0],'Project'),issue=req(a[1],'Issue'),specification=readFileSync(req(a[2],'Specification file'),'utf8');
+      // Intake shares the submission fence: a reconcile reservation must make
+      // ingestion fail closed rather than add work mid-reservation.
+      return out({id:await withTurnSubmission(async()=>s.enqueue(project,issue,specification))});
+    }
     if(command==='plan'){
       const job=req(a[0],'Job'),revision=latestRevision(s,job);
       if(blockingRevision(revision))throw Error('Active requirement revision requires spec-reconcile before manual plan submission');

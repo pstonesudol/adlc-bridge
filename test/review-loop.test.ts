@@ -531,15 +531,15 @@ test('a late GitHub review-request receipt preserves the completed target and it
 });
 test('a review request for an unregistered PR posts nothing',async()=>{
  const f=templateFixture();try{
-  let posts=0;f.loop.postReview=async()=>{posts++;};
+  const calls:any[]=[];f.loop.postReview=async(...args:any[])=>{calls.push(args);};
   const registered=f.loop.get(f.id).pr;
   expect(await f.loop.requestReview(f.id,registered+1,f.head,'body')).toBe(false);
-  expect(posts).toBe(0);
+  expect(calls).toHaveLength(0);
   expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(0);
   expect(f.loop.get(f.id).pr).toBe(registered);
   // The registered PR still requests normally.
   expect(await f.loop.requestReview(f.id,registered,f.head,'body')).toBe(true);
-  expect(posts).toBe(1);
+  expect(calls).toEqual([['owner/repo',registered]]);
  }finally{f.s.close();}
 });
 test('a target rebound during a tick keeps the old PR decision unwritten',async()=>{
