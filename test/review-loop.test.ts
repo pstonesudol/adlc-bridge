@@ -529,6 +529,21 @@ test('a late GitHub review-request receipt preserves the completed target and it
   const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
  }finally{release?.();f.s.close();}
 });
+test('remediation reconciliation cannot write an old PR decision to a rebound target',async()=>{
+ const f=templateFixture();try{
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  let rebound:any;const snapshot=f.loop.io.readBranchSnapshot;
+  f.loop.io.readBranchSnapshot=async(...args:any[])=>{
+   const result=await (snapshot as any)(...args);
+   f.s.db.query("UPDATE review_targets SET pr=2,state='waiting_for_review',reason=NULL,head=NULL,last_signature=NULL WHERE job=?").run(f.id);
+   rebound=f.loop.get(f.id);
+   return result;
+  };
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'});
+  expect(f.loop.get(f.id)).toEqual(rebound);
+  expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 test('a review request for an unregistered PR posts nothing',async()=>{
  const f=templateFixture();try{
   const calls:any[]=[];f.loop.postReview=async(...args:any[])=>{calls.push(args);};

@@ -409,6 +409,10 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job'),hash=req(a[1],'Hash'),j=s.get(job);
       if(hash!==j.plan_hash)throw Error('Stale plan or invalid state');
       assertCapturedRevision(s,job,hash,new Planning(s).get(job)?.session_id??null);
+      if(latestRevision(s,job)?.state==='awaiting_approval'){
+        const dispatch=workflow.implementation(job);
+        if(dispatch&&dispatch.plan_hash!==hash)throw Error('Revised plan requires approve-job to atomically rebind implementation authorization');
+      }
       assertApprovalReadiness(s,job,req(a[2],'Human'),a.includes('--acknowledge-readiness'));
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }

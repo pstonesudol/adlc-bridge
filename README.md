@@ -1836,7 +1836,8 @@ breaking polling. Confirming that exact completed turn retires it without replay
 a fresh planning attempt still needs separate preview/confirmation. Active
 revisions require approval of the exact captured revised-plan hash, even before
 the first implementation. A manually submitted plan cannot bypass that capture.
-Direct `plan` and `capture-plan` refuse while an active revision is pending; use
+Direct `plan` and `capture-plan` refuse for every recorded revision state except
+`preplanning`, including `pending`, `awaiting_approval`, and `authorized`; use
 `spec-reconcile` instead. A revised handoff must be the PR the review target
 registered. The recorded revision handoff is authoritative: if the target points
 at another PR, `adlc rebind-review-target JOB REPO PR` (with the handoff's PR)

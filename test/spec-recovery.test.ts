@@ -15,8 +15,8 @@ import {turnBarrier} from '../src/turn-submission';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
-async function fixture(){
- const s=new Store(':memory:'),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
+async function fixture(database=':memory:'){
+ const s=new Store(database),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
  let e:any,sends:any[]=[];
  const transport:any={evidence:async()=>e,worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40),tree:'/worktree'}),disableFeedback:async()=>{},branchSnapshot:async()=>({branch:e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),sendImplementation:async(session:string,text:string,clientId:string,mode?:string)=>{sends.push({session,text,clientId,mode});e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:e.transcript.entries.length+1});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';}};
  const w=new Workflow(s,transport),p=new Planning(s),r=p.reserve(job,'project');p.gate(job,'project','owner',r.branch,'/worktree');
@@ -536,6 +536,25 @@ test('propose and executeApproved reject a revision that changed after evidence 
   f.s.db.query("UPDATE spec_replans SET proof=? WHERE revision=?").run(JSON.stringify({...JSON.parse((f.s.db.query('SELECT proof FROM spec_replans WHERE revision=?').get(after.id) as any).proof),capturedPlanHash:'0'.repeat(64)}),after.id);
   await expect(f.w.executeApproved(f.job,config)).rejects.toThrow('Exact captured replan for the current requirement revision required');
  }finally{f.s.close();}
+});
+test('approve-plan refuses a captured revision that needs implementation rebinding',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-revised-approve-')),db=join(dir,'state.db');
+ const f=await fixture(db);
+ try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  const before=f.w.implementation(f.job),hash=f.s.get(f.job).plan_hash;
+  expect(before.plan_hash).not.toBe(hash);
+  const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'approve-plan',f.job,hash,'Human'],{env:{ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'}});
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr.toString()).toContain('Revised plan requires approve-job');
+  expect(f.s.get(f.job)).toMatchObject({state:'awaiting_approval',approved_hash:null});
+  expect(latestRevision(f.s,f.job).state).toBe('awaiting_approval');
+  expect(f.w.implementation(f.job)).toEqual(before);
+  f.w.approve(f.job,hash,'Human',['src/**'],'supervised-host',featureGit);
+  expect(f.s.get(f.job).state).toBe('approved');
+  expect(f.w.implementation(f.job).plan_hash).toBe(hash);
+  expect(latestRevision(f.s,f.job).state).toBe('authorized');
+ }finally{f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
 test('approve-plan refuses an active revision without its captured replan',()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-cli-approve-')),db=join(dir,'state.db');

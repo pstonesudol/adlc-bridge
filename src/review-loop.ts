@@ -147,11 +147,11 @@ export class ReviewLoop{
    const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
     const run=new Lifecycle(this.s).run(job),j=this.s.get(job);
     const receipt=new ReceiptReconciliation(this.s).inspect({job,plan:run.plan_hash,spec:digest(j.spec),session:run.session_id,client:handle,attempt:`remediation:${pending.attempt}`},session);
-    if(receipt.state!=='completed')return this.record(job,{state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:receipt.reason,delivery:receipt});
+     if(receipt.state!=='completed')return {state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:receipt.reason,delivery:receipt};
     if(activeOnly)return;
    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
    if(recovery){const detail=JSON.parse(recovery.detail);if(detail.message==='uncertain')this.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=? AND detail=?').run(JSON.stringify({...detail,message:'completed'}),recovery.id,recovery.detail);}
-   if(pending.head===head)return this.record(job,{state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'});
+    if(pending.head===head)return {state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'};
   }
   record(job:string,result:any,pr?:number){
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
@@ -233,7 +233,7 @@ export class ReviewLoop{
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
    const collected=this.completed(job);if(collected)return collected;
-   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return activeDelivery;
+   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return record(activeDelivery);
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
@@ -386,7 +386,7 @@ export class ReviewLoop{
   if(!stored)return this.get(job)?.pr!==t.pr?{state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}:{state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
   if(d.send&&t.remediate){
    const reconciliation=this.reconcileRemediation(job,e.head,session);
-   if(reconciliation)return reconciliation;
+   if(reconciliation)return record(reconciliation);
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
