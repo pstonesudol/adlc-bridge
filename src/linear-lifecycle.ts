@@ -100,16 +100,23 @@ export class LinearLifecycle{
   const planning=this.s.db.query('SELECT spec_hash FROM planning_runs WHERE job=?').get(job) as any;
   if(!binding||planning?.spec_hash!==binding||digest(this.s.get(job).spec)!==binding)throw Error('Run requirements binding changed or missing; reconcile before status update');
  }
- async move(job:string,phase:string,desired:string,c:SyncConfig,binding:string){
-  this.assertSpecification(job,binding);
+  private assertRevision(job:string,expected:string|null){
+   const r=latestRevision(this.s,job);
+   if((r?.id??null)!==expected||(r&&!['authorized','preplanning'].includes(r.state))||(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)))throw Error('Revision or revised handoff changed before Linear status update');
+  }
+  async move(job:string,phase:string,desired:string,c:SyncConfig,binding:string,revision:string|null=latestRevision(this.s,job)?.id??null){
+   this.assertSpecification(job,binding);
+   this.assertRevision(job,revision);
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear lifecycle identity or label scope mismatch');
   if(j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Requirements changed; refusing status update');
   const target=await this.api('query($id:String!){workflowState(id:$id){id type team{id}}}',{id:desired});
   const expected=phase==='done'?'completed':'started';
   if(target.workflowState?.team?.id!==c.linear.teamId||target.workflowState.type!==expected)throw Error('Configured Linear status has wrong team or category');
-  this.assertSpecification(job,binding);
-  let row=this.s.db.query('SELECT * FROM linear_transitions WHERE job=? AND phase=?').get(job,phase) as any;
+   const reservation=this.s.db.transaction(()=>{
+    this.assertSpecification(job,binding);
+    this.assertRevision(job,revision);
+   const row=this.s.db.query('SELECT * FROM linear_transitions WHERE job=? AND phase=?').get(job,phase) as any;
   if(row&&row.desired!==desired)throw Error('Status mapping changed; reconcile previous transition');
   if(issue.state.id===desired){
    this.s.db.query('INSERT INTO linear_transitions VALUES (?,?,?,?,?,?) ON CONFLICT(job,phase) DO UPDATE SET state=excluded.state,reason=NULL').run(job,phase,desired,issue.state.id,'confirmed',null);return {state:'confirmed'};
@@ -118,12 +125,19 @@ export class LinearLifecycle{
   if(row){return {state:'needs_reconciliation',reason:'Status changed or previous delivery uncertain; no blind replay'};}
   const allowed=phase==='in-progress'?[c.linear.readyStateId]:[c.linear.readyStateId,c.statusSync!.inProgress,c.statusSync!.inReview];
   if(!allowed.includes(issue.state.id))return {state:'needs_reconciliation',reason:'Ticket moved to an unexpected state; human changes preserved'};
-  const claim=this.s.db.query('INSERT OR IGNORE INTO linear_transitions VALUES (?,?,?,?,?,?)').run(job,phase,desired,issue.state.id,'delivery_uncertain',null);
-  if(!claim.changes)return {state:'delivery_uncertain'};
+    const claim=this.s.db.query('INSERT OR IGNORE INTO linear_transitions VALUES (?,?,?,?,?,?)').run(job,phase,desired,issue.state.id,'delivery_uncertain',null);
+    if(!claim.changes)return {state:'delivery_uncertain'};
+    return null;
+   }).immediate();
+   if(reservation)return reservation;
+    this.assertSpecification(job,binding);
+    this.assertRevision(job,revision);
   const b=await this.api('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success issue{id state{id}}}}',{id:j.issue,state:desired});
   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||b.issueUpdate.issue.state?.id!==desired)throw Error('Linear status delivery requires reconciliation');
-  this.assertSpecification(job,binding);
-  this.s.db.query("UPDATE linear_transitions SET state='confirmed' WHERE job=? AND phase=?").run(job,phase);this.s.event(job,'linear_status_changed',JSON.stringify({phase,state:desired}));return {state:'confirmed'};
+   return this.s.db.transaction(()=>{
+    this.assertSpecification(job,binding);this.assertRevision(job,revision);
+    this.s.db.query("UPDATE linear_transitions SET state='confirmed' WHERE job=? AND phase=?").run(job,phase);this.s.event(job,'linear_status_changed',JSON.stringify({phase,state:desired}));return {state:'confirmed'};
+   }).immediate();
  }
   async revisionNotices(c:SyncConfig){
    const limit=5,cursor=this.s.db.query('SELECT last_rowid FROM spec_notice_cursor WHERE project=?').get(c.linear.projectId) as any,after=cursor?.last_rowid??0;
@@ -217,7 +231,7 @@ export class LinearLifecycle{
    // unconfirmed delivery evidence must not advance the issue to In Review.
    const reviewHandoffMissing=review&&delivery?.state!=='pr_handoff';
    if((row.state==='blocked'||branchMismatch||reviewHandoffMissing||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
-   const result=await this.move(row.id,phase,desired,c,row.spec_hash);results.push({job:row.id,phase,...result});
+    const result=await this.move(row.id,phase,desired,c,row.spec_hash,revision?.id??null);results.push({job:row.id,phase,...result});
     if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
      this.assertSpecification(row.id,row.spec_hash);
      if((latestRevision(this.s,row.id)?.id??null)!==(revision?.id??null)||(revisedExecution(this.s,row.id)&&!revisedHandoff(this.s,row.id)))throw Error('Revision or revised handoff changed before Done completion');

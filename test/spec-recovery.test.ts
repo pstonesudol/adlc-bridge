@@ -427,6 +427,35 @@ test('old failed notices receive round-robin retries despite sustained new revis
   expect(posted).toHaveLength(20);expect(new Set(posted).size).toBe(20);
  }finally{s.close();}
 });
+for(const stage of ['pr','issue','state'])for(const change of ['revision','handoff','none'])test(`real status move rejects ${change} changes during ${stage} lookup before any Linear write`,async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  await f.w.executeApproved(f.job,config);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  await f.w.executionStatus(f.job,f.e,config);new ReviewLoop(f.s).register(f.job,'owner/repo',1,['CI'],['src/**']);
+  let writes=0;
+  const mutate=()=>{
+   if(change==='handoff')f.s.db.query('DELETE FROM revision_handoffs WHERE job=?').run(f.job);
+   if(change==='revision'){const original=f.s.get(f.job).spec;f.s.enqueue('p','issue','Intermediate revision');f.s.enqueue('p','issue',original);}
+  };
+  const api:any=async(q:string)=>{
+   if(q.includes('issueUpdate')){writes++;return {issueUpdate:{success:true,issue:{id:'issue',state:{id:'done'}}}};}
+   if(q.includes('workflowState')){if(stage==='state')mutate();return {workflowState:{id:'done',type:'completed',team:{id:'t'}}};}
+   if(stage==='issue')mutate();return {issue:await f.recovery.issue('issue')};
+  };
+  const linear=new LinearLifecycle(f.s,api,(async()=>{if(stage==='pr')mutate();return {merged:true,state:'closed'};}) as any);
+  linear.revisionNotices=async()=>[];
+  const result=await linear.sync({...config,statusSync:{enabled:true,inProgress:'doing',inReview:'review',done:'done'}});
+  if(change==='none'){expect(writes).toBe(1);expect(f.s.get(f.job).state).toBe('done');}
+  else{
+   expect(result).toEqual(expect.arrayContaining([expect.objectContaining({error:'Revision or revised handoff changed before Linear status update'})]));
+   expect(writes).toBe(0);expect(f.s.get(f.job).state).not.toBe('done');
+   expect(f.s.db.query('SELECT * FROM linear_transitions WHERE job=?').all(f.job)).toHaveLength(0);
+  }
+ }finally{f.s.close();}
+});
 for(const stage of ['pr','move'])for(const change of ['revision','handoff','none'])test(`Done rechecks ${change} after awaited ${stage} evidence`,async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
