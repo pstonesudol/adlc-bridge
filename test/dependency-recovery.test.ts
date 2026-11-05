@@ -7,6 +7,7 @@ import {validateDependencies} from '../src/dependency-policy';
 import {dependencyRelations,dependencyIO} from '../src/dependency-evidence';
 import {assertWorktreeAvailable} from '../src/worktree-reservation';
 import {LinearBlockers} from '../src/linear-blockers';
+import {settleDependencyWait} from '../src/spec-revisions';
 import {mkdtempSync,writeFileSync,mkdirSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -40,12 +41,12 @@ async function fixture(){
  const r=new DependencyRecovery(s,w,io,async fn=>fn());
   return {s,w,r,c,job,e,sends,io,issue,setMerged:(n:number)=>merged=n,setHead:(v:string)=>head=v,setLost:(v:boolean,hasReceipt=true)=>{lose=v;receipt=hasReceipt;},updates:()=>updates,fetches:()=>fetches};
 }
-function linearSurface(f:Awaited<ReturnType<typeof fixture>>,onRead?:(count:number)=>void){
+function linearSurface(f:Awaited<ReturnType<typeof fixture>>,onRead?:(count:number)=>void,onCreate?:()=>void){
  const comments:any[]=[],labels=new Set<string>(['ready']);let creates=0,adds=0,reads=0;
  f.c.blockerSync={enabled:true,labelId:'44444444-4444-4444-4444-444444444444'};
  const issue=()=>({...f.issue,labels:{nodes:[...labels].map(id=>({id})),pageInfo:{hasNextPage:false}}});
  const api:any=async(q:string,v:any)=>{
-  if(q.includes('commentCreate')){creates++;const comment={id:v.input.id,body:v.input.body,createdAt:new Date().toISOString()};comments.push(comment);return {commentCreate:{success:true,comment}};}
+  if(q.includes('commentCreate')){creates++;const comment={id:v.input.id,body:v.input.body,createdAt:new Date().toISOString()};comments.push(comment);onCreate?.();return {commentCreate:{success:true,comment}};}
   if(q.includes('issueUpdate')){for(const id of v.added??[]){adds++;labels.add(id);}for(const id of v.removed??[])labels.delete(id);return {issueUpdate:{success:true,issue:issue()}};}
   if(q.includes('comments(first:'))return {issue:{id:root,comments:{nodes:comments,pageInfo:{hasNextPage:false}}}};
   onRead?.(++reads);return {issue:issue()};
@@ -160,6 +161,46 @@ for(const change of ['outcome','wait','binding'])test(`dependency notice recheck
   const result=await f.r.notices(f.c,surface.blockers);
   expect(result[0]).toMatchObject({state:'blocked',reason:'Dependency wait or worker outcome changed before notice publication'});
   expect(surface.counts()).toEqual({creates:0,adds:0});
+ }finally{f.s.close();}
+});
+for(const change of ['outcome','wait','binding'])test(`dependency label guard rejects ${change} changes after the comment was published`,async()=>{
+ const f=await fixture();try{
+  f.setMerged(1);await f.r.tick(f.job,f.c);
+  const surface=linearSurface(f,undefined,()=>{
+   if(change==='outcome')f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+   if(change==='wait')f.s.db.query("UPDATE dependency_waits SET state='settled' WHERE job=?").run(f.job);
+   if(change==='binding')f.s.db.query("UPDATE worker_outcomes SET dispatch_id='different-dispatch' WHERE job=?").run(f.job);
+  });
+  const result=await f.r.notices(f.c,surface.blockers);
+  expect(result[0]).toMatchObject({state:'blocked',reason:'Dependency wait or worker outcome changed before notice publication'});
+  expect(surface.counts()).toEqual({creates:1,adds:0});expect(surface.comments).toHaveLength(1);
+  expect(f.s.db.query('SELECT state,label_applied FROM blocker_notices WHERE job=?').get(f.job)).toEqual({state:'posted',label_applied:0});
+ }finally{f.s.close();}
+});
+for(const transition of ['reopened','resumed','settled'])for(const field of ['state','evidence'])test(`dependency wait ${transition} preserves a concurrent ${field} change without an audit claim`,async()=>{
+ const f=await fixture();try{
+  f.r.install();const j=f.s.get(f.job);
+  let evidence:any={};
+  if(transition==='resumed'){
+   evidence={clientId:'accepted-continuation'};
+   f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(f.job,j.plan_hash,digest(j.spec),'accepted','accepted-continuation','session','delivery_accepted');
+  }
+  f.r.save(f.job,transition==='reopened'?'settled':'waiting_for_dependencies','Before race',evidence);
+  if(transition!=='reopened')f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+  const query=f.s.db.query.bind(f.s.db);let raced=false;
+  (f.s.db as any).query=(sql:string,...args:any[])=>{
+   if(!raced&&sql.startsWith('UPDATE dependency_waits SET')){
+    raced=true;
+    if(field==='state')query("UPDATE dependency_waits SET state='operator_changed' WHERE job=?").run(f.job);
+    else query('UPDATE dependency_waits SET evidence=? WHERE job=?').run('{"operator":"new evidence"}',f.job);
+   }
+   return query(sql,...args);
+  };
+  expect(settleDependencyWait(f.s,f.job)).toBeUndefined();expect(raced).toBe(true);
+  const row=f.r.rows()[0];
+  if(field==='state')expect(row.state).toBe('operator_changed');
+  else expect(row.evidence).toBe('{"operator":"new evidence"}');
+  expect(query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(0);
  }finally{f.s.close();}
 });
 test('historical settled proof cannot hide a current restored-hash dependency blocker',async()=>{
