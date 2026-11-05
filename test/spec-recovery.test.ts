@@ -103,6 +103,40 @@ for(const discovery of ['one','zero','ambiguous','wrong-project','wrong-branch',
   }
  }finally{f.s.close();}
 });
+for(const remaining of ['none','latest','older'])test(`superseded completion releases planning only with no remaining replan: ${remaining}`,async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  const old=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+  if(remaining==='older'){
+   f.edit('v3');
+   const intermediate=latestRevision(f.s,f.job);
+   f.s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,?,'delivery_uncertain',?,NULL)").run(intermediate.id,f.job,'unresolved-other','owner','other',old.proof);
+  }
+  f.edit('v4');const current=latestRevision(f.s,f.job);
+  if(remaining==='latest')f.s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,?,'accepted',?,NULL)").run(current.id,f.job,'unresolved-latest','owner','latest',old.proof);
+  await f.recovery.capture(f.job,config);
+  expect(f.s.db.query('SELECT state FROM spec_replans WHERE revision=?').get(old.revision)).toEqual({state:'superseded_completed'});
+  expect(f.w.planning(f.job).state).toBe(remaining==='none'?'planning_finished':'revision_pending');
+  expect(f.s.get(f.job).state).toBe('awaiting_plan');expect(f.sends).toHaveLength(2);
+  await f.recovery.capture(f.job,config);
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='superseded_replan_completed'").get(f.job)).toEqual({n:1});
+ }finally{f.s.close();}
+});
+test('superseded completion cannot retire a replaced client reservation',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  const old=latestRevision(f.s,f.job);f.edit('v3');
+  const evidence=f.w.t.evidence;
+  f.w.t.evidence=async session=>{
+   f.s.db.query("UPDATE spec_replans SET client_id='replacement-client' WHERE revision=?").run(old.id);
+   return evidence(session);
+  };
+  await f.recovery.capture(f.job,config);
+  expect(f.s.db.query('SELECT state,client_id FROM spec_replans WHERE revision=?').get(old.id)).toEqual({state:'accepted',client_id:'replacement-client'});
+  expect(f.w.planning(f.job).state).toBe('revision_pending');
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE job=? AND kind='superseded_replan_completed'").get(f.job)).toEqual({n:0});
+ }finally{f.s.close();}
+});
 test('spec summary never exposes arbitrary ticket text; exact byte edits fail closed',()=>{
  expect(revisionSummary('{"description":"secret old"}','{"description":"secret new"}')).toBe('description changed (10 → 10 characters; content redacted)');
  expect(revisionSummary('secret','other secret')).not.toContain('other secret');

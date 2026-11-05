@@ -529,6 +529,18 @@ test('a late GitHub review-request receipt preserves the completed target and it
   const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
  }finally{release?.();f.s.close();}
 });
+test('completed same-head remediation persists the guarded blocked decision',async()=>{
+ const f=templateFixture();try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['commit','push-feature'],'human');
+  f.e.findings=[{kind:'code',path:'src/a.ts',message:'Fix the scoped defect'}];f.e.failedChecks=[];
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  f.session.transcript.turns[0].state='completed';
+  const reason='Worker completed remediation without a new commit or metadata change; inspect before retry';
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason,pr:1});
+  expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
 test('remediation reconciliation cannot write an old PR decision to a rebound target',async()=>{
  const f=templateFixture();try{
   expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});

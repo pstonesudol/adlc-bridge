@@ -361,9 +361,9 @@ export class ReviewLoop{
    return record({state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence'});
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
-  // as dispatched.
-  const reconciliation=this.reconcileRemediation(job,e.head,session);
-  if(reconciliation)return reconciliation;
+   // as dispatched.
+   const reconciliation=this.reconcileRemediation(job,e.head,session);
+   if(reconciliation)return record(reconciliation);
   const dispatched=dispatchedFeedback(this.s,job);
   const threadFindings=e.findings.filter((f:any)=>f.kind==='review_thread');
   const freshThreadFindings=threadFindings.filter((f:any)=>!dispatched.has(feedbackKey(f.threadId,f.commentsHash)));

@@ -145,8 +145,17 @@ export class SpecRecovery{
    const proof=JSON.parse(old.proof),e=await this.w.t.evidence(old.session);
    const sent=e.transcript?.entries?.find((x:any)=>x.clientMessageId===old.client_id);
    if(e.session?.id===old.session&&e.session.projectId===proof.project&&e.session.branch===proof.branch&&e.transcript?.controller==='ready'&&sent&&e.transcript.turns?.some((t:any)=>t.id===sent.turnId&&t.state==='completed')){
-    this.s.db.query("UPDATE spec_replans SET state='superseded_completed' WHERE revision=?").run(old.revision);
-    this.s.event(job,'superseded_replan_completed',old.client_id);
+     this.s.db.transaction(()=>{
+      const changed=this.s.db.query("UPDATE spec_replans SET state='superseded_completed' WHERE revision=? AND client_id=? AND state=?").run(old.revision,old.client_id,old.state).changes;
+      if(!changed)return;
+      // Release only an otherwise idle revision slot. A latest-revision row
+      // or any other unresolved attempt must keep its existing reservation.
+      this.s.db.query(`UPDATE planning_dispatch SET state='planning_finished',reason='Superseded replan completed; new revision requires explicit spec-reconcile'
+       WHERE job=? AND state='revision_pending'
+       AND NOT EXISTS (SELECT 1 FROM spec_replans WHERE revision=?)
+       AND NOT EXISTS (SELECT 1 FROM spec_replans WHERE job=? AND state IN ('accepted','delivery_uncertain'))`).run(job,latestRevision(this.s,job)?.id??'',job);
+      this.s.event(job,'superseded_replan_completed',old.client_id);
+     }).immediate();
    }
   }
   const r=latestRevision(this.s,job),j=this.s.get(job);
