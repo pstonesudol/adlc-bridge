@@ -52,6 +52,28 @@ export function currentOutcome(s:Store,job:string,o:any){
  return !!(d&&o.plan_hash===j.plan_hash&&o.plan_hash===d.plan_hash&&o.session_id===d.session_id&&
   (r?o.revision_id===r.id&&o.dispatch_id===d.client_id:!o.revision_id&&(!o.dispatch_id||o.dispatch_id===d.client_id)));
 }
+/** A fresh same-instance outcome can retire a dependency wait, but not a
+ * historical or unbound receipt. Resumed notices retain their retraction flow. */
+export function settleDependencyWait(s:Store,job:string){
+ if(!s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get())return;
+ if(!s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return;
+ const row=s.db.query('SELECT * FROM dependency_waits WHERE job=?').get(job) as any;
+ if(!row||['resumed','settled'].includes(row.state)||row.plan!==s.get(job).plan_hash)return;
+ const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
+ if(!currentOutcome(s,job,o)||o.outcome==='blocked_dependency')return;
+ const evidence=JSON.parse(row.evidence),client=evidence.clientId;
+ if(client&&s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()){
+  const cont=s.db.query('SELECT * FROM continuations WHERE client_id=? AND job=? AND plan_hash=?').get(client,job,row.plan) as any;
+  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
+  const bound=!r||(evidence.proof?.auth?.revision===r.id&&evidence.proof.auth.delivery===d?.client_id);
+  if(bound&&cont?.session_id===d?.session_id&&['delivery_accepted','completed'].includes(cont?.state)){
+   s.db.query("UPDATE dependency_waits SET state='resumed',reason='Existing continuation accepted; no replay' WHERE job=?").run(job);
+   return 'resumed';
+  }
+ }
+ s.db.query("UPDATE dependency_waits SET state='settled',reason='Current worker outcome no longer reports a dependency blocker' WHERE job=?").run(job);
+ s.event(job,'dependency_wait_settled',JSON.stringify({outcome:o.outcome,revision:o.revision_id??null,dispatch:o.dispatch_id??null}));
+}
 /** Jobs whose plan was renewed after a requirement revision keep their prior PR
  * historical until that exact revised plan completes a handoff. */
 export function revisedExecution(s:Store,job:string){

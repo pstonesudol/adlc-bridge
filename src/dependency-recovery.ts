@@ -8,7 +8,7 @@ import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation'
 import {withTurnSubmission} from './turn-submission';
 import {LinearBlockers} from './linear-blockers';
 import {remediationPolicy} from './remediation';
-import {currentOutcome,latestRevision} from './spec-revisions';
+import {currentOutcome,latestRevision,settleDependencyWait} from './spec-revisions';
 
 export class DependencyRecovery{
  io:DependencyIO;
@@ -82,9 +82,11 @@ export class DependencyRecovery{
    if(!currentOutcome(this.s,job,this.workflow.outcomes(job))||JSON.stringify(this.workflow.outcomes(job))!==JSON.stringify(o)||JSON.stringify(this.authorization(job,c))!==JSON.stringify(auth))throw Error('Dependency blocker or authorization changed during observation');
   return {mode:'preview_only',id,confirmation:digest(JSON.stringify([proof,facts,retained])),proof,facts,retained,nextAction:'Verify/fetch exact base, fast-forward clean feature only, and use existing guarded continuation. Unsafe evidence requires operator reconciliation.'};
  }
- async tick(job:string,c:any,confirmation?:string){return this.submit(async()=>{
-  this.install();
+  async tick(job:string,c:any,confirmation?:string){return this.submit(async()=>{
+   this.install();
+   settleDependencyWait(this.s,job);
    const prior=this.rows().find(r=>r.job===job);
+   if(prior?.state==='settled')return {job,state:'settled',reason:prior.reason};
    if(prior&&!this.currentWait(prior))return {job,state:'stale_dependencies',reason:'Retained dependency evidence belongs to a superseded revision or dispatch; history preserved'};
    if(!JSON.parse(prior?.evidence??'{}').clientId&&!currentOutcome(this.s,job,this.workflow.outcomes(job)))return {job,state:'stale_dependencies',reason:'Current revision-bound worker blocker required; no dependency work reserved'};
   // A reserved/sent continuation is never interpreted as permission to retry.
@@ -167,9 +169,12 @@ export class DependencyRecovery{
   this.s.db.query('INSERT INTO dependency_waits VALUES (?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET plan=excluded.plan,state=excluded.state,reason=excluded.reason,evidence=excluded.evidence').run(job,this.s.get(job).plan_hash,state,reason,JSON.stringify(evidence));
   return {job,state,displayStatus:state==='waiting_for_dependencies'?'Waiting for dependencies':state,reason,nextAction:state==='waiting_for_dependencies'?'Inspect dependency-preview; provide missing proof or reconcile safely, then explicitly confirm dependency-resume. Never replay uncertain delivery.':null};
  }
- async sync(c:any){
-  if(!c.dependencyRecovery?.enabled)return [];
+   async sync(c:any){
+   if(!c.dependencyRecovery?.enabled)return [];
+   const reconciled:string[]=[];
+   for(const wait of this.rows())if(this.s.get(wait.job).project===c.linear.projectId&&settleDependencyWait(this.s,wait.job)==='resumed')reconciled.push(wait.job);
    const rows=(this.s.db.query("SELECT j.id FROM jobs j JOIN worker_outcomes w ON w.job=j.id WHERE j.project=? AND j.state='approved' AND w.outcome='blocked_dependency'").all(c.linear.projectId) as any[]).filter(r=>currentOutcome(this.s,r.id,this.workflow.outcomes(r.id)));
+   for(const job of reconciled)if(!rows.some(r=>r.id===job))rows.push({id:job});
    for(const wait of this.rows())if(this.currentWait(wait)&&['ready','delivery_uncertain'].includes(wait.state)&&this.s.get(wait.job).project===c.linear.projectId&&!rows.some(r=>r.id===wait.job))rows.push({id:wait.job});
   const results=[];for(const r of rows)results.push(await this.tick(r.id,c));return results;
  }
@@ -178,7 +183,11 @@ export class DependencyRecovery{
    if(!c.blockerSync?.enabled)return results;
    for(const row of this.rows()){
     try{
-    const j=this.s.get(row.job);if(j.project!==c.linear.projectId||!this.currentWait(row))continue;
+    const j=this.s.get(row.job);if(j.project!==c.linear.projectId)continue;
+    settleDependencyWait(this.s,row.job);
+    const active=this.rows().find(r=>r.job===row.job);
+    if(active?.state==='settled'||!this.currentWait(active??row))continue;
+    Object.assign(row,active);
    const p=JSON.parse(row.evidence),definition=p.proof?.definition??p.definition;
    const outcome={plan_hash:row.plan,outcome:row.state,reason:row.reason,questions:'[]',dependencies:JSON.stringify((definition?.prerequisites??[]).map((d:any)=>({ref:d.ref,reason:`${d.repo}#${d.pr}; ${d.kind}; capabilities ${d.capabilities.map((x:any)=>x.path).join(', ')}`})))};
    const reason=row.state==='resumed'?`Verified dependency evidence ${p.id}; continuation accepted in the existing session. No new authorization or runtime activation.`:row.reason;

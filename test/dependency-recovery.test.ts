@@ -83,6 +83,44 @@ test('revision-bound dependency wait retries after a provider failure before pro
   expect(f.fetches()).toBe(1);expect(f.updates()).toBe(1);expect(f.sends).toHaveLength(2);
  }finally{f.s.close();}
 });
+for(const proof of [false,true])for(const entry of ['tick','notices','retract'])test(`${entry} settles a ${proof?'proof-bearing':'proof-less'} dependency wait after same-dispatch handoff`,async()=>{
+ const f=await fixture();try{
+  const j=f.s.get(f.job);
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('wait-revision',f.job,digest(j.spec),digest(j.spec),'Revision','authorized');
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('wait-revision',f.w.implementation(f.job).client_id,f.job);
+  f.setMerged(proof?2:1);
+  if(proof)f.r.io.fetch=async()=>{throw Error('Fetch unavailable');};
+  expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');
+  const before=f.r.rows()[0];expect(!!JSON.parse(before.evidence).proof).toBe(proof);
+  // Change only the outcome: plan, revision, dispatch and session stay equal.
+  f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+  f.c.blockerSync={enabled:true,labelId:'44444444-4444-4444-4444-444444444444'};
+  let notices=0;
+  if(entry==='tick')expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+  if(entry==='notices')expect(await f.r.notices(f.c,{leave:async()=>{notices++;}} as any)).toEqual([]);
+  if(entry==='retract'){
+   let removals=0;const api:any=async(q:string)=>{
+    if(q.startsWith('mutation')){removals++;return {issueUpdate:{success:true,issue:{id:root,labels:{nodes:[],pageInfo:{hasNextPage:false}}}}};}
+    return {issue:{id:root,project:{id:'p'},labels:{nodes:[{id:f.c.blockerSync.labelId}],pageInfo:{hasNextPage:false}}}};
+   };
+   const blockers=new LinearBlockers(f.s,api);
+   f.s.db.query("INSERT INTO blocker_notices(job,binding,comment_id,body,state,label_applied,applied_label_id) VALUES (?,?,?,?,'posted',1,?)").run(f.job,'owned','comment','Dependency blocker',f.c.blockerSync.labelId);
+   expect((await blockers.retract(f.job,f.c)).state).toBe('retracted');expect(removals).toBe(1);
+  }
+  const after=f.r.rows()[0];expect(after.state).toBe('settled');expect(after.evidence).toBe(before.evidence);
+  expect(notices).toBe(0);expect(f.fetches()).toBe(0);expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
+  expect((await f.r.tick(f.job,f.c)).state).toBe('settled');
+ }finally{f.s.close();}
+});
+test('resumed dependency notices still publish and retract their owned blocker label',async()=>{
+ const f=await fixture();try{
+  f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
+  f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+  f.c.blockerSync={enabled:true};let notices=0,retractions=0;
+  await f.r.notices(f.c,{leave:async()=>{notices++;},retract:async()=>{retractions++;}} as any);
+  expect(notices).toBe(1);expect(retractions).toBe(1);expect(f.r.rows()[0].state).toBe('resumed');
+ }finally{f.s.close();}
+});
 test('DEV-19: first merge waits; second verifies/updates and sends exactly once to original session',async()=>{
  const f=await fixture();try{
   f.setMerged(1);expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);

@@ -3,6 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
+import {settleDependencyWait} from './spec-revisions';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -86,9 +87,10 @@ export class LinearBlockers{
   }
   return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:labelState};
  }
- async retract(job:string,c:BlockerConfig){
-  if(c.blockerSync?.enabled!==true)return {state:'disabled'};
-  if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state!='resumed'").get(job))return {state:'retained',reason:'Dependency evidence or delivery remains unresolved'};
+  async retract(job:string,c:BlockerConfig){
+   if(c.blockerSync?.enabled!==true)return {state:'disabled'};
+   settleDependencyWait(this.s,job);
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state NOT IN ('resumed','settled')").get(job))return {state:'retained',reason:'Dependency evidence or delivery remains unresolved'};
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&this.s.db.query("SELECT job FROM clarification_receipts WHERE job=? AND state IN ('waiting','partial','confirmed','replan','needs_review')").get(job))return {state:'retained',reason:'Another unresolved clarification remains'};
   const rows=this.s.db.query("SELECT * FROM blocker_notices WHERE job=? AND state='posted' AND label_applied=1").all(job) as any[];
   if(!rows.length)return {state:'none'};
