@@ -40,8 +40,8 @@ test('full review requests survive lost replies without duplicate comments',asyn
  p.gate(id,'project','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');
  new Lifecycle(s).adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  let calls=0;const loop=new ReviewLoop(s,async()=>{calls++;throw Error('Reply lost');});loop.register(id,'owner/repo',1,['CI'],['a'],true);
- await expect(loop.requestReview(id,'sha','body')).rejects.toThrow('lost');
- expect(await loop.requestReview(id,'sha','body')).toBe(false);expect(calls).toBe(1);
+ await expect(loop.requestReview(id,loop.get(id).pr,'sha','body')).rejects.toThrow('lost');
+ expect(await loop.requestReview(id,loop.get(id).pr,'sha','body')).toBe(false);expect(calls).toBe(1);
  expect((s.db.query('SELECT state FROM full_review_requests').get() as any).state).toBe('delivery_uncertain');s.close();
 });
 
@@ -526,8 +526,33 @@ test('a late GitHub review-request receipt preserves the completed target and it
   f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.e.metadataCheckEvidence=bodyEvidence(f.e);f.loop.postReview=async()=>{entered();await gate;};
   const pending=f.loop.tick(f.id);await started;const newer='b'.repeat(40);f.s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';");f.s.db.query("UPDATE review_targets SET state='completed',head=?,reason='Merge observed' WHERE job=?").run(newer,f.id);
   const target=f.loop.get(f.id),changes=f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get();release();expect(await pending).toEqual({state:'completed',send:false,head:newer,reason:'Merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get()).toEqual(changes);expect(f.sends()).toBe(0);
-  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
  }finally{release?.();f.s.close();}
+});
+test('a target rebound during a tick keeps the old PR decision unwritten',async()=>{
+ const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
+ try{
+  f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.e.metadataCheckEvidence=bodyEvidence(f.e);
+  f.loop.postReview=async()=>{entered();await gate;};
+  const pending=f.loop.tick(f.id);await started;
+  const original=f.loop.get(f.id);
+  f.s.db.query('UPDATE review_targets SET pr=? WHERE job=?').run(original.pr+1,f.id);
+  release();
+  expect(await pending).toMatchObject({state:'blocked',reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'});
+  expect(f.loop.get(f.id)).toMatchObject({pr:original.pr+1,head:original.head});
+ }finally{release?.();f.s.close();}
+});
+test('legacy review-request receipts are migrated under an unknown PR key',()=>{
+ const s=new Store(':memory:');
+ s.db.exec('CREATE TABLE full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash))');
+ s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run('job','sha','body','accepted',1);
+ try{
+  new ReviewLoop(s);
+  expect(s.db.query('SELECT * FROM full_review_requests').all()).toEqual([{job:'job',pr:0,head:'sha',body_hash:'body',state:'accepted',requested:1}]);
+  // The same head/body can now hold a receipt for a different PR.
+  s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run('job',3,'sha','body','delivery_uncertain',2);
+  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=? ORDER BY pr').all('job')).toEqual([{pr:0},{pr:3}]);
+ }finally{s.close();}
 });
 test('failed review requests revoke stale ready state but retain their reservation and never post twice',async()=>{
  for(const edited of [false,true]){const f=templateFixture();try{
@@ -545,14 +570,14 @@ test('failed review requests revoke stale ready state but retain their reservati
 test('a late failed review request cannot reopen a concurrently completed target',async()=>{
  const f=templateFixture();try{
   let terminal:any;f.loop.postReview=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Merge observed'});terminal=f.loop.get(f.id);throw Error('Late GitHub failure');};
-  await expect(f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
+  await expect(f.loop.requestReview(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.s.close();}
 });
 test('a concurrently reserved review request cannot be downgraded to a normal wait by either request branch',async()=>{
  for(const edited of [false,true]){const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);f.e.clear=edited;f.e.failedChecks=[];f.e.findings=[];f.e.reasons=['CodeRabbit review absent'];f.e.botReviewSubmittedAt=Date.now()-1000;
   if(edited)f.s.db.query('INSERT INTO description_delivery_gates VALUES (?,?,?,?)').run(f.id,f.head,'previous-body',Date.now()-1000);
-  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.requestReview=async()=>{f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,'delivery_uncertain',Date.now());return false;};
+  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.requestReview=async()=>{f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash,'delivery_uncertain',Date.now());return false;};
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}}
 });
@@ -562,10 +587,10 @@ test('description edits cannot escape same-head review-request uncertainty or tr
   f.loop.postReview=async()=>{posts++;throw Error('Lost request receipt');};
   await expect(f.loop.tick(f.id)).rejects.toThrow('Lost request receipt');f.e.descriptionHash='edited-body';
   for(const clear of [false,true]){f.e.clear=clear;f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');}
-  expect(await f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).toBe(false);expect(posts).toBe(1);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toHaveLength(1);
+  expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash)).toBe(false);expect(posts).toBe(1);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toHaveLength(1);
   // Even a separately accepted receipt for the new body cannot mask the old
   // same-head uncertain delivery. Every outstanding receipt must be reconciled.
-  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
   f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });

@@ -631,7 +631,7 @@ test('a revised handoff must belong to the registered review target PR',async()=
   expect(loop.rebind(f.job,'owner/repo',9)).toMatchObject({state:'rebound',pr:9});
   expect(loop.get(f.job)).toMatchObject({pr:9,state:'waiting_for_review',head:null,last_signature:null});
   // The rebound target must not look ready before the new PR's evidence exists.
-  expect(await loop.tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).not.toMatchObject({state:'ready'});
+  expect(await loop.tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).not.toMatchObject({state:'ready_for_human'});
   expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
   expect(revisedHandoff(f.s,f.job)).toBe(true);
   expect((f.s.db.query("SELECT detail FROM events WHERE kind='review_target_rebound'").get() as any).detail).toContain('"handoff":9');
