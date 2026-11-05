@@ -8,7 +8,7 @@ import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation'
 import {withTurnSubmission} from './turn-submission';
 import {LinearBlockers} from './linear-blockers';
 import {remediationPolicy} from './remediation';
-import {currentOutcome,latestRevision,settleDependencyWait} from './spec-revisions';
+import {currentOutcome,latestRevision,settleDependencyWait,revisionBoundWait} from './spec-revisions';
 
 export class DependencyRecovery{
  io:DependencyIO;
@@ -19,9 +19,7 @@ export class DependencyRecovery{
   rows(){return this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()?this.s.db.query('SELECT * FROM dependency_waits').all() as any[]:[];}
   currentWait(row:any){
    const j=this.s.get(row.job),d=this.workflow.implementation(row.job),r=latestRevision(this.s,row.job),p=JSON.parse(row.evidence);
-   return row.plan===j.plan_hash&&(!r||(p.proof?.auth
-    ?p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id
-    :!p.clientId&&currentOutcome(this.s,row.job,this.workflow.outcomes(row.job))));
+   return row.plan===j.plan_hash&&revisionBoundWait(this.s,row.job,row,this.workflow.outcomes(row.job));
   }
  status(){return {waits:this.rows(),updates:this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_updates'").get()?this.s.db.query('SELECT id,job,plan,worktree,state,detail FROM dependency_updates').all():[],nextAction:'Inspect dependency-preview. Confirm only unchanged safe evidence; never replay uncertain continuation or discard local work.'};}
  definition(job:string,c:any):DependencyJob{

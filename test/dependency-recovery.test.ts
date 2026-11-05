@@ -7,7 +7,7 @@ import {validateDependencies} from '../src/dependency-policy';
 import {dependencyRelations,dependencyIO} from '../src/dependency-evidence';
 import {assertWorktreeAvailable} from '../src/worktree-reservation';
 import {LinearBlockers} from '../src/linear-blockers';
-import {settleDependencyWait} from '../src/spec-revisions';
+import {settleDependencyWait,revisionBoundWait} from '../src/spec-revisions';
 import {mkdtempSync,writeFileSync,mkdirSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -314,6 +314,31 @@ test('DEV-19: first merge waits; second verifies/updates and sends exactly once 
 });
 test('read-only preview has no reservation or Git mutation and binds confirmation',async()=>{
  const f=await fixture();try{f.setMerged(2);const p=await f.r.preview(f.job,f.c);expect(p.mode).toBe('preview_only');expect(f.r.rows()).toEqual([]);expect(f.fetches()).toBe(0);expect((await f.r.tick(f.job,f.c,'0'.repeat(64))).reason).toContain('preview changed');expect(f.updates()).toBe(0);}finally{f.s.close();}
+});
+function boundWaitFixture(){
+ const s=new Store(':memory:'),w=new Workflow(s,{} as any),job=s.enqueue('p','issue','spec'),p=new Planning(s),r=p.reserve(job,'project');
+ p.gate(job,'project','worker',r.branch,'/worktree');
+ const hash=s.propose(job,'Plan');
+ s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(job,hash,'worker','client-1','approved_pending','["src/**"]','supervised-host','human',null);
+ return {s,w,job};
+}
+test('revisionBoundWait accepts a legacy wait before any revision',()=>{
+ const f=boundWaitFixture();try{
+  expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({})},null)).toBe(true);
+ }finally{f.s.close();}
+});
+test('revisionBoundWait requires current outcome evidence for a proof-less wait',()=>{
+ const f=boundWaitFixture();try{
+  const j=f.s.get(f.job),d=f.w.implementation(f.job);
+  f.s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('bound-revision',f.job,digest(j.spec),digest(j.spec),'Summary','authorized');
+  f.s.db.query('INSERT INTO worker_outcomes(job,plan_hash,session_id,outcome,questions,dependencies,source,confidence,first_observed,observed,revision_id,dispatch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(f.job,j.plan_hash,d.session_id,'blocked_dependency','[]','[]','receipt','high',Date.now(),Date.now(),'bound-revision',d.client_id);
+  const wait={evidence:JSON.stringify({})};
+  expect(revisionBoundWait(f.s,f.job,wait,f.w.outcomes(f.job))).toBe(true);
+  expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({clientId:'uncertain'})},f.w.outcomes(f.job))).toBe(false);
+  expect(revisionBoundWait(f.s,f.job,wait,{...f.w.outcomes(f.job),dispatch_id:'stale'})).toBe(false);
+  expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({proof:{auth:{revision:'other',delivery:d.client_id}}})},f.w.outcomes(f.job))).toBe(false);
+  expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({proof:{auth:{revision:'bound-revision',delivery:d.client_id}}})},f.w.outcomes(f.job))).toBe(true);
+ }finally{f.s.close();}
 });
 test('waits without an instance retain and reuse their legacy notice binding',async()=>{
  const f=await fixture();try{

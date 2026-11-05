@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
-import {settleDependencyWait,latestRevision,currentOutcome} from './spec-revisions';
+import {settleDependencyWait,revisionBoundWait} from './spec-revisions';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -166,11 +166,7 @@ export class LinearBlockers{
    try{
      if(outcome.outcome==='blocked_dependency'&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()){
       const wait=this.s.db.query('SELECT * FROM dependency_waits WHERE job=? AND plan=?').get(outcome.job,outcome.plan_hash) as any;
-      if(wait&&wait.state!=='settled'){
-       const p=JSON.parse(wait.evidence),r=latestRevision(this.s,outcome.job),d=this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(outcome.job) as any;
-       const worker=this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(outcome.job);
-       if(!r||(p.proof?.auth?p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id:!p.clientId&&currentOutcome(this.s,outcome.job,worker)))continue;
-      }
+      if(wait&&wait.state!=='settled'&&revisionBoundWait(this.s,outcome.job,wait))continue;
      }
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.

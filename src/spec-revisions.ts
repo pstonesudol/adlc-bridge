@@ -52,6 +52,15 @@ export function currentOutcome(s:Store,job:string,o:any){
  return !!(d&&o.plan_hash===j.plan_hash&&o.plan_hash===d.plan_hash&&o.session_id===d.session_id&&
   (r?o.revision_id===r.id&&o.dispatch_id===d.client_id:!o.revision_id&&(!o.dispatch_id||o.dispatch_id===d.client_id)));
 }
+/** Fail-closed binding for a dependency wait against the active revision and
+ * dispatch. Legacy waits before any revision remain bound to their plan only. */
+export function revisionBoundWait(s:Store,job:string,wait:any,worker?:any){
+ const r=latestRevision(s,job);
+ if(!r)return true;
+ const p=JSON.parse(wait.evidence),d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
+ return p.proof?.auth?p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id
+  :!p.clientId&&currentOutcome(s,job,worker??s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job));
+}
 /** A fresh same-instance outcome can retire a dependency wait, but not a
  * historical or unbound receipt. Resumed notices retain their retraction flow. */
 export function settleDependencyWait(s:Store,job:string){
@@ -64,7 +73,7 @@ export function settleDependencyWait(s:Store,job:string){
   const fresh=currentOutcome(s,job,o);
  const evidence=JSON.parse(row.evidence),client=evidence.clientId;
  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
-  const bound=row.plan===s.get(job).plan_hash&&(!r?(!o?.dispatch_id||o.dispatch_id===d?.client_id):(evidence.proof?.auth?evidence.proof.auth.revision===r.id&&evidence.proof.auth.delivery===d?.client_id:!client&&fresh));
+  const bound=row.plan===s.get(job).plan_hash&&(!r?(!o?.dispatch_id||o.dispatch_id===d?.client_id):revisionBoundWait(s,job,row,o));
   if(!fresh){
    // Historical waits cannot retain a label for a new authorization instance.
    // Keep the exact evidence and record retirement without interpreting it anew.

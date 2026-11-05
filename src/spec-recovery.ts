@@ -46,8 +46,7 @@ export class SpecRecovery{
   // A terminal failure from an earlier revision still holds a durable
   // reservation. Surface its exact receipt before the latest revision so the
   // operator can retire it without replaying a send or editing live state.
-  if(j.state==='awaiting_plan')for(const prior of this.s.db.query('SELECT * FROM spec_replans WHERE job=? AND revision!=? ORDER BY rowid').all(job,r.id) as any[]){
-   if(['failed','superseded_completed'].includes(prior.state))continue;
+  if(j.state==='awaiting_plan')for(const prior of this.s.db.query("SELECT * FROM spec_replans WHERE job=? AND revision!=? AND state IN ('accepted','delivery_uncertain') ORDER BY rowid").all(job,r.id) as any[]){
    const owner=await this.w.t.evidence(prior.session),sent=owner.transcript?.entries?.find((x:any)=>x.clientMessageId===prior.client_id),turn=sent&&owner.transcript.turns?.find((t:any)=>t.id===sent.turnId);
    const absent=this.absentPreview(job,prior,owner);if(absent)return absent;
    const unmarked=this.unmarkedPreview(job,prior,owner);if(unmarked)return unmarked;
