@@ -437,6 +437,45 @@ test('manual plan submission and capture refuse a pending requirement revision',
   expect(blockedCapture.exitCode).not.toBe(0);
   expect(blockedCapture.stderr.toString()).toContain('Active requirement revision requires spec-reconcile before manual plan capture');
   expect(s.get(job).plan).toBeNull();
+  // An active uncaptured revision is equally blocking for both manual paths.
+  s.db.query("UPDATE spec_revisions SET state='awaiting_approval' WHERE job=?").run(job);
+  for(const args of [['plan',job,planFile],['capture-plan',job,'owner','1']]){
+   const blocked=Bun.spawnSync([process.execPath,cli,...args],{env});
+   expect(blocked.exitCode).not.toBe(0);
+   expect(blocked.stderr.toString()).toContain('Active requirement revision requires spec-reconcile');
+  }
+  expect(s.get(job).plan).toBeNull();
+  s.close();
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+test('propose and executeApproved reject a revision that changed after evidence was read',async()=>{
+ const f=await fixture();try{
+  const before=latestRevision(f.s,f.job);
+  f.edit('v2');const after=latestRevision(f.s,f.job);
+  expect(()=>f.s.propose(f.job,'Old plan',before?.id??null)).toThrow('Requirement revision changed before plan submission');
+  expect(f.s.get(f.job).plan).toBeNull();
+  // A restored plan hash still requires the captured evidence for this revision.
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  f.s.db.query("UPDATE spec_replans SET proof=? WHERE revision=?").run(JSON.stringify({...JSON.parse((f.s.db.query('SELECT proof FROM spec_replans WHERE revision=?').get(after.id) as any).proof),capturedPlanHash:'0'.repeat(64)}),after.id);
+  await expect(f.w.executeApproved(f.job,config)).rejects.toThrow('Exact captured replan for the current requirement revision required');
+ }finally{f.s.close();}
+});
+test('approve-plan refuses an active revision without its captured replan',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-cli-approve-')),db=join(dir,'state.db');
+ try{
+  const s=new Store(db);new Workflow(s,{} as any);
+  const job=s.enqueue('p','issue','Original'),planning=new Planning(s),run=planning.reserve(job,'project');
+  planning.gate(job,'project','owner',run.branch,'/worktree');
+  s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(job,digest(s.get(job).spec),'awaiting_approval','owner',null,'initial');
+  const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));
+  s.db.query("UPDATE spec_revisions SET state='authorized' WHERE job=?").run(job);
+  s.enqueue('p','issue','Changed requirements');s.propose(job,'Restored plan');
+  const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
+  const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'approve-plan',job,s.get(job).plan_hash??hash,'Human'],{env});
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr.toString()).toContain('Exact captured replan for the current requirement revision required');
+  expect(s.get(job).approved_hash).toBeNull();
   s.close();
  }finally{rmSync(dir,{recursive:true,force:true});}
 });

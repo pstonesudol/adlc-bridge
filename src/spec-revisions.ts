@@ -127,6 +127,20 @@ export function observeLegacyRevision(s:Store,job:string){
  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary) VALUES (?,?,?,?,?)').run(id,job,p.spec_hash,digest(j.spec),'Legacy requirement mismatch: previous content/plan unavailable; inspect retained session history. No approval restored.');
  s.event(job,'legacy_spec_revision_observed',JSON.stringify({id,oldHash:p.spec_hash,newHash:digest(j.spec)}));
 }
+/** Shared approval/dispatch guard: an active revision must have produced the
+ * exact captured plan for the current hash in the same planning session. */
+export function capturedRevision(s:Store,job:string,plan:string|null,session?:string|null){
+ const r=latestRevision(s,job);
+ if(!r||r.state==='preplanning')return {revision:r??null,captured:true};
+ const replan=s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(r.id) as any;
+ const proof=replan?JSON.parse(replan.proof):null;
+ const captured=r.state!=='pending'&&r.new_hash===digest(s.get(job).spec)&&replan?.state==='captured'&&
+  proof?.capturedPlanHash===plan&&(!session||replan.session===session);
+ return {revision:r,captured};
+}
+export function assertCapturedRevision(s:Store,job:string,plan:string|null,session?:string|null){
+ if(!capturedRevision(s,job,plan,session).captured)throw Error('Exact captured replan for the current requirement revision required');
+}
 export function revisionStatus(s:Store,job:string){
  const r=latestRevision(s,job);if(!r)return null;
  const p=s.db.query('SELECT state,reason FROM spec_replans WHERE revision=?').get(r.id) as any;

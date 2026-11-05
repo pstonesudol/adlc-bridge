@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
-import {installRevisions,recordRevision,observeLegacyRevision} from './spec-revisions';
+import {installRevisions,recordRevision,observeLegacyRevision,latestRevision} from './spec-revisions';
 
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
@@ -92,16 +92,17 @@ export class Store {
     return row;
   }
   list() { return this.db.query('SELECT id,project,issue,state,plan_hash,attempts,reason,updated FROM jobs ORDER BY updated,id').all(); }
-  propose(id: string, plan: string) {
+  propose(id: string, plan: string, expectRevision?: string | null) {
     if (!plan.trim()) throw Error('Empty plan');
     return this.db.transaction(() => {
+      if (expectRevision !== undefined && (latestRevision(this, id)?.id ?? null) !== expectRevision) throw Error('Requirement revision changed before plan submission; refresh evidence');
       const job = this.get(id);
       const hash = digest(JSON.stringify([job.spec, plan]));
       this.db.query(`UPDATE jobs SET plan=?,plan_hash=?,approved_hash=NULL,actor=NULL,
         state='awaiting_approval',reason=NULL,updated=CURRENT_TIMESTAMP WHERE id=?`).run(plan, hash, id);
       this.event(id, 'plan_proposed', hash);
       return hash;
-    })();
+    }).immediate();
   }
   approve(id: string, hash: string, actor: string, source:'human'|'standing-policy'='human') {
     if (!actor.trim()) throw Error('Human approver required');

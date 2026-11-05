@@ -15,7 +15,7 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
-import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome} from './spec-revisions';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
@@ -218,9 +218,8 @@ export class Workflow{
    const j=this.s.get(job),r=new Planning(this.s).get(job),d=this.planning(job);
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
     const revision=latestRevision(this.s,job),prior=this.implementation(job),run=new Lifecycle(this.s).run(job);
-     const replan=revision&&this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(revision.id) as any;
-     const revised=revision?.state==='awaiting_approval'&&revision.new_hash===digest(j.spec)&&replan?.state==='captured'&&replan.session===r.session_id&&JSON.parse(replan.proof).capturedPlanHash===j.plan_hash;
-     if(revision&&revision.state!=='preplanning'&&!revised)throw Error('Exact captured replan for the current requirement revision required');
+     if(!capturedRevision(this.s,job,j.plan_hash,r.session_id).captured)throw Error('Exact captured replan for the current requirement revision required');
+     const revised=!!(revision&&revision.state==='awaiting_approval');
     if((prior||run)&&!revised)throw Error('Existing execution requires reconciliation');
     if(revised){
      if(prior&&prior.session_id!==r.session_id||run&&(run.session_id!==r.session_id||run.owner!=='orchestrator'))throw Error('Revised plan execution owner changed');
@@ -250,6 +249,8 @@ export class Workflow{
   const d=this.implementation(job);if(!d)return;
   const l=new Lifecycle(this.s),j=l.current(job),r=new Planning(this.s).get(job);
   if(j.plan_hash!==d.plan_hash||r?.session_id!==d.session_id)throw Error('Execution approval is stale');
+  // A restored plan hash must still carry this revision's captured evidence.
+  if(!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured)throw Error('Exact captured replan for the current requirement revision required');
   if(new ApprovalPolicyStore(this.s).get(job)){if(!c)throw Error('Project policy required for automatic execution');new ApprovalPolicyStore(this.s).verify(job,c.linear.projectId,c.approval);}
   let e;
   try{
