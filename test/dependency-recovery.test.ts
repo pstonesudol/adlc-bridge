@@ -53,6 +53,16 @@ function linearSurface(f:Awaited<ReturnType<typeof fixture>>,onRead?:(count:numb
  };
  return {blockers:new LinearBlockers(f.s,api),comments,counts:()=>({creates,adds})};
 }
+function transitionFixture(f:Awaited<ReturnType<typeof fixture>>,transition:string){
+ f.r.install();const j=f.s.get(f.job);let evidence:any={};
+ if(transition==='resumed'){
+  evidence={clientId:'accepted-continuation'};
+  f.s.db.query('INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,?)').run(f.job,j.plan_hash,digest(j.spec),'accepted','accepted-continuation','session','delivery_accepted');
+ }
+ f.r.save(f.job,transition==='reopened'?'settled':'waiting_for_dependencies','Before transition',evidence);
+ if(transition!=='reopened')f.s.db.query("UPDATE worker_outcomes SET outcome='pr_handoff' WHERE job=?").run(f.job);
+ return f.r.rows()[0];
+}
  for(const restored of [false,true])test(`superseded dependency receipt cannot drive revised recovery (${restored?'restored':'different'} plan hash)`,async()=>{
  const f=await fixture();try{
   const original=f.s.get(f.job),outcome=f.w.outcomes(f.job);
@@ -200,6 +210,41 @@ for(const transition of ['reopened','resumed','settled'])for(const field of ['st
   const row=f.r.rows()[0];
   if(field==='state')expect(row.state).toBe('operator_changed');
   else expect(row.evidence).toBe('{"operator":"new evidence"}');
+  expect(query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(0);
+ }finally{f.s.close();}
+});
+for(const transition of ['reopened','resumed','settled'])test(`${transition} wait transition rolls back when its audit event fails`,async()=>{
+ const f=await fixture();try{
+  const before=transitionFixture(f,transition),event=f.s.event.bind(f.s);
+  f.s.event=(job,kind,detail)=>{if(kind===`dependency_wait_${transition}`)throw Error('Audit write failed');event(job,kind,detail);};
+  expect(()=>settleDependencyWait(f.s,f.job)).toThrow('Audit write failed');
+  expect(f.r.rows()[0]).toEqual(before);
+  expect(f.s.db.query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(0);
+ }finally{f.s.close();}
+});
+for(const transition of ['reopened','resumed','settled'])for(const change of ['outcome','revision','dispatch'])test(`${transition} rechecks ${change} under the transition transaction`,async()=>{
+ const f=await fixture();try{
+  const before=transitionFixture(f,transition),transaction=f.s.db.transaction.bind(f.s.db),query=f.s.db.query.bind(f.s.db);
+  const lockedReads:boolean[]=[];let injected=false;
+  (f.s.db as any).transaction=(fn:any)=>{
+   const wrapped=transaction(fn),immediate=wrapped.immediate.bind(wrapped);
+   return {immediate:(...args:any[])=>{
+    if(!injected){
+     injected=true;
+     if(change==='outcome')query('UPDATE worker_outcomes SET outcome=? WHERE job=?').run(transition==='reopened'?'pr_handoff':'blocked_dependency',f.job);
+     if(change==='dispatch')query("UPDATE implementation_dispatch SET client_id='new-dispatch' WHERE job=?").run(f.job);
+     if(change==='revision')query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('concurrent-revision',f.job,'old','new','Concurrent edit','pending');
+    }
+    return immediate(...args);
+   }};
+  };
+  (f.s.db as any).query=(sql:string,...args:any[])=>{
+   if(sql==='SELECT * FROM worker_outcomes WHERE job=?'||sql==='SELECT * FROM implementation_dispatch WHERE job=?')lockedReads.push(f.s.db.inTransaction);
+   return query(sql,...args);
+  };
+  expect(settleDependencyWait(f.s,f.job)).toBeUndefined();
+  expect(injected).toBe(true);expect(lockedReads.length).toBeGreaterThan(0);expect(lockedReads.every(Boolean)).toBe(true);
+  expect(f.r.rows()[0]).toEqual(before);
   expect(query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(0);
  }finally{f.s.close();}
 });

@@ -57,6 +57,7 @@ export function currentOutcome(s:Store,job:string,o:any){
 export function settleDependencyWait(s:Store,job:string){
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get())return;
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return;
+ return s.db.transaction(()=>{
  const row=s.db.query('SELECT * FROM dependency_waits WHERE job=?').get(job) as any;
  if(!row)return;
  const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
@@ -68,10 +69,9 @@ export function settleDependencyWait(s:Store,job:string){
   // A historical proof/continuation cannot suppress a new authorized blocker.
   // Archive it in full; an unproven new wait must collect fresh evidence.
   const next=bound?evidence:{workerDependencies:JSON.parse(o.dependencies)};
-   return s.db.transaction(()=>{
-    const changed=s.db.query("UPDATE dependency_waits SET plan=?,state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement or revision; re-evaluate evidence without replay',evidence=? WHERE job=? AND plan=? AND state=? AND evidence=?").run(o.plan_hash,JSON.stringify({...next,waitInstance:randomUUID()}),job,row.plan,row.state,row.evidence).changes;
-    if(changed){s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));return 'reopened';}
-   }).immediate();
+   const changed=s.db.query("UPDATE dependency_waits SET plan=?,state='waiting_for_dependencies',reason='Current worker reported a dependency blocker after settlement or revision; re-evaluate evidence without replay',evidence=? WHERE job=? AND plan=? AND state=? AND evidence=?").run(o.plan_hash,JSON.stringify({...next,waitInstance:randomUUID()}),job,row.plan,row.state,row.evidence).changes;
+   if(changed){s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));return 'reopened';}
+   return;
  }
  if(row.state==='resumed'||row.state==='settled'||!bound)return;
  if(o.outcome==='blocked_dependency')return;
@@ -85,6 +85,7 @@ export function settleDependencyWait(s:Store,job:string){
  }
   const changed=s.db.query("UPDATE dependency_waits SET state='settled',reason='Current worker outcome no longer reports a dependency blocker' WHERE job=? AND plan=? AND state=? AND evidence=?").run(job,row.plan,row.state,row.evidence).changes;
   if(changed)s.event(job,'dependency_wait_settled',JSON.stringify({outcome:o.outcome,revision:o.revision_id??null,dispatch:o.dispatch_id??null}));
+ }).immediate();
 }
 /** Jobs whose plan was renewed after a requirement revision keep their prior PR
  * historical until that exact revised plan completes a handoff. */
