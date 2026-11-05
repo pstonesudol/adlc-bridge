@@ -213,6 +213,7 @@ spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning
     [--confirm HASH --human NAME]      verify and release only proven completed recovery
   authorize-base-merge JOB HASH HUMAN  explicitly add merge-base-feature to current job grant
   register-review JOB REPO PR CONFIG    register bounded review target
+  rebind-review-target JOB REPO PR     reconcile a revised handoff recorded on another PR
   review-status                        show CI/review waits, blockers and remediation budget
   tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
@@ -281,7 +282,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
@@ -406,6 +407,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       assertApprovalReadiness(s,job,req(a[2],'Human'),a.includes('--acknowledge-readiness'));
       s.approve(job,hash,req(a[2],'Human'));return out({approved:true,executionEnabled:false});
     }
+    if(command==='rebind-review-target')return out(reviewLoop.rebind(req(a[0],'Job'),req(a[1],'Repository'),Number(req(a[2],'Pull request'))));
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
     const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
