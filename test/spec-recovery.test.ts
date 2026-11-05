@@ -537,19 +537,25 @@ test('propose and executeApproved reject a revision that changed after evidence 
   await expect(f.w.executeApproved(f.job,config)).rejects.toThrow('Exact captured replan for the current requirement revision required');
  }finally{f.s.close();}
 });
-test('approve-plan refuses a captured revision that needs implementation rebinding',async()=>{
+for(const dispatchState of ['different','matching','missing'])test(`approve-plan refuses a captured revision with ${dispatchState} dispatch`,async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-revised-approve-')),db=join(dir,'state.db');
  const f=await fixture(db);
  try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
-  const before=f.w.implementation(f.job),hash=f.s.get(f.job).plan_hash;
-  expect(before.plan_hash).not.toBe(hash);
+  const original=f.w.implementation(f.job),hash=f.s.get(f.job).plan_hash;
+  expect(original.plan_hash).not.toBe(hash);
+  if(dispatchState==='matching')f.s.db.query('UPDATE implementation_dispatch SET plan_hash=? WHERE job=?').run(hash,f.job);
+  if(dispatchState==='missing')f.s.db.query('DELETE FROM implementation_dispatch WHERE job=?').run(f.job);
+  const before=f.w.implementation(f.job);
   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'approve-plan',f.job,hash,'Human'],{env:{ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'}});
   expect(result.exitCode).not.toBe(0);
   expect(result.stderr.toString()).toContain('Revised plan requires approve-job');
   expect(f.s.get(f.job)).toMatchObject({state:'awaiting_approval',approved_hash:null});
   expect(latestRevision(f.s,f.job).state).toBe('awaiting_approval');
   expect(f.w.implementation(f.job)).toEqual(before);
+  // Restore the original dispatch to exercise the supported authorization path.
+  if(dispatchState==='missing')f.s.db.query('INSERT INTO implementation_dispatch VALUES (?,?,?,?,?,?,?,?,?)').run(original.job,original.plan_hash,original.session_id,original.client_id,original.state,original.paths,original.runtime,original.actor,original.reason);
+  if(dispatchState==='matching')f.s.db.query('UPDATE implementation_dispatch SET plan_hash=? WHERE job=?').run(original.plan_hash,f.job);
   f.w.approve(f.job,hash,'Human',['src/**'],'supervised-host',featureGit);
   expect(f.s.get(f.job).state).toBe('approved');
   expect(f.w.implementation(f.job).plan_hash).toBe(hash);
