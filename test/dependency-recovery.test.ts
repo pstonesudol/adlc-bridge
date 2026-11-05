@@ -369,6 +369,8 @@ test('revisionBoundWait requires current outcome evidence for a proof-less wait'
   expect(revisionBoundWait(f.s,f.job,wait,{...f.w.outcomes(f.job),dispatch_id:'stale'})).toBe(false);
   expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({proof:{auth:{revision:'other',delivery:d.client_id}}})},f.w.outcomes(f.job))).toBe(false);
   expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({proof:{auth:{revision:'bound-revision',delivery:d.client_id}}})},f.w.outcomes(f.job))).toBe(true);
+  // An explicit null marker predates any revision and never rebinds to one.
+  expect(revisionBoundWait(f.s,f.job,{evidence:JSON.stringify({waitRevision:null,waitDispatch:null})},f.w.outcomes(f.job))).toBe(false);
  }finally{f.s.close();}
 });
 test('waits without an instance retain and reuse their legacy notice binding',async()=>{

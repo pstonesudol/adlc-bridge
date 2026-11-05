@@ -60,7 +60,8 @@ export function revisionBoundWait(s:Store,job:string,wait:any,worker?:any){
  const p=JSON.parse(wait.evidence),d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
  if(p.proof?.auth)return p.proof.auth.revision===r.id&&p.proof.auth.delivery===d?.client_id;
  // A saved wait keeps the instance that created it; never rebind to a later one.
- if(p.waitRevision!==undefined&&p.waitRevision!==null)return p.waitRevision===r.id&&p.waitDispatch===d?.client_id;
+ // An explicit null marker means it predates any revision and cannot match one.
+ if(p.waitRevision!==undefined)return p.waitRevision===r.id&&p.waitDispatch===d?.client_id;
  return !p.clientId&&currentOutcome(s,job,worker??s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job));
 }
 /** A fresh same-instance outcome can retire a dependency wait, but not a

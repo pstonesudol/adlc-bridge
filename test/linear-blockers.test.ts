@@ -72,9 +72,18 @@ test('stale worker outcomes from an earlier revision never reach the generic pub
   // A current receipt publishes...
   f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?').run('blocker-revision',dispatch,f.id);
   expect((await f.blockers().sync(f.config))[0].state).toBe('posted');expect(f.creates).toBe(1);
-  // ...but a later receipt bound to an earlier dispatch is historical.
-  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run('old-dispatch',f.id);
+  // ...but a later receipt bound to an earlier dispatch and different evidence
+  // is historical.
+  f.s.db.query("UPDATE worker_outcomes SET dispatch_id='old-dispatch',reason='Superseded receipt',dependencies='[]' WHERE job=?").run(f.id);
   await f.blockers().sync(f.config);
+  expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
+  // A binding change between the row scan and the external write aborts it.
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=?,dispatch_id=? WHERE job=?' ).run('blocker-revision',dispatch,f.id);
+  f.s.db.query("UPDATE blocker_notices SET state='reserved',comment_id='second-comment' WHERE job=?").run(f.id);
+  const blockers=f.blockers();const api=(blockers as any).api;let mutated=false;
+  (blockers as any).api=async(q:string,v:any)=>{if(!mutated&&q.includes('comments(first:100')){mutated=true;f.s.db.query("UPDATE worker_outcomes SET dispatch_id='changed-during-write' WHERE job=?").run(f.id);}return api(q,v);};
+  const result=await blockers.sync(f.config);
+  expect(result.some((r:any)=>r.state==='blocked'&&r.reason==='Worker blocker binding changed before Linear write')).toBe(true);
   expect(f.creates).toBe(1);expect(f.comments).toHaveLength(1);
  }finally{f.s.close();}
 });

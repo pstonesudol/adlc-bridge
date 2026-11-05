@@ -7,7 +7,7 @@ import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} fr
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
-export type NoticeOptions={binding:string;body:string;applyLabel?:boolean;guard:(issue:any)=>void};
+export type NoticeOptions={binding?:string;body?:string;applyLabel?:boolean;guard?:(issue:any)=>void};
 
 function blockerOutcome(outcome:string){return ['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(outcome);}
 
@@ -40,7 +40,7 @@ export class LinearBlockers{
   const labelId=c.blockerSync!.labelId!;
   const j=this.s.get(job),issue=await readLinearIssue(j.issue,this.api);
   if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity or label scope mismatch');
-  options?.guard(issue);
+  options?.guard?.(issue);
   const questions=JSON.parse(outcome.questions),dependencies=JSON.parse(outcome.dependencies);
   const binding=options?.binding??this.binding(job,outcome,labelId);
   let row=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(job,binding) as any;
@@ -64,7 +64,7 @@ export class LinearBlockers{
    this.s.db.query("UPDATE blocker_notices SET state='posted',created=?,reason=NULL WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
   }else{
    if(row.state!=='reserved')throw Error('Blocker comment delivery uncertain or missing; never repost blindly');
-   if(options)options.guard(await readLinearIssue(j.issue,this.api));
+   if(options?.guard)options.guard(await readLinearIssue(j.issue,this.api));
    const claim=this.s.db.query("UPDATE blocker_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
    if(!claim.changes)return {job,state:'delivery_uncertain',reason:'Blocker comment already claimed'};
    const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:row.comment_id,issueId:j.issue,body:row.body,doNotSubscribeToIssue:false}}).catch(()=>{throw Error('Blocker comment delivery uncertain; never repost blindly');});
@@ -76,7 +76,7 @@ export class LinearBlockers{
    if(outcome.outcome==='recovery_completed'||options?.applyLabel===false)return {job,state:'posted',issue:issue.identifier,outcome:outcome.outcome,label:'unchanged'};
    let labelState='present';
    if(!issue.labels.nodes.some((x:any)=>x.id===labelId)){
-    options?.guard(issue);
+    options?.guard?.(issue);
    // Record ownership before the mutation so a lost reply or verification failure
    // still lets retract reconcile the bridge-applied label.
    this.s.db.query("UPDATE blocker_notices SET label_applied=1,applied_label_id=? WHERE job=? AND binding=?").run(labelId,job,binding);
@@ -174,7 +174,10 @@ export class LinearBlockers{
     // The clarification adapter uses this same publisher and receipts. Do not
     // publish a competing generic blocker before it has inspected discovery.
     if(c.clarifications?.enabled&&['needs_input','blocked_dependency'].includes(outcome.outcome))continue;
-    if(blockerOutcome(outcome.outcome)){results.push(await this.leave(outcome.job,outcome,c));}
+    // Worker blocker writes revalidate their instance immediately before each
+    // external mutation; synthetic recovery/review rows keep their prior flow.
+    const bound=outcome.worker&&(outcome.revision_id||outcome.dispatch_id||latestRevision(this.s,outcome.job)),guard=bound?()=>{const worker=this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(outcome.job);if(!currentOutcome(this.s,outcome.job,worker))throw Error('Worker blocker binding changed before Linear write');}:undefined;
+    if(blockerOutcome(outcome.outcome)){results.push(await this.leave(outcome.job,outcome,c,guard?{guard}:undefined));}
     else results.push(await this.retract(outcome.job,c));
    }catch(error){results.push({job:outcome.job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
   }
