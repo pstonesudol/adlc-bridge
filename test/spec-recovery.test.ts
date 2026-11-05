@@ -469,7 +469,6 @@ test('approve-plan refuses an active revision without its captured replan',()=>{
   planning.gate(job,'project','owner',run.branch,'/worktree');
   s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(job,digest(s.get(job).spec),'awaiting_approval','owner',null,'initial');
   const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));
-  s.db.query("UPDATE spec_revisions SET state='authorized' WHERE job=?").run(job);
   s.enqueue('p','issue','Changed requirements');s.propose(job,'Restored plan');
   const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'};
   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'approve-plan',job,s.get(job).plan_hash??hash,'Human'],{env});
