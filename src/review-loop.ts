@@ -172,6 +172,9 @@ export class ReviewLoop{
    try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
     const reserved=this.s.db.transaction(()=>{
      if(this.completed(job))return false;
+     // The caller's PR may have been rebound while it awaited evidence; never
+     // request or reserve a review for a PR that is no longer registered.
+     const target=this.get(job);if(!target||target.pr!==pr)return false;
      if(this.uncertainReview(job,pr,head))return false;
    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
