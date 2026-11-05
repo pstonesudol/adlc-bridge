@@ -315,6 +315,44 @@ test('terminal failed replan is reconciled by exact receipt, then a fresh confir
   f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
  }finally{f.s.close();}
 });
+test('completed unmarked replans survive repeated polling and need exact confirmation before a new attempt',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  f.e.transcript.entries.at(-1).text=`Plan without revision marker\n${ready}`;
+  for(let n=0;n<2;n++){
+   const results=await f.w.tick(config);
+   expect(results).toEqual(expect.arrayContaining([expect.objectContaining({job:f.job,state:'replan_unmarked'})]));
+   expect(f.s.get(f.job).state).toBe('awaiting_plan');expect(f.s.get(f.job).plan).toBeNull();
+  }
+  expect(f.sends).toHaveLength(2);
+  const unmarked=await f.recovery.preview(f.job,config);expect(unmarked.action).toBe('reconcile_unmarked_replan');
+  await expect(f.recovery.reconcile(f.job,config,'0'.repeat(64))).rejects.toThrow('Unmarked-plan evidence changed');
+  const old=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+  expect(await f.recovery.reconcile(f.job,config,unmarked.confirmation)).toMatchObject({action:'replan_unmarked_reconciled',state:'failed'});
+  expect(f.sends).toHaveLength(2);
+  const event=f.s.db.query("SELECT detail FROM events WHERE kind='spec_replan_unmarked_reconciled'").get() as any;
+  expect(JSON.parse(event.detail)).toMatchObject({delivery:{client_id:old.client_id,session:old.session},unmarked:{turn:old.client_id,state:'completed'}});
+  await f.w.tick(config);expect(f.sends).toHaveLength(2);
+  const fresh=await f.recovery.preview(f.job,config);expect(fresh.action).toBe('request_replanning');
+  await f.recovery.reconcile(f.job,config,fresh.confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  expect(f.sends).toHaveLength(3);expect(f.sends[2].clientId).not.toBe(old.client_id);
+ }finally{f.s.close();}
+});
+test('an unmarked confirmation cannot retire a different turn or a subsequently marked plan',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
+  const marked=f.e.transcript.entries.at(-1).text;f.e.transcript.entries.at(-1).text='Unmarked reply';
+  const preview=await f.recovery.preview(f.job,config);expect(preview.action).toBe('reconcile_unmarked_replan');
+  f.e.transcript.turns.at(-1).id='different-turn';
+  await expect(f.recovery.reconcile(f.job,config,preview.confirmation)).rejects.toThrow('Preview changed or delivery already reserved');
+  f.e.transcript.turns.at(-1).id=(f.s.db.query('SELECT client_id FROM spec_replans').get() as any).client_id;
+  f.e.transcript.entries.at(-1).text=marked;
+  await expect(f.recovery.reconcile(f.job,config,preview.confirmation)).rejects.toThrow('Preview changed or delivery already reserved');
+  expect((f.s.db.query('SELECT state FROM spec_replans').get() as any).state).toBe('accepted');
+  await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
+ }finally{f.s.close();}
+});
 test('capture refuses a plan when approval policy or scope changed after the reservation',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
@@ -386,6 +424,11 @@ test('restoring a plan hash uses a new dispatch receipt and ignores historical c
   // of the provider's revised-plan marker formatting.
   const hash=f.s.propose(f.job,original.plan);expect(hash).toBe(f.hash);
   recordReadiness(f.s,f.job,original.plan,hash,digest(original.spec));
+  expect(()=>f.w.approve(f.job,hash,'human',['src/**'],'supervised-host',featureGit)).toThrow('Exact captured replan for the current requirement revision required');
+  // Explicitly bind synthetic captured evidence to the repeated hash only for
+  // this receipt-selection fixture; the public manual-plan path cannot do so.
+  const captured=f.s.db.query('SELECT revision,proof FROM spec_replans WHERE state=?').get('captured') as any;
+  f.s.db.query('UPDATE spec_replans SET proof=? WHERE revision=?').run(JSON.stringify({...JSON.parse(captured.proof),capturedPlanHash:hash}),captured.revision);
   f.w.approve(f.job,hash,'human',['src/**'],'supervised-host',featureGit);
   expect(f.w.implementation(f.job).client_id).not.toBe(oldDispatch.client_id);
   await f.w.executeApproved(f.job,config);

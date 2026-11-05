@@ -1831,6 +1831,11 @@ If a throwing send has no receipt, only a complete fresh inventory of the exact
 idle owner can offer an explicit absence confirmation. It retires that uncertain
 reservation without replay; a new planning attempt needs a separate confirmation.
 Incomplete, stale, busy, mismatched or accepted-message evidence stays blocked.
+Completed replans without their revision marker report `replan_unmarked` without
+breaking polling. Confirming that exact completed turn retires it without replay;
+a fresh planning attempt still needs separate preview/confirmation. Active
+revisions require approval of the exact captured revised-plan hash, even before
+the first implementation. A manually submitted plan cannot bypass that capture.
 Linear revision notices require enabled status synchronization and are
 published in bounded batches with durable forward and older-retry cursors.
 `status`, `review-status` and `reconcile-preview` retain independent

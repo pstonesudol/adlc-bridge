@@ -5,6 +5,8 @@ import {Planning} from '../src/planning';
 import {ApprovalPolicyStore} from '../src/approval-policy';
 import {LinearApprovals,parsePlanApproval} from '../src/linear-approvals';
 import {recordReadiness} from '../src/readiness';
+import {SpecRecovery} from '../src/spec-recovery';
+import {latestRevision} from '../src/spec-revisions';
 function fixture(){
  const s=new Store(':memory:'),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
@@ -57,7 +59,25 @@ test('restored spec and plan hashes publish a revision-specific notice and rejec
   expect(f.counts().creates).toBe(2);
   expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
   expect(f.s.get(f.id).approved_hash).toBeNull();
+  f.approve();expect((await f.surface.sync(f.c))[0]).toMatchObject({state:'approval_blocked',reason:'Exact captured replan for the current requirement revision required'});
+  expect(f.w.implementation(f.id)).toBeNull();expect(f.s.get(f.id).approved_hash).toBeNull();
+  // A fresh notice alone cannot replace capture, even before first execution.
+  // Start a real same-owner revised planning turn and capture its exact reply.
+  f.issue.description='Requirement v2';f.s.enqueue('p','issue',JSON.stringify({identifier:f.issue.identifier,title:f.issue.title,description:f.issue.description}));
+  f.c.automation.planningEnabled=true;
+  const p=new Planning(f.s).get(f.id),e:any={session:{id:'worker',projectId:'ao',branch:p.branch,isTerminated:false,prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[],turns:[{id:'initial-plan',state:'completed'}]}};
+  f.w.t.evidence=async()=>e;f.w.t.worktree=async()=>({branch:p.branch,head:'a'.repeat(40),tree:'/worktree'});
+  f.w.t.sendImplementation=async(_session,_text,clientId)=>{
+   e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:1});
+   e.transcript.turns.push({id:clientId,state:'completed'});
+   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
+  };
+  const recovery=new SpecRecovery(f.s,f.w,async()=>f.issue,async fn=>fn());
+  await recovery.reconcile(f.id,f.c,(await recovery.preview(f.id,f.c)).confirmation);await recovery.capture(f.id,f.c);
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']),Date.now(),new Set(['issue']));
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
   f.approve();expect((await f.surface.sync(f.c))[0].state).toBe('approved');
+  expect(f.w.implementation(f.id).session_id).toBe('worker');expect(f.counts().creates).toBe(3);
  }finally{f.s.close();}
 });
 test('requirements changes and removed eligibility reject a previously issued approval',async()=>{

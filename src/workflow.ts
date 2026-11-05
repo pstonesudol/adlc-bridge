@@ -218,7 +218,9 @@ export class Workflow{
    const j=this.s.get(job),r=new Planning(this.s).get(job),d=this.planning(job);
    if(!r?.session_id||r.state!=='plan_captured'||!d||d.state!=='awaiting_approval'||d.spec_hash!==digest(j.spec))throw Error('Automatically captured current plan required');
     const revision=latestRevision(this.s,job),prior=this.implementation(job),run=new Lifecycle(this.s).run(job);
-    const revised=revision?.state==='awaiting_approval'&&revision.new_hash===digest(j.spec)&&(this.s.db.query("SELECT state FROM spec_replans WHERE revision=?").get(revision.id) as any)?.state==='captured';
+     const replan=revision&&this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(revision.id) as any;
+     const revised=revision?.state==='awaiting_approval'&&revision.new_hash===digest(j.spec)&&replan?.state==='captured'&&replan.session===r.session_id&&JSON.parse(replan.proof).capturedPlanHash===j.plan_hash;
+     if(revision&&revision.state!=='preplanning'&&!revised)throw Error('Exact captured replan for the current requirement revision required');
     if((prior||run)&&!revised)throw Error('Existing execution requires reconciliation');
     if(revised){
      if(prior&&prior.session_id!==r.session_id||run&&(run.session_id!==r.session_id||run.owner!=='orchestrator'))throw Error('Revised plan execution owner changed');
