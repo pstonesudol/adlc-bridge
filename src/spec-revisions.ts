@@ -128,7 +128,12 @@ export function revisedHandoff(s:Store,job:string){
  const plan=s.get(job).plan_hash;
  if(!plan||!revisedExecution(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoffs'").get())return false;
  const revision=latestRevision(s,job)?.id??'';
- return !!s.db.query('SELECT 1 FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision);
+ const handoff=s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
+ if(!handoff)return false;
+ // The handoff must be the PR the review target registered; a different open PR
+ // cannot release review or Done while that target still points elsewhere.
+ const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT pr FROM review_targets WHERE job=?').get(job) as any:null;
+ return !target||target.pr===handoff.pr;
 }
 export function observeLegacyRevision(s:Store,job:string){
  if(latestRevision(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get())return;

@@ -612,6 +612,19 @@ test('recovered delivery records the single open PR as the current revision hand
   expect(revisedHandoff(f.s,f.job)).toBe(true);
  }finally{f.s.close();}
 });
+test('a revised handoff must belong to the registered review target PR',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  new ReviewLoop(f.s).register(f.job,'owner/repo',7,['CI'],['src/**']);
+  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:9});
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  // The registered target still cannot be released by the other PR.
+  expect(await new ReviewLoop(f.s).tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).toMatchObject({state:'waiting_for_revised_handoff'});
+  f.s.db.query('UPDATE revision_handoffs SET pr=7 WHERE job=?').run(f.job);
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
+ }finally{f.s.close();}
+});
 test('revision notices are bounded per poll and advance past failures',async()=>{
  const s=new Store(':memory:');
  const c:any={linear:{projectId:'p',teamId:'t'}};let reads=0,failId:string|null='issue-1';
