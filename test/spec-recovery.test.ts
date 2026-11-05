@@ -33,6 +33,27 @@ test('spec summary never exposes arbitrary ticket text; exact byte edits fail cl
  expect(revisionSummary('{"description":"secret old"}','{"description":"secret new"}')).toBe('description changed (10 → 10 characters; content redacted)');
  expect(revisionSummary('secret','other secret')).not.toContain('other secret');
 });
+for(const legacy of [false,true])test(`enqueue acquires its write lock before ${legacy?'legacy mismatch':'active revision'} reads`,()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-intake-lock-')),path=join(dir,'state.db');
+ const s=new Store(path);let other:Store|undefined;
+ try{
+  const job=s.enqueue('p','issue','before'),planning=new Planning(s),run=planning.reserve(job,'project');
+  planning.gate(job,'project','owner',run.branch,'/tree');
+  if(legacy)s.db.query("UPDATE jobs SET spec='after' WHERE id=?").run(job);
+  other=new Store(path);other.db.exec('PRAGMA busy_timeout=0');
+  const query=s.db.query.bind(s.db);let inspected=false;
+  (s.db as any).query=(sql:string,...args:any[])=>{
+   if(!inspected&&sql==='SELECT * FROM jobs WHERE id=?'){
+    inspected=true;
+    expect(()=>other!.db.query("UPDATE jobs SET reason='competing writer' WHERE id=?").run(job)).toThrow(/locked|busy/i);
+   }
+   return query(sql,...args);
+  };
+  expect(s.enqueue('p','issue','after')).toBe(job);expect(inspected).toBe(true);
+  expect(latestRevision(s,job).new_hash).toBe(digest('after'));
+  expect(other.db.query("UPDATE jobs SET reason='writer after commit' WHERE id=?").run(job).changes).toBe(1);
+ }finally{other?.close();s.close();rmSync(dir,{recursive:true,force:true});}
+});
 test('active edit preserves owner/history, blocks dispatch and requires a fresh captured plan and approval',async()=>{
  const f=await fixture();try{
   const before=f.w.implementation(f.job),run=f.s.db.query('SELECT * FROM runs').get() as any;
@@ -382,6 +403,55 @@ test('revision notices are bounded per poll and advance past failures',async()=>
   expect(reads).toBe(7);
   expect(s.db.query('SELECT count(*) AS n FROM spec_notices WHERE state=?').get('posted')).toMatchObject({n:6});
  }finally{s.close();}
+});
+test('old failed notices receive round-robin retries despite sustained new revisions and restarts',async()=>{
+ const s=new Store(':memory:');try{
+  const c:any={linear:{projectId:'p',teamId:'t'}},attempted:string[]=[],posted:string[]=[];
+  const add=(id:string)=>{s.enqueue('p',id,'before');s.enqueue('p',id,'after');s.db.query("UPDATE spec_revisions SET state='pending' WHERE job=?").run(digest(JSON.stringify(['p',id])));};
+  const api:any=async(q:string,v:any)=>{
+   if(q.includes('commentCreate')){posted.push(v.input.id);return {commentCreate:{success:true,comment:{id:v.input.id,body:v.input.body}}};}
+   if(q.includes('comments('))return {issue:{id:v.id,comments:{nodes:[],pageInfo:{hasNextPage:false}}}};
+   attempted.push(v.id);if(v.id.startsWith('old-'))throw Error('Persistent old provider failure');
+   return {issue:{id:v.id,team:{id:'t'},project:{id:'p'}}};
+  };
+  for(let n=0;n<5;n++)add(`old-${n}`);
+  await new LinearLifecycle(s,api).revisionNotices(c);
+  const retries:string[]=[];
+  for(let poll=0;poll<5;poll++){
+   for(let n=0;n<5;n++)add(`new-${poll}-${n}`);
+   const start=attempted.length,result=await new LinearLifecycle(s,api).revisionNotices(c),batch=attempted.slice(start);
+   expect(batch).toHaveLength(5);expect(result.filter((x:any)=>x.state==='requirements_notice_posted')).toHaveLength(4);
+   retries.push(...batch.filter(id=>id.startsWith('old-')));
+  }
+  expect(retries).toEqual(['old-0','old-1','old-2','old-3','old-4']);
+  expect(posted).toHaveLength(20);expect(new Set(posted).size).toBe(20);
+ }finally{s.close();}
+});
+for(const stage of ['pr','move'])for(const change of ['revision','handoff','none'])test(`Done rechecks ${change} after awaited ${stage} evidence`,async()=>{
+ const f=await fixture();try{
+  f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  await f.w.executeApproved(f.job,config);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  f.e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
+  await f.w.executionStatus(f.job,f.e,config);
+  new ReviewLoop(f.s).register(f.job,'owner/repo',1,['CI'],['src/**']);
+  const mutate=()=>{
+   if(change==='handoff')f.s.db.query('DELETE FROM revision_handoffs WHERE job=?').run(f.job);
+   if(change==='revision'){const original=f.s.get(f.job).spec;f.s.enqueue('p','issue','Intermediate revision');f.s.enqueue('p','issue',original);}
+  };
+  const linear=new LinearLifecycle(f.s,undefined,(async()=>{if(stage==='pr')mutate();return {merged:true,state:'closed'};}) as any);
+  linear.revisionNotices=async()=>[];
+  linear.move=async()=>{if(stage==='move')mutate();return {state:'confirmed'};};
+  const results=await linear.sync({...config,statusSync:{enabled:true,inProgress:'doing',inReview:'review',done:'done'}});
+  if(change==='none')expect(f.s.get(f.job).state).toBe('done');
+  else{
+   expect(results).toEqual(expect.arrayContaining([expect.objectContaining({error:'Revision or revised handoff changed before Done completion'})]));
+   expect(f.s.get(f.job).state).not.toBe('done');
+   expect((f.s.db.query('SELECT state FROM runs WHERE job=?').get(f.job) as any).state).not.toBe('completed');
+   expect(new ReviewLoop(f.s).get(f.job).state).not.toBe('completed');
+  }
+ }finally{f.s.close();}
 });
 test('preplanning edits do not publish authorization-invalidated notices',async()=>{
  const s=new Store(':memory:');try{

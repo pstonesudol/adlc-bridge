@@ -59,12 +59,21 @@ export function settleDependencyWait(s:Store,job:string){
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return;
  return s.db.transaction(()=>{
  const row=s.db.query('SELECT * FROM dependency_waits WHERE job=?').get(job) as any;
- if(!row)return;
- const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
- if(!currentOutcome(s,job,o))return;
+  if(!row)return;
+  const o=s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any;
+  const fresh=currentOutcome(s,job,o);
  const evidence=JSON.parse(row.evidence),client=evidence.clientId;
  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
- const bound=row.plan===s.get(job).plan_hash&&(!r||(evidence.proof?.auth?evidence.proof.auth.revision===r.id&&evidence.proof.auth.delivery===d?.client_id:!client));
+  const bound=row.plan===s.get(job).plan_hash&&(!r?(!o?.dispatch_id||o.dispatch_id===d?.client_id):(evidence.proof?.auth?evidence.proof.auth.revision===r.id&&evidence.proof.auth.delivery===d?.client_id:!client&&fresh));
+  if(!fresh){
+   // Historical waits cannot retain a label for a new authorization instance.
+   // Keep the exact evidence and record retirement without interpreting it anew.
+   if(!bound&&row.state!=='settled'){
+    const changed=s.db.query("UPDATE dependency_waits SET state='settled',reason='Dependency wait belongs to a superseded revision or dispatch' WHERE job=? AND plan=? AND state=? AND evidence=?").run(job,row.plan,row.state,row.evidence).changes;
+    if(changed)s.event(job,'dependency_wait_settled',JSON.stringify({historical:true,previous:row}));
+   }
+   return;
+  }
  if(o.outcome==='blocked_dependency'&&(row.state==='settled'||!bound)){
   // A historical proof/continuation cannot suppress a new authorized blocker.
   // Archive it in full; an unproven new wait must collect fresh evidence.
@@ -73,9 +82,9 @@ export function settleDependencyWait(s:Store,job:string){
    if(changed){s.event(job,'dependency_wait_reopened',JSON.stringify({settled:row,outcome:o}));return 'reopened';}
    return;
  }
- if(row.state==='resumed'||row.state==='settled'||!bound)return;
+  if(row.state==='settled'||(row.state==='resumed'&&bound))return;
  if(o.outcome==='blocked_dependency')return;
- if(client&&s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()){
+  if(bound&&client&&s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()){
   const cont=s.db.query('SELECT * FROM continuations WHERE client_id=? AND job=? AND plan_hash=?').get(client,job,row.plan) as any;
    if(bound&&cont?.session_id===d?.session_id&&['delivery_accepted','completed'].includes(cont?.state)){
     const changed=s.db.query("UPDATE dependency_waits SET state='resumed',reason='Existing continuation accepted; no replay' WHERE job=? AND plan=? AND state=? AND evidence=?").run(job,row.plan,row.state,row.evidence).changes;

@@ -84,7 +84,7 @@ export class Store {
       }
       observeLegacyRevision(this,id);
       return id;
-    })();
+    }).immediate();
   }
   get(id: string): any {
     const row = this.db.query('SELECT * FROM jobs WHERE id=?').get(id);

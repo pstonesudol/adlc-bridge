@@ -11,6 +11,7 @@ export class LinearLifecycle{
   CREATE TABLE IF NOT EXISTS remediation_notices(job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,created TEXT,PRIMARY KEY(job,binding));
   CREATE TABLE IF NOT EXISTS spec_notices(revision TEXT PRIMARY KEY,job TEXT NOT NULL,comment_id TEXT NOT NULL,body TEXT NOT NULL,state TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS spec_notice_cursor(project TEXT PRIMARY KEY,last_rowid INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS spec_notice_retry_cursor(project TEXT PRIMARY KEY,last_rowid INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS branch_drift_notices(job TEXT NOT NULL,signature TEXT NOT NULL,comment_id TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(job,signature));`);
   if(!(s.db.query('PRAGMA table_info(branch_drift_notices)').all() as any[]).some(x=>x.name==='comment_id'))s.db.exec('ALTER TABLE branch_drift_notices ADD COLUMN comment_id TEXT');}
  async driftComment(issueId:string,commentId:string,body:string){
@@ -126,12 +127,20 @@ export class LinearLifecycle{
  }
   async revisionNotices(c:SyncConfig){
    const limit=5,cursor=this.s.db.query('SELECT last_rowid FROM spec_notice_cursor WHERE project=?').get(c.linear.projectId) as any,after=cursor?.last_rowid??0;
-   const page=(from:number)=>this.s.db.query(`SELECT r.*,r.rowid AS rid FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? AND r.rowid>? AND r.state!='preplanning' AND NOT EXISTS(SELECT 1 FROM spec_notices n WHERE n.revision=r.id AND n.state='posted') ORDER BY r.rowid LIMIT ?`).all(c.linear.projectId,from,limit) as any[];
+   const page=(from:number,count=limit,through=Number.MAX_SAFE_INTEGER)=>this.s.db.query(`SELECT r.*,r.rowid AS rid FROM spec_revisions r JOIN jobs j ON j.id=r.job WHERE j.project=? AND r.rowid>? AND r.rowid<=? AND r.state!='preplanning' AND NOT EXISTS(SELECT 1 FROM spec_notices n WHERE n.revision=r.id AND n.state='posted') ORDER BY r.rowid LIMIT ?`).all(c.linear.projectId,from,through,count) as any[];
    let rows=page(after);
+   let forward=rows.at(-1)?.rid,retryRow:any;
+   // Under sustained intake, reserve one slot for a round-robin old retry.
+   // Its separate durable cursor prevents one permanent failure monopolizing it.
+   if(rows.length===limit&&after>0){
+    const retry=this.s.db.query('SELECT last_rowid FROM spec_notice_retry_cursor WHERE project=?').get(c.linear.projectId) as any;
+    retryRow=page(retry?.last_rowid??0,1,after)[0]??page(0,1,after)[0];
+    if(retryRow){rows=[...rows.slice(0,limit-1),retryRow];forward=rows[limit-2].rid;}
+   }
    // A bounded batch prevents one failing revision from starving every later
    // stage of the poll. The durable cursor advances past each attempted
    // revision, including failures, and wraps to retry older ones next time.
-   if(!rows.length&&after>0)rows=page(0);
+   if(!rows.length&&after>0){rows=page(0);forward=rows.at(-1)?.rid;}
    const results:any[]=[];
    for(const r of rows)try{
     let n=this.s.db.query('SELECT * FROM spec_notices WHERE revision=?').get(r.id) as any;
@@ -161,7 +170,8 @@ export class LinearLifecycle{
     this.s.db.query("UPDATE spec_notices SET state='posted' WHERE revision=?").run(r.id);
     results.push({job:j.id,revision:r.id,state:'requirements_notice_posted'});
    }catch(e){results.push({job:r.job,revision:r.id,state:'requirements_notice_blocked',reason:e instanceof Error?e.message:'Notice unavailable'});}
-   if(rows.length)this.s.db.query('INSERT INTO spec_notice_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,rows[rows.length-1].rid);
+   if(rows.length)this.s.db.query('INSERT INTO spec_notice_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,forward);
+   if(retryRow)this.s.db.query('INSERT INTO spec_notice_retry_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,retryRow.rid);
    return results;
   }
   async sync(c:SyncConfig){
@@ -208,12 +218,13 @@ export class LinearLifecycle{
    const reviewHandoffMissing=review&&delivery?.state!=='pr_handoff';
    if((row.state==='blocked'||branchMismatch||reviewHandoffMissing||(review?.state==='blocked'&&review.reason))&&phase!=='done')continue;
    const result=await this.move(row.id,phase,desired,c,row.spec_hash);results.push({job:row.id,phase,...result});
-   if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
-    this.assertSpecification(row.id,row.spec_hash);
+    if(phase==='done'&&result.state==='confirmed')this.s.db.transaction(()=>{
+     this.assertSpecification(row.id,row.spec_hash);
+     if((latestRevision(this.s,row.id)?.id??null)!==(revision?.id??null)||(revisedExecution(this.s,row.id)&&!revisedHandoff(this.s,row.id)))throw Error('Revision or revised handoff changed before Done completion');
     this.s.db.query("UPDATE jobs SET state='done',reason=NULL,updated=CURRENT_TIMESTAMP WHERE id=?").run(row.id);
     this.s.db.query("UPDATE runs SET state='completed',reason='PR merge observed; bridge did not merge' WHERE job=?").run(row.id);
     this.s.db.query("UPDATE review_targets SET state='completed',reason='PR merge observed' WHERE job=?").run(row.id);
-   })();
+    }).immediate();
   }catch(e){results.push({job:row.id,error:e instanceof Error?e.message:'Linear status sync failed'});}
   return results;
  }

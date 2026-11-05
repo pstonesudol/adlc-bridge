@@ -244,8 +244,10 @@ for(const transition of ['reopened','resumed','settled'])for(const change of ['o
   };
   expect(settleDependencyWait(f.s,f.job)).toBeUndefined();
   expect(injected).toBe(true);expect(lockedReads.length).toBeGreaterThan(0);expect(lockedReads.every(Boolean)).toBe(true);
-  expect(f.r.rows()[0]).toEqual(before);
-  expect(query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(0);
+  const retired=change!=='outcome'&&transition!=='reopened';
+  if(retired){expect(f.r.rows()[0]).toMatchObject({state:'settled',evidence:before.evidence});expect(f.r.rows()[0].reason).toContain('superseded');}
+  else expect(f.r.rows()[0]).toEqual(before);
+  expect(query('SELECT * FROM events WHERE job=? AND kind=?').all(f.job,`dependency_wait_${transition}`)).toHaveLength(retired&&transition==='settled'?1:0);
  }finally{f.s.close();}
 });
 test('historical settled proof cannot hide a current restored-hash dependency blocker',async()=>{
@@ -271,6 +273,26 @@ test('historical settled proof cannot hide a current restored-hash dependency bl
   expect(surface.counts().creates).toBe(2);expect(surface.comments[1].body).toContain('Waiting for dependencies');
   f.setMerged(2);expect((await f.r.tick(f.job,f.c)).state).toBe('resumed');
   expect(f.sends).toHaveLength(2);expect(f.sends[1].clientId).not.toBe('old-continuation');
+ }finally{f.s.close();}
+});
+for(const proof of [false,true])test(`superseded ${proof?'proof-bearing':'proof-less'} dependency waits release owned labels without new worker evidence`,async()=>{
+ const f=await fixture();try{
+  f.setMerged(proof?2:1);
+  if(proof){const preview=await f.r.preview(f.job,f.c);f.r.install();f.r.save(f.job,'waiting_for_dependencies','Waiting',preview);}
+  else await f.r.tick(f.job,f.c);
+  const surface=linearSurface(f);await f.r.notices(f.c,surface.blockers);
+  expect(surface.counts()).toEqual({creates:1,adds:1});
+  const oldWait=f.r.rows()[0],original=f.s.get(f.job),oldOutcome=f.w.outcomes(f.job);
+  f.s.enqueue('p',root,'Intermediate requirements');f.s.enqueue('p',root,original.spec);f.s.propose(f.job,original.plan);
+  f.s.db.query("UPDATE jobs SET state='approved',approved_hash=plan_hash,actor='human' WHERE id=?").run(f.job);
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='new-current-dispatch',state='approved_pending' WHERE job=?").run(f.job);
+  expect((await surface.blockers.retract(f.job,f.c)).state).toBe('retracted');
+  expect(f.r.rows()[0]).toMatchObject({state:'settled',evidence:oldWait.evidence});
+  expect(f.w.outcomes(f.job)).toEqual(oldOutcome);
+  const event=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='dependency_wait_settled'").get(f.job) as any;
+  expect(JSON.parse(event.detail)).toMatchObject({historical:true,previous:oldWait});
+  await f.r.notices(f.c,surface.blockers);expect(surface.counts().creates).toBe(1);
+  expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
  }finally{f.s.close();}
 });
 test('resumed dependency notices still publish and retract their owned blocker label',async()=>{
