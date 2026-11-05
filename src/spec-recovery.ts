@@ -7,11 +7,25 @@ import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation'
 import {PLAN_STATUS_INSTRUCTION,recordReadiness} from './readiness';
 import {withTurnSubmission} from './turn-submission';
 import {readBranchSnapshot} from './branch-updates';
+import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 
 /** Preview never changes reservations, routing or authorization. Confirmation
  * authorizes a planning-only turn, not implementation or a permission expansion. */
 export class SpecRecovery{
  constructor(public s:Store,public w:Workflow,public issue=readLinearIssue,public submit=withTurnSubmission){}
+ private absentPreview(job:string,delivery:any,e:any){
+  if(delivery.state!=='delivery_uncertain')return null;
+  const proof=JSON.parse(delivery.proof),observed=e.receiptObservation?.observed,age=Date.now()-observed;
+  const entries=e.transcript?.entries,turns=e.transcript?.turns;
+  if(e.receiptObservation?.complete!==true||!Number.isFinite(observed)||age<0||age>RECEIPT_FRESHNESS_MS||(Number.isFinite(proof.attemptedAt)&&observed<proof.attemptedAt)||
+   e.session?.id!==delivery.session||e.session.projectId!==proof.project||e.session.branch!==proof.branch||e.session.isTerminated!==false||
+   (e.session.activity?.state!==undefined&&e.session.activity.state!=='idle')||e.transcript?.controller!=='ready'||!Array.isArray(entries)||!Array.isArray(turns)||!turns.length||
+   turns.some((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state))||entries.some((x:any)=>x.clientMessageId===delivery.client_id))return null;
+  // Freshness is checked on every preview/confirmation. Fingerprint stable
+  // inventory content, not its collection time, so a refreshed read can confirm.
+  const inventory=digest(JSON.stringify({session:e.session.id,project:e.session.projectId,branch:e.session.branch,entries,turns}));
+  return {action:'reconcile_absent_replan',revision:delivery.revision,delivery,absence:{inventory,observed},confirmation:digest(JSON.stringify([latestRevision(this.s,job)?.id,delivery,inventory,'confirm-absent-replan'])),status:revisionStatus(this.s,job),nextAction:'Confirm only this complete fresh idle inventory to retire the uncertain reservation without replay. A new planning turn requires a separate fresh preview and confirmation.'};
+ }
  async preview(job:string,c:WorkflowConfig){
   const j=this.s.get(job),r=latestRevision(this.s,job),p=this.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
   if(!r||r.new_hash!==digest(j.spec)||j.project!==c.linear.projectId)throw Error('Current requirement revision required');
@@ -21,11 +35,13 @@ export class SpecRecovery{
   if(j.state==='awaiting_plan')for(const prior of this.s.db.query('SELECT * FROM spec_replans WHERE job=? AND revision!=? ORDER BY rowid').all(job,r.id) as any[]){
    if(['failed','superseded_completed'].includes(prior.state))continue;
    const owner=await this.w.t.evidence(prior.session),sent=owner.transcript?.entries?.find((x:any)=>x.clientMessageId===prior.client_id),turn=sent&&owner.transcript.turns?.find((t:any)=>t.id===sent.turnId);
+   const absent=this.absentPreview(job,prior,owner);if(absent)return absent;
    if(turn&&['failed','cancelled','interrupted'].includes(turn.state))return {action:'reconcile_failed_replan',revision:prior.revision,delivery:prior,confirmation:digest(JSON.stringify([prior.revision,prior.client_id,prior.session,turn.id,turn.state])),status:revisionStatus(this.s,job),nextAction:'Confirm this exact earlier terminal failure first; the failed send is never replayed. Then preview again for the current revision.'};
   }
   const delivery=this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(r.id) as any;
    if(delivery&&!['failed','superseded_completed'].includes(delivery.state)){
     const owner=await this.w.t.evidence(delivery.session),sent=owner.transcript?.entries?.find((x:any)=>x.clientMessageId===delivery.client_id),turn=sent&&owner.transcript.turns?.find((t:any)=>t.id===sent.turnId);
+    const absent=this.absentPreview(job,delivery,owner);if(absent)return absent;
     if(turn&&['failed','cancelled','interrupted'].includes(turn.state))return {action:'reconcile_failed_replan',revision:r.id,delivery,confirmation:digest(JSON.stringify([r.id,delivery.client_id,delivery.session,turn.id,turn.state])),status:revisionStatus(this.s,job),nextAction:'Confirm this exact terminal failure to retire the reservation; the failed send is never replayed and a fresh preview is then required.'};
     return {action:j.state==='awaiting_approval'?'await_approval':r.state==='authorized'?'continue_under_current_grants':'refresh_evidence',revision:r.id,delivery,status:revisionStatus(this.s,job)};
    }
@@ -65,17 +81,18 @@ export class SpecRecovery{
   if(!confirmation)return this.preview(job,c);
   return this.submit(async()=>{
    const preview=await this.preview(job,c);
-   if(preview.action==='reconcile_failed_replan'){
-    if(preview.confirmation!==confirmation)throw Error('Failed-turn evidence changed; refresh preview, never guess');
+   if(preview.action==='reconcile_failed_replan'||preview.action==='reconcile_absent_replan'){
+    const absent=preview.action==='reconcile_absent_replan';
+    if(preview.confirmation!==confirmation)throw Error(absent?'Absence evidence changed; refresh preview, never guess':'Failed-turn evidence changed; refresh preview, never guess');
     const row=this.s.db.transaction(()=>{
      const current=this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(preview.revision) as any;
      if(current?.state==='failed')return {revision:preview.revision,state:'failed',alreadyReconciled:true};
-     if(!current||!['accepted','delivery_uncertain'].includes(current.state)||current.client_id!==preview.delivery.client_id)throw Error('Replan reservation changed; refresh preview');
-     this.s.db.query("UPDATE spec_replans SET state='failed',reason='Terminal replan turn reconciled; no replay' WHERE revision=?").run(preview.revision);
-     this.s.event(job,'spec_replan_terminal_failure_reconciled',preview.delivery.client_id);
+     if(!current||!['accepted','delivery_uncertain'].includes(current.state)||JSON.stringify(current)!==JSON.stringify(preview.delivery))throw Error('Replan reservation changed; refresh preview');
+     this.s.db.query("UPDATE spec_replans SET state='failed',reason=? WHERE revision=?").run(absent?'Complete fresh idle inventory confirmed absence; no replay':'Terminal replan turn reconciled; no replay',preview.revision);
+     this.s.event(job,absent?'spec_replan_absence_reconciled':'spec_replan_terminal_failure_reconciled',absent?JSON.stringify({delivery:current,absence:preview.absence}):preview.delivery.client_id);
      return {revision:preview.revision,state:'failed',alreadyReconciled:false};
     }).immediate();
-    return {...row,action:'replan_failed_reconciled',nextAction:'Run spec-reconcile again for a fresh preview; a new planning turn requires its own confirmation.'};
+    return {...row,action:absent?'replan_absence_reconciled':'replan_failed_reconciled',nextAction:'Run spec-reconcile again for a fresh preview; a new planning turn requires its own confirmation.'};
    }
    if(!preview.proof||preview.confirmation!==confirmation)throw Error('Preview changed or delivery already reserved; refresh evidence, never replay');
    const proof=preview.proof,priorRow=this.s.db.query('SELECT client_id FROM spec_replans WHERE revision=?').get(preview.revision) as any;
@@ -88,7 +105,7 @@ export class SpecRecovery{
    this.s.db.transaction(()=>{
     if(latestRevision(this.s,job)?.id!==proof.revision||digest(this.s.get(job).spec)!==proof.spec||this.s.get(job).state!=='awaiting_plan')throw Error('Requirements changed before reservation');
     assertWorktreeAvailable(this.s,job);
-     this.s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,?,'delivery_uncertain',?,NULL) ON CONFLICT(revision) DO UPDATE SET client_id=excluded.client_id,session=excluded.session,binding=excluded.binding,state=excluded.state,proof=excluded.proof,reason=NULL").run(proof.revision,job,clientId,proof.session,confirmation,JSON.stringify(proof));
+     this.s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,?,'delivery_uncertain',?,NULL) ON CONFLICT(revision) DO UPDATE SET client_id=excluded.client_id,session=excluded.session,binding=excluded.binding,state=excluded.state,proof=excluded.proof,reason=NULL").run(proof.revision,job,clientId,proof.session,confirmation,JSON.stringify({...proof,attemptedAt:Date.now()}));
      this.s.db.query("UPDATE planning_dispatch SET state='revision_pending' WHERE job=?").run(job);
    }).immediate();
    const history=this.s.db.query('SELECT old_plan,old_plan_hash,summary FROM spec_revisions WHERE job=? ORDER BY rowid').all(job);
@@ -117,6 +134,7 @@ export class SpecRecovery{
   // Keep the outcome after the status spread: revisionStatus carries a
   // revision state (`pending`) that must not mask the reason no replan exists.
   if(!d)return {...revisionStatus(this.s,job),state:'requirements_changed'};
+  if(d.state==='failed')return {state:'replan_failed',reason:'Reconciled replan reservation retired; a new planning turn requires fresh preview and confirmation'};
   if(j.state!=='awaiting_plan')return {state:j.state};
   const proof=JSON.parse(d.proof),e=await this.w.t.evidence(d.session);
   if(e.session?.id!==d.session||e.session.projectId!==proof.project||e.session.branch!==proof.branch||e.session.isTerminated!==false)throw Error('Replan owner identity changed');

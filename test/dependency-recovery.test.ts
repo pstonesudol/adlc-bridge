@@ -315,6 +315,18 @@ test('DEV-19: first merge waits; second verifies/updates and sends exactly once 
 test('read-only preview has no reservation or Git mutation and binds confirmation',async()=>{
  const f=await fixture();try{f.setMerged(2);const p=await f.r.preview(f.job,f.c);expect(p.mode).toBe('preview_only');expect(f.r.rows()).toEqual([]);expect(f.fetches()).toBe(0);expect((await f.r.tick(f.job,f.c,'0'.repeat(64))).reason).toContain('preview changed');expect(f.updates()).toBe(0);}finally{f.s.close();}
 });
+test('waits without an instance retain and reuse their legacy notice binding',async()=>{
+ const f=await fixture();try{
+  f.setMerged(1);await f.r.tick(f.job,f.c);
+  const row=f.r.rows()[0],p=JSON.parse(row.evidence),definition=p.proof?.definition??p.definition;
+  expect(p.waitInstance).toBeUndefined();
+  const legacy=digest(JSON.stringify([row.job,row.plan,row.state,row.reason,p.id??definition]));
+  const surface=linearSurface(f);await f.r.notices(f.c,surface.blockers);
+  expect(f.s.db.query('SELECT binding FROM blocker_notices WHERE job=?').get(f.job)).toEqual({binding:legacy});
+  await new DependencyRecovery(f.s,f.w,f.r.io,async fn=>fn()).notices(f.c,surface.blockers);
+  expect(surface.counts()).toEqual({creates:1,adds:1});
+ }finally{f.s.close();}
+});
 test('concurrent polls reserve only one update and continuation',async()=>{
  const f=await fixture();try{f.setMerged(2);await Promise.all([f.r.tick(f.job,f.c),f.r.tick(f.job,f.c)]);expect(f.updates()).toBe(1);expect(f.sends.length).toBe(2);}finally{f.s.close();}
 });

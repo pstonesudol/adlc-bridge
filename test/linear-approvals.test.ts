@@ -30,6 +30,16 @@ test('publishes one plan; exact human reply approves once, implementation starts
  await f.surface.sync(f.c);await f.w.tick(f.c);expect(f.counts().sends).toBe(1);
  }finally{f.s.close();}
 });
+test('unrevised plans preserve the legacy approval notice binding and pending token',async()=>{
+ const f=fixture();try{
+  const j=f.s.get(f.id),route=f.w.router.get(f.id,'implementation');
+  const legacy=digest(JSON.stringify([j.spec,j.plan_hash,route?.route??null,f.c.planApproval,f.c.approval??{mode:'manual'}]));
+  expect(f.surface.binding(f.id,f.c)).toBe(legacy);
+  await f.surface.sync(f.c);f.approve();
+  expect((await new LinearApprovals(f.s,f.w,f.surface.api).sync(f.c))[0].state).toBe('approved');
+  expect(f.counts().creates).toBe(1);
+ }finally{f.s.close();}
+});
 test('unauthorized, bot-authored, edited, and quoted approvals cannot release gate',async()=>{
  const f=fixture();try{await f.surface.sync(f.c);f.approve('outsider');f.approve(undefined,{botActor:{id:'bot'}});f.approve(undefined,{editedAt:new Date().toISOString()});f.approve(undefined,{user:{id:f.c.planApproval.approverIds[0],app:true}});f.approve(undefined,{body:'> Approve ADLC plan quoted'});
  await f.surface.sync(f.c);expect(f.s.get(f.id).state).toBe('awaiting_approval');expect(f.counts().sends).toBe(0);

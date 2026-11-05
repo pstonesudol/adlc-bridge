@@ -188,9 +188,9 @@ export class LinearLifecycle{
    if(retryRow)this.s.db.query('INSERT INTO spec_notice_retry_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,retryRow.rid);
    return results;
   }
-  async sync(c:SyncConfig){
-   const notices=await this.revisionNotices(c);
-   if(!c.statusSync?.enabled)return notices;
+   async sync(c:SyncConfig){
+    if(!c.statusSync?.enabled)return [];
+    const notices=await this.revisionNotices(c);
   const rows=this.s.db.query("SELECT j.id,j.state,p.spec_hash FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state IN ('awaiting_plan','awaiting_approval','approved','blocked')").all(c.linear.projectId) as any[];
    const results:any[]=[...notices];
    for(const row of rows)try{

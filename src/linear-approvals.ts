@@ -24,8 +24,9 @@ export class LinearApprovals{
  constructor(public s:Store,public workflow:Workflow,public api:LinearAPI=linearAPI){s.db.exec(`CREATE TABLE IF NOT EXISTS plan_approval_notices(
   job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,plan_hash TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,token TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,created TEXT,approval_comment TEXT,reason TEXT,PRIMARY KEY(job,binding));`);}
  binding(job:string,c:ApprovalConfig){
-  const j=this.s.get(job),route=this.workflow.router.get(job,'implementation');
-   return digest(JSON.stringify([j.spec,j.plan_hash,latestRevision(this.s,job)?.id??null,route?.route??null,c.planApproval,c.approval??{mode:'manual'}]));
+   const j=this.s.get(job),route=this.workflow.router.get(job,'implementation');
+   const fields=[j.spec,j.plan_hash,route?.route??null,c.planApproval,c.approval??{mode:'manual'}],revision=latestRevision(this.s,job);
+   return digest(JSON.stringify(revision?[...fields,revision.id]:fields));
  }
  async current(job:string,c:ApprovalConfig){
   const j=this.s.get(job),p=new ApprovalPolicyStore(this.s),q=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;

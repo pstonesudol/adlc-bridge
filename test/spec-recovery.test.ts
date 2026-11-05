@@ -187,6 +187,54 @@ test('missing uncertain delivery receipt cannot be cleared by an existing PR or 
   await expect(f.recovery.preview(f.job,config)).rejects.toThrow('Prior delivery');expect(f.sends).toHaveLength(1);
  }finally{f.s.close();}
 });
+test('throwing replan send with no receipt needs confirmed fresh absence and never replays automatically',async()=>{
+ const f=await fixture();try{
+  f.edit('v2');const send=f.w.t.sendImplementation;let attempts=0;
+  f.w.t.sendImplementation=async()=>{attempts++;throw Error('Send failed before receipt');};
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
+  const delivery=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+  expect((await f.recovery.capture(f.job,config)).state).toBe('delivery_uncertain');
+  f.e.receiptObservation.observed=Date.now();
+  const absent=await f.recovery.preview(f.job,config);expect(absent.action).toBe('reconcile_absent_replan');
+  await expect(f.recovery.reconcile(f.job,config,'0'.repeat(64))).rejects.toThrow('Absence evidence changed');
+  f.w.t.evidence=async()=>{f.e.receiptObservation.observed=Date.now();return f.e;};
+  expect(await f.recovery.reconcile(f.job,config,absent.confirmation)).toMatchObject({action:'replan_absence_reconciled',state:'failed'});
+  expect(attempts).toBe(1);expect(f.sends).toHaveLength(1);
+  expect((await f.recovery.capture(f.job,config)).state).toBe('replan_failed');
+  const event=f.s.db.query("SELECT detail FROM events WHERE kind='spec_replan_absence_reconciled'").get() as any;
+  expect(JSON.parse(event.detail).delivery.client_id).toBe(delivery.client_id);
+  // A separate explicit preview/confirmation, not retirement, authorizes a new ID.
+  f.w.t.sendImplementation=send;
+  const fresh=await f.recovery.preview(f.job,config);expect(fresh.action).toBe('request_replanning');
+  await f.recovery.reconcile(f.job,config,fresh.confirmation);expect(f.sends).toHaveLength(2);
+  expect(f.sends[1].clientId).not.toBe(delivery.client_id);
+  f.complete();await f.recovery.capture(f.job,config);expect(f.s.get(f.job).state).toBe('awaiting_approval');
+ }finally{f.s.close();}
+});
+for(const invalid of ['incomplete','stale','pre-send','future','busy','active-turn','owner','branch','accepted-entry'])test(`uncertain replan absence cannot retire ${invalid} evidence`,async()=>{
+ const f=await fixture();try{
+  f.edit('v2');f.w.t.sendImplementation=async()=>{throw Error('No receipt');};
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
+  f.e.receiptObservation.observed=Date.now();
+  const absent=await f.recovery.preview(f.job,config);expect(absent.action).toBe('reconcile_absent_replan');
+  if(invalid==='incomplete')f.e.receiptObservation.complete=false;
+  if(invalid==='stale')f.e.receiptObservation.observed=Date.now()-120001;
+  if(invalid==='pre-send')f.e.receiptObservation.observed=JSON.parse((f.s.db.query('SELECT proof FROM spec_replans').get() as any).proof).attemptedAt-1;
+  if(invalid==='future')f.e.receiptObservation.observed=Date.now()+10000;
+  if(invalid==='busy')f.e.transcript.controller='busy';
+  if(invalid==='active-turn')f.e.transcript.turns.push({id:'competing',state:'running'});
+  if(invalid==='owner')f.e.session.id='different-owner';
+  if(invalid==='branch')f.e.session.branch='different-branch';
+  if(invalid==='accepted-entry'){
+   const d=f.s.db.query('SELECT * FROM spec_replans').get() as any;
+   f.e.transcript.entries.push({clientMessageId:d.client_id});
+  }
+  expect((await f.recovery.preview(f.job,config)).action).toBe('refresh_evidence');
+  await expect(f.recovery.reconcile(f.job,config,absent.confirmation)).rejects.toThrow('Preview changed or delivery already reserved');
+  expect((f.s.db.query('SELECT state FROM spec_replans').get() as any).state).toBe('delivery_uncertain');
+  expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
 test('unsupported plan scope stays blocked and retains the previous grant',async()=>{
  const f=await fixture();try{
   f.edit('Need a security decision');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();
@@ -489,6 +537,15 @@ test('preplanning edits do not publish authorization-invalidated notices',async(
   expect(await new LinearLifecycle(s,api).revisionNotices({linear:{projectId:'p',teamId:'t'}} as any)).toEqual([]);
   expect(calls).toBe(0);expect(s.db.query('SELECT * FROM spec_notices').all()).toHaveLength(0);
  }finally{s.close();}
+});
+for(const enabled of [undefined,false])test(`disabled status sync (${enabled}) performs no Linear notice or status access`,async()=>{
+ const f=await fixture();try{
+  f.edit('Changed requirements');let calls=0;
+  const linear=new LinearLifecycle(f.s,async()=>{calls++;throw Error('Disabled sync must not access Linear');});
+  const c:any={...config,...(enabled===undefined?{}:{statusSync:{enabled:false}})};
+  expect(await linear.sync(c)).toEqual([]);expect(calls).toBe(0);
+  expect(f.s.db.query('SELECT * FROM spec_notices').all()).toHaveLength(0);
+ }finally{f.s.close();}
 });
 test('a failed replan from an earlier revision is retired before the newer revision can proceed',async()=>{
  const f=await fixture();try{

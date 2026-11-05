@@ -1826,8 +1826,14 @@ also bind the revision, even when specification and plan hashes recur.
 Previous PR/verification evidence is historical until the revised implementation
 hands off; a merge of that old PR cannot mark the revised job Done. Terminal
 failed/cancelled replan turns are retired only by confirming their exact receipt
-(`spec-reconcile` preview), then a fresh preview/confirmation is required. Linear
-revision notices are published in bounded batches with a durable cursor. `status`, `review-status` and `reconcile-preview` retain independent
+(`spec-reconcile` preview), then a fresh preview/confirmation is required.
+If a throwing send has no receipt, only a complete fresh inventory of the exact
+idle owner can offer an explicit absence confirmation. It retires that uncertain
+reservation without replay; a new planning attempt needs a separate confirmation.
+Incomplete, stale, busy, mismatched or accepted-message evidence stays blocked.
+Linear revision notices require enabled status synchronization and are
+published in bounded batches with durable forward and older-retry cursors.
+`status`, `review-status` and `reconcile-preview` retain independent
 provider/dependency blockers alongside the requirements blocker.
 
 Existing incidents are not automatically approved or resumed. A subsequent
