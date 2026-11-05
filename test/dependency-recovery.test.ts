@@ -40,6 +40,31 @@ async function fixture(){
  const r=new DependencyRecovery(s,w,io,async fn=>fn());
  return {s,w,r,c,job,e,sends,io,issue,setMerged:(n:number)=>merged=n,setHead:(v:string)=>head=v,setLost:(v:boolean,hasReceipt=true)=>{lose=v;receipt=hasReceipt;},updates:()=>updates,fetches:()=>fetches};
 }
+for(const restored of [false,true])test(`superseded dependency receipt cannot drive revised recovery (${restored?'restored':'different'} plan hash)`,async()=>{
+ const f=await fixture();try{
+  const original=f.s.get(f.job),outcome=f.w.outcomes(f.job);
+  f.s.enqueue('p',root,'Revision B');f.s.enqueue('p',root,original.spec);
+  f.s.propose(f.job,restored?original.plan:'Different plan');
+  const current=f.s.get(f.job),revision=f.s.db.query('SELECT id FROM spec_revisions ORDER BY rowid DESC LIMIT 1').get() as any;
+  f.s.db.query("UPDATE jobs SET state='approved',approved_hash=plan_hash,actor='human' WHERE id=?").run(f.job);
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='revised-dispatch',plan_hash=?,state='approved_pending' WHERE job=?").run(current.plan_hash,f.job);
+  f.c.dependencyRecovery.jobs[0].planHash=current.plan_hash;
+  f.setMerged(2);
+  expect(await f.r.sync(f.c)).toEqual([]);
+  await expect(f.r.preview(f.job,f.c)).rejects.toThrow(restored?'Current structured dependency-only worker blocker required':'Current unchanged execution approval and reservation required');
+  expect((await f.r.tick(f.job,f.c)).state).toBe('stale_dependencies');
+  await expect(f.w.resume(f.job,f.c)).rejects.toThrow('superseded revision or dispatch');
+  expect(f.fetches()).toBe(0);expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);
+  expect(f.r.rows()).toHaveLength(0);expect(f.w.outcomes(f.job)).toEqual(outcome);
+  expect(f.w.status().outcomes).toEqual(expect.arrayContaining([expect.objectContaining({plan_hash:original.plan_hash,dispatch_id:outcome.dispatch_id})]));
+  expect(f.w.status().blockers).toHaveLength(0);
+  // A genuinely saved current-revision receipt carries both instance bindings.
+  f.s.db.query('UPDATE worker_outcomes SET revision_id=? WHERE job=?').run(revision.id,f.job);
+  if(restored)await expect(f.r.preview(f.job,f.c)).rejects.toThrow('Current structured dependency-only worker blocker required');
+  f.s.db.query('UPDATE worker_outcomes SET dispatch_id=? WHERE job=?').run('revised-dispatch',f.job);
+  if(restored)expect((await f.r.preview(f.job,f.c)).proof.auth.revision).toBe(revision.id);
+ }finally{f.s.close();}
+});
 test('DEV-19: first merge waits; second verifies/updates and sends exactly once to original session',async()=>{
  const f=await fixture();try{
   f.setMerged(1);expect((await f.r.tick(f.job,f.c)).state).toBe('waiting_for_dependencies');expect(f.updates()).toBe(0);expect(f.sends).toHaveLength(1);

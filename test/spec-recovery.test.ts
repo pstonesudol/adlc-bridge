@@ -52,6 +52,9 @@ test('active edit preserves owner/history, blocks dispatch and requires a fresh 
   expect((f.s.db.query('SELECT * FROM runs').get() as any).correlation).toBe(run.correlation);
   expect(f.s.db.query('SELECT * FROM spec_execution_history').all()).toHaveLength(1);
   await f.w.executeApproved(f.job,config);expect(f.sends).toHaveLength(3);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  await f.w.executionStatus(f.job,f.e,config);
+  expect(f.w.outcomes(f.job)).toMatchObject({revision_id:r.id,dispatch_id:f.w.implementation(f.job).client_id});
  }finally{f.s.close();}
 });
 for(const binding of ['client','plan','revision','spec'])for(const outcome of ['handoff','failure'])test(`in-flight ${outcome} cannot overwrite a changed ${binding} binding`,async()=>{

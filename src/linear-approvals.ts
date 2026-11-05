@@ -4,6 +4,7 @@ import {Workflow,type WorkflowConfig} from './workflow';
 import {ApprovalPolicyStore,featureGit} from './approval-policy';
 import {validScopes} from './file-scope';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {latestRevision} from './spec-revisions';
 export type ApprovalSurface={enabled:boolean;approverIds:string[];scope:string[]};
 export type ApprovalConfig=WorkflowConfig&{linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};statusSync?:{inProgress:string;inReview:string};planApproval?:ApprovalSurface};
 // Only presentation whitespace at the outside is ignored (including NBSP).
@@ -24,7 +25,7 @@ export class LinearApprovals{
   job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,plan_hash TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,token TEXT NOT NULL UNIQUE,body TEXT NOT NULL,state TEXT NOT NULL,created TEXT,approval_comment TEXT,reason TEXT,PRIMARY KEY(job,binding));`);}
  binding(job:string,c:ApprovalConfig){
   const j=this.s.get(job),route=this.workflow.router.get(job,'implementation');
-  return digest(JSON.stringify([j.spec,j.plan_hash,route?.route??null,c.planApproval,c.approval??{mode:'manual'}]));
+   return digest(JSON.stringify([j.spec,j.plan_hash,latestRevision(this.s,job)?.id??null,route?.route??null,c.planApproval,c.approval??{mode:'manual'}]));
  }
  async current(job:string,c:ApprovalConfig){
   const j=this.s.get(job),p=new ApprovalPolicyStore(this.s),q=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;

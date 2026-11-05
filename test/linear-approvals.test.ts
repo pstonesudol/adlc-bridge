@@ -35,6 +35,21 @@ test('unauthorized, bot-authored, edited, and quoted approvals cannot release ga
  await f.surface.sync(f.c);expect(f.s.get(f.id).state).toBe('awaiting_approval');expect(f.counts().sends).toBe(0);
  }finally{f.s.close();}
 });
+test('restored spec and plan hashes publish a revision-specific notice and reject the old token',async()=>{
+ const f=fixture();try{
+  const original=f.s.get(f.id);await f.surface.sync(f.c);
+  const before=f.surface.binding(f.id,f.c);
+  f.s.enqueue('p','issue','Changed requirements');f.approve();
+  f.s.enqueue('p','issue',original.spec);f.s.propose(f.id,original.plan);
+  expect(f.s.get(f.id).plan_hash).toBe(original.plan_hash);
+  expect(f.surface.binding(f.id,f.c)).not.toBe(before);
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
+  expect(f.counts().creates).toBe(2);
+  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');
+  expect(f.s.get(f.id).approved_hash).toBeNull();
+  f.approve();expect((await f.surface.sync(f.c))[0].state).toBe('approved');
+ }finally{f.s.close();}
+});
 test('requirements changes and removed eligibility reject a previously issued approval',async()=>{
  const f=fixture();try{await f.surface.sync(f.c);f.approve();f.issue.description='Changed';expect((await f.surface.sync(f.c))[0].state).toBe('approval_blocked');
  f.issue.description='Requirement';f.issue.labels.nodes=[];expect((await f.surface.sync(f.c))[0].state).toBe('approval_blocked');expect(f.s.get(f.id).state).toBe('awaiting_approval');

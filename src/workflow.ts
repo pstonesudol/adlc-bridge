@@ -15,7 +15,7 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
-import {latestRevision,revisionStatus,handoffPr,recordHandoff} from './spec-revisions';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
@@ -59,7 +59,8 @@ export class Workflow{
     job TEXT PRIMARY KEY REFERENCES jobs(id),plan_hash TEXT NOT NULL,session_id TEXT NOT NULL,
     client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,paths TEXT NOT NULL,runtime TEXT NOT NULL,
     actor TEXT NOT NULL,reason TEXT);`);
-  if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
+   if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
+   for(const name of ['revision_id','dispatch_id'])if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name===name))s.db.exec(`ALTER TABLE worker_outcomes ADD COLUMN ${name} TEXT`);
   if(!(s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))s.db.exec('ALTER TABLE continuations ADD COLUMN failed_at INTEGER');
  }
  planning(job:string):any{return this.s.db.query('SELECT * FROM planning_dispatch WHERE job=?').get(job);}
@@ -453,7 +454,7 @@ export class Workflow{
    first_observed=excluded.first_observed,grace_deadline=excluded.grace_deadline,observed=excluded.observed`)
    .run(job,d.plan_hash,d.session_id,result.outcome,result.reason??null,JSON.stringify(result.questions??[]),
      JSON.stringify(result.dependencies??[]),result.source,result.confidence,first,deadline,now);
-  this.s.db.query('UPDATE worker_outcomes SET discovery=? WHERE job=?').run(result.discovery?JSON.stringify(result.discovery):null,job);
+   this.s.db.query('UPDATE worker_outcomes SET discovery=?,revision_id=?,dispatch_id=? WHERE job=?').run(result.discovery?JSON.stringify(result.discovery):null,latestRevision(this.s,job)?.id??null,d.client_id,job);
   return {...result,graceDeadline:deadline};
  }
  private completedOutcome(job:string,d:any,e:any,entry:any,graceMs:number,now:number){
@@ -527,7 +528,8 @@ export class Workflow{
   if(!d||!r||!run)throw Error('Existing owned worker and delivery required');
   if(j.state!=='approved'||j.approved_hash!==j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))throw Error('Current unchanged plan approval required; replan after material changes');
   if(d.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))throw Error('Material plan or requirement change invalidates the previous authorization');
-  const outcome=this.outcomes(job);
+   const outcome=this.outcomes(job);
+   if(!currentOutcome(this.s,job,outcome))throw Error('Worker outcome belongs to a superseded revision or dispatch; await current implementation evidence');
    if(!outcome||!['needs_input','blocked_dependency'].includes(outcome.outcome))throw Error('Only a worker stopped on needs-input or a blocked dependency can resume');
    if(outcome.outcome==='blocked_dependency'&&(c as any).dependencyRecovery?.enabled&&!dependencyEvidence)throw Error('Dependency verification enabled; use dependency-preview/dependency-resume, not a prose resolution');
   if(outcome.plan_hash!==d.plan_hash)throw Error('Worker outcome belongs to a different plan');
@@ -605,7 +607,8 @@ export class Workflow{
     if(current.state!=='approved'||current.approved_hash!==j.plan_hash||current.actor!==j.actor)throw Error('Plan approval revoked or changed during resume reservation');
     const latestGrant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
     if(!latestGrant||JSON.stringify(latestGrant)!==JSON.stringify(grant)||latestGrant.plan_hash!==j.plan_hash||featureGit.some(op=>!JSON.parse(latestGrant.operations).includes(op)))throw Error('Scoped Git authorization changed during resume');
-    if(JSON.stringify(this.implementation(job))!==JSON.stringify(d))throw Error('Implementation scope or delivery changed during resume');
+     if(JSON.stringify(this.implementation(job))!==JSON.stringify(d))throw Error('Implementation scope or delivery changed during resume');
+     if(!currentOutcome(this.s,job,this.outcomes(job)))throw Error('Worker outcome revision or dispatch changed during resume');
     if(proof)policy.verify(job,c.linear.projectId,c.approval);
     const currentRun=new Lifecycle(this.s).run(job);
     if(currentRun?.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(currentRun.state)||currentRun.session_id!==run.session_id||currentRun.worktree!==run.worktree||currentRun.plan_hash!==j.plan_hash)throw Error('Worker ownership changed during resume');
@@ -667,9 +670,9 @@ export class Workflow{
  status(){return {deliveries:new ReceiptReconciliation(this.s).list(),dependencies:this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()?this.s.db.query('SELECT * FROM dependency_waits').all():[],policyAuthorizations:new ApprovalPolicyStore(this.s).list(),runtimePolicy:this.s.db.query('SELECT project,runtime FROM project_execution_policy').all(),routing:this.router.list(),planning:this.s.db.query('SELECT * FROM planning_dispatch').all(),implementation:this.s.db.query('SELECT job,plan_hash,session_id,state,paths,runtime,reason FROM implementation_dispatch').all(),
   readiness:this.s.db.query('SELECT job,plan_hash,state,valid,source,reason,questions,dependencies,risks,observed FROM plan_readiness').all(),
   resolutions:this.s.db.query('SELECT job,plan_hash,binding,source,actor,detail,state,at FROM plan_resolutions WHERE state=?').all('active'),
-  outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
-    FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all(),
+   outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.revision_id,w.dispatch_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
+     FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all().map((o:any)=>({...o,historical:!currentOutcome(this.s,o.job,o)})),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
   blockers:this.s.db.query(`SELECT w.job,j.issue,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.grace_deadline
-      FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.plan_hash=j.plan_hash AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all(),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
+      FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.plan_hash=j.plan_hash AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all().filter((o:any)=>currentOutcome(this.s,o.job,this.outcomes(o.job))),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
 }

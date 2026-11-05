@@ -1819,6 +1819,10 @@ After capture, `plan-approval-required` tickets use the exact fenced command in
 the new Linear plan notice, from a configured human. Previous replies are stale.
 Standing-policy tickets pass through current eligibility/readiness/scope policy;
 an ineligible or unresolved plan stays blocked, without expanding permissions.
+Worker outcomes retain revision/dispatch instance identifiers; legacy outcomes
+without them cannot drive dependency
+recovery or continuation after a requirement revision. Approval notice tokens
+also bind the revision, even when specification and plan hashes recur.
 Previous PR/verification evidence is historical until the revised implementation
 hands off; a merge of that old PR cannot mark the revised job Done. Terminal
 failed/cancelled replan turns are retired only by confirming their exact receipt

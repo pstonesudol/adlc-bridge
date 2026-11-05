@@ -44,6 +44,14 @@ export function latestRevision(s:Store,job:string):any{
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='spec_revisions'").get())return null;
  return s.db.query('SELECT * FROM spec_revisions WHERE job=? ORDER BY rowid DESC LIMIT 1').get(job);
 }
+/** Legacy outcomes without instance evidence remain usable only before any
+ * requirement revision. Repeated hashes never revive historical blockers. */
+export function currentOutcome(s:Store,job:string,o:any){
+ if(!o)return false;
+ const j=s.get(job),d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any,r=latestRevision(s,job);
+ return !!(d&&o.plan_hash===j.plan_hash&&o.plan_hash===d.plan_hash&&o.session_id===d.session_id&&
+  (r?o.revision_id===r.id&&o.dispatch_id===d.client_id:!o.revision_id&&(!o.dispatch_id||o.dispatch_id===d.client_id)));
+}
 /** Jobs whose plan was renewed after a requirement revision keep their prior PR
  * historical until that exact revised plan completes a handoff. */
 export function revisedExecution(s:Store,job:string){
