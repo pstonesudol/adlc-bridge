@@ -78,11 +78,16 @@ export class ReviewLoop{
   CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);
   // Existing databases keep their PR receipts under an unknown-PR key; the
   // request key now also scopes by PR so a rebound target cannot inherit them.
-  const requestColumns=this.s.db.query('PRAGMA table_info(full_review_requests)').all() as any[];
-  if(!requestColumns.some(c=>c.name==='pr'))this.s.db.exec(`ALTER TABLE full_review_requests RENAME TO full_review_requests_legacy;
-   CREATE TABLE full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
-   INSERT OR IGNORE INTO full_review_requests(job,pr,head,body_hash,state,requested) SELECT job,0,head,body_hash,state,requested FROM full_review_requests_legacy;
-   DROP TABLE full_review_requests_legacy;`);}
+  this.s.db.transaction(()=>{
+   const requestColumns=this.s.db.query('PRAGMA table_info(full_review_requests)').all() as any[];
+   if(requestColumns.some(c=>c.name==='pr'))return;
+   this.s.db.exec(`ALTER TABLE full_review_requests RENAME TO full_review_requests_legacy;
+    CREATE TABLE full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
+    INSERT OR IGNORE INTO full_review_requests(job,pr,head,body_hash,state,requested)
+     SELECT l.job,COALESCE((SELECT t.pr FROM review_targets t WHERE t.job=l.job),0),l.head,l.body_hash,l.state,l.requested FROM full_review_requests_legacy l;
+    DROP TABLE full_review_requests_legacy;`);
+  }).immediate();
+ }
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
   this.s.db.query('INSERT INTO metadata_check_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET checks=excluded.checks').run(project,JSON.stringify([...new Set(names)]));
@@ -190,7 +195,14 @@ export class ReviewLoop{
    const t=this.get(job);if(!t)throw Error('Unknown review target');const l=new Lifecycle(this.s);l.current(job);
    // Every write in this tick is scoped to the PR captured here; a rebound
    // target must not receive this PR's decisions.
-   const record=(result:any)=>this.record(job,result,t.pr);
+   const record=(result:any)=>{
+    const stored=this.record(job,result,t.pr);
+    if(stored)return stored;
+    const current=this.get(job);
+    return current&&current.pr!==t.pr
+     ?{state:'blocked',send:false,head:result.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}
+     :{state:'completed',send:false,head:current?.head??result.head,reason:current?.reason??'Review target completed during collection'};
+   };
    if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
     // A durable handoff marker survives later remediation states, so failed or
     // uncertain remediation after a revised handoff still reaches reconciliation.

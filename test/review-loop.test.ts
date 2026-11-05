@@ -542,16 +542,33 @@ test('a target rebound during a tick keeps the old PR decision unwritten',async(
   expect(f.loop.get(f.id)).toMatchObject({pr:original.pr+1,head:original.head});
  }finally{release?.();f.s.close();}
 });
+test('a legacy uncertain receipt for the current target blocks a duplicate request',async()=>{
+ const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');
+ const hash=s.propose(id,'plan');s.approve(id,hash,'human');new Lifecycle(s).adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
+ let posts=0;try{
+  new ReviewLoop(s);
+  s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)").run(id,'owner/repo',7,'["CI"]','["src/**"]',0,1);
+  s.db.exec('DROP TABLE full_review_requests; CREATE TABLE full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash))');
+  s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(id,'sha','body','delivery_uncertain',1);
+  const loop=new ReviewLoop(s);loop.postReview=async()=>{posts++;};
+  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=?').get(id)).toEqual({pr:7});
+  expect(await loop.requestReview(id,7,'sha','body')).toBe(false);
+  expect(posts).toBe(0);
+ }finally{s.close();}
+});
 test('legacy review-request receipts are migrated under an unknown PR key',()=>{
  const s=new Store(':memory:');
  s.db.exec('CREATE TABLE full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash))');
+ s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,repo TEXT NOT NULL,pr INTEGER NOT NULL,required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,head_since INTEGER NOT NULL,last_signature TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
  s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run('job','sha','body','accepted',1);
  try{
+  // A registered target supplies its PR for the migrated receipt.
+  s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES ('job','owner/repo',7,'[\"CI\"]','[\"src/**\"]',0,1)").run();
   new ReviewLoop(s);
-  expect(s.db.query('SELECT * FROM full_review_requests').all()).toEqual([{job:'job',pr:0,head:'sha',body_hash:'body',state:'accepted',requested:1}]);
+  expect(s.db.query('SELECT * FROM full_review_requests').all()).toEqual([{job:'job',pr:7,head:'sha',body_hash:'body',state:'accepted',requested:1}]);
   // The same head/body can now hold a receipt for a different PR.
   s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run('job',3,'sha','body','delivery_uncertain',2);
-  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=? ORDER BY pr').all('job')).toEqual([{pr:0},{pr:3}]);
+  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=? ORDER BY pr').all('job')).toEqual([{pr:3},{pr:7}]);
  }finally{s.close();}
 });
 test('failed review requests revoke stale ready state but retain their reservation and never post twice',async()=>{

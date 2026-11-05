@@ -631,7 +631,19 @@ test('a revised handoff must belong to the registered review target PR',async()=
   expect(loop.rebind(f.job,'owner/repo',9)).toMatchObject({state:'rebound',pr:9});
   expect(loop.get(f.job)).toMatchObject({pr:9,state:'waiting_for_review',head:null,last_signature:null});
   // The rebound target must not look ready before the new PR's evidence exists.
-  expect(await loop.tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).not.toMatchObject({state:'ready_for_human'});
+  // An isolated adapter keeps provider calls local; the rebound target is not
+  // reported ready and its stored state reflects the fresh review cycle.
+  const evidence={required:['CI'],checks:[],review:null,unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true,descriptionHash:'d',findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],clear:false,reasons:[]};
+  const isolated=new ReviewLoop(f.s,undefined,{
+   sessionEvidence:async()=>({session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:9,url:'https://github.com/owner/repo/pull/9'}]},transcript:{controller:'ready',turns:[],entries:[]}}),
+   readBranchSnapshot:async()=>({branch:f.e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),
+   worktreeIdentity:async()=>({branch:f.e.session.branch,head:'a'.repeat(40)}),
+   readiness:async()=>evidence,
+  } as any);
+  const result=await isolated.tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
+  expect(result).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(isolated.get(f.job)).toMatchObject({pr:9,state:'waiting_for_coderabbit',head:null,last_signature:expect.any(String)});
+  expect(isolated.get(f.job).state).not.toBe('ready_for_human');
   expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
   expect(revisedHandoff(f.s,f.job)).toBe(true);
   expect((f.s.db.query("SELECT detail FROM events WHERE kind='review_target_rebound'").get() as any).detail).toContain('"handoff":9');
