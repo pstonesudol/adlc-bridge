@@ -811,6 +811,32 @@ test('ingest respects the turn-submission pause',()=>{
   expect(JSON.parse(accepted.stdout.toString()).id).toBeString();
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+test('held submission lock blocks specification intake without touching the job or revisions',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-ingest-lock-')),db=join(dir,'state.db'),first=join(dir,'first.json'),second=join(dir,'second.json');
+ try{
+  writeFileSync(first,JSON.stringify({identifier:'DEV-1',title:'Task',description:'Original'}));
+  writeFileSync(second,JSON.stringify({identifier:'DEV-1',title:'Task',description:'Changed while locked'}));
+  const state=join(dir,'Library','Application Support','ADLC Bridge');mkdirSync(state,{recursive:true});
+  const env={ADLC_DB:db,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'},cli=join(import.meta.dir,'../src/cli.ts');
+  const initial=Bun.spawnSync([process.execPath,cli,'ingest','p','issue',first],{env});
+  expect(initial.exitCode).toBe(0);const id=JSON.parse(initial.stdout.toString()).id;
+  const lock=join(state,'turn-submission.lock');mkdirSync(lock,{mode:0o700});
+  const blocked=Bun.spawnSync([process.execPath,cli,'ingest','p','issue',second],{env});
+  expect(blocked.exitCode).not.toBe(0);
+  expect(blocked.stderr.toString()).toContain('Turn submission or shutdown is in progress');
+  const s=new Store(db);try{
+   expect(s.get(id).spec).toBe(JSON.stringify({identifier:'DEV-1',title:'Task',description:'Original'}));
+   expect(s.db.query('SELECT * FROM spec_revisions WHERE job=?').all(id)).toHaveLength(0);
+  }finally{s.close();}
+  rmSync(lock,{recursive:true,force:true});
+  const accepted=Bun.spawnSync([process.execPath,cli,'ingest','p','issue',second],{env});
+  expect(accepted.exitCode).toBe(0);
+  const after=new Store(db);try{
+   expect(after.get(id).spec).toContain('Changed while locked');
+   expect(after.db.query('SELECT * FROM spec_revisions WHERE job=?').all(id)).toHaveLength(1);
+  }finally{after.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
 test('worktree reservations are detected through alias paths',()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-alias-'));try{
   const tree=join(dir,'tree'),link=join(dir,'link');mkdirSync(tree);symlinkSync(tree,link);
