@@ -1,6 +1,7 @@
 import {latestWorkflowChecks} from './check-runs';
 import {templateLogReader} from './gh-logs';
-import {templateCIFindings,templateSignature,metadataCheckEvidence,metadataBodyCovered} from './pr-template-ci';
+import {templateCIFindings,templateSignature,metadataBodyCovered} from './pr-template-ci';
+import {attestMetadataChecks,currentMetadataChecks} from './metadata-attestation';
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
@@ -80,7 +81,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   const first=await gh(['api',`${base}/pulls/${number}`]);
   if(first.state!=='open')throw Error('PR is not open');
   const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
-   const checks=latestWorkflowChecks(rawChecks);
+  let checks=latestWorkflowChecks(rawChecks);
   const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();
   const threads:ReviewThread[]=[];
   const findings:any[]=[];
@@ -126,14 +127,21 @@ export async function readiness(repo:string, number:number, required:string[],me
   const currentBase=await baseTip(repo,first.base.ref);
   const comparison=await gh(['api',`${base}/compare/${currentBase}...${first.head.sha}`]);
   if(!Number.isSafeInteger(comparison.behind_by)||comparison.behind_by<0)throw Error('Incomplete base branch comparison');
-  const final=await gh(['api',`${base}/pulls/${number}`]);
+  let final=await gh(['api',`${base}/pulls/${number}`]);
+  const bodyEvidence=await attestMetadataChecks(repo,number,first.head.sha,checks,metadataChecks,path=>gh(['api',path]),templateLogReader());
+  // Recheck after collecting evidence too: description edits do not change SHA.
+  const observed=metadataChecks.length?await gh(['api',`${base}/pulls/${number}`]):final;
+  const changed=first.body!==final.body||final.body!==observed.body||first.head.sha!==final.head.sha||first.head.sha!==observed.head.sha;
+  if(changed)for(const row of bodyEvidence)row.descriptionHash=null;
+  final=observed;
+  checks=currentMetadataChecks(checks,bodyEvidence,final.body??'');
   const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,
     checks:checks.map((c:any)=>({name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
     review:latest?{sha:latest.commit_id,author:latest.user.login,state:latest.state}:null,
     unresolved,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
   const custom=customCheckEvidence(latest,first.head.sha,comments,{repo,pr:number,body:final.body??'',version,checks});
-  if(first.body!==final.body||first.head.sha!==final.head.sha){custom.findings=[];custom.bodyReviewed=false;custom.blocker='PR head or description changed during custom-check collection';}
+  if(changed){custom.findings=[];custom.bodyReviewed=false;custom.blocker='PR head or description changed during custom-check collection';}
   findings.push(...custom.findings);
   if(custom.blocker||custom.findings.length){gate.clear=false;gate.reasons.push(custom.blocker??'Actionable CodeRabbit Verification Evidence failure');}
   if(comparison.behind_by>0){gate.clear=false;gate.reasons.push('Feature branch is behind base');}
@@ -143,18 +151,18 @@ export async function readiness(repo:string, number:number, required:string[],me
   const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
   const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
   const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
-    const bodyEvidence=metadataCheckEvidence(checks,first.head.sha,metadataChecks);
+    const currentBodyEvidence=bodyEvidence.filter(row=>checks.some(c=>c.id===row.checkId));
     const descriptionHash=digest(final.body??'');
-    if(metadataChecks.length&&!metadataBodyCovered({head:first.head.sha,descriptionHash,metadataCheckEvidence:bodyEvidence},metadataChecks)){
+    if(metadataChecks.length&&!metadataBodyCovered({head:first.head.sha,descriptionHash,metadataCheckEvidence:currentBodyEvidence},metadataChecks)){
      gate.clear=false;gate.reasons.push('Missing body-bound success evidence for every configured metadata check');
     }
-    const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,descriptionHash,path=>gh(['api',path]),templateLogReader(),bodyEvidence);
+    const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,descriptionHash,path=>gh(['api',path]),templateLogReader(),currentBodyEvidence);
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
     coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
-    metadataCheckEvidence:bodyEvidence,
+    metadataCheckEvidence:currentBodyEvidence,
      botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }
 

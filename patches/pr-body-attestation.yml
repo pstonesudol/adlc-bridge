@@ -1,0 +1,50 @@
+# Operator-reviewed template: replace the repository's PR-body workflow on its
+# default branch. Requires its existing trusted scripts/pr-body.mjs validator.
+name: PR body attestation
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
+permissions:
+  contents: read
+concurrency:
+  group: pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  structure:
+    name: PR body structure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # Only the base snapshot is executed. PR metadata stays JSON data.
+      - name: Validate description
+        id: validate
+        continue-on-error: true
+        run: node scripts/pr-body.mjs
+      - name: Attest validated description and preserve result
+        env:
+          VALIDATION_RESULT: ${{ steps.validate.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, sys
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as f:
+              event = json.load(f)
+          pr = event['pull_request']
+          result = os.environ['VALIDATION_RESULT']
+          if result not in ('success', 'failure'):
+              sys.exit('Validator did not complete')
+          workflow = os.environ['GITHUB_WORKFLOW_REF'].split('/', 2)[2].rsplit('@', 1)[0]
+          print('ADLC_METADATA_V1 ' + json.dumps({
+              'version': 1, 'repository': os.environ['GITHUB_REPOSITORY'],
+              'pr': pr['number'], 'head': pr['head']['sha'],
+              'descriptionHash': hashlib.sha256((pr['body'] or '').encode('utf-8')).hexdigest(),
+              'runId': int(os.environ['GITHUB_RUN_ID']),
+              'runAttempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+              'workflow': workflow, 'check': 'PR body structure', 'result': result,
+          }, separators=(',', ':')))
+          sys.exit(0 if result == 'success' else 1)
+          PY
