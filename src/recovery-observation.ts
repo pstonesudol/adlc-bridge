@@ -1,13 +1,16 @@
 import {randomUUID} from 'node:crypto';
 import {assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {Store} from './core';
-import {readEvidence,ReadValidationError,type ReadEvidence} from './provider-read';
+import {readEvidence,ReadValidationError,validReadTime,type ReadEvidence} from './provider-read';
 export const transient=(e:ReadEvidence)=>['throttled','timeout','network','server'].includes(e.classification);
 export class RecoveryObservation{
  constructor(public s:Store,public now=Date.now,public random=Math.random){
  s.db.exec('CREATE TABLE IF NOT EXISTS recovery_observations(job TEXT PRIMARY KEY,failures INTEGER NOT NULL,next_read INTEGER NOT NULL,reason TEXT)');
  s.db.exec('CREATE TABLE IF NOT EXISTS observation_leases(key TEXT PRIMARY KEY,token TEXT NOT NULL,until_ms INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS observation_capacity(provider TEXT PRIMARY KEY,next_read INTEGER NOT NULL)');
  s.db.exec('CREATE TABLE IF NOT EXISTS mergeability_waits(job TEXT PRIMARY KEY,waits INTEGER NOT NULL,next_read INTEGER NOT NULL)');
+ // Repair legacy invalid timestamps once, durably, without clearing failures or
+ // mutation receipts. A bounded health-probe delay replaces an unusable hint.
+ s.db.transaction(()=>{for(const table of ['recovery_observations','observation_capacity','mergeability_waits'])s.db.query(`UPDATE ${table} SET next_read=? WHERE typeof(next_read) NOT IN ('integer','real') OR next_read<0 OR next_read>8640000000000000 OR next_read!=CAST(next_read AS INTEGER)`).run(this.now()+30*60*1000);}).immediate();
  }
  status(job:string){const r=this.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(job) as any;if(!r)return null;let evidence;try{evidence=JSON.parse(r.reason);}catch{}const capacity=evidence?.provider?this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(evidence.provider) as any:null;return {...r,evidence:evidence?.classification?evidence:null,evidenceAgeMs:evidence?.timestamp?Math.max(0,this.now()-evidence.timestamp):null,sharedNextRead:capacity?.next_read??null};}
  wait(job:string){const merge=this.s.db.query('SELECT * FROM mergeability_waits WHERE job=?').get(job) as any;
@@ -19,12 +22,13 @@ export class RecoveryObservation{
  }
  failed(job:string,error?:unknown,provider:ReadEvidence['provider']='github'){
  assertObservationFence();
- const e=readEvidence(error,provider),now=this.now();
+ const e={...readEvidence(error,provider)},now=this.now();if(!validReadTime(e.retryAt))delete e.retryAt;
  this.s.db.transaction(()=>{const old=this.status(job),n=(old?.failures??0)+1;
  const delay=n>=6?30*60*1000:Math.min(15*60*1000,1000*2**Math.min(n-1,10))*(0.75+this.random()*0.5);
- const next=Math.max(now+Math.ceil(delay),e.retryAt??0);
+ const providerNext=Math.max(now+1000,e.retryAt??0);
+ const next=Math.max(now+Math.ceil(delay),providerNext);
  this.s.db.query('INSERT INTO recovery_observations VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET failures=excluded.failures,next_read=excluded.next_read,reason=excluded.reason').run(job,n,next,JSON.stringify(e));
- if(transient(e))this.s.db.query('INSERT INTO observation_capacity VALUES (?,?) ON CONFLICT(provider) DO UPDATE SET next_read=MAX(next_read,excluded.next_read)').run(e.provider,next);
+ if(transient(e))this.s.db.query('INSERT INTO observation_capacity VALUES (?,?) ON CONFLICT(provider) DO UPDATE SET next_read=MAX(next_read,excluded.next_read)').run(e.provider,providerNext);
  }).immediate();
  }
  claim(key:string,duration=10*60*1000){const token=randomUUID();const ok=this.s.db.query('INSERT INTO observation_leases VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET token=excluded.token,until_ms=excluded.until_ms WHERE until_ms<=?').run(key,token,this.now()+duration,this.now()).changes;
@@ -47,4 +51,4 @@ export class RecoveryObservation{
  }
  retry(job:string){this.clear(job);this.mergeabilityKnown(job);/* Shared provider cooldown is not an operator bypass. */}
 }
-export class ObservationDeferred extends Error{constructor(public nextRead:number){super(`Provider read deferred until ${new Date(nextRead).toISOString()}; no read failure or mutation`);}}
+export class ObservationDeferred extends Error{constructor(public nextRead:number){super(validReadTime(nextRead)?`Provider read deferred until ${new Date(nextRead).toISOString()}; no read failure or mutation`:'Invalid provider cooldown; inspect observation state before retrying');}}

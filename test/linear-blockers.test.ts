@@ -7,6 +7,15 @@ import {ConflictRecovery} from '../src/conflict-recovery';
 import {ReviewLoop} from '../src/review-loop';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
+test('observation notice does not retain an old-plan owned blocker label',async()=>{
+ const f=fixture();try{
+ const blockers=f.blockers();await blockers.sync(f.config);expect(f.labels).toContain(labelId);
+ const j=f.s.get(f.id),plan='new approved plan',hash=digest(JSON.stringify([j.spec,plan]));
+ f.s.db.query("UPDATE jobs SET state='approved',plan=?,plan_hash=?,approved_hash=? WHERE id=?").run(plan,hash,hash,f.id);
+ new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ await blockers.sync(f.config);expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.labels).toContain('ready');
+ }finally{f.s.close();}
+});
 
 test('permanent read failures publish one secret-safe operator notice without labels',async()=>{
  const f=fixture();try{

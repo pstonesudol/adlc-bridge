@@ -2081,6 +2081,15 @@ polling stops for inspection; `retry-observation JOB` rearms that wait after
 operator inspection. A known branch result clears the mergeability wait only.
 
 Capacity/cooldowns are shared by provider across projects/jobs in the same state
+database. A job's circuit delay is not shared: transient failures impose only a
+one-second provider coordination cooldown, extended by valid provider retry
+hints. Invalid timestamps outside the supported Date range are rejected; legacy
+invalid stored cooldowns are durably normalized to a 30-minute health-probe wait
+without clearing failure history or mutation receipts. Reserved conflict recovery
+uses this read backoff before any worktree mutation; later uncertain mutation
+stages still require their existing reconciliation and are never replayed.
+
+Capacity coordination uses the same state
 database. A provider lease permits one collection at a time (10-minute crash
 expiry); a job evaluation lease suppresses concurrent continuations (one-hour
 crash expiry). Run projects sharing provider capacity against the same state

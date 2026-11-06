@@ -1,6 +1,15 @@
 import {test,expect} from 'bun:test';
 import {githubRead,ProviderReadError,readFailure} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('partial response headers preserve failed transport classification',async()=>{
+ for(const [code,signal,err,classification] of [[143,'SIGTERM','','timeout'],[1,undefined,'ECONNRESET','network'],[0,undefined,'','malformed']] as const){
+ try{await githubRead(['api','fixture'],'branch-read',spawn('HTTP/2.0 200 OK\r\nx-partial: value',err,code,signal));throw Error('Expected failure');}catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe(classification);}
+ }
+});
+test('retry hints beyond the supported Date range are rejected',()=>{
+ for(const headers of ['Retry-After: 9000000000000','x-ratelimit-remaining: 0\nx-ratelimit-reset: 9000000000000'])expect(readFailure('github','branch-read',`HTTP 429\n${headers}\n`,1,undefined,1000).evidence.retryAt).toBeUndefined();
+ expect(readFailure('github','branch-read','HTTP 429\nRetry-After: 60\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 9000000000000\n',1,undefined,1000).evidence.retryAt).toBe(61000);
+});
 test('review reads capture headers for GraphQL and slurped pagination',async()=>{
  for(const args of [['api','graphql','-f','query=query { viewer { login } }'],['api','--paginate','--slurp','fixture']]){
  let seen:string[]=[];const child=spawn(args.includes('--slurp')?'[HTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"page":1},\nHTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"page":2}]':'HTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"data":{"body":"HTTP/2.0 500 spoof"}}');

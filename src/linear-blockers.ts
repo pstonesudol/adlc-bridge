@@ -168,7 +168,7 @@ export class LinearBlockers{
    if(!e||transient(e))continue;
    try{new Lifecycle(this.s).current(j.id);}catch{continue;}
    const reason=`${e.provider} ${e.operation}: ${e.classification}. Inspect provider login status, repository/session visibility and configuration locally; do not paste credentials. After correction run retry-observation ${j.id}; mutation uncertainty remains unchanged.`;
-   try{results.push(await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding:digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification])),applyLabel:false}));handled.add(j.id);}
+   try{results.push(await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding:digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification])),applyLabel:false}));}
    catch(error){results.push({job:j.id,state:'blocked',reason:'Observation blocker notice requires reconciliation; no blind resend'});}
   }
   for(const outcome of rows){

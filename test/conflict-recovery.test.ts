@@ -1,4 +1,6 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -42,6 +44,20 @@ async function fixture(filename='app.txt'){
  const recovery=new ConflictRecovery(s,io as any);
  return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
 }
+test('reserved conflict recovery retries six read failures before any mutation',async()=>{
+ const f=await fixture();let fail=true,reads=0;
+ const snapshot=async()=>{if(++reads>=3&&fail)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ try{
+ for(let n=1;n<=6;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});expect(f.sends()).toBe(0);
+ expect(f.commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref'].includes(a[1]))).toHaveLength(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);setSystemTime(new Date(status.next_read+1));
+ }
+ fail=false;expect((await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);expect(new RecoveryObservation(f.s).status(f.job)).toBeNull();
+ }finally{setSystemTime();f.close();}
+},60000);
 test('DEV-15/16 conflict preserves feature and base safeguards, normal pushes and invalidates old clearance',async()=>{
  const f=await fixture();try{
   expect((await f.recovery.tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');expect(f.sends()).toBe(1);

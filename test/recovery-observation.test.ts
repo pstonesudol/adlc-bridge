@@ -6,6 +6,24 @@ import {readFailure,readEvidence,malformed} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+test('one session circuit cannot impose its 30-minute delay on healthy jobs',async()=>{
+ const s=new Store(':memory:');let now=1000;const bad=s.enqueue('p','bad','s'),healthy=s.enqueue('q','good','s'),o=new RecoveryObservation(s,()=>now,()=>0.5);
+ try{
+ for(let n=0;n<6;n++)o.failed(bad,readFailure('orchestrator','session-evidence','timeout',1,undefined,now));
+ expect(o.status(bad).next_read).toBe(now+1800000);expect(o.status(bad).sharedNextRead).toBe(now+1000);now+=1001;
+ expect(await o.read(healthy,'orchestrator',async()=>true)).toBe(true);expect(o.wait(bad)?.state).toBe('waiting_for_worker');expect(o.status(healthy)).toBeNull();
+ }finally{s.close();}
+});
+test('legacy out-of-range cooldowns normalize durably and remain safe to display',async()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','s');let now=1000;const o=new RecoveryObservation(s,()=>now);
+ try{
+ const error=readFailure('github','branch-read','HTTP 429',1,undefined,now);error.evidence.retryAt=9000000000000000;o.failed(job,error);expect(o.status(job).evidence.retryAt).toBeUndefined();
+ s.db.query('UPDATE recovery_observations SET next_read=?').run(9000000000000000);s.db.query('UPDATE observation_capacity SET next_read=?').run(9000000000000000);
+ const restarted=new RecoveryObservation(s,()=>now);expect(restarted.status(job).next_read).toBe(now+1800000);expect(restarted.wait(job)?.state).toBe('waiting_for_worker');
+ await expect(restarted.read(job,'github',async()=>true)).rejects.toBeInstanceOf(ObservationDeferred);
+ now+=1000;expect(new RecoveryObservation(s,()=>now).status(job).next_read).toBe(1801000);
+ }finally{s.close();}
+});
 test('inspected shared cooldown override is audited and separate from job retry',()=>{
  const s=new Store(':memory:'),job=s.enqueue('p','i','s'),other=s.enqueue('p','j','s'),o=new RecoveryObservation(s,()=>1000);
  try{

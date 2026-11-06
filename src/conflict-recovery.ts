@@ -1,5 +1,7 @@
 import {existsSync} from 'node:fs';
 import {fencedIO,assertObservationFence} from './observation-fence';
+import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
+import {ProviderReadError} from './provider-read';
 import {resolve} from 'node:path';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
@@ -70,8 +72,10 @@ export class ConflictRecovery{
   const d=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
   if(d?.state!=='pr_handoff')throw Error('Completed implementation PR handoff required');
  }
- async inspect(job:string,c:any,repo:string,pr:number){
-  const auth=this.auth(job,c),facts=await this.io.facts(job,c),b=await this.io.snapshot(repo,pr),e=await this.io.evidence(auth.session);
+ async inspect(job:string,c:any,repo:string,pr:number,observations?:RecoveryObservation){
+  const auth=this.auth(job,c),facts=await this.io.facts(job,c);
+  const b=await (observations?observations.read(job,'github',()=>this.io.snapshot(repo,pr)):this.io.snapshot(repo,pr));
+  const e=await (observations?observations.read(job,'orchestrator',()=>this.io.evidence(auth.session)):this.io.evidence(auth.session));
   assertDeliveryTarget(this.s,job,e.session,repo,pr,b);
   if(e.session?.id!==auth.session||e.session.isTerminated!==false||e.session.activity?.state!=='idle'||!e.session.prs?.some((p:any)=>p.number===pr&&p.url===`https://github.com/${repo}/pull/${pr}`&&p.state==='open'))throw Error('Native session activity or PR attachment changed');
   if(repo!==c.githubRepo||b.baseBranch!==c.conflictRecovery.baseBranch||facts.session!==auth.session||facts.worktree!==canonicalWorktree(auth.worktree)||facts.project!==auth.project||!facts.isolated||!facts.lineage||!facts.completed||facts.owners.length!==1||facts.owners[0]!==auth.session||facts.branch!==b.branch||facts.candidates.length!==1||facts.candidates[0].pr!==pr||facts.candidates[0].repo!==repo)throw Error('Owned isolated delivery repository/base/worktree evidence mismatch');
@@ -226,13 +230,20 @@ export class ConflictRecovery{
     }).immediate();
    }
    if(r.repo!==repo||r.pr!==pr)throw Error('Recovery target mismatch');
+   if(r.state==='reserved'){const wait=new RecoveryObservation(this.s).wait(job);if(wait)return {...wait,recovery:r.id,stage:r.state};}
    if(r.reason&&!['resolving','pushing'].includes(r.state))return this.result(r);
    if(r.state==='resolving'){
     const e=await this.io.evidence(r.session),entry=e.transcript?.entries?.find((e:any)=>e.clientMessageId===r.client_id);
     const active=e.transcript?.turns?.filter((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state));
     if(active?.length===1&&entry&&active[0].id===entry.turnId)return {state:'waiting_for_worker',send:false,head:r.head,stage:r.state,reason:'Waiting for existing conflict resolution turn; no new attempt'};
    }
+   const previousReadFailures=r.state==='reserved'?new RecoveryObservation(this.s).status(job)?.failures??0:0;
    try{return await this.advance(r,c);}catch(error){
+    if(r.state==='reserved'&&(error instanceof ProviderReadError||error instanceof ObservationDeferred)){
+     assertObservationFence();const observations=new RecoveryObservation(this.s);
+     if(error instanceof ProviderReadError&&(observations.status(job)?.failures??0)===previousReadFailures)observations.failed(job,error);
+     return {...(observations.wait(job)??{state:'waiting_for_worker',send:false,reason:error.message}),recovery:r.id,stage:r.state};
+    }
     const latest=this.row(job);if(latest.state!==r.state||latest.detail!==r.detail||latest.reason!==r.reason)return this.result(latest);
     const reason=(error instanceof Error?error.message:'Recovery evidence unavailable')+`; recovery ${r.id} retains its reservation and evidence. Inspect recovery-status; no automatic replay, reset or force-push.`;
     this.set(r,r.state,JSON.parse(r.detail),reason);return this.result(r);
@@ -240,9 +251,10 @@ export class ConflictRecovery{
   });
  }
  async guard(r:any,c:any,expectedRemote=r.head){
-  const x=await this.inspect(r.job,c,r.repo,r.pr);
+  const observations=r.state==='reserved'?new RecoveryObservation(this.s):undefined;
+  const x=await this.inspect(r.job,c,r.repo,r.pr,observations);
   if(x.auth.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy||JSON.stringify(JSON.parse(x.auth.paths))!==JSON.stringify(JSON.parse(r.detail).paths)||x.b.head!==expectedRemote||x.b.base!==r.base||x.b.branch!==r.branch||x.b.baseBranch!==r.base_branch)throw Error('Approval, policy, scope, remote head/base or ownership changed; preserve recovery evidence');
-  await this.noOperation(r.worktree,true);return x;
+  await this.noOperation(r.worktree,true);observations?.clear(r.job);return x;
  }
  async index(r:any){return (await this.git(r.worktree,'ls-files','--stage','-z')).split('\0').filter(Boolean);}
  async assertResolved(r:any,d:any){

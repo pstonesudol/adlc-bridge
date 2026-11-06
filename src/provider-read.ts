@@ -1,4 +1,5 @@
 export type ReadClass='authentication'|'permission'|'throttled'|'timeout'|'network'|'server'|'missing'|'malformed'|'unknown';
+export const validReadTime=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0&&value<=8640000000000000;
 export type ReadEvidence={provider:'github'|'orchestrator';operation:string;timestamp:number;classification:ReadClass;exitStatus?:number;httpStatus?:number;retryAt?:number;requestId?:string;detail:string};
 export class ProviderReadError extends Error{
  constructor(public evidence:ReadEvidence,options?:ErrorOptions){super(`${evidence.provider} ${evidence.operation}: ${evidence.classification}`,options);}
@@ -30,8 +31,8 @@ export function readFailure(provider:ReadEvidence['provider'],operation:string,r
  const retry=protocol.match(/^retry-after:[ \t]*(\d+)[ \t]*\r?$/im),reset=protocol.match(/^x-ratelimit-reset:[ \t]*(\d+)[ \t]*\r?$/im);
  const requestId=protocol.match(/^x-github-request-id:[ \t]*([A-F0-9: -]{1,100})\r?$/im)?.[1]?.trim();
  const remaining=protocol.match(/^x-ratelimit-remaining:[ \t]*(\d+)[ \t]*\r?$/im);
- const hint=Math.max(retry?now+Number(retry[1])*1000:0,reset&&remaining&&Number(remaining[1])===0?Number(reset[1])*1000:0);
- return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(Number.isSafeInteger(hint)&&hint>now?{retryAt:hint}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
+ const hint=Math.max(0,...[retry?now+Number(retry[1])*1000:0,reset&&remaining&&Number(remaining[1])===0?Number(reset[1])*1000:0].filter(validReadTime));
+ return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(validReadTime(hint)&&hint>now?{retryAt:hint}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
 }
 export function readEvidence(error:unknown,provider:ReadEvidence['provider']='github',operation='observation'):ReadEvidence{
  let e:any=error;for(let n=0;e&&n<8;n++,e=e.cause)if(e instanceof ProviderReadError)return e.evidence;
@@ -43,7 +44,8 @@ export async function githubRead(args:string[],operation='branch-read',spawn=Bun
  const include=args[0]==='api';
  const p=spawn(['gh',...args,...(include?['--include']:[])],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
- const parsed=githubOutput(out);
+ let parsed:ReturnType<typeof githubOutput>;
+ try{parsed=githubOutput(out);}catch(cause){if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,cause);throw cause;}
  if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,undefined,Date.now(),parsed.protocol+parsed.json);
  try{return JSON.parse(parsed.json);}catch(cause){throw malformed('github',operation,cause);}
  }catch(cause){if(cause instanceof ProviderReadError)throw cause;throw readFailure('github',operation,cause instanceof Error?cause.message:'',undefined,cause);}
