@@ -850,6 +850,43 @@ This separation is necessary when the bridge manages its own repository.
 
 ### Safe runtime updates (DEV-51)
 
+#### Read-only update history
+
+```sh
+adlc update history
+adlc update history --project PROJECT --json
+adlc update history --help
+```
+
+History reads the existing owner-only `update-intent.json` without creating state,
+querying providers/services, or executing activation/recovery. JSON has a stable
+`version: 1` envelope, `history`, `reason`, `scope`, `nextCommands` and `entries`.
+Entries include attempt identity, exact known commit/snapshot hashes, timestamps,
+transitions, outcome, deferred/failure category, restart/migration/health evidence
+and recorded rollback compatibility. Text uses the same redacted projection.
+Raw errors, configuration, service definitions and paths are deliberately omitted;
+inspect protected local evidence separately when needed.
+
+New apply/rollback attempts retain prior attempts and transitions in that same
+intent file (no independent ledger). Preflight verification failures are recorded;
+failures before a candidate can be verified/reserved may have no attempt record.
+Inspection never upgrades legacy records. Missing/overwritten legacy history and
+interrupted effects are **unknown**, not synthesized success. Snapshot installation
+and a successful readiness check do not prove which bridge/backend identities are
+actually running. Migration compatibility evidence does not prove migration execution.
+Health refers to the existing readiness/service checks, not an end-to-end activation.
+
+`--project` annotates observed project membership but never hides shared-runtime
+operations or their cross-project impact. Legacy project scope can be unknown.
+Recorded rollback compatibility is **not current authorization**: snapshot presence,
+database changes, quiescence and reattachment must be rechecked by the explicit
+`adlc update-rollback` command. History only suggests `adlc update-status` and
+`adlc update-preview`; preview stages/verifies but does not activate. Neither is
+executed by history. Interrupted/ambiguous records require explicit operator recovery.
+Retained evidence is not silently pruned and the intent file can grow over time.
+Separately authorized controlled end-to-end activation is still required before
+claiming unattended updates are supported.
+
 Updates are manual by default. A policy pins an authenticated GitHub remote and
 an authoritative branch or immutable release; ticket, PR or comment text never
 supplies executable instructions.
