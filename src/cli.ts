@@ -400,6 +400,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job');
       if(s.get(job).project!==c!.linear.projectId)throw Error('Job project does not match configured project');
       const result=await runPollTick(async()=>{
+       assertProjectIntakeEnabled(c!.automation?.orchestratorProject);
        await poll(c!,s,linearToken());
        const stage=await workflow.resume(job,c!);
        let blockerLabel='retained';
