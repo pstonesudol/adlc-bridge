@@ -214,6 +214,20 @@ test('second branch read failure invalidates stale readiness and enters durable 
   await f.loop.tick(f.id,undefined,undefined,undefined,config);expect(reads).toBe(2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
+test('branch-only ticks preserve readiness failure history',async()=>{
+ const f=templateFixture();try{
+ let branchOnly=false;const original=f.loop.io.readBranchSnapshot;
+ f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),behind:branchOnly?1:0,mergeable:branchOnly?null:true});
+ f.loop.io.readiness=async()=>{throw readFailure('github','review-read','HTTP 503');};
+ const config={conflictRecovery:{enabled:true}};
+ await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ let row=f.s.db.query('SELECT failures,next_read FROM recovery_observations').get() as any;expect(row.failures).toBe(1);setSystemTime(new Date(row.next_read+1));
+ branchOnly=true;expect((await f.loop.tick(f.id,undefined,undefined,undefined,config)).state).toBe('updating_branch');
+ expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(1);
+ setSystemTime(new Date(Date.now()+60001));branchOnly=false;await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ row=f.s.db.query('SELECT failures FROM recovery_observations').get() as any;expect(row.failures).toBe(2);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
 test('six accepted ancestry read failures recover automatically without manual database edits',async()=>{
  const f=templateFixture();try{
   const l=new Lifecycle(f.s);l.grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');

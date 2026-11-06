@@ -2061,6 +2061,12 @@ malformed, missing-resource and authentication/permission failures require
 inspection and an explicit read retry; unknown errors are never called quota
 failures. A successful read is not approval or permission to write.
 
+Failure history spans providers and survives branch-only ticks until readiness
+collection succeeds. Unknown mergeability uses a separate durable one-minute
+wait, not the provider-failure or remediation budget. After six unknown results,
+polling stops for inspection; `retry-observation JOB` rearms that wait after
+operator inspection. A known branch result clears the mergeability wait only.
+
 Capacity/cooldowns are shared by provider across projects/jobs in the same state
 database. A provider lease permits one collection at a time (10-minute crash
 expiry); a job evaluation lease suppresses concurrent continuations (one-hour

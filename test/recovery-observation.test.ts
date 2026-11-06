@@ -6,6 +6,19 @@ import {readFailure,readEvidence,malformed} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+test('alternating providers retain the job circuit budget',()=>{
+ const s=new Store(':memory:');let now=100;const job=s.enqueue('p','i','s'),o=new RecoveryObservation(s,()=>now,()=>0.5);
+ try{for(let n=1;n<=6;n++){
+ o.failed(job,readFailure(n%2?'github':'orchestrator','observation','HTTP 503',1,undefined,now));
+ expect(o.status(job).failures).toBe(n);if(n===6)expect(o.status(job).next_read-now).toBe(1800000);now=o.status(job).next_read;
+ }o.clear(job);expect(o.status(job)).toBeNull();}finally{s.close();}
+});
+test('unknown mergeability has a separate bounded wait',()=>{
+ const s=new Store(':memory:');let now=100;const job=s.enqueue('p','i','s');
+ try{for(let n=1;n<=6;n++){
+ const o=new RecoveryObservation(s,()=>now);expect(o.mergeabilityUnknown(job).state).toBe(n===6?'blocked':'updating_branch');expect(o.status(job)).toBeNull();now+=60001;
+ }const o=new RecoveryObservation(s,()=>now);expect(o.wait(job)?.state).toBe('blocked');expect(s.get(job).attempts).toBe(0);o.retry(job);expect(o.wait(job)).toBeNull();}finally{s.close();}
+});
 test('six failures recover after restart without manual edits or remediation budget',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-observation-')),path=join(dir,'state.sqlite');
  let s=new Store(path);const job=s.enqueue('p','issue','spec');let now=100;

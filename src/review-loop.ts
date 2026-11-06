@@ -247,18 +247,18 @@ export class ReviewLoop{
     let snapshot;
     try{snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));}
     catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
-    if(snapshot.behind>0&&snapshot.mergeable===null){observation.clear(job);return record({state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; successful observation, no remediation attempt'});}
+    if(snapshot.behind>0&&snapshot.mergeable===null)return record({...observation.mergeabilityUnknown(job),head:snapshot.head});
+    observation.mergeabilityKnown(job);
     if(snapshot.mergeable===false&&snapshot.behind>0){
      try{await new BranchUpdates(this.s,observedTransport).observeAccepted(job,t.repo,t.pr,snapshot);}
      catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
-     observation?.clear(job);
      try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
      catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
    }
    try{branch=await new BranchUpdates(this.s,observedTransport).ensure(job,t.repo,t.pr,session,branchPolicy);}
    catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record({state:'blocked',send:false,reason:error.message});}throw error;}
-   if(branch){observation.clear(job);return record(branch);}
+   if(branch)return record(branch);
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
