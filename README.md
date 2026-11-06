@@ -6,7 +6,9 @@ Project JSON keeps repository/Linear mappings, approval and routing policies, an
 an optional `verification` object. Machine JSON is separate: copy
 `config/runtime.example.json` to an ignored local file and replace every path
 and tool version. Supported service platform is macOS launchd only. Examples
-are templates, not installable configurations. No package installation is needed.
+are templates, not installable configurations. The default test suite and routing
+previews do not require package installation. OpenCode classification and new
+installed snapshots require the pinned project dependencies; see setup below.
 
 ```sh
 bun src/cli.ts verification config/local.json
@@ -345,19 +347,33 @@ Install and configure these before enabling automation:
 - A local repository checkout registered as a project in Orchestrator.
 - Linear access to the intended project, team, statuses, and `agent-ready` label.
 - CodeRabbit installed on the GitHub repository and configured to review its PRs.
-- For routing: an ADLC routing document and optionally an authorized OpenCode classifier model
-  source directory, plus an available Orchestrator OpenCode 2 harness.
+- For routing: an ADLC routing document and an available Orchestrator OpenCode 2 harness.
+- Optionally, for classification: an authorized OpenCode classifier model and a
+  compatible running OpenCode V2 service.
 - Docker Desktop when using Docker verification. Project verification also needs
   the tools and configuration required by that repository.
 
 Place this source folder at `~/Code/adlc-bridge`, or adjust the paths below.
-There are no package dependencies to install for the bridge itself.
+Install the pinned project dependencies before enabling classification or preparing
+an installed snapshot. This is a local source-checkout operation, not a global
+install or runtime activation:
 
 ```sh
 cd "$HOME/Code/adlc-bridge"
+bun install --ignore-scripts --linker hoisted
 bun test
+bun test ./test/routing-client.integration.ts
 bun src/cli.ts help
 ```
+
+New snapshots include only the pinned OpenCode client runtime packages, their
+`dist` files, manifests and licenses—not arbitrary `node_modules`, provider
+credentials or development configuration. Those bytes participate in the snapshot
+hash and are imported with Bun auto-install disabled before publication/activation.
+Missing, mismatched, symlinked or unloadable dependencies abort preparation and
+leave the active installation unchanged. Routing never downloads packages on
+first use; a source checkout without the client uses the configured failure
+fallback. Source dependency changes do not activate installed snapshots.
 
 The adapters use the installed Orchestrator API and OpenCode's supported client/service API, not OpenChamber runtime modules.
 Validate them after upgrades; passing unit tests alone does not verify live access.

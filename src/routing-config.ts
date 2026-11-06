@@ -1,6 +1,7 @@
 import {readFileSync,existsSync,writeFileSync,renameSync,unlinkSync,copyFileSync,realpathSync} from 'node:fs';
 import {resolve,dirname,join} from 'node:path';
 import type {RoutingConfig,RoutingSettings,RoutingSnapshot} from './task-routing';
+import {routingClientURL} from './routing-dependencies';
 export type RoutingDocument=RoutingConfig&{version:1;harness:'opencode-v2';classifier:{adapter:'off'|'opencode';model?:string}};
 const keys=(v:any,allowed:string[],p:string)=>{if(!v||typeof v!=='object'||Array.isArray(v))throw Error(`${p}: expected object`);for(const k of Object.keys(v))if(!allowed.includes(k))throw Error(`${p}.${k}: unsupported field`);};
 const text=(v:any,p:string)=>{if(typeof v!=='string'||!v.trim())throw Error(`${p}: expected nonempty string`);};
@@ -27,7 +28,7 @@ type ClassifierConnection={url:string;headers:HeadersInit};
 export type ClassifierTransport={connect:()=>Promise<ClassifierConnection>;fetch:typeof fetch;timeoutMs:number};
 type ClassifierEndpoint={url:string;auth?:{type:'basic';username:string;password:string}};
 export type ClassifierService={discover:(options:{version:(version:string)=>boolean})=>Promise<ClassifierEndpoint|undefined>;headers:(endpoint:ClassifierEndpoint)=>HeadersInit|undefined};
-export async function connectClassifier(loadService:()=>Promise<{Service:ClassifierService}>=()=>import('@opencode/client/service')):Promise<ClassifierConnection>{
+export async function connectClassifier(loadService:()=>Promise<{Service:ClassifierService}>=()=>import(routingClientURL())):Promise<ClassifierConnection>{
  // Supported discovery/authentication only; never start, stop, or copy credentials
  // from a service. Do not fall back to a tool-capable run/session endpoint.
  const {Service}=await loadService();
@@ -36,6 +37,7 @@ export async function connectClassifier(loadService:()=>Promise<{Service:Classif
  return {url:endpoint.url,headers:Service.headers(endpoint)??{}};
 }
 export async function classifyOpenCode(model:string,request:string,config:RoutingConfig,transport:ClassifierTransport={connect:connectClassifier,fetch,timeoutMs:30000}){
+ if(!config.enabled)throw Error('ADLC routing is disabled');
  const controller=new AbortController();let reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
  const cancel=()=>{controller.abort();void reader?.cancel().catch(()=>{});};
  let timeout:ReturnType<typeof setTimeout>|undefined;
@@ -56,7 +58,7 @@ export async function classifyOpenCode(model:string,request:string,config:Routin
   if(typeof answer.choice!=='string'||typeof answer.confidence!=='number')throw Error('Invalid classifier response');return answer;
  })()]);}finally{clearTimeout(timeout);cancel();}
 }
-export function routingSnapshot(config:RoutingConfig):RoutingSnapshot{return {config,classify:async(request,policy)=>{const selected=policy??config,classifier=(selected as RoutingDocument).classifier;if(!classifier||classifier.adapter==='off')throw Error('Classifier disabled');return classifyOpenCode(classifier.model!,request,selected);}};}
+export function routingSnapshot(config:RoutingConfig,classify=classifyOpenCode):RoutingSnapshot{return {config,classify:async(request,policy)=>{const selected=policy??config,classifier=(selected as RoutingDocument).classifier;if(!selected.enabled)throw Error('ADLC routing is disabled');if(!classifier||classifier.adapter==='off')throw Error('Classifier disabled');return classify(classifier.model!,request,selected);}};}
 export async function loadRouting(settings:RoutingSettings):Promise<RoutingSnapshot>{return routingSnapshot(effectiveRouting(settings).config);}
 export function importRouting(source:string,destination:string,apply=false){
  if(resolve(source)===resolve(destination)||realpathSync(source)===(existsSync(destination)?realpathSync(destination):join(realpathSync(dirname(resolve(destination))),destination.split('/').at(-1)!)))throw Error('Import destination must differ from source');

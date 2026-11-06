@@ -62,6 +62,20 @@ Response bodies are limited to 1 MiB. No classifier child process is created, so
 there is no child process tree to terminate or inherited stdout to keep open.
 Task data is never placed in process arguments. No automatic inference retries occur.
 
+Disabled effective policies are rejected before service discovery, classification,
+or transmission of task data, including reconciliation and task-file previews.
+New installation snapshots package `@opencode/client@2.2.5` and its pinned runtime
+closure (`@opencode/protocol`, `@opencode/schema`, `effect`, `@standard-schema/spec`).
+Prepare source dependencies with `bun install --ignore-scripts --linker hoisted`.
+Snapshot preparation checks exact versions, rejects symlinks, copies only package
+manifests, `dist` trees and licenses, and hashes those bytes with the application.
+Before publication it verifies the staged client import with auto-install disabled;
+failure leaves the active installation untouched. This does not contact a provider
+or start a service. Runtime loading requires these local packages and never asks
+Bun to download a missing client. Legacy snapshots remain unchanged until an
+operator explicitly installs the reviewed version; rollback retains each prior
+snapshot's dependency bytes.
+
 The default `bun test` suite is dependency-free: it exercises the ADLC service
 loader boundary, real loopback HTTP generation, deadlines and failure fallback
 without requiring an installed client or OpenChamber. After installing the pinned

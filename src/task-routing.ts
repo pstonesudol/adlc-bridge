@@ -33,7 +33,7 @@ export class TaskRouting{
    if(j.state!=='awaiting_approval'||!old)throw Error('Routing reconciliation requires an unapproved captured plan and existing implementation route');
    const hasDispatch=this.s.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='implementation_dispatch'").get();
    if(hasDispatch&&this.s.db.query('SELECT job FROM implementation_dispatch WHERE job=?').get(job))throw Error('Existing implementation dispatch cannot be rerouted');
-   const snapshot=await this.load(settings);let answer=null,reason:string|undefined;
+   const snapshot=await this.load(settings);if(!snapshot.config.enabled)throw Error('ADLC routing is disabled');let answer=null,reason:string|undefined;
    try{answer=await snapshot.classify(`Implement the requested task (planning is complete; supporting checks are part of the change):\n${j.spec}`);}catch{reason='classifier-unavailable';}
    const route=selectRoute(snapshot.config,answer,reason),binding=digest(JSON.stringify([j.spec,j.plan_hash]));
    const hash=digest(JSON.stringify([job,j.plan_hash,old.route,route]));
@@ -56,6 +56,7 @@ export class TaskRouting{
     if(implementation){const pinned=this.s.db.query('SELECT config FROM routing_snapshots WHERE job=? AND config_hash=?').get(job,JSON.parse(implementation.route).configHash) as any;if(!pinned)throw Error('Approved routing policy snapshot missing');pinnedPolicy=JSON.parse(pinned.config);}
    }
    const snapshot=pinnedPolicy&&this.load===loadRouting?routingSnapshot(pinnedPolicy):await this.load(settings),policy=pinnedPolicy??snapshot.config;
+   if(!policy.enabled)throw Error('ADLC routing is disabled');
   let answer=null,reason:string|undefined;
   if(knownCategory)answer={choice:knownCategory,confidence:1};
   else try{answer=await snapshot.classify(request,policy);}catch{reason='classifier-unavailable';}
