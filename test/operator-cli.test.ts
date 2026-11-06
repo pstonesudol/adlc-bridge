@@ -9,6 +9,7 @@ test('ticket lookup requires project selection, never picks a candidate',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-'));try{
   const path=join(root,'state.sqlite'),s=new Store(path);
   const first=s.enqueue('p1','uuid1',JSON.stringify({identifier:'DEV-31'}));
+  s.enqueue('p3',first,JSON.stringify({identifier:'OTHER-1'}));
   s.enqueue('p2','uuid2',JSON.stringify({identifier:'DEV-31'}));s.close();
   expect(()=>resolveJob(path,'DEV-31')).toThrow('Ambiguous');
   expect(resolveJob(path,'dev-31','p1')).toBe(first);
@@ -19,7 +20,7 @@ test('ticket lookup requires project selection, never picks a candidate',()=>{
   const ambiguous=run('jobs','lookup','DEV-31','--json');
   expect(ambiguous.exitCode).toBe(4);expect(JSON.parse(ambiguous.stderr.toString()).error.candidates).toHaveLength(2);
   const result=run('jobs','status','DEV-31','--project','p1','--json');
-  expect(result.exitCode).toBe(0);expect(JSON.parse(result.stdout.toString())).toMatchObject({schemaVersion:1,command:'jobs',data:{jobs:[{job:first,state:'working',worker:{activity:'unknown'},evidence:{freshness:'unknown'}}]}});
+  expect(result.exitCode).toBe(0);expect(JSON.parse(result.stdout.toString())).toMatchObject({schemaVersion:1,command:'jobs',data:{jobs:[{job:first,state:'awaiting_plan',worker:{activity:'unknown'},evidence:{freshness:'unknown'}}]}});
   expect(run('jobs','status','DEV-404').exitCode).toBe(3);
   expect(run('jobs','list','--bogus').exitCode).toBe(2);
   expect(run('jobs','status','DEV-31','--project','p1').stdout.toString()).toContain('Next:');
@@ -50,6 +51,7 @@ test('dependency status trusts current persisted bindings, not resumed or stale 
  const root=mkdtempSync(join(tmpdir(),'operator-deps-'));try{
   const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}'),hash=s.propose(id,'plan');s.approve(id,hash,'human');
   s.db.exec('CREATE TABLE dependency_waits(job TEXT,plan TEXT,state TEXT,reason TEXT)');
+  s.db.exec('CREATE TABLE worker_outcomes(job TEXT,plan_hash TEXT,outcome TEXT)');s.db.query('INSERT INTO worker_outcomes VALUES (?,?,?)').run(id,hash,'blocked_dependency');
   s.db.query('INSERT INTO dependency_waits VALUES (?,?,?,?)').run(id,hash,'waiting_for_dependencies','Missing prerequisite proof');s.close();
   expect(jobViews(path)[0]).toMatchObject({state:'dependency_wait',reason:'Missing prerequisite proof'});
   const writer=new Store(path);writer.db.query("UPDATE dependency_waits SET state='resumed'").run();writer.close();

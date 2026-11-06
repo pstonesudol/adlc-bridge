@@ -49,13 +49,15 @@ import {DependencyRecovery} from './dependency-recovery';
 import {SpecRecovery} from './spec-recovery';
 import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revisions';
 import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
+import {modernCommand,dispatchOperator} from './operator-dispatch';
+import {projectEntries,selectProject} from './operator-discovery';
 
 let [command='help',...a]=process.argv.slice(2);
-const requested=command,json=a.includes('--json'),grouped=!!groups[command]&&(a.length>0||command!=='projects')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
+const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
 let groupHelp='';
 let project:string|undefined;
 const out=(x:unknown)=>console.log(JSON.stringify(grouped&&json?{schemaVersion:1,command:requested,data:x}:x,null,2));
-const req=(x:string|undefined,n:string)=>{if(!x)throw Error(`${n} required`);return x;};
+const req=(x:string|undefined,n:string)=>{if(!x)throw grouped?new OperatorError(`${n} required; use ${requested} --help`):Error(`${n} required`);return x;};
 // Ordinary intake edits are not blocking; every active revision needs reconciliation.
 const blockingRevision=(r:any)=>!!r&&r.state!=='preplanning';
 export function authorizeBaseMerge(lifecycle:Pick<Lifecycle,'grantBaseMerge'>,args:string[]){
@@ -116,12 +118,16 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
 }
 async function main(){
    if(command==='help'||a.includes('--help')||a.includes('-h')){groupHelp=operatorHelp(command==='help'?a[0]:groups[command]?command:undefined);command='help';}
+   else if(modern)return dispatchOperator(command,a,db);
    else if(grouped){
     const verbs=groups[command],verb=a.shift();
     if(!verb||!verbs[verb])throw new OperatorError(`Unknown ${command} command. Use ${command} --help.`);
     command=verbs[verb];
     a=a.filter(x=>x!=='--json');
-    const pi=a.indexOf('--project');if(pi>=0){project=a[pi+1];if(!project||project.startsWith('-'))throw new OperatorError('--project requires a project ID');a.splice(pi,2);}
+    const pi=a.indexOf('--project');if(pi>=0){if(requested!=='jobs')throw new OperatorError('--project is supported only for jobs in legacy aliases; use the documented positional service project');project=a[pi+1];if(!project||project.startsWith('-'))throw new OperatorError('--project requires a project ID');a.splice(pi,2);}
+    if(project){const entries=projectEntries(db);if(entries.length)project=selectProject(entries,project).linear_project;}
+    const minimum:Record<string,number>={'show-plan':1,'approve-job':3,recover:1,cleanup:1,'resume-job':2};
+    if(minimum[command]&&a.filter(x=>!x.startsWith('-')).length<minimum[command])throw new OperatorError(`Missing arguments; use ${requested} --help`);
     if(command.startsWith('@')){
      if(a.some(x=>x.startsWith('-'))||a.length>1||command==='@list'&&a.length||command==='@lookup'&&!a.length)throw new OperatorError('Use jobs list | status [JOB/TICKET] | lookup JOB/TICKET [--project PROJECT] [--json]');
      const jobs=jobViews(db,project,a[0]);
@@ -131,6 +137,14 @@ async function main(){
     if(requested==='jobs'&&command==='show-plan'){
      if(a.length!==1)throw new OperatorError('Use jobs show-plan JOB/TICKET [--project PROJECT]');
      const store=Store.readonly(db);try{const j=store.get(a[0]);return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan});}finally{store.close();}
+    }
+    if(requested==='jobs'&&['approvals','review-status'].includes(command)){
+     if(a.length)throw new OperatorError('This inspection takes no positional arguments');
+     if(!existsSync(db))return out([]);
+     const store=Store.readonly(db);try{
+      if(command==='approvals')return out(store.db.query("SELECT id AS job,project,plan_hash AS hash,reason FROM jobs WHERE state='awaiting_approval' AND (? IS NULL OR project=?)").all(project??null,project??null));
+      return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null):[]);
+     }finally{store.close();}
     }
    }
   if(command==='bind-controller'){
@@ -168,7 +182,7 @@ async function main(){
     if(a.slice(1).some(x=>x!=='--apply')||(a.includes('--apply')&&command!=='service-config'))throw Error('Unsupported service option');
     return out(await serviceControl(command,a[0],a.includes('--apply')));
   }
-  if(command==='projects')return out(await registeredProjects());
+  if(command==='projects')return out(await registeredProjects(true));
    if(command==='help')return console.log(groupHelp+`ADLC Bridge 0.6 — Agent Orchestrator + OpenChamber
   recover JOB                         inspect guarded recovery
     [--apply --confirm HASH]           apply only the exact inspected state
@@ -358,7 +372,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='status')return out({jobs:s.list().map(j=>({...j,remediation:lifecycle.budgetSummary(j.id)})),intents:bridge.intents(),runs:lifecycle.summary(),reviews:reviewStatus(),workflow:workflow.status(),clarifications:clarifications.status(),features:features.list(),featureIntakeBlocks:s.db.query('SELECT * FROM feature_intake_blocks').all(),newWorkerDispatch:'per-project policy; plan-approval-required tickets wait for explicit human approval'});
     if(command==='show-plan'){const j=s.get(req(a[0],'Job'));return out({job:j.id,state:j.state,hash:j.plan_hash,plan:j.plan,requiresHumanPlanApproval:new ApprovalPolicyStore(s).requiresManual(j.id),routing:new TaskRouting(s).list(j.id)});}
     if(command==='approve-job'){
-      const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw Error(`${flag} required`);return req(a[i+1],flag);};
+      const option=(flag:string)=>{const i=a.indexOf(flag);if(i<0)throw grouped?new OperatorError(`${flag} required`):Error(`${flag} required`);return req(a[i+1],flag);};
       if(option('--git')!=='feature-pr')throw Error('Only feature-pr Git scope is supported; merge/deploy are forbidden');
       return out(workflow.approve(req(a[0],'Job'),req(a[1],'Hash'),req(a[2],'Human'),option('--paths').split(','),option('--runtime'),['inspect','fetch','worktree','branch','commit','push-feature','open-pr'],undefined,{readiness:a.includes('--acknowledge-readiness')}));
     }
@@ -448,4 +462,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{const message=e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[]}}):`${message}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});
+if(import.meta.main)main().catch(e=>{const message=modern&&!(e instanceof OperatorError)?'Operation failed; inspect project configuration and supported service/auth diagnostics. Sensitive details withheld.':e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(grouped&&json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[]}}):`${message}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});

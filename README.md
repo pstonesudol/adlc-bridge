@@ -1890,7 +1890,7 @@ Grouped `--json` success output is `{schemaVersion:1, command:GROUP, data:...}`;
 job inspection data is `{jobs:[...]}` with stable fields `job`, `project`, `issue`,
 `ticket`, `state`, `orchestrationState`, `reason`, `nextAction`, `worker`
 (`activity`, `session`, `dispatchState`, `outcome`), and `evidence`
-(`freshness`, `persistedUpdatedAt`, `note`). State is `working`, `approval_wait`,
+(`freshness`, `persistedUpdatedAt`, `note`). State is `awaiting_plan`, `working`, `approval_wait`,
 `dependency_wait`, `blocked`, or `complete`. JSON errors go to stderr as
 `{schemaVersion:1, command:GROUP, error:{code,message,candidates}}`.
 Exit codes: 0 successful inspection (including empty lists), 1 operational
@@ -1914,3 +1914,94 @@ updates source. `install` and `install-runtime` are separate preview-first
 installation commands, with activation requiring explicit `--apply`; service
 inspection does not install or activate anything. Merge and deployment remain
 outside the CLI's authority.
+
+## Scoped configuration and discovery
+
+```sh
+adlc projects show ORCHESTRATOR_PROJECT_ID
+adlc status --project ORCHESTRATOR_PROJECT_ID --json
+adlc jobs show DEV-31 --project ORCHESTRATOR_PROJECT_ID
+adlc jobs list --project ORCHESTRATOR_PROJECT_ID --state approval_wait
+adlc doctor --project ORCHESTRATOR_PROJECT_ID
+adlc config show --project ORCHESTRATOR_PROJECT_ID --json
+adlc config get automation.maxPlanning --project ORCHESTRATOR_PROJECT_ID
+adlc config set automation.maxPlanning 8 --project ORCHESTRATOR_PROJECT_ID
+adlc config set automation.maxPlanning 8 --project ORCHESTRATOR_PROJECT_ID --apply
+adlc config set pollingIntervalSeconds 30 --project ORCHESTRATOR_PROJECT_ID
+adlc config set remediation.maxAttempts null --project ORCHESTRATOR_PROJECT_ID
+adlc config reset automation.maxPlanning --project ORCHESTRATOR_PROJECT_ID
+adlc config validate --project ORCHESTRATOR_PROJECT_ID
+adlc config diff --project ORCHESTRATOR_PROJECT_ID
+adlc queue list --project ORCHESTRATOR_PROJECT_ID --json
+adlc auth status --project ORCHESTRATOR_PROJECT_ID --json
+adlc version --json
+adlc completion zsh
+```
+
+Config commands require explicit project selection. Registered Orchestrator IDs
+and unambiguous registered Linear IDs resolve to the same project. Job lookup
+also supports a stored Linear ID when no registry entry exists. Exact job IDs
+take precedence over issue/ticket matches. `services list` is an alias of
+`projects`; `jobs show` aliases operator job status. Unsupported `--project` on
+legacy grouped service aliases is rejected, never silently discarded: use
+`services status PROJECT` or the documented positional legacy service command.
+
+Writable settings and defaults:
+
+| Key | Allowed value | Default |
+| --- | --- | --- |
+| automation.maxPlanning | integer 1–32 | 1 |
+| pollingIntervalSeconds | integer 5–86400 | 60 |
+| remediation.maxAttempts | positive safe integer or literal null | 5 |
+| remediation.maxNoProgress | positive safe integer | 5 |
+| remediation.window | job | job |
+
+Numbers must use canonical decimal notation: no signs, leading zeros, fractions,
+exponents or whitespace. `maxPlanning` limits concurrent **planning**, not total
+implementation/review workers. Next poll adopts capacity; reductions never kill
+active work. Remediation changes do not reset history, attempts, or existing stops.
+Approval, routing, service identity and Git/recovery grants are not writable here.
+
+Set/reset preview by default. `--apply` saves atomically, keeps unrelated fields
+and permissions, creates a uniquely named `.backup-*` beside the config, and
+rejects concurrent changes. Reset removes only the allowed override and restores
+its default. A `.adlc-config-lock` prevents overlapping CLI editors; a stale lock
+requires operator inspection, not automatic deletion. External editors must not
+race an apply. Config output projects only allowlisted values; it is not a raw
+export and never prints secrets or credential references.
+
+`config diff` shows declared/default/effective values plus saved-versus-installed
+polling settings. Polling set/reset previews the proposed service interval;
+explicit apply reuses guarded service-config. Stopped services stay stopped.
+Loaded services require verified enabled identity and quiescence before reload.
+Native backend and worker sessions are not restarted. Saving config and reloading
+a service are separate operations: a failure reports unknown active interval,
+returns a nonzero result and gives supported service-status/config recovery steps.
+Do not assume a saved interval is active. Missing service installation does not
+implicitly install or start one. `serve` captures its sleep interval at startup;
+saved values alone do not change that running loop.
+
+Queue reads provider evidence without ingesting or reconciling jobs. It exhausts
+cursor pages (bounded at 100), rejects repeated/incomplete/expired evidence, and
+reports unavailable/incomplete snapshots separately from an empty queue. Existing
+jobs, waits and uncertain reservations remain visible. Provider eligibility is
+not admission authorization: when dependency/approval evidence was not refreshed,
+admission stays unknown with that precise evidence gap rather than guessing.
+Queue capacity/occupancy describes planning only. No queue status or readiness
+label is changed. Provider-unavailable/incomplete results exit 1.
+
+Auth status reports missing or unverified authentication from safe presence and
+configured harness metadata; it never reads raw token files, prints sensitive
+references, refreshes logins or makes paid probes. Presence cannot establish
+expiry/validity, so use the explicit provider/harness login-status workflow when
+verification is needed. Version distinguishes source package, installed snapshot
+package and unknown running backend; equal package versions do not prove the same
+commit or active runtime. Completion prints bash/zsh/fish definitions only; shell
+files are never modified automatically.
+
+New scoped commands use schemaVersion 1 success/error envelopes. Existing flat
+commands retain legacy text/JSON contracts. Display state `awaiting_plan` means
+no planning dispatch, not an active worker; activity/freshness remain unknown
+without authoritative evidence. Linked DEV-35/43/34/33/51/55 integrations remain
+planned, not success-shaped placeholders; existing guarded engine commands remain
+available as documented elsewhere.

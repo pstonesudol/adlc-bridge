@@ -37,7 +37,7 @@ export async function reloadService(apply:boolean,loaded:boolean,domain:string,t
  if((await run(['bootstrap',domain,plist])).code!==0)throw Error('Service reload failed; inspect service-status and use start PROJECT');
  return true;
 }
-type ServiceControlOptions={home?:string;statePath?:string;run?:typeof launch;turns?:TurnBarrier;pollState?:string;startupWait?:StartupWait};
+type ServiceControlOptions={home?:string;statePath?:string;run?:typeof launch;turns?:TurnBarrier;pollState?:string;startupWait?:StartupWait;requireEnabled?:boolean;previewPollingSeconds?:number};
 export async function serviceControl(action:string,project?:string,applyOrTurns:boolean|TurnBarrier=false,optionsOrOperate:ServiceControlOptions|((action:string,project?:string)=>Promise<any>)={}){
  const apply=typeof applyOrTurns==='boolean'?applyOrTurns:false;
  const options=typeof optionsOrOperate==='function'?{}:optionsOrOperate;
@@ -57,6 +57,7 @@ async function controlProject(action:string,project:string|undefined,apply:boole
   }
    if(action==='service-config'&&!project)throw Error('Explicit project ID required');
    const entry=registry.select(project,extra),projectConfig=registry.verify(entry,!recovery);
+   if(options.previewPollingSeconds!==undefined){if(action!=='service-config'||apply)throw Error('Proposed settings are preview-only');projectConfig.pollingIntervalSeconds=options.previewPollingSeconds;effectiveSettings(projectConfig);}
    let settings:ReturnType<typeof effectiveSettings>|undefined,settingsError:string|undefined;
    try{settings=effectiveSettings(projectConfig);}catch(e){if(!recovery)throw e;settingsError=e instanceof Error?e.message:'Invalid runtime settings';}
   const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(home,'Library/LaunchAgents',`${label}.plist`);
@@ -70,6 +71,10 @@ async function controlProject(action:string,project:string|undefined,apply:boole
   if(action==='service-status')return {project:entry.project,service:label,...await status(),definitionInstalled:existsSync(plist),intervalSeconds:settings?.pollingIntervalSeconds??null,...settings,settingsError,installedIntervalSeconds:existsSync(plist)?readDefinition(plist).StartInterval:null};
   if(action==='service-config'){
    const current=await status(),def=readDefinition(plist);
+   if(apply&&current.loaded&&options.requireEnabled){
+    const disabled=await run(['print-disabled',domain]);
+    if(disabled.code!==0||!disabled.stdout.includes(`"${label}" => false`))throw Error('Service enabled state is unverified; use explicit service configuration workflow');
+   }
    // Verify quiescence before updating a loaded definition, not just at bootout.
    const verify=()=>assertPollQuiescent(current,entry.config,def.ProgramArguments[1],options.pollState);
    if(apply&&current.loaded)verify();
