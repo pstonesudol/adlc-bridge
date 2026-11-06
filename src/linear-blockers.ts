@@ -8,7 +8,7 @@ import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} fr
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
-export type NoticeOptions={binding?:string;body?:string;applyLabel?:boolean;guard?:(issue:any)=>void};
+export type NoticeOptions={binding?:string;body?:string;heading?:string;applyLabel?:boolean;guard?:(issue:any)=>void};
 
 function blockerOutcome(outcome:string){return ['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(outcome);}
 
@@ -48,7 +48,7 @@ export class LinearBlockers{
   if(!row){
    const commentId=randomUUID();
    const body=options?.body??[
-      `## ADLC: ${outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped'} — ${issue.identifier}`,
+      `## ADLC: ${options?.heading??(outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped')} — ${issue.identifier}`,
      `Outcome: **${outcome.outcome.replaceAll('_',' ')}**`,
      `Plan version: \`${outcome.plan_hash}\``,
      outcome.reason?`Reason: ${outcome.reason}`:null,
@@ -168,7 +168,7 @@ export class LinearBlockers{
    if(!e||transient(e))continue;
    try{new Lifecycle(this.s).current(j.id);}catch{continue;}
    const reason=`${e.provider} ${e.operation}: ${e.classification}. Inspect provider login status, repository/session visibility and configuration locally; do not paste credentials. After correction run retry-observation ${j.id}; mutation uncertainty remains unchanged.`;
-   try{results.push(await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding:digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification])),applyLabel:false}));}
+   try{results.push(await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding:digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification])),applyLabel:false,heading:'provider observation recovery required'}));}
    catch(error){results.push({job:j.id,state:'blocked',reason:'Observation blocker notice requires reconciliation; no blind resend'});}
   }
   for(const outcome of rows){

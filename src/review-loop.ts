@@ -20,15 +20,15 @@ import {worktreeIdentity} from './delivery-evidence';
 import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
 import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
-import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
+import {RecoveryObservation,ObservationDeferred,transient} from './recovery-observation';
 import {assertObservationFence,withObservationFence,fencedIO,ObservationLeaseLost} from './observation-fence';
-import {ReadValidationError} from './provider-read';
+import {ReadValidationError,readEvidence} from './provider-read';
 function readStop(error:unknown,fallback:string){
  let cause=error;for(let n=0;n<8;n++){
  if(cause instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:cause.message};
  if(!(cause instanceof BranchObservationFailure))break;cause=cause.cause;
  }
- return {state:'blocked',send:false,reason:error instanceof Error?error.message:fallback};
+ return {state:transient(readEvidence(error))?'waiting_for_worker':'blocked',send:false,reason:error instanceof Error?error.message:fallback};
 }
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';

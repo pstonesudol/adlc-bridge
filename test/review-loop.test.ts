@@ -285,7 +285,7 @@ test('six accepted ancestry read failures recover automatically without manual d
   let reads=0;f.loop.io.contains=async()=>{reads++;throw readFailure('github','ancestry','HTTP 503');};
   const c={conflictRecovery:{enabled:true}},p={enabled:true,authorizedBy:'human',maxUpdates:3};
   for(let n=1;n<=6;n++){
-   expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('blocked');
+   expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('waiting_for_worker');
    expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(n);
    await f.loop.tick(f.id,p,undefined,undefined,c);expect(reads).toBe(n);
    const row=f.s.db.query('SELECT next_read FROM recovery_observations').get() as any;setSystemTime(new Date(row.next_read+1));

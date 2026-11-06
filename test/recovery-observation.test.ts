@@ -2,10 +2,27 @@ import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
 import {BranchUpdates} from '../src/branch-updates';
 import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
-import {readFailure,readEvidence,malformed} from '../src/provider-read';
+import {readFailure,readEvidence,malformed,MAX_PROVIDER_RETRY_MS} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+test('untyped callback failure cannot create a transient provider cooldown',async()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','s'),o=new RecoveryObservation(s);
+ try{await expect(o.read(job,'github',async()=>{throw Error('timeout');})).rejects.toThrow('timeout');expect(o.status(job).evidence.classification).toBe('unknown');expect(o.status(job).sharedNextRead).toBeNull();expect(o.wait(job)?.state).toBe('blocked');}finally{s.close();}
+});
+test('GitHub throttle without hints holds both job and shared cooldown for a minute',async()=>{
+ const s=new Store(':memory:');let now=1000;const job=s.enqueue('p','i','s'),other=s.enqueue('q','i','s'),o=new RecoveryObservation(s,()=>now,()=>0.5);
+ try{
+ o.failed(job,readFailure('github','branch-read','HTTP 403 secondary rate limit',1,undefined,now));expect(o.status(job).next_read).toBe(61000);expect(o.status(job).sharedNextRead).toBe(61000);
+ now=60999;let called=false;await expect(o.read(other,'github',async()=>{called=true;})).rejects.toBeInstanceOf(ObservationDeferred);expect(called).toBe(false);expect(o.status(other)).toBeNull();now=61000;expect(await o.read(other,'github',async()=>true)).toBe(true);
+ }finally{s.close();}
+});
+test('startup caps excessive stored cooldowns without resetting failure counts',()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','s'),o=new RecoveryObservation(s,()=>1000);
+ try{o.failed(job,readFailure('github','branch-read','HTTP 503',1,undefined,1000));s.db.query('UPDATE recovery_observations SET next_read=?').run(8000000000000);s.db.query('UPDATE observation_capacity SET next_read=?').run(8000000000000);
+ const restarted=new RecoveryObservation(s,()=>1000);expect(restarted.status(job)).toMatchObject({failures:1,next_read:1000+MAX_PROVIDER_RETRY_MS,sharedNextRead:1000+MAX_PROVIDER_RETRY_MS});
+ }finally{s.close();}
+});
 test('one session circuit cannot impose its 30-minute delay on healthy jobs',async()=>{
  const s=new Store(':memory:');let now=1000;const bad=s.enqueue('p','bad','s'),healthy=s.enqueue('q','good','s'),o=new RecoveryObservation(s,()=>now,()=>0.5);
  try{

@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import {assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {Store} from './core';
-import {readEvidence,ReadValidationError,validReadTime,type ReadEvidence} from './provider-read';
+import {readEvidence,ReadValidationError,validReadTime,boundedRetryAt,MAX_PROVIDER_RETRY_MS,type ReadEvidence} from './provider-read';
 export const transient=(e:ReadEvidence)=>['throttled','timeout','network','server'].includes(e.classification);
 export class RecoveryObservation{
  constructor(public s:Store,public now=Date.now,public random=Math.random){
@@ -11,6 +11,7 @@ export class RecoveryObservation{
  // Repair legacy invalid timestamps once, durably, without clearing failures or
  // mutation receipts. A bounded health-probe delay replaces an unusable hint.
  s.db.transaction(()=>{for(const table of ['recovery_observations','observation_capacity','mergeability_waits'])s.db.query(`UPDATE ${table} SET next_read=? WHERE typeof(next_read) NOT IN ('integer','real') OR next_read<0 OR next_read>8640000000000000 OR next_read!=CAST(next_read AS INTEGER)`).run(this.now()+30*60*1000);}).immediate();
+ s.db.transaction(()=>{const limit=this.now()+MAX_PROVIDER_RETRY_MS;for(const table of ['recovery_observations','observation_capacity'])s.db.query(`UPDATE ${table} SET next_read=? WHERE next_read>?`).run(limit,limit);}).immediate();
  }
  status(job:string){const r=this.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(job) as any;if(!r)return null;let evidence;try{evidence=JSON.parse(r.reason);}catch{}const capacity=evidence?.provider?this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(evidence.provider) as any:null;return {...r,evidence:evidence?.classification?evidence:null,evidenceAgeMs:evidence?.timestamp?Math.max(0,this.now()-evidence.timestamp):null,sharedNextRead:capacity?.next_read??null};}
  wait(job:string){const merge=this.s.db.query('SELECT * FROM mergeability_waits WHERE job=?').get(job) as any;
@@ -22,10 +23,11 @@ export class RecoveryObservation{
  }
  failed(job:string,error?:unknown,provider:ReadEvidence['provider']='github'){
  assertObservationFence();
- const e={...readEvidence(error,provider)},now=this.now();if(!validReadTime(e.retryAt))delete e.retryAt;
+ const e={...readEvidence(error,provider)},now=this.now();const retryAt=boundedRetryAt(e.retryAt,now);if(retryAt===undefined)delete e.retryAt;else e.retryAt=retryAt;
  this.s.db.transaction(()=>{const old=this.status(job),n=(old?.failures??0)+1;
  const delay=n>=6?30*60*1000:Math.min(15*60*1000,1000*2**Math.min(n-1,10))*(0.75+this.random()*0.5);
- const providerNext=Math.max(now+1000,e.retryAt??0);
+ const providerFloor=e.provider==='github'&&e.classification==='throttled'&&e.retryAt===undefined?60000:1000;
+ const providerNext=Math.max(now+providerFloor,e.retryAt??0);
  const next=Math.max(now+Math.ceil(delay),providerNext);
  this.s.db.query('INSERT INTO recovery_observations VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET failures=excluded.failures,next_read=excluded.next_read,reason=excluded.reason').run(job,n,next,JSON.stringify(e));
  if(transient(e))this.s.db.query('INSERT INTO observation_capacity VALUES (?,?) ON CONFLICT(provider) DO UPDATE SET next_read=MAX(next_read,excluded.next_read)').run(e.provider,providerNext);

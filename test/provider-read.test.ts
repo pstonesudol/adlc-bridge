@@ -1,6 +1,13 @@
 import {test,expect} from 'bun:test';
-import {githubRead,ProviderReadError,readFailure} from '../src/provider-read';
+import {githubRead,ProviderReadError,readFailure,readEvidence,MAX_PROVIDER_RETRY_MS} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('untyped callback messages remain unknown but nested typed evidence is preserved',()=>{
+ for(const message of ['timeout','HTTP 503','ECONNRESET','rate limit exceeded'])expect(readEvidence(new Error(message)).classification).toBe('unknown');
+ const typed=readFailure('github','branch-read','HTTP 503',1);expect(readEvidence(new Error('wrapper',{cause:typed}))).toEqual(typed.evidence);
+});
+test('operational retry-hint cap applies to seconds and quota reset timestamps',()=>{
+ for(const headers of ['Retry-After: 999999999','x-ratelimit-remaining: 0\nx-ratelimit-reset: 8000000000'])expect(readFailure('github','branch-read',`HTTP 429\n${headers}\n`,1,undefined,1000).evidence.retryAt).toBe(1000+MAX_PROVIDER_RETRY_MS);
+});
 test('partial response headers preserve failed transport classification',async()=>{
  for(const [code,signal,err,classification] of [[143,'SIGTERM','','timeout'],[1,undefined,'ECONNRESET','network'],[0,undefined,'','malformed']] as const){
  try{await githubRead(['api','fixture'],'branch-read',spawn('HTTP/2.0 200 OK\r\nx-partial: value',err,code,signal));throw Error('Expected failure');}catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe(classification);}
@@ -30,7 +37,7 @@ test('5xx responses with quota remaining ignore reset but honor Retry-After',()=
  expect(readFailure('github','branch-read','',1,undefined,1000,response+'\r\n{}').evidence).toMatchObject({classification:'server'});
  expect(readFailure('github','branch-read','',1,undefined,1000,response+'\r\n{}').evidence.retryAt).toBeUndefined();
  expect(readFailure('github','branch-read','',1,undefined,1000,response+'Retry-After: 60\r\n\r\n{}').evidence.retryAt).toBe(61000);
- expect(readFailure('github','branch-read','',1,undefined,1000,response.replace('remaining: 500','remaining: 0')+'\r\n{}').evidence.retryAt).toBe(8000000000000);
+ expect(readFailure('github','branch-read','',1,undefined,1000,response.replace('remaining: 500','remaining: 0')+'\r\n{}').evidence.retryAt).toBe(1000+MAX_PROVIDER_RETRY_MS);
 });
 test('comment text cannot supply throttling or provider-wide retry hints',async()=>{
  const body=JSON.stringify({data:{body:'rate limit exceeded x-ratelimit-reset: 8000000000\nRetry-After: 999999999\nx-github-request-id: ABC'}});

@@ -2083,7 +2083,11 @@ operator inspection. A known branch result clears the mergeability wait only.
 Capacity/cooldowns are shared by provider across projects/jobs in the same state
 database. A job's circuit delay is not shared: transient failures impose only a
 one-second provider coordination cooldown, extended by valid provider retry
-hints. Invalid timestamps outside the supported Date range are rejected; legacy
+hints. GitHub throttling without a usable hint instead waits at least one minute
+across the job and shared provider cooldown. Provider hints are capped at 24 hours
+from observation time; existing longer stored cooldowns are also capped at startup.
+Untyped callback errors remain unknown; only typed provider-read evidence can
+authorize automatic transient recovery. Invalid timestamps outside the supported Date range are rejected; legacy
 invalid stored cooldowns are durably normalized to a 30-minute health-probe wait
 without clearing failure history or mutation receipts. Reserved conflict recovery
 uses this read backoff before any worktree mutation; later uncertain mutation
