@@ -9,7 +9,7 @@ import {validate} from './linear';
 import {effectiveSettings,type ProjectSettings} from './project-settings';
 import {validScopes} from './file-scope';
 import {localAO,installWorkflowHook} from './workflow-transport';
-import {loadOpenChamber} from './task-routing';
+import {loadRouting} from './routing-config';
 import {serviceControl} from './service-control';
 import {Store} from './core';
 import {ProjectServices,registryPath,legacyLabel,readDefinition,assertDefinition} from './project-services';
@@ -121,9 +121,9 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
    c.pollingIntervalSeconds=decimal('pollingIntervalSeconds',await ask('Polling interval seconds (5–86400)','60'));
    c.automation.maxPlanning=decimal('automation.maxPlanning',await ask('Concurrent planning stages (1–32; not implementation/review workers)','1'));
    validate(c);
-   if(await yes('Enable shared OpenChamber task routing')){
-   c.routing={enabled:true,harness:'opencode-v2',dataDir:resolve(await ask('OpenChamber config directory',join(homedir(),'.config/openchamber'))),runtimeDir:resolve(await ask('OpenChamber routing runtime directory',join(homedir(),'Code/openchamber/packages/web/server/lib/routing')))};
-   await loadOpenChamber(c.routing);
+   if(await yes('Enable ADLC task routing')){
+   c.routing={enabled:true,harness:'opencode-v2',configFile:resolve(await ask('ADLC routing JSON file'))};
+   await loadRouting(c.routing);
   }
   if(await yes('Enable Linear status updates'))c.statusSync={enabled:true,inProgress:await ask('In Progress state UUID'),inReview:await ask('In Review state UUID'),done:await ask('Done state UUID')};
   if(c.routing&&await yes('Enable multi-agent feature planning'))c.featurePlanning={enabled:true,backlogStateId:await ask('Backlog state UUID'),maxAgents:3,maxTickets:25};

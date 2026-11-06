@@ -6,7 +6,9 @@ Project JSON keeps repository/Linear mappings, approval and routing policies, an
 an optional `verification` object. Machine JSON is separate: copy
 `config/runtime.example.json` to an ignored local file and replace every path
 and tool version. Supported service platform is macOS launchd only. Examples
-are templates, not installable configurations. No package installation is needed.
+are templates, not installable configurations. The default test suite and routing
+previews do not require package installation. OpenCode classification and new
+installed snapshots require the pinned project dependencies; see setup below.
 
 ```sh
 bun src/cli.ts verification config/local.json
@@ -199,7 +201,7 @@ and mocked container execution; these do not prove live Honey Summer, Docker,
 provider or launchd compatibility. Report live commands separately. Plan approval,
 scoped Git grants, human-only PR merging and no automatic deployment are unchanged.
 
-Local-first coordination between Linear, Agent Orchestrator, OpenChamber routing,
+Local-first coordination between Linear, Agent Orchestrator, ADLC-owned routing,
 GitHub CI, and CodeRabbit. Coding runs locally in isolated Orchestrator worktrees.
 Docker is used for supported verification, not for coding or the controller.
 
@@ -345,21 +347,35 @@ Install and configure these before enabling automation:
 - A local repository checkout registered as a project in Orchestrator.
 - Linear access to the intended project, team, statuses, and `agent-ready` label.
 - CodeRabbit installed on the GitHub repository and configured to review its PRs.
-- For shared routing: OpenChamber configuration and its local routing runtime
-  source directory, plus an available Orchestrator OpenCode 2 harness.
+- For routing: an ADLC routing document and an available Orchestrator OpenCode 2 harness.
+- Optionally, for classification: an authorized OpenCode classifier model and a
+  compatible running OpenCode V2 service.
 - Docker Desktop when using Docker verification. Project verification also needs
   the tools and configuration required by that repository.
 
 Place this source folder at `~/Code/adlc-bridge`, or adjust the paths below.
-There are no package dependencies to install for the bridge itself.
+Install the pinned project dependencies before enabling classification or preparing
+an installed snapshot. This is a local source-checkout operation, not a global
+install or runtime activation:
 
 ```sh
 cd "$HOME/Code/adlc-bridge"
+bun install --ignore-scripts --linker hoisted
 bun test
+bun test ./test/routing-client.integration.ts
 bun src/cli.ts help
 ```
 
-The adapters are coupled to the installed Orchestrator API and OpenChamber runtime.
+New snapshots include only the pinned OpenCode client runtime packages, their
+`dist` files, manifests and licenses—not arbitrary `node_modules`, provider
+credentials or development configuration. Those bytes participate in the snapshot
+hash and are imported with Bun auto-install disabled before publication/activation.
+Missing, mismatched, symlinked or unloadable dependencies abort preparation and
+leave the active installation unchanged. Routing never downloads packages on
+first use; a source checkout without the client uses the configured failure
+fallback. Source dependency changes do not activate installed snapshots.
+
+The adapters use the installed Orchestrator API and OpenCode's supported client/service API, not OpenChamber runtime modules.
 Validate them after upgrades; passing unit tests alone does not verify live access.
 
 ### 2. Make the CLI available
@@ -407,8 +423,8 @@ can override the stored key for a process; a Terminal export is not automaticall
 inherited by launchd, so the stored credential is the simplest service setup.
 
 Provider authentication is separate from Linear and GitHub. Sign in to the
-providers used by the worker harness in Orchestrator. OpenChamber and Orchestrator
-can have separate login stores; working OpenChamber routing does not prove that
+providers used by the worker harness in Orchestrator. The local OpenCode service and Orchestrator
+can have separate login stores; working classifier inference does not prove that
 Orchestrator can make a model request. Use their native provider login controls,
 then verify an actual small request in Orchestrator. There is no automatic
 credential-copy command in this CLI. Preserve existing credentials and global rules.
@@ -432,7 +448,7 @@ and its placeholders must be replaced; it is not an executable configuration.
 | `linear` IDs | Verified project, team, Todo state, and `agent-ready` label UUIDs |
 | `requiredChecks` | Exact required GitHub Actions check names for this repository |
 | `reviewAllowedPaths` | Approved repository-relative review scope for explicit manual registration |
-| `routing` | Existing OpenChamber configuration and routing runtime directories; supported harness |
+| `routing` | ADLC routing `configFile`, optional `overridesFile`, and `opencode-v2` harness; see [routing setup](OPENCHAMBER-ROUTING.md) |
 | `statusSync` | Team-specific In Progress, In Review, and Done UUIDs |
 | `remediation.maxAttempts` | Positive per-job remediation budget; `null` enables explicit uncapped mode |
 | `remediation.maxNoProgress` | Consecutive attempts without verified progress before an explicit stop |
@@ -449,7 +465,7 @@ path `scope`, and `gitScope: "feature-pr"`. This is authorization for real edits
 commits, pushes, and PRs; copying another person's grant does not authorize yours.
 Protected secret files, Git metadata, and agent policy/config paths stay excluded.
 
-For the shared OpenChamber routing flow, configure its paths and set
+For ADLC-owned routing, configure `routing.configFile` and set
 `routing.enabled: true`. Routing chooses the task's provider/model/effort; it does
 not supply authentication. Optional status synchronization and feature planning
 must each be enabled explicitly after their IDs are verified.
@@ -673,7 +689,7 @@ no clone or Git setup.
 | --- | --- |
 | No tickets picked up | Service loaded, Mac awake, Orchestrator running, exact project/team/Todo/label IDs, log errors |
 | Worker setup exits 78 | Reserved branch/worktree and startup gate configuration; do not bypass the gate |
-| Provider request fails | Login in the actual worker harness; OpenChamber credentials may be separate |
+| Provider request fails | Login in the actual worker harness; classifier service credentials may be separate |
 | PR appears but bridge is blocked | Existing session/branch/PR and original authorization; investigate before guarded recovery |
 | Review says Changes requested but no inline threads | CodeRabbit may have a PR-description or pre-merge evidence finding |
 | Poll fails | Read `intake-error.log`; foreground `poll` also shows errors but can perform real work |
@@ -1863,3 +1879,262 @@ recovery demonstration**. A separately authorized controlled run must verify
 the installed host version, real provider receipts and same-session behavior
 before claiming unattended recovery works. No such activation or end-to-end
 operation is performed by this coding change.
+
+# Worker delivery receipt reconciliation
+
+New implementation, remediation and guarded-continuation dispatches reserve an
+exact job/spec/plan/session/client-message/attempt binding before sending. The
+delivery ledger is separate from worker outcomes, remediation budgets and PR
+identity. Host acceptance is not provider confirmation. Queued/running native
+turns mean **wait for the existing worker**, never send a competing turn.
+Completion proves only delivery; existing scope, requirement, dependency,
+approval, implementation-outcome and current-head CI/review gates still apply.
+
+`reconcile-preview CONFIG` evaluates the same receipt rules without writing state
+and includes per-attempt delivery results. Workflow status includes durable
+delivery observations and exact `ageMs` (null when never observed). Polling audits
+state/turn changes once rather than emitting an event for every evidence refresh.
+
+The AO collector exhausts sequence-cursor pages (100 entries per page, bounded to
+100 pages), rejects inconsistent turn snapshots and requires evidence no older
+than two minutes for automatic reconciliation. Each page timeout is bounded by
+the remaining freshness window, and a final page returned after that window is
+rejected as incomplete. Missing/duplicate client receipts,
+unknown turn states, mismatched identities, incomplete pagination, contradictory
+terminal results and changed specifications remain uncertain. The native AO turn
+ID is the execution receipt; prompt prose, timestamps alone and branch-head changes
+are never substitutes. A send accepted by the host without a native turn remains
+accepted-but-not-provider-confirmed.
+
+Legacy remediation attempts without a durable binding cannot be automatically
+settled by this ledger. Inspect the original session and attempt through supported
+operator previews; do not backfill guessed identities, repair live SQL, reset
+attempts, replace the worker/PR or resend. Provider-read recovery/backoff remains
+separate from mutation uncertainty. No provider replay/idempotency guarantee is
+assumed or introduced. If complete authoritative receipts cannot be obtained,
+preserve the uncertain attempt and escalate the specific evidence gap. Human-only
+merges and no deployments remain mandatory.
+
+# Editing requirements of an active ticket
+
+Changing any byte of the executable specification (identifier, title or
+description, including formatting) invalidates the plan approval and scoped
+dispatch authority. This deterministic conservative policy uses no model to
+classify an edit as harmless. Provider timestamps and other fields outside that
+specification do not change its hash; labels, project, state and policy still
+undergo their independent eligibility/security checks. Revision notices expose
+field names and character counts, not ticket excerpts or secrets.
+
+An edit made before any planning owner exists is ordinary intake: the first
+captured plan binds those requirements, so it is not a blocking revision.
+Edits once planning has started always invalidate the previous scope.
+
+Record future suggestions in a **separate follow-up ticket without agent-ready**,
+linked to the active ticket. Do not append them to its executable description or
+rely on an “ignore this” heading, comment or label to waive scope checks. Promoting
+follow-up scope into the active description requires a new plan and authority.
+
+New dispatch stops when the edit is observed. The bridge does not interrupt an
+active turn or Git operation: wait for authoritative idle/completed receipts.
+An already-running supervised-host process is not retroactively sandboxed or
+cancelled. Missing/failed/uncertain receipts require controlled reconciliation,
+not a resend or database repair. Existing PR/session/worktree identity, attempts,
+reservations and historical evidence remain intact.
+
+Use `adlc spec-reconcile JOB CONFIG` for a read-only preview. It refreshes Linear,
+owner, worktree and attached PR evidence. `--confirm HASH` authorizes **only a
+planning turn in the existing owner** when that exact evidence remains valid.
+It does not grant implementation, verification, commit/push or PR metadata edits.
+Do not create another worker/PR. A reserved send is never replayed; normal polling
+captures its exact completed reply, or retains its uncertainty. Repeated edits
+coalesce to the latest revision while preserving earlier delivery records.
+
+After capture, `plan-approval-required` tickets use the exact fenced command in
+the new Linear plan notice, from a configured human. Previous replies are stale.
+Standing-policy tickets pass through current eligibility/readiness/scope policy;
+an ineligible or unresolved plan stays blocked, without expanding permissions.
+Worker outcomes retain revision/dispatch instance identifiers; legacy outcomes
+without them cannot drive dependency
+recovery or continuation after a requirement revision. Approval notice tokens
+also bind the revision, even when specification and plan hashes recur.
+Previous PR/verification evidence is historical until the revised implementation
+hands off; a merge of that old PR cannot mark the revised job Done. Terminal
+failed/cancelled replan turns are retired only by confirming their exact receipt
+(`spec-reconcile` preview), then a fresh preview/confirmation is required.
+If a throwing send has no receipt, only a complete fresh inventory of the exact
+idle owner can offer an explicit absence confirmation. It retires that uncertain
+reservation without replay; a new planning attempt needs a separate confirmation.
+Incomplete, stale, busy, mismatched or accepted-message evidence stays blocked.
+Completed replans without their revision marker report `replan_unmarked` without
+breaking polling. Confirming that exact completed turn retires it without replay;
+a fresh planning attempt still needs separate preview/confirmation. Active
+revisions require approval of the exact captured revised-plan hash, even before
+the first implementation. A manually submitted plan cannot bypass that capture.
+Direct `plan` and `capture-plan` refuse for every recorded revision state except
+`preplanning`, including `pending`, `awaiting_approval`, and `authorized`; use
+`spec-reconcile` instead. A revised handoff must be the PR the review target
+registered. The recorded revision handoff is authoritative: if the target points
+at another PR, `adlc rebind-review-target JOB REPO PR` (with the handoff's PR)
+aligns the target atomically or leaves progression blocked. It cannot substitute
+a different PR for the recorded handoff.
+Linear revision notices require enabled status synchronization and are
+published in bounded batches with durable forward and older-retry cursors.
+`status`, `review-status` and `reconcile-preview` retain independent
+provider/dependency blockers alongside the requirements blocker.
+
+Existing incidents are not automatically approved or resumed. A subsequent
+eligible intake can record a legacy planning/spec mismatch using its retained
+hashes; unavailable historical text stays explicitly unknown. Use the same
+preview/confirmation path and inspect session history. No live SQL repair,
+automatic merge, deployment or runtime activation is part of this recovery.
+DEV-35/DEV-55 integrations are optional; this core command does not require them.
+
+# Everyday operator CLI
+
+Grouped commands coexist with all existing flat commands. No migration or
+installation activation is needed to use the source CLI:
+
+```sh
+adlc projects list
+adlc jobs list
+adlc jobs lookup DEV-31
+adlc jobs status DEV-31 --project LINEAR_PROJECT_ID
+adlc jobs status DEV-31 --project LINEAR_PROJECT_ID --json
+adlc jobs show-plan DEV-31 --project LINEAR_PROJECT_ID
+adlc services status
+adlc routing show PROJECT_JSON
+adlc routing preview PROJECT_JSON TASK_FILE
+adlc diagnostics doctor
+adlc jobs --help
+```
+
+Lookup accepts an exact job ID, stored issue ID, or ticket identifier from the
+ingested specification. It never queries Linear or picks the newest match.
+Ambiguity prints candidates and requires `--project PROJECT` (the stored project
+ID), or an exact job ID. Commands never prompt to resolve ambiguity.
+
+`jobs list/status/lookup` use read-only persisted evidence, never initialize
+engines, dispatch workers, change labels, fetch Git, or activate configuration.
+Worker activity and evidence freshness are explicitly `unknown`: a persisted
+dispatch is not proof a worker is currently working. The persisted update time,
+orchestration state, reason, and next supported inspection action are shown.
+
+Grouped `--json` success output is `{schemaVersion:1, command:GROUP, data:...}`;
+job inspection data is `{jobs:[...]}` with stable fields `job`, `project`, `issue`,
+`ticket`, `state`, `orchestrationState`, `reason`, `nextAction`, `worker`
+(`activity`, `session`, `dispatchState`, `outcome`), and `evidence`
+(`freshness`, `persistedUpdatedAt`, `note`). State is `awaiting_plan`, `working`, `approval_wait`,
+`dependency_wait`, `blocked`, or `complete`. JSON errors go to stderr as
+`{schemaVersion:1, command:GROUP, error:{code,message,candidates}}`.
+Exit codes: 0 successful inspection (including empty lists), 1 operational
+failure, 2 grouped usage error, 3 missing job, 4 ambiguous lookup. Errors never
+select a candidate or dispatch work. Legacy flat commands retain their existing
+JSON/text output and operational error behavior for scripts.
+
+Compatibility aliases: `projects list` → `projects`; `routing show/preview` →
+`routing`; `services start/stop/status/config` →
+`start/stop/service-status/service-config`; `diagnostics doctor/readiness/runtime-check/ao-status`
+→ the corresponding flat command. `jobs show-plan/approvals/recover/cleanup/resume/approve/dependency-status/review-status`
+map to `show-plan/approvals/recover/cleanup/resume-job/approve-job/dependency-status/review-status`.
+Their existing explicit authorization, confirmation and argument requirements
+still apply; grouped job commands accept ticket references in the job position.
+`status` remains the legacy detailed queue output; `jobs status` is the new
+read-only operator summary. See `help` for the full legacy command reference.
+
+Services control running processes only. Job approval/resume/recovery remains
+explicit and separate. Source updates remain operator-managed; no inspection
+updates source. `install` and `install-runtime` are separate preview-first
+installation commands, with activation requiring explicit `--apply`; service
+inspection does not install or activate anything. Merge and deployment remain
+outside the CLI's authority.
+
+## Scoped configuration and discovery
+
+```sh
+adlc projects show ORCHESTRATOR_PROJECT_ID
+adlc status --project ORCHESTRATOR_PROJECT_ID --json
+adlc jobs show DEV-31 --project ORCHESTRATOR_PROJECT_ID
+adlc jobs list --project ORCHESTRATOR_PROJECT_ID --state approval_wait
+adlc doctor --project ORCHESTRATOR_PROJECT_ID
+adlc config show --project ORCHESTRATOR_PROJECT_ID --json
+adlc config get automation.maxPlanning --project ORCHESTRATOR_PROJECT_ID
+adlc config set automation.maxPlanning 8 --project ORCHESTRATOR_PROJECT_ID
+adlc config set automation.maxPlanning 8 --project ORCHESTRATOR_PROJECT_ID --apply
+adlc config set pollingIntervalSeconds 30 --project ORCHESTRATOR_PROJECT_ID
+adlc config set remediation.maxAttempts null --project ORCHESTRATOR_PROJECT_ID
+adlc config reset automation.maxPlanning --project ORCHESTRATOR_PROJECT_ID
+adlc config validate --project ORCHESTRATOR_PROJECT_ID
+adlc config diff --project ORCHESTRATOR_PROJECT_ID
+adlc queue list --project ORCHESTRATOR_PROJECT_ID --json
+adlc auth status --project ORCHESTRATOR_PROJECT_ID --json
+adlc version --json
+adlc completion zsh
+```
+
+Config commands require explicit project selection. Registered Orchestrator IDs
+and unambiguous registered Linear IDs resolve to the same project. Job lookup
+also supports a stored Linear ID when no registry entry exists. Exact job IDs
+take precedence over issue/ticket matches. `services list` is an alias of
+`projects`; `jobs show` aliases operator job status. Unsupported `--project` on
+legacy grouped service aliases is rejected, never silently discarded: use
+`services status PROJECT` or the documented positional legacy service command.
+
+Writable settings and defaults:
+
+| Key | Allowed value | Default |
+| --- | --- | --- |
+| automation.maxPlanning | integer 1–32 | 1 |
+| pollingIntervalSeconds | integer 5–86400 | 60 |
+| remediation.maxAttempts | positive safe integer or literal null | 5 |
+| remediation.maxNoProgress | positive safe integer | 5 |
+| remediation.window | job | job |
+
+Numbers must use canonical decimal notation: no signs, leading zeros, fractions,
+exponents or whitespace. `maxPlanning` limits concurrent **planning**, not total
+implementation/review workers. Next poll adopts capacity; reductions never kill
+active work. Remediation changes do not reset history, attempts, or existing stops.
+Approval, routing, service identity and Git/recovery grants are not writable here.
+
+Set/reset preview by default. `--apply` saves atomically, keeps unrelated fields
+and permissions, creates a uniquely named `.backup-*` beside the config, and
+rejects concurrent changes. Reset removes only the allowed override and restores
+its default. A `.adlc-config-lock` prevents overlapping CLI editors; a stale lock
+requires operator inspection, not automatic deletion. External editors must not
+race an apply. Config output projects only allowlisted values; it is not a raw
+export and never prints secrets or credential references.
+
+`config diff` shows declared/default/effective values plus saved-versus-installed
+polling settings. Polling set/reset previews the proposed service interval;
+explicit apply reuses guarded service-config. Stopped services stay stopped.
+Loaded services require verified enabled identity and quiescence before reload.
+Native backend and worker sessions are not restarted. Saving config and reloading
+a service are separate operations: a failure reports unknown active interval,
+returns a nonzero result and gives supported service-status/config recovery steps.
+Do not assume a saved interval is active. Missing service installation does not
+implicitly install or start one. `serve` captures its sleep interval at startup;
+saved values alone do not change that running loop.
+
+Queue reads provider evidence without ingesting or reconciling jobs. It exhausts
+cursor pages (bounded at 100), rejects repeated/incomplete/expired evidence, and
+reports unavailable/incomplete snapshots separately from an empty queue. Existing
+jobs, waits and uncertain reservations remain visible. Provider eligibility is
+not admission authorization: when dependency/approval evidence was not refreshed,
+admission stays unknown with that precise evidence gap rather than guessing.
+Queue capacity/occupancy describes planning only. No queue status or readiness
+label is changed. Provider-unavailable/incomplete results exit 1.
+
+Auth status reports missing or unverified authentication from safe presence and
+configured harness metadata; it never reads raw token files, prints sensitive
+references, refreshes logins or makes paid probes. Presence cannot establish
+expiry/validity, so use the explicit provider/harness login-status workflow when
+verification is needed. Version distinguishes source package, installed snapshot
+package and unknown running backend; equal package versions do not prove the same
+commit or active runtime. Completion prints bash/zsh/fish definitions only; shell
+files are never modified automatically.
+
+New scoped commands use schemaVersion 1 success/error envelopes. Existing flat
+commands retain legacy text/JSON contracts. Display state `awaiting_plan` means
+no planning dispatch, not an active worker; activity/freshness remain unknown
+without authoritative evidence. Linked DEV-35/43/34/33/51/55 integrations remain
+planned, not success-shaped placeholders; existing guarded engine commands remain
+available as documented elsewhere.

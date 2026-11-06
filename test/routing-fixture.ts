@@ -5,4 +5,4 @@ export const routingConfig:RoutingConfig={enabled:true,minConfidence:0.6,fallbac
  {id:'hard',enabled:true,description:'Exceptional complexity',model:{providerID:'openai',modelID:'astra'},variant:'high'},
  {id:'testing',enabled:true,description:'Test focused',model:{providerID:'openai',modelID:'sol'},variant:'low'}
 ]};
-export const settings={enabled:true,dataDir:'/config/openchamber',runtimeDir:'/runtime/routing',harness:'opencode-v2' as const};
+export const settings={enabled:true,configFile:'/config/adlc-routing.json',harness:'opencode-v2' as const};

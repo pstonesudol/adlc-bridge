@@ -40,8 +40,8 @@ test('full review requests survive lost replies without duplicate comments',asyn
  p.gate(id,'project','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');
  new Lifecycle(s).adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  let calls=0;const loop=new ReviewLoop(s,async()=>{calls++;throw Error('Reply lost');});loop.register(id,'owner/repo',1,['CI'],['a'],true);
- await expect(loop.requestReview(id,'sha','body')).rejects.toThrow('lost');
- expect(await loop.requestReview(id,'sha','body')).toBe(false);expect(calls).toBe(1);
+ await expect(loop.requestReview(id,loop.get(id).pr,'sha','body')).rejects.toThrow('lost');
+ expect(await loop.requestReview(id,loop.get(id).pr,'sha','body')).toBe(false);expect(calls).toBe(1);
  expect((s.db.query('SELECT state FROM full_review_requests').get() as any).state).toBe('delivery_uncertain');s.close();
 });
 
@@ -54,7 +54,7 @@ test('one project service cannot select another project’s PR targets',()=>{
 function templateFixture(){
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['open-pr'],'human');l.adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
  const head='a'.repeat(40),e:any={clear:false,reasons:['PR body structure failed'],head,descriptionHash:'old-body',templateSignature:'old-check',findings:[{kind:'pr_description',source:'github-ci',check:'PR body structure',checkId:1,descriptionHash:'old-body',sha:head}],failedChecks:[{id:1,sha:head,name:'PR body structure'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,metadataCheckEvidence:[{name:'PR body structure',checkId:1,sha:head,status:'completed',conclusion:'failure',descriptionHash:'old-body'}]};
- const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const session:any={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>e,sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
@@ -309,7 +309,7 @@ test('an empty metadata policy skips wait creation and ignores historical metada
 test('removing metadata policy cannot bypass an uncertain description send or its fresh-review obligation',async()=>{
  const f=templateFixture();try{
   await f.loop.tick(f.id);f.loop.configureMetadataChecks('project',[]);f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];f.e.botReviewSubmittedAt=Date.now()+1000;
-  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_worker');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   f.session.transcript.turns[0].state='completed';expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   f.e.descriptionHash='edited-after-policy-removal';f.e.botReviewSubmittedAt=Date.now()-1000;
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'completed'});expect(f.s.db.query('SELECT * FROM metadata_waits').all()).toEqual([]);
@@ -526,8 +526,90 @@ test('a late GitHub review-request receipt preserves the completed target and it
   f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.e.metadataCheckEvidence=bodyEvidence(f.e);f.loop.postReview=async()=>{entered();await gate;};
   const pending=f.loop.tick(f.id);await started;const newer='b'.repeat(40);f.s.db.exec("UPDATE jobs SET state='done';UPDATE runs SET state='completed';");f.s.db.query("UPDATE review_targets SET state='completed',head=?,reason='Merge observed' WHERE job=?").run(newer,f.id);
   const target=f.loop.get(f.id),changes=f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get();release();expect(await pending).toEqual({state:'completed',send:false,head:newer,reason:'Merge observed'});expect(f.loop.get(f.id)).toEqual(target);expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_state_changed'").get()).toEqual(changes);expect(f.sends()).toBe(0);
-  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+  const events=f.s.db.query('SELECT count(*) AS n FROM events').get();expect(await f.loop.tick(f.id)).toMatchObject({state:'completed',send:false,head:newer});expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,newer,'later-body')).toBe(false);expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
  }finally{release?.();f.s.close();}
+});
+test('completed same-head remediation persists the guarded blocked decision',async()=>{
+ const f=templateFixture();try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['commit','push-feature'],'human');
+  f.e.findings=[{kind:'code',path:'src/a.ts',message:'Fix the scoped defect'}];f.e.failedChecks=[];
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  f.session.transcript.turns[0].state='completed';
+  const reason='Worker completed remediation without a new commit or metadata change; inspect before retry';
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason});
+  expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason,pr:1});
+  expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('remediation reconciliation cannot write an old PR decision to a rebound target',async()=>{
+ const f=templateFixture();try{
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  let rebound:any;const snapshot=f.loop.io.readBranchSnapshot;
+  f.loop.io.readBranchSnapshot=async(...args:any[])=>{
+   const result=await (snapshot as any)(...args);
+   f.s.db.query("UPDATE review_targets SET pr=2,state='waiting_for_review',reason=NULL,head=NULL,last_signature=NULL WHERE job=?").run(f.id);
+   rebound=f.loop.get(f.id);
+   return result;
+  };
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'});
+  expect(f.loop.get(f.id)).toEqual(rebound);
+  expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('a review request for an unregistered PR posts nothing',async()=>{
+ const f=templateFixture();try{
+  const calls:any[]=[];f.loop.postReview=async(...args:any[])=>{calls.push(args);};
+  const registered=f.loop.get(f.id).pr;
+  expect(await f.loop.requestReview(f.id,registered+1,f.head,'body')).toBe(false);
+  expect(calls).toHaveLength(0);
+  expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(0);
+  expect(f.loop.get(f.id).pr).toBe(registered);
+  // The registered PR still requests normally.
+  expect(await f.loop.requestReview(f.id,registered,f.head,'body')).toBe(true);
+  expect(calls).toEqual([['owner/repo',registered]]);
+ }finally{f.s.close();}
+});
+test('a target rebound during a tick keeps the old PR decision unwritten',async()=>{
+ const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
+ try{
+  f.e.findings=[];f.e.failedChecks=[];f.e.reasons=['CodeRabbit review absent'];f.e.metadataCheckEvidence=bodyEvidence(f.e);
+  f.loop.postReview=async()=>{entered();await gate;};
+  const pending=f.loop.tick(f.id);await started;
+  const original=f.loop.get(f.id);
+  f.s.db.query('UPDATE review_targets SET pr=? WHERE job=?').run(original.pr+1,f.id);
+  release();
+  expect(await pending).toMatchObject({state:'blocked',reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'});
+  expect(f.loop.get(f.id)).toMatchObject({pr:original.pr+1,head:original.head});
+ }finally{release?.();f.s.close();}
+});
+test('a legacy uncertain receipt for the current target blocks a duplicate request',async()=>{
+ const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('project','issue','spec'),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/worktree');
+ const hash=s.propose(id,'plan');s.approve(id,hash,'human');new Lifecycle(s).adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
+ let posts=0;try{
+  new ReviewLoop(s);
+  s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES (?,?,?,?,?,?,?)").run(id,'owner/repo',7,'["CI"]','["src/**"]',0,1);
+  s.db.exec('DROP TABLE full_review_requests; CREATE TABLE full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash))');
+  s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(id,'sha','body','delivery_uncertain',1);
+  const loop=new ReviewLoop(s);loop.postReview=async()=>{posts++;};
+  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=?').get(id)).toEqual({pr:7});
+  expect(await loop.requestReview(id,7,'sha','body')).toBe(false);
+  expect(posts).toBe(0);
+ }finally{s.close();}
+});
+test('legacy review-request receipts are migrated under an unknown PR key',()=>{
+ const s=new Store(':memory:');
+ s.db.exec('CREATE TABLE full_review_requests(job TEXT NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,head,body_hash))');
+ s.db.exec("CREATE TABLE review_targets(job TEXT PRIMARY KEY,repo TEXT NOT NULL,pr INTEGER NOT NULL,required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,head_since INTEGER NOT NULL,last_signature TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+ s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run('job','sha','body','accepted',1);
+ try{
+  // A registered target supplies its PR for the migrated receipt.
+  s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head_since) VALUES ('job','owner/repo',7,'[\"CI\"]','[\"src/**\"]',0,1)").run();
+  new ReviewLoop(s);
+  expect(s.db.query('SELECT * FROM full_review_requests').all()).toEqual([{job:'job',pr:7,head:'sha',body_hash:'body',state:'accepted',requested:1}]);
+  // The same head/body can now hold a receipt for a different PR.
+  s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run('job',3,'sha','body','delivery_uncertain',2);
+  expect(s.db.query('SELECT pr FROM full_review_requests WHERE job=? ORDER BY pr').all('job')).toEqual([{pr:3},{pr:7}]);
+ }finally{s.close();}
 });
 test('failed review requests revoke stale ready state but retain their reservation and never post twice',async()=>{
  for(const edited of [false,true]){const f=templateFixture();try{
@@ -545,14 +627,14 @@ test('failed review requests revoke stale ready state but retain their reservati
 test('a late failed review request cannot reopen a concurrently completed target',async()=>{
  const f=templateFixture();try{
   let terminal:any;f.loop.postReview=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Merge observed'});terminal=f.loop.get(f.id);throw Error('Late GitHub failure');};
-  await expect(f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
+  await expect(f.loop.requestReview(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.s.close();}
 });
 test('a concurrently reserved review request cannot be downgraded to a normal wait by either request branch',async()=>{
  for(const edited of [false,true]){const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);f.e.clear=edited;f.e.failedChecks=[];f.e.findings=[];f.e.reasons=['CodeRabbit review absent'];f.e.botReviewSubmittedAt=Date.now()-1000;
   if(edited)f.s.db.query('INSERT INTO description_delivery_gates VALUES (?,?,?,?)').run(f.id,f.head,'previous-body',Date.now()-1000);
-  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.requestReview=async()=>{f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,'delivery_uncertain',Date.now());return false;};
+  f.loop.record(f.id,{state:'ready_for_human',send:false,head:f.head});f.loop.requestReview=async()=>{f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash,'delivery_uncertain',Date.now());return false;};
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}}
 });
@@ -562,10 +644,10 @@ test('description edits cannot escape same-head review-request uncertainty or tr
   f.loop.postReview=async()=>{posts++;throw Error('Lost request receipt');};
   await expect(f.loop.tick(f.id)).rejects.toThrow('Lost request receipt');f.e.descriptionHash='edited-body';
   for(const clear of [false,true]){f.e.clear=clear;f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');}
-  expect(await f.loop.requestReview(f.id,f.head,f.e.descriptionHash)).toBe(false);expect(posts).toBe(1);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toHaveLength(1);
+  expect(await f.loop.requestReview(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash)).toBe(false);expect(posts).toBe(1);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toHaveLength(1);
   // Even a separately accepted receipt for the new body cannot mask the old
   // same-head uncertain delivery. Every outstanding receipt must be reconciled.
-  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?)').run(f.id,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
   f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
@@ -576,7 +658,7 @@ function threadFixture(){
  const head='a'.repeat(40),candidate={threadId:'T1',path:'src/workflow.ts',line:12,commentIds:['C1'],commentsHash:'d'.repeat(64),body:'Planning slot is not released on failure',originalCommit:'dcf66943',outdated:false};
  const finding={source:'github-review',kind:'review_thread',threadId:'T1',path:'src/workflow.ts',line:12,body:candidate.body,sha:head,originalCommit:'dcf66943',commentIds:['C1'],commentsHash:'d'.repeat(64),outdated:false};
  const e:any={clear:false,reasons:['Unresolved or unknown findings'],head,descriptionHash:'body',templateSignature:'sig',findings:[finding],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,coderabbitRateLimited:false,metadataCheckEvidence:[],reviewThreads:{unresolved:1,resolved:0,candidates:[candidate],stale:[],humanOnly:[]}};
- const session:any={session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
+ const session:any={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',branch:r.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};let sends=0,reviews=0;
  const io:any={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch:r.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch:r.branch,head}),readiness:async()=>({...e,findings:e.findings.map((f:any)=>({...f})),reviewThreads:{...e.reviewThreads,candidates:e.reviewThreads.candidates.map((c:any)=>({...c}))}}),sessionEvidence:async()=>session,submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
   sends++;const handle=args[args.indexOf('--client-message-id')+1],turnId=`fix-${sends}`;
   session.transcript.entries.push({clientMessageId:handle,turnId});session.transcript.turns.push({id:turnId,state:'running'});
@@ -593,7 +675,7 @@ test('carried-forward review thread dispatches exactly one provenance-bound reme
   expect(f.s.db.query('SELECT thread_id,comments_hash,path,head,attempt,state FROM review_feedback').get()).toEqual({thread_id:'T1',comments_hash:f.candidate.commentsHash,path:'src/workflow.ts',head:f.head,attempt:1,state:'dispatched'});
   expect(f.s.db.query('SELECT state FROM remediation').get()).toEqual({state:'delivery_uncertain'});
   // Uncertain delivery is reconciled, never resent.
-  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.sends()).toBe(1);
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_worker');expect(f.sends()).toBe(1);
   // Worker completes and pushes. The same thread remains unresolved and mapped,
   // so it is not sent again; a human must confirm the current code.
   f.session.transcript.turns[0].state='completed';const newer='c'.repeat(40);f.e.head=newer;f.e.findings[0].sha=newer;

@@ -1,6 +1,7 @@
 import {Store,digest} from './core';
 import {parseRequirements,validateDraft,validateReview,extractResult,batchHash,type FeatureDraft} from './feature-schema';
-import {loadOpenChamber,selectRoute,type Route,type RoutingSettings,type RoutingLoader} from './task-routing';
+import {selectRoute,type Route,type RoutingSettings,type RoutingLoader} from './task-routing';
+import {loadRouting} from './routing-config';
 import {TurnSubmissionBlocked} from './turn-submission';
 import {PreSendFailure} from './pre-send';
 export const planningRoles=['architecture','delivery','quality'] as const;
@@ -16,7 +17,7 @@ export interface FeatureAgents{
 }
 const instructions:Record<string,string>={architecture:'Analyze architecture, interfaces, data ownership, migrations, compatibility and dependencies.',delivery:'Decompose delivery into independently reviewable, reasonably sized tickets and identify sequencing and scope boundaries.',quality:'Analyze acceptance criteria, automated verification, security/privacy risks, rollout boundaries and missing requirements.'};
 export class FeaturePlanning{
- constructor(public s:Store,public agents:FeatureAgents,public load:RoutingLoader=loadOpenChamber){s.db.exec(`CREATE TABLE IF NOT EXISTS feature_plans(id TEXT PRIMARY KEY,project TEXT NOT NULL,requirements TEXT NOT NULL,target TEXT NOT NULL,repo TEXT NOT NULL,route TEXT NOT NULL,state TEXT NOT NULL,draft TEXT,hash TEXT,approved_hash TEXT,actor TEXT,reason TEXT,max_tickets INTEGER NOT NULL);
+ constructor(public s:Store,public agents:FeatureAgents,public load:RoutingLoader=loadRouting){s.db.exec(`CREATE TABLE IF NOT EXISTS feature_plans(id TEXT PRIMARY KEY,project TEXT NOT NULL,requirements TEXT NOT NULL,target TEXT NOT NULL,repo TEXT NOT NULL,route TEXT NOT NULL,state TEXT NOT NULL,draft TEXT,hash TEXT,approved_hash TEXT,actor TEXT,reason TEXT,max_tickets INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS feature_agents(plan TEXT NOT NULL REFERENCES feature_plans(id),role TEXT NOT NULL,name TEXT NOT NULL UNIQUE,client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL,session TEXT,started INTEGER,result TEXT,reason TEXT,PRIMARY KEY(plan,role));
  CREATE TABLE IF NOT EXISTS feature_events(seq INTEGER PRIMARY KEY,plan TEXT NOT NULL REFERENCES feature_plans(id),kind TEXT NOT NULL,detail TEXT NOT NULL,at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
  CREATE TABLE IF NOT EXISTS feature_issue_holds(issue TEXT PRIMARY KEY,plan TEXT NOT NULL REFERENCES feature_plans(id));

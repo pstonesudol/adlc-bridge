@@ -54,9 +54,15 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
  evidence:sessionEvidence,
  preflightRoute,
  configureRoute:configureSessionRoute,
-  async sendImplementation(session,prompt,clientId){
+   async sendImplementation(session,prompt,clientId,mode){
    return submit(async()=>{
-   const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
+    if(mode==='idle-only'){
+     const current=await sessionEvidence(session,spawn);
+     if(current.session.activity?.state!=='idle'||current.transcript.controller!=='ready'||!Array.isArray(current.transcript.turns)||current.transcript.turns.some((turn:any)=>!['completed','failed','cancelled','interrupted'].includes(turn.state)))throw Error('Worker is not idle');
+     await api(`sessions/${encodeURIComponent(session)}/conversation/messages`,'POST',{text:prompt,clientMessageId:clientId});
+     return;
+    }
+    const p=spawn([AO,'send','--session',session,'--steer','--client-message-id',clientId,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
   const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
    if(code!==0)throw Error('Implementation delivery uncertain');
    });
