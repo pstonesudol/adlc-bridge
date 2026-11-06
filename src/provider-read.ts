@@ -3,16 +3,22 @@ export type ReadEvidence={provider:'github'|'orchestrator';operation:string;time
 export class ProviderReadError extends Error{
  constructor(public evidence:ReadEvidence,options?:ErrorOptions){super(`${evidence.provider} ${evidence.operation}: ${evidence.classification}`,options);}
 }
+export class ReadValidationError extends Error{constructor(){super('PR is not open; inspect PR state before further review.');}}
 // Never persist arbitrary stderr, response bodies, URLs, commands or causes.
 // Only recognized protocol facts survive this boundary.
 export function readFailure(provider:ReadEvidence['provider'],operation:string,raw:string,exitStatus?:number,cause?:unknown,now=Date.now(),response=''){
  // stdout may contain arbitrary PR/comment bodies. Only its initial HTTP status
  // line is protocol evidence; stderr also supports gh's trailing (HTTP NNN).
  const httpStatus=Number(response.match(/^HTTP\/[\d.]+[ \t]+([45]\d\d)\b/i)?.[1]??raw.match(/^HTTP(?:\/[\d.]+)?[ \t]+([45]\d\d)\b/im)?.[1]??raw.match(/\(HTTP ([45]\d\d)\)[ \t]*$/im)?.[1])||undefined;
- const diagnostics=`${raw}\n${response}`;
- const classification:ReadClass=httpStatus===401?'authentication':httpStatus===429||/secondary rate limit|rate limit exceeded|abuse detection/i.test(diagnostics)?'throttled':httpStatus===403?'permission':httpStatus===404?'missing':httpStatus&&httpStatus>=500?'server':/timed? ?out|timeout|ETIMEDOUT/i.test(raw)?'timeout':/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|network is unreachable|could not resolve|connection reset|error connecting/i.test(raw)?'network':'unknown';
- const retry=diagnostics.match(/retry-after:\s*(\d+)\s*(?:\r?\n|$)/i),reset=diagnostics.match(/x-ratelimit-reset:\s*(\d+)/i);
- const requestId=diagnostics.match(/x-github-request-id:\s*([A-F0-9: -]{1,100})(?:\r?\n|$)/i)?.[1]?.trim();
+ const headers=(text:string)=>/^HTTP(?:\/[\d.]+)?[ \t]+\d{3}\b/.test(text)?text.split(/\r?\n\r?\n/,1)[0]:'';
+ const protocol=`${headers(raw)}\n${headers(response)}`;
+ let messages:string[]=[];
+ try{const body=response.replace(/^HTTP\/[\d.]+[^\r\n]*\r?\n[\s\S]*?\r?\n\r?\n/,'');const parsed=JSON.parse(body);if(typeof parsed.message==='string')messages.push(parsed.message);if(Array.isArray(parsed.errors))messages.push(...parsed.errors.map((e:any)=>e?.type==='RATE_LIMITED'?'rate limit exceeded':typeof e?.message==='string'?e.message:''));}catch{}
+ // Error fields are provider-owned; GraphQL data (including comments) is not.
+ const rateEvidence=[...messages,...raw.split(/\r?\n/).filter(line=>/^(?:gh: |HTTP(?:\/[\d.]+)?[ \t]+\d{3}\b)/.test(line))].join('\n');
+ const classification:ReadClass=httpStatus===401?'authentication':httpStatus===429||/secondary rate limit|rate limit exceeded|abuse detection/i.test(rateEvidence)?'throttled':httpStatus===403?'permission':httpStatus===404?'missing':httpStatus&&httpStatus>=500?'server':/timed? ?out|timeout|ETIMEDOUT/i.test(raw)?'timeout':/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|network is unreachable|could not resolve|connection reset|error connecting/i.test(raw)?'network':'unknown';
+ const retry=protocol.match(/^retry-after:[ \t]*(\d+)[ \t]*\r?$/im),reset=protocol.match(/^x-ratelimit-reset:[ \t]*(\d+)[ \t]*\r?$/im);
+ const requestId=protocol.match(/^x-github-request-id:[ \t]*([A-F0-9: -]{1,100})\r?$/im)?.[1]?.trim();
  const hint=Math.max(retry?now+Number(retry[1])*1000:0,reset?Number(reset[1])*1000:0);
  return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(Number.isSafeInteger(hint)&&hint>now?{retryAt:hint}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
 }

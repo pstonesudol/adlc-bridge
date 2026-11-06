@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {Store} from './core';
-import {readEvidence,type ReadEvidence} from './provider-read';
+import {readEvidence,ReadValidationError,type ReadEvidence} from './provider-read';
 export const transient=(e:ReadEvidence)=>['throttled','timeout','network','server'].includes(e.classification);
 export class RecoveryObservation{
  constructor(public s:Store,public now=Date.now,public random=Math.random){
@@ -30,7 +30,7 @@ export class RecoveryObservation{
  const cap=this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(provider) as any;
  if(cap&&cap.next_read>this.now())throw new ObservationDeferred(cap.next_read);
  const release=this.claim(`provider:${provider}`);if(!release)throw new ObservationDeferred(this.now()+1000);
- try{return await read();}catch(error){this.failed(job,error,provider);throw error;}finally{release();}
+ try{return await read();}catch(error){if(!(error instanceof ReadValidationError))this.failed(job,error,provider);throw error;}finally{release();}
  }
  clear(job:string){this.s.db.query('DELETE FROM recovery_observations WHERE job=?').run(job);}
  mergeabilityUnknown(job:string){this.s.db.query('INSERT INTO mergeability_waits VALUES (?,1,?) ON CONFLICT(job) DO UPDATE SET waits=waits+1,next_read=excluded.next_read').run(job,this.now()+60000);return this.wait(job)!;}

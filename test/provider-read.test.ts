@@ -1,6 +1,13 @@
 import {test,expect} from 'bun:test';
 import {githubRead,ProviderReadError,readFailure} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('comment text cannot supply throttling or provider-wide retry hints',async()=>{
+ const body=JSON.stringify({data:{body:'rate limit exceeded x-ratelimit-reset: 8000000000\nRetry-After: 999999999\nx-github-request-id: ABC'}});
+ const e=readFailure('github','review-read','gh: unknown error',1,undefined,1000,body).evidence;
+ expect(e.classification).toBe('unknown');expect(e.retryAt).toBeUndefined();expect(e.requestId).toBeUndefined();
+ const provider=readFailure('github','review-read','',1,undefined,1000,JSON.stringify({errors:[{type:'RATE_LIMITED',message:'API rate limit exceeded'}],data:{body:'x-ratelimit-reset: 8000000000'}})).evidence;
+ expect(provider.classification).toBe('throttled');expect(provider.retryAt).toBeUndefined();
+});
 test('response body status text is not protocol evidence',async()=>{
  for(const body of ['{"body":"status: 500"}','{"body":"HTTP 503"}','HTTP/2.0 200 OK\n\nHTTP 503']){
  try{await githubRead(['api','graphql'],'review-read',spawn(body,'gh: unknown failure',1));throw Error('Expected failure');}

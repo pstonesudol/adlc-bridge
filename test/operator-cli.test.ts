@@ -3,8 +3,18 @@ import {mkdtempSync,rmSync,existsSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../src/core';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('completed jobs retain observation evidence without suggesting an inactive probe',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-complete-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');
+ new RecoveryObservation(s).failed(id,readFailure('github','review-read','HTTP 503'));
+ s.db.query("UPDATE jobs SET state='done',reason='Human merged PR' WHERE id=?").run(id);s.close();
+ expect(jobViews(path)[0]).toMatchObject({state:'complete',reason:'Human merged PR',nextAction:'No job action required; merging remains human-only.',observation:{failures:1,nextRetry:null,error:{classification:'server'}}});
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('ticket lookup requires project selection, never picks a candidate',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-'));try{
   const path=join(root,'state.sqlite'),s=new Store(path);

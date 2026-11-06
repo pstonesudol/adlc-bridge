@@ -1,5 +1,6 @@
-import {test,expect,setSystemTime} from 'bun:test';
-import {readFailure} from '../src/provider-read';
+import {test,expect,setSystemTime,spyOn} from 'bun:test';
+import {readFailure,ReadValidationError} from '../src/provider-read';
+import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
 import {decision,ReviewLoop} from '../src/review-loop';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
@@ -213,6 +214,33 @@ test('second branch read failure invalidates stale readiness and enters durable 
   expect((f.loop.get(f.id)).state).toBe('blocked');
   await f.loop.tick(f.id,undefined,undefined,undefined,config);expect(reads).toBe(2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
+});
+test('closed PR readiness validation remains actionable without a read failure budget',async()=>{
+ const f=templateFixture();try{
+ f.loop.io.readiness=async()=>{throw new ReadValidationError();};
+ for(let n=0;n<2;n++){
+ expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'PR is not open; inspect PR state before further review.'});
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.sends()).toBe(0);
+ }
+ }finally{f.s.close();}
+});
+test('later read deferrals, including wrapped ancestry errors, remain waiting without failures',async()=>{
+ for(const stage of ['snapshot','ensure','readiness','accepted']){
+ const f=templateFixture();const original=RecoveryObservation.prototype.read;let calls=0;
+ const at=stage==='snapshot'?3:stage==='readiness'?4:stage==='accepted'?4:3;
+ const spy=spyOn(RecoveryObservation.prototype,'read').mockImplementation(async function(job,provider,read){if(++calls===at)throw new ObservationDeferred(Date.now()+1000);return original.call(this,job,provider,read);});
+ try{
+ if(stage==='accepted'){
+ const {BranchUpdates}=await import('../src/branch-updates');new BranchUpdates(f.s);
+ f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
+ const snapshot=f.loop.io.readBranchSnapshot;f.loop.io.readBranchSnapshot=async(...args)=>({...await snapshot(...args),behind:1,mergeable:false});
+ }
+ const config=stage==='snapshot'||stage==='accepted'?{conflictRecovery:{enabled:true}}:undefined;
+ const result=await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.sends()).toBe(0);
+ }finally{spy.mockRestore();f.s.close();}
+ }
 });
 test('branch-only ticks preserve readiness failure history',async()=>{
  const f=templateFixture();try{
@@ -451,7 +479,9 @@ test('concurrent ticks retain their explicitly supplied check policy despite sha
   f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve),seen:any[]=[];
   f.loop.io.sessionEvidence=async()=>{await gate;return f.session;};f.loop.io.readiness=async(_repo,_pr,required,metadata)=>{seen.push({required,metadata});return f.e;};
   const checks=['Strict metadata'],strict=f.loop.tick(f.id,undefined,undefined,{project:'project',checks}),empty=f.loop.tick(f.id,undefined,undefined,{project:'project',checks:[]});
-  checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await Promise.all([strict,empty]);
+  const before={...f.loop.get(f.id)};
+  expect(await empty).toMatchObject({state:'waiting_for_worker',send:false});expect(seen).toEqual([]);expect(f.loop.get(f.id)).toEqual(before);expect(f.sends()).toBe(0);
+  checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await strict;
   expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']}]);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });

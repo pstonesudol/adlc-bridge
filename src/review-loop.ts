@@ -21,6 +21,14 @@ import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feed
 import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
 import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
+import {ReadValidationError} from './provider-read';
+function readStop(error:unknown,fallback:string){
+ let cause=error;for(let n=0;n<8;n++){
+ if(cause instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:cause.message};
+ if(!(cause instanceof BranchObservationFailure))break;cause=cause.cause;
+ }
+ return {state:'blocked',send:false,reason:error instanceof Error?error.message:fallback};
+}
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
 
@@ -233,7 +241,7 @@ export class ReviewLoop{
   try{
    session=await observation.read(job,'orchestrator',()=>this.io.sessionEvidence(run.session_id));
    snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));
-  }catch(e){return record({state:e instanceof ObservationDeferred?'waiting_for_worker':'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
+  }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
    const local=await this.io.worktreeIdentity(this.s,job);
@@ -246,24 +254,24 @@ export class ReviewLoop{
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
     try{snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));}
-    catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
+    catch(error){return record(readStop(error,'Branch snapshot unavailable'));}
     if(snapshot.behind>0&&snapshot.mergeable===null)return record({...observation.mergeabilityUnknown(job),head:snapshot.head});
     observation.mergeabilityKnown(job);
     if(snapshot.mergeable===false&&snapshot.behind>0){
      try{await new BranchUpdates(this.s,observedTransport).observeAccepted(job,t.repo,t.pr,snapshot);}
-     catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
+     catch(error){return record({...readStop(error,'Accepted base update evidence unavailable; inspect published recovery'),head:snapshot.head});}
      try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
      catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
    }
    try{branch=await new BranchUpdates(this.s,observedTransport).ensure(job,t.repo,t.pr,session,branchPolicy);}
-   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record({state:'blocked',send:false,reason:error.message});}throw error;}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record(readStop(error,'Branch observation unavailable'));}throw error;}
    if(branch)return record(branch);
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
   try{e=await observation.read(job,'github',()=>this.io.readiness(t.repo,t.pr,required,metadataChecks));}
-  catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
+  catch(error){if(error instanceof ReadValidationError)observation.clear(job);return record(readStop(error,'Readiness evidence unavailable'));}
    observation.clear(job);
    const reviewed=this.completed(job);if(reviewed)return reviewed;
    // Completed jobs no longer satisfy execution approval; handle that terminal
