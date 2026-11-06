@@ -375,13 +375,17 @@ test('unsupported plan scope stays blocked and retains the previous grant',async
  }finally{f.s.close();}
 });
 test('revision planning transport never steers a competing turn',async()=>{
- const calls:string[][]=[];
- const spawn:any=(args:string[])=>{calls.push(args);return {stdout:new Blob(['']).stream(),stderr:new Blob(['']).stream(),exited:Promise.resolve(0)};};
- const t=createWorkflowTransport(async f=>f(),spawn);
+ const calls:string[][]=[],requests:unknown[][]=[];
+ const evidence={session:{id:'owner',activity:{state:'idle'}},transcript:{controller:'ready',entries:[],turns:[]}};
+ const spawn:any=(args:string[])=>{calls.push(args);return {stdout:new Blob([JSON.stringify(evidence)]).stream(),stderr:new Blob(['']).stream(),exited:Promise.resolve(0)};};
+ const t=createWorkflowTransport(async f=>f(),spawn,async (...args)=>{requests.push(args);});
  await t.sendImplementation('owner','plan only','revision','idle-only');
- expect(calls[0]).not.toContain('--steer');expect(calls[0]).toContain('--client-message-id');
+ expect(requests).toEqual([['sessions/owner/conversation/messages','POST',{text:'plan only',clientMessageId:'revision'}]]);
+ evidence.session.activity.state='working';
+ await expect(t.sendImplementation('owner','plan only','second','idle-only')).rejects.toThrow('Worker is not idle');
+ expect(requests).toHaveLength(1);
  await t.sendImplementation('owner','implement','default');
- expect(calls[1]).toContain('--steer');
+ expect(calls.at(-1)).toContain('--steer');
 });
 test('explicit confirmed revision can replan a previously finished planning owner',async()=>{
  const f=await fixture();try{

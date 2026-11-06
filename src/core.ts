@@ -57,8 +57,8 @@ export class Store {
       this.db.query('SELECT seq,job,kind,detail,at FROM events LIMIT 0').all();
       this.db.query('SELECT seq,job,plan_hash,actor,at FROM approvals LIMIT 0').all();
       if (version < 2) this.db.exec(`
-        CREATE INDEX events_job_seq ON events(job,seq);
-        CREATE INDEX approvals_job_seq ON approvals(job,seq);
+        CREATE INDEX IF NOT EXISTS events_job_seq ON events(job,seq);
+        CREATE INDEX IF NOT EXISTS approvals_job_seq ON approvals(job,seq);
         PRAGMA user_version=2;`);
     }).immediate();
     installRevisions(this);

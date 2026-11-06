@@ -1,3 +1,4 @@
+import {latestRevision} from './spec-revisions';
 import {Store,digest} from './core';
 import {loadRouting,routingSnapshot} from './routing-config';
 
@@ -26,7 +27,16 @@ export class TaskRouting{
  CREATE TABLE IF NOT EXISTS routing_projects(job TEXT PRIMARY KEY REFERENCES jobs(id),settings TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS route_approvals(job TEXT PRIMARY KEY REFERENCES jobs(id),plan_hash TEXT NOT NULL,route_hash TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS planning_delivery(job TEXT PRIMARY KEY REFERENCES jobs(id),session_id TEXT NOT NULL,client_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL);`);}
- get(job:string,phase:string):any{return this.s.db.query('SELECT * FROM task_routes WHERE job=? AND phase=?').get(job,phase);}
+ private phaseKey(job:string,phase:string){
+  if(phase!=='planning'&&phase!=='implementation')return phase;
+  const revision=latestRevision(this.s,job);
+  return revision&&revision.state!=='preplanning'?`${phase}:${revision.id}`:phase;
+ }
+ private approvalHash(job:string,route:string){
+  const key=this.phaseKey(job,'implementation');
+  return digest(key==='implementation'?route:JSON.stringify([key,route]));
+ }
+ get(job:string,phase:string):any{return this.s.db.query('SELECT * FROM task_routes WHERE job=? AND phase=?').get(job,this.phaseKey(job,phase));}
   settings(job:string):RoutingSettings|null{const row=this.s.db.query('SELECT settings FROM routing_projects WHERE job=?').get(job) as any;return row?JSON.parse(row.settings):null;}
   async reconcile(job:string,settings:RoutingSettings,confirm?:string){
    const j=this.s.get(job),old=this.get(job,'implementation');
@@ -42,15 +52,15 @@ export class TaskRouting{
     const current=this.s.get(job);if(current.state!=='awaiting_approval'||current.plan_hash!==j.plan_hash||this.get(job,'implementation')?.route!==old.route)throw Error('Job changed during routing reconciliation');
     this.s.db.query('DELETE FROM route_approvals WHERE job=?').run(job);
     this.s.db.query('INSERT OR IGNORE INTO routing_snapshots VALUES (?,?,?)').run(job,route.configHash,JSON.stringify(snapshot.config));
-    this.s.db.query("UPDATE task_routes SET binding=?,route=?,state='selected' WHERE job=? AND phase='implementation'").run(binding,JSON.stringify(route),job);
+    this.s.db.query("UPDATE task_routes SET binding=?,route=?,state='selected' WHERE job=? AND phase=?").run(binding,JSON.stringify(route),job,this.phaseKey(job,'implementation'));
     this.s.db.query('INSERT INTO routing_projects VALUES (?,?) ON CONFLICT(job) DO UPDATE SET settings=excluded.settings').run(job,JSON.stringify(settings));
     this.s.event(job,'routing_reconciled',JSON.stringify({hash,route}));
    }).immediate();
    return {hash,previous:JSON.parse(old.route),route,applied:!!confirm};
   }
  async choose(job:string,phase:string,binding:string,request:string,settings:RoutingSettings,knownCategory?:string):Promise<Route>{
-  const old=this.get(job,phase);if(old){if(old.binding!==binding)throw Error('Route binding changed; explicit reconciliation required');return JSON.parse(old.route);}
-   let pinnedPolicy:RoutingConfig|undefined;
+  const key=this.phaseKey(job,phase),old=this.get(job,phase);if(old){if(old.binding!==binding)throw Error('Route binding changed; explicit reconciliation required');return JSON.parse(old.route);}
+  let pinnedPolicy:RoutingConfig|undefined;
   if(phase.startsWith('remediation:')){
    const implementation=this.get(job,'implementation');
     if(implementation){const pinned=this.s.db.query('SELECT config FROM routing_snapshots WHERE job=? AND config_hash=?').get(job,JSON.parse(implementation.route).configHash) as any;if(!pinned)throw Error('Approved routing policy snapshot missing');pinnedPolicy=JSON.parse(pinned.config);}
@@ -63,12 +73,13 @@ export class TaskRouting{
   const route=selectRoute(policy,answer,reason);
   if(knownCategory==='planning')route.mode='plan';
   return this.s.db.transaction(()=>{
+   if(this.phaseKey(job,phase)!==key)throw Error('Route revision changed during selection');
    const existing=this.get(job,phase);if(existing){if(existing.binding!==binding)throw Error('Concurrent route binding changed');return JSON.parse(existing.route);}
    this.s.db.query('INSERT OR IGNORE INTO routing_snapshots VALUES (?,?,?)').run(job,route.configHash,JSON.stringify(policy));
    if(phase==='implementation')this.s.db.query('INSERT INTO routing_projects VALUES (?,?) ON CONFLICT(job) DO UPDATE SET settings=excluded.settings').run(job,JSON.stringify(settings));
    else this.s.db.query('INSERT OR IGNORE INTO routing_projects VALUES (?,?)').run(job,JSON.stringify(settings));
-   this.s.db.query('INSERT INTO task_routes(job,phase,binding,route) VALUES (?,?,?,?)').run(job,phase,binding,JSON.stringify(route));
-   this.s.event(job,'task_route_selected',JSON.stringify({phase,...route}));return route;
+   this.s.db.query('INSERT INTO task_routes(job,phase,binding,route) VALUES (?,?,?,?)').run(job,key,binding,JSON.stringify(route));
+   this.s.event(job,'task_route_selected',JSON.stringify({phase:key,...route}));return route;
   }).immediate();
  }
  approve(job:string,hash:string){
@@ -76,14 +87,14 @@ export class TaskRouting{
   const route=this.get(job,'implementation');
   const j=this.s.get(job);if(route&&route.binding!==digest(JSON.stringify([j.spec,j.plan_hash])))throw Error('Implementation route is stale');
   if(!route)throw Error('Implementation route must be selected before approval');
-  this.s.db.query('INSERT INTO route_approvals VALUES (?,?,?)').run(job,hash,digest(route.route));
+  this.s.db.query('INSERT INTO route_approvals VALUES (?,?,?) ON CONFLICT(job) DO UPDATE SET plan_hash=excluded.plan_hash,route_hash=excluded.route_hash').run(job,hash,this.approvalHash(job,route.route));
  }
  approved(job:string,hash:string):Route|null{
   const row=this.get(job,'implementation');if(!row){if(this.get(job,'planning'))throw Error('Approved implementation routing is missing');return null;}
   const a=this.s.db.query('SELECT * FROM route_approvals WHERE job=?').get(job) as any;
-  if(!a||a.plan_hash!==hash||a.route_hash!==digest(row.route))throw Error('Routing choice is not covered by the current human approval');
+  if(!a||a.plan_hash!==hash||a.route_hash!==this.approvalHash(job,row.route))throw Error('Routing choice is not covered by the current human approval');
   return JSON.parse(row.route);
  }
- verified(job:string,phase:string){this.s.db.query("UPDATE task_routes SET state='verified' WHERE job=? AND phase=?").run(job,phase);}
+ verified(job:string,phase:string){this.s.db.query("UPDATE task_routes SET state='verified' WHERE job=? AND phase=?").run(job,this.phaseKey(job,phase));}
  list(job?:string){const rows=job?this.s.db.query('SELECT job,phase,binding,route,state FROM task_routes WHERE job=?').all(job):this.s.db.query('SELECT job,phase,binding,route,state FROM task_routes').all();return rows.map((r:any)=>({...r,route:JSON.parse(r.route)}));}
 }

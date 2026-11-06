@@ -22,7 +22,8 @@ export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs
  const batch=r.transcript.entries;
  if(batch.some((x:any)=>!Number.isSafeInteger(x.sequence)||(before!==undefined&&x.sequence>=before))||new Set(batch.map((x:any)=>x.sequence)).size!==batch.length)throw Error('Invalid transcript pagination sequence');
  entries.unshift(...batch);
- if(batch.length<100){first.transcript.entries=entries;first.receiptObservation={observed:started,complete:true};return first;}
+ if(r.transcript.hasMoreBefore===false||r.transcript.hasMoreBefore===undefined&&batch.length<100){first.transcript.entries=entries;first.receiptObservation={observed:started,complete:true};return first;}
+ if(!batch.length)throw Error('Transcript page has no pagination cursor');
  before=Math.min(...batch.map((x:any)=>x.sequence));
  }
  throw Error('Transcript pagination limit reached; receipt evidence incomplete');
