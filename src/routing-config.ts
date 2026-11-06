@@ -1,5 +1,5 @@
-import {readFileSync,existsSync,writeFileSync,renameSync,unlinkSync,copyFileSync,realpathSync} from 'node:fs';
-import {resolve,dirname,join} from 'node:path';
+import {readFileSync,existsSync,writeFileSync,renameSync,unlinkSync,copyFileSync,realpathSync,lstatSync,constants} from 'node:fs';
+import {resolve,dirname,join,basename} from 'node:path';
 import type {RoutingConfig,RoutingSettings,RoutingSnapshot} from './task-routing';
 import {routingClientURL} from './routing-dependencies';
 export type RoutingDocument=RoutingConfig&{version:1;harness:'opencode-v2';classifier:{adapter:'off'|'opencode';model?:string}};
@@ -61,10 +61,14 @@ export async function classifyOpenCode(model:string,request:string,config:Routin
 export function routingSnapshot(config:RoutingConfig,classify=classifyOpenCode):RoutingSnapshot{return {config,classify:async(request,policy)=>{const selected=policy??config,classifier=(selected as RoutingDocument).classifier;if(!selected.enabled)throw Error('ADLC routing is disabled');if(!classifier||classifier.adapter==='off')throw Error('Classifier disabled');return classify(classifier.model!,request,selected);}};}
 export async function loadRouting(settings:RoutingSettings):Promise<RoutingSnapshot>{return routingSnapshot(effectiveRouting(settings).config);}
 export function importRouting(source:string,destination:string,apply=false){
- if(resolve(source)===resolve(destination)||realpathSync(source)===(existsSync(destination)?realpathSync(destination):join(realpathSync(dirname(resolve(destination))),destination.split('/').at(-1)!)))throw Error('Import destination must differ from source');
+ const directory=realpathSync(dirname(resolve(destination))),target=join(directory,basename(resolve(destination))),sourcePath=realpathSync(source);
+ if(sourcePath===target||(existsSync(target)&&sourcePath===realpathSync(target)))throw Error('Import destination must differ from source');
+ const existing=lstatSync(target,{throwIfNoEntry:false});
+ if(existing?.isSymbolicLink())throw Error('Import destination must not be a symlink; choose a regular ADLC configuration file');
+ if(existing&&!existing.isFile())throw Error('Import destination must be a regular file');
  const raw=read(source),allowed=['enabled','minConfidence','fallback','categories'];keys(raw,Object.keys(raw),'OpenChamber source');
  const unsupported=Object.keys(raw).filter(k=>!allowed.includes(k));const candidate:any={version:1,harness:'opencode-v2',classifier:{adapter:'off'}};for(const k of allowed)candidate[k]=raw[k];
  const config=validateRouting(candidate);let backup:string|null=null;
- if(apply){if(existsSync(destination)){backup=destination+'.backup-'+crypto.randomUUID();copyFileSync(destination,backup);}const temporary=join(dirname(resolve(destination)),'.routing-'+crypto.randomUUID());try{writeFileSync(temporary,JSON.stringify(config,null,2)+'\n',{mode:0o600,flag:'wx'});renameSync(temporary,destination);}finally{if(existsSync(temporary))unlinkSync(temporary);}}
+ if(apply){if(existing){backup=target+'.backup-'+crypto.randomUUID();copyFileSync(target,backup,constants.COPYFILE_EXCL);}const temporary=join(directory,'.routing-'+crypto.randomUUID());try{writeFileSync(temporary,JSON.stringify(config,null,2)+'\n',{mode:0o600,flag:'wx'});renameSync(temporary,target);}finally{if(existsSync(temporary))unlinkSync(temporary);}}
  return {config,unsupported,backup,applied:apply};
 }

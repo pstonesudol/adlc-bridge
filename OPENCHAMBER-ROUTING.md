@@ -118,8 +118,11 @@ adlc routing-import /absolute/source.json /absolute/adlc-routing.json
 adlc routing-import /absolute/source.json /absolute/adlc-routing.json --apply
 ```
 
-The destination parent must exist. Apply creates a uniquely named backup of any
-existing destination and uses a private same-directory temporary file plus rename
+The destination parent must exist and is resolved to its real directory. Symlink
+destinations (including dangling links) are rejected without modification. Apply
+creates an exclusively created, uniquely named backup of an existing regular file;
+a backup-name collision fails without overwriting it or the destination. Apply
+uses a private temporary file in the real destination directory plus rename
 for atomic replacement. Source and destination must differ; the source is never
 modified. Repeated imports require another explicit apply and create another backup;
 there is no background synchronization. Restore the reported backup using a
