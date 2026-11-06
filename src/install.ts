@@ -1,5 +1,6 @@
 import {readdirSync,lstatSync,readFileSync,writeFileSync,mkdirSync,mkdtempSync,rmSync,existsSync,copyFileSync,renameSync,unlinkSync} from 'node:fs';
 import {atomicFile as atomic} from './atomic-file';
+import {routingDependencyFiles,routingClientURL} from './routing-dependencies';
 import {trustedDaemon} from './daemon-runtime';
 import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {definitionXML} from './project-services';
@@ -25,7 +26,8 @@ export function distributionFiles(root:string){
  const files:string[]=[];
  function walk(dir:string){for(const name of readdirSync(join(root,dir)).sort()){const rel=join(dir,name),st=lstatSync(join(root,rel));if(name==='__pycache__'||name.endsWith('.pyc'))continue;if(st.isSymbolicLink())throw Error('Distribution cannot contain symlinks');if(st.isDirectory())walk(rel);else if(st.isFile())files.push(rel);}}
  for(const dir of ['src','scripts','patches'])if(existsSync(join(root,dir)))walk(dir);
- for(const f of ['package.json','LICENSE','README.md','AGENTS.md'])if(existsSync(join(root,f)))files.push(f);
+  for(const f of ['package.json','LICENSE','README.md','AGENTS.md'])if(existsSync(join(root,f)))files.push(f);
+  files.push(...routingDependencyFiles(root));
  return files.sort();
 }
 export function snapshot(root:string,destination:string,copy=copyFileSync){
@@ -37,11 +39,17 @@ export function snapshot(root:string,destination:string,copy=copyFileSync){
    const copied=createHash('sha256');
    for(const f of files){mkdirSync(dirname(join(stage,f)),{recursive:true});copy(join(root,f),join(stage,f));copied.update(f+'\0').update(readFileSync(join(stage,f))).update('\0');}
    if(copied.digest('hex')!==version)throw Error('Source changed during snapshot; retry from a stable checkout');
-   writeFileSync(join(stage,'manifest.json'),JSON.stringify({version,files},null,2)+'\n',{mode:0o600});renameSync(stage,target);
+    verifyRoutingImport(stage,files);
+    writeFileSync(join(stage,'manifest.json'),JSON.stringify({version,files},null,2)+'\n',{mode:0o600});renameSync(stage,target);
   }finally{rmSync(stage,{recursive:true,force:true});}
  }
- else for(const f of files)if(!readFileSync(join(target,f)).equals(readFileSync(join(root,f))))throw Error('Installed snapshot changed; preserved for inspection');
+  else {for(const f of files)if(!readFileSync(join(target,f)).equals(readFileSync(join(root,f))))throw Error('Installed snapshot changed; preserved for inspection');verifyRoutingImport(target,files);}
  return {version,cli:join(target,'src/cli.ts'),files:files.length};
+}
+function verifyRoutingImport(root:string,files:string[]){
+ if(!files.some(f=>f.startsWith('node_modules/@opencode/client/')))return;
+ const result=Bun.spawnSync([process.execPath,'--no-install','--eval',`const {Service}=await import(${JSON.stringify(routingClientURL(root))});if(typeof Service.discover!=='function'||typeof Service.headers!=='function')throw Error('Invalid service client');`],{cwd:root,env:{HOME:root,PATH:process.env.PATH},stdout:'ignore',stderr:'ignore',timeout:10000});
+ if(result.exitCode!==0)throw Error('Routing runtime dependency import verification failed with auto-install disabled; snapshot was not activated');
 }
 const quote=(v:string)=>"'"+v.replaceAll("'","'\\''")+"'";
 const installIO={registeredProjects,serviceControl,localAO,installWorkflowHook,readDefinition,assertDefinition,trustedDaemon,state:appState,home:homedir};

@@ -9,6 +9,9 @@
   "scripts": {
     "test": "bun test"
   },
+  "dependencies": {
+    "@opencode/client": "2.2.5"
+  },
   "engines": {
     "bun": ">=1.4.2"
   }

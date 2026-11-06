@@ -229,3 +229,13 @@ test('installation preserves a loaded intake whose definition is unavailable',as
   rmSync(f.plist);await expect(installBridge(true,f.source,f.launcher,f.io)).rejects.toThrow('Loaded intake definition unavailable');expect(f.calls).toEqual(['service-status']);expect(readFileSync(f.record,'utf8')).toBe('old record');expect(existsSync(join(f.state,'versions'))).toBe(false);
  }finally{f.close();}
 });
+test('missing pinned routing dependencies refuse preparation before fixture activation or approval changes',async()=>{
+ for(const apply of [false,true]){const f=controlFixture();try{
+  writeFileSync(join(f.source,'package.json'),JSON.stringify({dependencies:{'@opencode/client':'2.2.5'}}));
+  const db=join(f.state,'state.sqlite'),s=new Store(db),job=s.enqueue('p','i','spec'),hash=s.propose(job,'plan');s.approve(job,hash,'human');s.close();
+  const paths=[f.record,f.launcher,f.plist,db],before=paths.map(path=>readFileSync(path));
+  await expect(installBridge(apply,f.source,f.launcher,f.io)).rejects.toThrow('Routing runtime dependencies');
+  expect(paths.map(path=>readFileSync(path))).toEqual(before);expect(f.calls).toEqual(apply?['service-status']:[]);
+  expect(existsSync(join(f.state,'versions'))).toBe(false);expect(existsSync(join(f.state,'backups'))).toBe(false);
+ }finally{f.close();}}
+});
