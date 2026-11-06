@@ -55,8 +55,27 @@ test('reserved conflict recovery retries six read failures before any mutation',
  const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);setSystemTime(new Date(status.next_read+1));
  }
  fail=false;expect((await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
- expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);expect(new RecoveryObservation(f.s).status(f.job)).toBeNull();
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);expect(new RecoveryObservation(f.s).status(f.job)?.failures).toBe(6);
  }finally{setSystemTime();f.close();}
+},60000);
+test('reserved manual preview is read-only and guards retain observation history',async()=>{
+ const f=await fixture();let reads=0;let reader:Store|undefined;
+ try{
+ const snapshot=async()=>{if(++reads===3)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ const row=f.recovery.row(f.job);expect(row.state).toBe('reserved');
+ const before=f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job);
+ const events=f.s.db.query('SELECT count(*) AS n FROM events').get();
+ reader=Store.readonly(join(f.dir,'state.sqlite'));
+ const preview=new ConflictRecovery(reader,f.io as any);
+ await expect(preview.manualPreview(f.job,f.config)).rejects.toThrow('recorded conflict index required');
+ expect(f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job)).toEqual(before);
+ expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ setSystemTime(new Date((before as any).next_read+1));
+ await f.recovery.guard(row,f.config);
+ expect(f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job)).toEqual(before);
+ expect(f.recovery.row(f.job)).toEqual(row);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();reader?.close();f.close();}
 },60000);
 test('DEV-15/16 conflict preserves feature and base safeguards, normal pushes and invalidates old clearance',async()=>{
  const f=await fixture();try{

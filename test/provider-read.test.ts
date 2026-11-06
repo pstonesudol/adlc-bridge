@@ -1,6 +1,16 @@
 import {test,expect} from 'bun:test';
 import {githubRead,ProviderReadError,readFailure,readEvidence,MAX_PROVIDER_RETRY_MS} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('known client HTTP errors cannot become transient transport failures from diagnostic text',()=>{
+ for(const status of [400,409,413,422]){
+ const evidence=readFailure('github','branch-read',`gh: validation timeout ECONNRESET (HTTP ${status})`,1).evidence;
+ expect(evidence.httpStatus).toBe(status);expect(evidence.classification).toBe('unknown');
+ }
+ expect(readFailure('github','branch-read','gh: secondary rate limit timeout (HTTP 403)',1).evidence.classification).toBe('throttled');
+ expect(readFailure('github','branch-read','HTTP 503 timeout',1).evidence.classification).toBe('server');
+ expect(readFailure('github','branch-read','timeout',1).evidence.classification).toBe('timeout');
+ expect(readFailure('github','branch-read','ECONNRESET',1).evidence.classification).toBe('network');
+});
 test('untyped callback messages remain unknown but nested typed evidence is preserved',()=>{
  for(const message of ['timeout','HTTP 503','ECONNRESET','rate limit exceeded'])expect(readEvidence(new Error(message)).classification).toBe('unknown');
  const typed=readFailure('github','branch-read','HTTP 503',1);expect(readEvidence(new Error('wrapper',{cause:typed}))).toEqual(typed.evidence);
