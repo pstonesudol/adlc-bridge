@@ -384,6 +384,7 @@ test('revision planning transport never steers a competing turn',async()=>{
  evidence.session.activity.state='working';
  await expect(t.sendImplementation('owner','plan only','second','idle-only')).rejects.toThrow('Worker is not idle');
  expect(requests).toHaveLength(1);
+ expect(calls.filter(args=>args.includes('send'))).toHaveLength(0);
  await t.sendImplementation('owner','implement','default');
  expect(calls.at(-1)).toContain('--steer');
 });

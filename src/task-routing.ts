@@ -32,6 +32,9 @@ export class TaskRouting{
   const revision=latestRevision(this.s,job);
   return revision&&revision.state!=='preplanning'?`${phase}:${revision.id}`:phase;
  }
+ private legacyRoute(job:string,phase:string){
+  return this.s.db.query('SELECT * FROM task_routes WHERE job=? AND phase=?').get(job,phase);
+ }
  private approvalHash(job:string,route:string){
   const key=this.phaseKey(job,'implementation');
   return digest(key==='implementation'?route:JSON.stringify([key,route]));
@@ -90,7 +93,14 @@ export class TaskRouting{
   this.s.db.query('INSERT INTO route_approvals VALUES (?,?,?) ON CONFLICT(job) DO UPDATE SET plan_hash=excluded.plan_hash,route_hash=excluded.route_hash').run(job,hash,this.approvalHash(job,route.route));
  }
  approved(job:string,hash:string):Route|null{
-  const row=this.get(job,'implementation');if(!row){if(this.get(job,'planning'))throw Error('Approved implementation routing is missing');return null;}
+  const row=this.get(job,'implementation');if(!row){
+   if(this.get(job,'planning'))throw Error('Approved implementation routing is missing');
+   // A revision changes the phase key. Unqualified rows written by an earlier
+   // build cannot be proven to cover the active revision, so never report "no
+   // route": execution would deliver without the approved routing policy.
+   if(this.legacyRoute(job,'implementation')||this.legacyRoute(job,'planning'))throw Error('Legacy routing cannot be bound to the current requirements revision; explicit reconciliation required');
+   return null;
+  }
   const a=this.s.db.query('SELECT * FROM route_approvals WHERE job=?').get(job) as any;
   if(!a||a.plan_hash!==hash||a.route_hash!==this.approvalHash(job,row.route))throw Error('Routing choice is not covered by the current human approval');
   return JSON.parse(row.route);
