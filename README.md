@@ -2059,12 +2059,15 @@ planned, not success-shaped placeholders; existing guarded engine commands remai
 available as documented elsewhere.
 # Read-only observation recovery
 
-Review-loop GitHub branch/ancestry/readiness reads and Orchestrator session
-evidence have durable observation recovery, separate from remediation and all
+Review-loop GitHub branch/ancestry/readiness reads, reserved conflict-recovery
+delivery facts and Orchestrator session evidence have durable observation
+recovery, separate from remediation and all
 mutation receipts. Evidence stores provider, safe operation, time, classification,
 exit/HTTP status and available retry/request identifiers. Raw stderr, credentials,
 URLs and response bodies are not retained; diagnostics are an allowlisted summary.
 Nested errors retain their cause in memory, not in persisted diagnostics.
+Transcript pagination reconciles page-local turns and retries a genuinely changed
+turn before failing closed.
 
 Timeout/network, 5xx and explicit primary/secondary throttling errors retry at
 1, 2, 4, 8 and 16 seconds (±25% jitter). From failure six onward the circuit uses

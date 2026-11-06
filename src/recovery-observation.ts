@@ -1,8 +1,9 @@
 import {randomUUID} from 'node:crypto';
 import {assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {Store} from './core';
-import {readEvidence,ReadValidationError,validReadTime,boundedRetryAt,MAX_PROVIDER_RETRY_MS,type ReadEvidence} from './provider-read';
+import {providerEvidence,readEvidence,ReadValidationError,validReadTime,boundedRetryAt,MAX_PROVIDER_RETRY_MS,type ReadEvidence} from './provider-read';
 export const transient=(e:ReadEvidence)=>['throttled','timeout','network','server'].includes(e.classification);
+const REPAIR='typeof(next_read) NOT IN (\'integer\',\'real\') OR next_read<0 OR next_read>8640000000000000 OR next_read!=CAST(next_read AS INTEGER)';
 export class RecoveryObservation{
  constructor(public s:Store,public now=Date.now,public random=Math.random){
  s.db.exec('CREATE TABLE IF NOT EXISTS recovery_observations(job TEXT PRIMARY KEY,failures INTEGER NOT NULL,next_read INTEGER NOT NULL,reason TEXT)');
@@ -10,8 +11,11 @@ export class RecoveryObservation{
  s.db.exec('CREATE TABLE IF NOT EXISTS mergeability_waits(job TEXT PRIMARY KEY,waits INTEGER NOT NULL,next_read INTEGER NOT NULL)');
  // Repair legacy invalid timestamps once, durably, without clearing failures or
  // mutation receipts. A bounded health-probe delay replaces an unusable hint.
- s.db.transaction(()=>{for(const table of ['recovery_observations','observation_capacity','mergeability_waits'])s.db.query(`UPDATE ${table} SET next_read=? WHERE typeof(next_read) NOT IN ('integer','real') OR next_read<0 OR next_read>8640000000000000 OR next_read!=CAST(next_read AS INTEGER)`).run(this.now()+30*60*1000);}).immediate();
- s.db.transaction(()=>{const limit=this.now()+MAX_PROVIDER_RETRY_MS;for(const table of ['recovery_observations','observation_capacity'])s.db.query(`UPDATE ${table} SET next_read=? WHERE next_read>?`).run(limit,limit);}).immediate();
+ // Both repairs are conditional so an unchanged database takes no write lock.
+ const repairTables=['recovery_observations','observation_capacity','mergeability_waits'];
+ if(repairTables.some(table=>s.db.query(`SELECT 1 FROM ${table} WHERE ${REPAIR} LIMIT 1`).get()))s.db.transaction(()=>{for(const table of repairTables)s.db.query(`UPDATE ${table} SET next_read=? WHERE ${REPAIR}`).run(this.now()+30*60*1000);}).immediate();
+ const limit=this.now()+MAX_PROVIDER_RETRY_MS,capTables=['recovery_observations','observation_capacity'];
+ if(capTables.some(table=>s.db.query(`SELECT 1 FROM ${table} WHERE next_read>? LIMIT 1`).get(limit)))s.db.transaction(()=>{for(const table of capTables)s.db.query(`UPDATE ${table} SET next_read=? WHERE next_read>?`).run(limit,limit);}).immediate();
  }
  status(job:string){const r=this.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(job) as any;if(!r)return null;let evidence;try{evidence=JSON.parse(r.reason);}catch{}const capacity=evidence?.provider?this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(evidence.provider) as any:null;return {...r,evidence:evidence?.classification?evidence:null,evidenceAgeMs:evidence?.timestamp?Math.max(0,this.now()-evidence.timestamp):null,sharedNextRead:capacity?.next_read??null};}
  wait(job:string){const merge=this.s.db.query('SELECT * FROM mergeability_waits WHERE job=?').get(job) as any;
@@ -37,12 +41,12 @@ export class RecoveryObservation{
  if(!ok)return null;
  return Object.assign(()=>{this.s.db.query('DELETE FROM observation_leases WHERE key=? AND token=?').run(key,token);},{assert:()=>{const row=this.s.db.query('SELECT token,until_ms FROM observation_leases WHERE key=?').get(key) as any;if(row?.token!==token||row.until_ms<=this.now())throw new ObservationLeaseLost();}});
  }
- async read<T>(job:string,provider:ReadEvidence['provider'],read:()=>Promise<T>){
+ async read<T>(job:string,provider:ReadEvidence['provider'],read:()=>Promise<T>,recordUnknown=true){
  assertObservationFence();
  const cap=this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(provider) as any;
  if(cap&&cap.next_read>this.now())throw new ObservationDeferred(cap.next_read);
- const release=this.claim(`provider:${provider}`);if(!release)throw new ObservationDeferred(this.now()+1000);
- try{const result=await read();assertObservationFence();return result;}catch(error){assertObservationFence();if(!(error instanceof ReadValidationError))this.failed(job,error,provider);throw error;}finally{release();}
+ const release=this.claim(`provider:${provider}`);if(!release)throw new ObservationDeferred(this.now()+1000,'Provider observation lease is busy; another read is in progress; no read failure or mutation');
+ try{const result=await read();assertObservationFence();return result;}catch(error){assertObservationFence();if(!(error instanceof ReadValidationError)&&(providerEvidence(error)||recordUnknown))this.failed(job,error,provider);throw error;}finally{release();}
  }
  clear(job:string){assertObservationFence();this.s.db.query('DELETE FROM recovery_observations WHERE job=?').run(job);}
  mergeabilityUnknown(job:string){assertObservationFence();this.s.db.query('INSERT INTO mergeability_waits VALUES (?,1,?) ON CONFLICT(job) DO UPDATE SET waits=waits+1,next_read=excluded.next_read').run(job,this.now()+60000);return this.wait(job)!;}
@@ -53,4 +57,4 @@ export class RecoveryObservation{
  }
  retry(job:string){this.clear(job);this.mergeabilityKnown(job);/* Shared provider cooldown is not an operator bypass. */}
 }
-export class ObservationDeferred extends Error{constructor(public nextRead:number){super(validReadTime(nextRead)?`Provider read deferred until ${new Date(nextRead).toISOString()}; no read failure or mutation`:'Invalid provider cooldown; inspect observation state before retrying');}}
+export class ObservationDeferred extends Error{constructor(public nextRead:number,reason?:string){super(reason??(validReadTime(nextRead)?`Provider read deferred until ${new Date(nextRead).toISOString()}; no read failure or mutation`:'Invalid provider cooldown; inspect observation state before retrying'));}}

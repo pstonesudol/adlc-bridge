@@ -226,18 +226,30 @@ test('closed PR readiness validation remains actionable without a read failure b
 });
 test('later read deferrals, including wrapped ancestry errors, remain waiting without failures',async()=>{
  for(const stage of ['snapshot','ensure','readiness','accepted']){
- const f=templateFixture();const original=RecoveryObservation.prototype.read;let calls=0;
- const at=stage==='snapshot'?3:stage==='readiness'?4:stage==='accepted'?4:3;
- const spy=spyOn(RecoveryObservation.prototype,'read').mockImplementation(async function(job,provider,read){if(++calls===at)throw new ObservationDeferred(Date.now()+1000);return original.call(this,job,provider,read);});
+ const f=templateFixture();const original=RecoveryObservation.prototype.read;
+ // Identify the intended call site from the read callback itself; a provider-only
+ // or call-count signal cannot distinguish these GitHub reads.
+ const target:{[stage:string]:[string,number]}={snapshot:['readBranchSnapshot',2],ensure:['readBranchSnapshot',2],readiness:['readiness',1],accepted:['contains',1]};
+ const [kind,wanted]=target[stage],seen:Record<string,number>={};
+ const spy=spyOn(RecoveryObservation.prototype,'read').mockImplementation(async function(job,provider,read:any){
+ const source=String(read),at=source.includes('readiness')?'readiness':source.includes('contains')?'contains':source.includes('sessionEvidence')?'sessionEvidence':'readBranchSnapshot';
+ seen[at]=(seen[at]??0)+1;
+ if(at===kind&&seen[at]===wanted)throw new ObservationDeferred(Date.now()+1000);
+ return original.call(this,job,provider,read);
+ });
  try{
  if(stage==='accepted'){
  const {BranchUpdates}=await import('../src/branch-updates');new BranchUpdates(f.s);
  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
  const snapshot=f.loop.io.readBranchSnapshot;f.loop.io.readBranchSnapshot=async(...args)=>({...await snapshot(...args),behind:1,mergeable:false});
+ f.loop.io.contains=async()=>{throw Error('Unexpected ancestry provider read');};
  }
  const config=stage==='snapshot'||stage==='accepted'?{conflictRecovery:{enabled:true}}:undefined;
  const result=await f.loop.tick(f.id,undefined,undefined,undefined,config);
  expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ expect(seen[kind]).toBe(wanted);
+ // A deferral must stop the tick before any later provider read (notably readiness).
+ if(stage!=='readiness')expect(seen.readiness??0).toBe(0);
  expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.sends()).toBe(0);
  }finally{spy.mockRestore();f.s.close();}
  }

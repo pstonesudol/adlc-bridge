@@ -79,6 +79,16 @@ test('collector exhausts sequence pages before proving receipt completeness',asy
  const spawn=((args:string[])=>{calls.push(args);const page=calls.length===1?Array.from({length:100},(_,i)=>({sequence:i+2})): [{sequence:1,clientMessageId:'exact'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
  const e=await sessionEvidence('worker',spawn);expect(e.transcript.entries).toHaveLength(101);expect(calls[1]).toContain('--before');expect(calls[1].at(-1)).toBe('2');expect(e.receiptObservation.complete).toBe(true);
 });
+test('collector reconciles page-local turns before proving completeness',async()=>{
+ let calls=0;
+ const spawn=((_args:string[])=>{const first=calls++%2===0;const page=first?Array.from({length:100},(_,i)=>({sequence:i+2})):[{sequence:1}];const turns=first?[{id:'a',state:'completed'}]:[{id:'b',state:'running'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ const e=await sessionEvidence('worker',spawn);expect(e.transcript.turns).toEqual([{id:'a',state:'completed'},{id:'b',state:'running'}]);
+});
+test('collector retries a genuinely changed turn and then fails closed',async()=>{
+ let calls=0;
+ const spawn=((_args:string[])=>{const first=calls++%2===0;const page=first?Array.from({length:100},(_,i)=>({sequence:i+2})):[{sequence:1}];const turns=first?[{id:'a',state:'running'}]:[{id:'a',state:'completed'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ await expect(sessionEvidence('worker',spawn)).rejects.toThrow('orchestrator session-evidence: malformed');expect(calls).toBe(6);
+});
 test('collector rejects repeated cursor evidence',async()=>{
  const spawn=(()=>({stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:Array.from({length:100},(_,i)=>({sequence:i+1})),turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)})) as typeof Bun.spawn;
  await expect(sessionEvidence('worker',spawn)).rejects.toThrow('orchestrator session-evidence: malformed');

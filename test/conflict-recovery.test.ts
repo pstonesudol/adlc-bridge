@@ -58,6 +58,22 @@ test('reserved conflict recovery retries six read failures before any mutation',
  expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);expect(new RecoveryObservation(f.s).status(f.job)?.failures).toBe(6);
  }finally{setSystemTime();f.close();}
 },60000);
+test('reserved conflict recovery retries transient facts read failures after GitHub recovers',async()=>{
+ const f=await fixture();let calls=0,remaining=2;
+ // The reservation preview and inspection read facts before the row exists;
+ // only reads under the reserved stage may be tracked and retried.
+ const facts=async()=>{if(++calls>2&&remaining-->0)throw readFailure('github','recovery-facts','HTTP 503',1);return f.io.facts(f.job,f.config);};
+ try{
+ for(let n=1;n<=2;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.sends()).toBe(0);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ expect(f.commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref'].includes(a[1]))).toHaveLength(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);expect(status.evidence).toMatchObject({provider:'github',classification:'server'});setSystemTime(new Date(status.next_read+1));
+ }
+ expect((await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
 test('reserved manual preview is read-only and guards retain observation history',async()=>{
  const f=await fixture();let reads=0;let reader:Store|undefined;
  try{

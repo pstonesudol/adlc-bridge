@@ -74,3 +74,14 @@ test('transport recognizes killed subprocess, malformed JSON and unknown exit',a
  catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe(classification);}
  }
 });
+test('untyped transport failures stay unknown despite transient-looking text',async()=>{
+ for(const mode of ['spawn','stream'] as const){
+ const cause=new Error('timeout ECONNRESET HTTP 503 rate limit exceeded');
+ const spawn=((_args:any,_options:any)=>{
+ if(mode==='spawn')throw cause;
+ return {stdout:new ReadableStream({start(controller){controller.error(cause);}}),stderr:new Response('').body,exited:Promise.resolve(0),signalCode:undefined};
+ }) as any;
+ try{await githubRead(['api','fixture'],'branch-read',spawn);throw Error('Expected failure');}
+ catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe('unknown');expect((error as Error).cause).toBe(cause);}
+ }
+});

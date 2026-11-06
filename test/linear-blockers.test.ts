@@ -24,6 +24,7 @@ test('permanent read failures publish one secret-safe operator notice without la
  const blockers=f.blockers();await blockers.sync(f.config);await blockers.sync(f.config);
  expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.comments[0].body).toContain('retry-observation');expect(f.comments[0].body).not.toContain('PRIVATE');
  expect(f.comments[0].body).toContain('## ADLC: provider observation recovery required');expect(f.comments[0].body).not.toContain('implementation stopped');expect(f.comments[0].body).toContain('This synchronization records an outcome only.');expect(f.comments[0].body).toContain('Human PR merges remain required.');
+ const before=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(before);
  }finally{f.s.close();}
 });
 

@@ -37,9 +37,14 @@ export function readFailure(provider:ReadEvidence['provider'],operation:string,r
  const retryAt=boundedRetryAt(hint,now);
  return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(retryAt!==undefined?{retryAt}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
 }
-export function readEvidence(error:unknown,provider:ReadEvidence['provider']='github',operation='observation'):ReadEvidence{
+// Only typed provider evidence may drive automatic recovery; an untyped error
+// keeps its cause in memory but never classifies itself from its message.
+export function providerEvidence(error:unknown):ReadEvidence|undefined{
  let e:any=error;for(let n=0;e&&n<8;n++,e=e.cause)if(e instanceof ProviderReadError)return e.evidence;
- return readFailure(provider,operation,'').evidence;
+ return undefined;
+}
+export function readEvidence(error:unknown,provider:ReadEvidence['provider']='github',operation='observation'):ReadEvidence{
+ return providerEvidence(error)??readFailure(provider,operation,'').evidence;
 }
 export function malformed(provider:ReadEvidence['provider'],operation:string,cause?:unknown){return new ProviderReadError({provider,operation,timestamp:Date.now(),classification:'malformed',detail:'Invalid or incomplete evidence; payload omitted'},{cause});}
 export async function githubRead(args:string[],operation='branch-read',spawn=Bun.spawn){
@@ -51,5 +56,5 @@ export async function githubRead(args:string[],operation='branch-read',spawn=Bun
  try{parsed=githubOutput(out);}catch(cause){if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,cause);throw cause;}
  if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,undefined,Date.now(),parsed.protocol+parsed.json);
  try{return JSON.parse(parsed.json);}catch(cause){throw malformed('github',operation,cause);}
- }catch(cause){if(cause instanceof ProviderReadError)throw cause;throw readFailure('github',operation,cause instanceof Error?cause.message:'',undefined,cause);}
+ }catch(cause){if(cause instanceof ProviderReadError)throw cause;throw readFailure('github',operation,'',undefined,cause);}
 }

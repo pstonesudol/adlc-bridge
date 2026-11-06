@@ -73,7 +73,7 @@ export class ConflictRecovery{
   if(d?.state!=='pr_handoff')throw Error('Completed implementation PR handoff required');
  }
  async inspect(job:string,c:any,repo:string,pr:number,observations?:RecoveryObservation){
-  const auth=this.auth(job,c),facts=await this.io.facts(job,c);
+  const auth=this.auth(job,c),facts=await (observations?observations.read(job,'github',()=>this.io.facts(job,c),false):this.io.facts(job,c));
   const b=await (observations?observations.read(job,'github',()=>this.io.snapshot(repo,pr)):this.io.snapshot(repo,pr));
   const e=await (observations?observations.read(job,'orchestrator',()=>this.io.evidence(auth.session)):this.io.evidence(auth.session));
   assertDeliveryTarget(this.s,job,e.session,repo,pr,b);

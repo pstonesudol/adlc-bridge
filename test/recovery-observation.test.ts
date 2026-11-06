@@ -80,6 +80,16 @@ test('six failures recover after restart without manual edits or remediation bud
  expect(s.db.query('SELECT state,reason FROM branch_updates WHERE job=?').get(job)).toEqual({state:'delivery_uncertain',reason:'Lost reply'});
  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
 });
+test('lease contention defers with a stable reason that keeps the retry time',async()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','s'),o=new RecoveryObservation(s,()=>1000);
+ try{
+ const release=o.claim('provider:github',1000);expect(release).not.toBeNull();
+ const reasons:string[]=[],times:number[]=[];
+ for(let n=0;n<2;n++){try{await o.read(job,'github',async()=>true);throw Error('Expected deferral');}catch(error){expect(error).toBeInstanceOf(ObservationDeferred);reasons.push((error as Error).message);times.push((error as ObservationDeferred).nextRead);}}
+ expect(new Set(reasons).size).toBe(1);expect(reasons[0]).not.toContain('deferred until');expect(times).toEqual([2000,2000]);
+ release!();
+ }finally{s.close();}
+});
 test('leases persist across restart and expire without multiplying active probes',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-observation-lease-')),path=join(dir,'state.sqlite');let s=new Store(path),now=100;
  try{
