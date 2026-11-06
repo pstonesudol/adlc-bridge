@@ -220,6 +220,40 @@ test.skipIf(process.platform!=='darwin')('service-config apply covers the loaded
  }finally{f.close();}
 });
 
+test.skipIf(process.platform!=='darwin')('config enabled guard accepts exact known formats and rejects unverified evidence before mutation',async()=>{
+ const {serviceControl}=await import('../src/service-control');const f=fixture();try{
+  const path=realpathSync(f.config('one','00000000-0000-0000-0000-000000000004')),statePath=join(f.dir,'registry.sqlite'),cli=resolve(import.meta.dir,'../src/cli.ts');
+  const s=new Store(statePath);let entry;try{const registry=new ProjectServices(s);entry=registry.register(path);registry.registerController(path,cli);}finally{s.close();}
+  mkdirSync(join(f.dir,'Library/LaunchAgents'),{recursive:true});
+  const plist=join(f.dir,'Library/LaunchAgents',entry.label+'.plist');writeFileSync(plist,serviceDefinition(path,process.execPath,cli,f.dir,entry.label));
+  const config=JSON.parse(readFileSync(path,'utf8'));config.pollingIntervalSeconds=30;writeFileSync(path,JSON.stringify(config));
+  const turns=turnBarrier(join(f.dir,'fence')),pollState=join(f.dir,'receipts'),calls:string[][]=[];
+  let response={code:0,stdout:'',stderr:''},finishStartup:(()=>void)|undefined;
+  const run=async(args:string[])=>{
+   calls.push(args);
+   if(args[0]==='print')return {code:0,stdout:`state = running\npid = ${process.pid}`,stderr:''};
+   if(args[0]==='print-disabled')return response;
+   if(args[0]==='kickstart'){finishStartup=await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());return {code:0,stdout:'',stderr:''};}
+   if(['bootout','bootstrap'].includes(args[0]))return {code:0,stdout:'',stderr:''};
+   throw Error('Unexpected service command');
+  };
+  const options={home:f.dir,statePath,run,turns,pollState,requireEnabled:true,startupWait:{attempts:1,pause:async()=>{}}};
+  for(const value of ['false','enabled']){
+   const idle=await acknowledgePoll(path,cli,pollState,undefined,async operation=>operation());idle();calls.length=0;
+   response={code:0,stdout:`disabled services = {\n  "unrelated" => true\n  "${entry.label}" => ${value}\n}`,stderr:''};
+   try{expect(await serviceControl('service-config','one',true,options)).toMatchObject({reloaded:true,pollingIntervalSeconds:30});
+    expect(calls.map(c=>c[0])).toEqual(['print','print-disabled','bootout','bootstrap','kickstart','print']);
+   }finally{finishStartup?.();}
+  }
+  const before=readFileSync(plist);
+  for(const [code,output] of [[0,''],[1,`"${entry.label}" => false`],[0,`"${entry.label}" => disabled`],[0,`"${entry.label}" => true`],[0,`"${entry.label}" => false-ish`],[0,`"${entry.label}-other" => false`],[0,`"${entry.label}" => false\n"${entry.label}" => enabled`]] as [number,string][]){
+   calls.length=0;response={code,stdout:output,stderr:''};
+   await expect(serviceControl('service-config','one',true,options)).rejects.toThrow('enabled state is unverified');
+   expect(calls.map(c=>c[0])).toEqual(['print','print-disabled']);expect(readFileSync(plist)).toEqual(before);
+  }
+ }finally{f.close();}
+});
+
 test('read-only legacy discovery retains verified controller identity only in that registry instance',()=>{
  const f=fixture();try{
   const config=realpathSync(f.config('discovered','00000000-0000-0000-0000-000000000004'));
