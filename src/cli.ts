@@ -40,7 +40,8 @@ import {readinessFor,recordResolution,assertApprovalReadiness} from './readiness
 import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
-import {withTurnSubmission,assertProjectIntakeEnabled} from './turn-submission';
+import {withTurnSubmission} from './turn-submission';
+import {assertConfiguredProjectIntakeEnabled} from './project-services';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
@@ -93,7 +94,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
  const initialIdentity=loadConfig?identity(startup):undefined;
  return async()=>runPollTick(async()=>{
   const c=loadConfig?loadConfig():startup;
-  assertProjectIntakeEnabled(c.automation?.orchestratorProject);
+  assertConfiguredProjectIntakeEnabled(c,s);
   if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
@@ -400,7 +401,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job');
       if(s.get(job).project!==c!.linear.projectId)throw Error('Job project does not match configured project');
       const result=await runPollTick(async()=>{
-       assertProjectIntakeEnabled(c!.automation?.orchestratorProject);
+       assertConfiguredProjectIntakeEnabled(c!,s);
        await poll(c!,s,linearToken());
        const stage=await workflow.resume(job,c!);
        let blockerLabel='retained';
@@ -478,4 +479,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{const message=modern&&!(e instanceof OperatorError)?'Operation failed; inspect project configuration and supported service/auth diagnostics. Sensitive details withheld.':e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error((grouped||lifecycleRequested)&&json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[],...(e instanceof LifecycleFailure?{result:e.result}:{})}}):`${message}${e instanceof LifecycleFailure?'\n'+JSON.stringify(e.result,null,2):''}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});
+if(import.meta.main)main().catch(e=>{const message=modern&&!(e instanceof OperatorError)?'Operation failed; inspect project configuration and supported service/auth diagnostics. Sensitive details withheld.':e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(grouped&&json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[],...(e instanceof LifecycleFailure?{result:e.result}:{})}}):`${message}${grouped&&e instanceof LifecycleFailure?'\n'+JSON.stringify(e.result,null,2):''}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});

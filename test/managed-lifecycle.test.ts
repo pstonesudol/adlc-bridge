@@ -2,9 +2,10 @@ import {test,expect} from 'bun:test';
 import {controlManagedLifecycle,LifecycleFailure,workerOwnership,featureWorkerProject,liveLifecycleOps,parseProcesses,descendants,type LifecycleOps,type LifecycleOptions,type Worker,type Inventory} from '../src/managed-lifecycle';
 import {parseLifecycle,lifecycleCLI} from '../src/lifecycle-cli';
 import {Store} from '../src/core';
+import {ProjectServices} from '../src/project-services';
 import {turnBarrier,projectIntakePaused,setProjectIntakePaused,assertProjectIntakeEnabled} from '../src/turn-submission';
 import {withStackLock} from '../src/stack-control';
-import {mkdtempSync,rmSync,existsSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,existsSync,writeFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 const worker=(extra:Partial<Worker>={}):Worker=>({session:'one-1',project:'one',branch:'adlc/work',owned:true,exited:false,busy:false,reason:'owned',...extra});
 function fixture(){
  const calls:string[]=[];let clock=0,paused=false,backend=true;let workers=[worker()];
@@ -87,13 +88,31 @@ test('parser validates all lifecycle options before any I/O',async()=>{
  expect(()=>parseLifecycle('status',['--workers'])).toThrow();expect(()=>parseLifecycle('start',['--apply'])).toThrow();expect(()=>parseLifecycle('restart',['--pause'])).toThrow();
  let calls=0;await expect(lifecycleCLI('stop',['--force'],'unused',async()=>{calls++;return {};})).rejects.toThrow();expect(calls).toBe(0);
 });
-test('grouped and flat lifecycle CLI emit JSON usage errors before creating state',()=>{
+test('grouped lifecycle JSON and flat legacy text usage errors do not create state',()=>{
  const root=mkdtempSync(join(tmpdir(),'managed-cli-'));try{
   const cli=join(import.meta.dir,'../src/cli.ts'),db=join(root,'missing.sqlite');
   for(const args of [['services','stop','--workers','--drain'],['stop','--all','--force'],['restart','--timeout','0'],['status','--all','--apply'],['start','--all','--project','one']]){
-   const r=Bun.spawnSync([process.execPath,cli,...args,'--json'],{env:{HOME:root,PATH:process.env.PATH,ADLC_DB:db}});expect(r.exitCode).toBe(2);expect(JSON.parse(r.stderr.toString())).toMatchObject({schemaVersion:1,error:{code:2}});expect(existsSync(db)).toBe(false);
+   const r=Bun.spawnSync([process.execPath,cli,...args,'--json'],{env:{HOME:root,PATH:process.env.PATH,ADLC_DB:db}});expect(r.exitCode).toBe(2);
+   if(args[0]==='services')expect(JSON.parse(r.stderr.toString())).toMatchObject({schemaVersion:1,error:{code:2}});
+   else{expect(r.stderr.toString()).not.toContain('schemaVersion');expect(()=>JSON.parse(r.stderr.toString())).toThrow();}
+   expect(existsSync(db)).toBe(false);
   }
   const r=Bun.spawnSync([process.execPath,cli,'services','restart','--help'],{env:{HOME:root,PATH:process.env.PATH,ADLC_DB:db}});expect(r.exitCode).toBe(0);expect(r.stdout.toString()).toContain('--apply --confirm HASH');expect(r.stdout.toString()).toContain('--drain');expect(existsSync(join(root,'Library/Application Support/ADLC Bridge'))).toBe(false);expect(existsSync(db)).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('flat lifecycle success stays unwrapped and operational errors omit grouped result data',()=>{
+ const root=mkdtempSync(join(tmpdir(),'lifecycle-contract-'));try{
+  const config=join(root,'project.json'),db=join(root,'state.sqlite'),uuid='00000000-0000-0000-0000-000000000001';
+  writeFileSync(config,JSON.stringify({version:1,name:'fixture',repo:root,requiredChecks:['CI'],automation:{orchestratorProject:'one'},linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid}}));
+  const store=new Store(db);new ProjectServices(store).register(config);store.close();
+  const run=(...args:string[])=>Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),...args],{env:{HOME:root,PATH:process.env.PATH,ADLC_DB:db,ADLC_AO_PATH:join(root,'nonexistent-daemon')},timeout:10000});
+  const flat=run('stop','one','--preview','--json'),grouped=run('services','stop','one','--preview','--json');expect(flat.exitCode).toBe(0);expect(grouped.exitCode).toBe(0);
+  expect(JSON.parse(flat.stdout.toString())).toMatchObject({preview:true,scope:'project'});expect(JSON.parse(flat.stdout.toString()).schemaVersion).toBeUndefined();expect(JSON.parse(grouped.stdout.toString())).toMatchObject({schemaVersion:1,command:'services',data:{preview:true,scope:'project'}});
+  // The nonexistent fixture AO path fails before any launchctl operation.
+  for(const json of [false,true]){
+   const failure=run('start','one',...(json?['--json']:[]));expect(failure.exitCode).toBe(1);expect(failure.stderr.toString()).not.toContain('schemaVersion');expect(failure.stderr.toString()).not.toContain('"scope"');expect(failure.stderr.toString()).not.toContain('"services"');
+  }
+  const failure=run('services','start','one','--json');expect(failure.exitCode).toBe(1);expect(JSON.parse(failure.stderr.toString())).toMatchObject({schemaVersion:1,error:{code:1,result:{action:'start',complete:false}}});
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('repeated stop and start do not re-exit an already exited worker or replace it',async()=>{

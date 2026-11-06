@@ -3,10 +3,19 @@ import {Store,digest} from './core';
 import {existsSync,readFileSync,realpathSync} from 'node:fs';
 import {join,isAbsolute,basename} from 'node:path';
 import {homedir} from 'node:os';
-import {validate} from './linear';
+import {validate,type ProjectConfig} from './linear';
+import {assertProjectIntakeEnabled} from './turn-submission';
 export const legacyLabel='local.adlc.linear-intake';
 export const registryPath=()=>join(homedir(),'Library/Application Support/ADLC Bridge/state.sqlite');
 export type ProjectService={project:string;name:string;repo:string;linear_project:string;config:string;label:string};
+export function assertConfiguredProjectIntakeEnabled(c:Pick<ProjectConfig,'linear'|'automation'>,s:Store,state?:string){
+ const entries=new ProjectServices(s,false).list().filter(p=>p.linear_project===c.linear.projectId);
+ const project=c.automation?.orchestratorProject;
+ // A copied/edited config must not evade a registered project's pause by
+ // omitting its AO identity or substituting an unrelated, unpaused identity.
+ if(entries.length&&(entries.length!==1||project!==entries[0].project))throw Error('Registered project identity missing or changed; reconcile the configuration before intake');
+ assertProjectIntakeEnabled(project,state);
+}
 export function projectServiceLabel(project:string){
  if(typeof project!=='string'||!/^[\w-]{1,80}$/.test(project))throw Error('Valid registered Orchestrator project ID required');
  return `local.adlc.project.${project.replaceAll('_','-').toLowerCase()}-${digest(project).slice(0,8)}`;
