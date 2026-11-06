@@ -74,6 +74,19 @@ test('reserved conflict recovery retries transient facts read failures after Git
  expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
  }finally{setSystemTime();f.close();}
 },60000);
+test('reserved conflict recovery retries transient orchestrator facts failures after AO recovers',async()=>{
+ const f=await fixture();let calls=0,remaining=2;
+ const facts=async()=>{if(++calls>2&&remaining-->0)throw readFailure('orchestrator','recovery-facts','AO daemon is not running — start it with `ao start`',1);return f.io.facts(f.job,f.config);};
+ try{
+ for(let n=1;n<=2;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.sends()).toBe(0);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);expect(status.evidence).toMatchObject({provider:'orchestrator',classification:'network'});setSystemTime(new Date(status.next_read+1));
+ }
+ expect((await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
 test('reserved manual preview is read-only and guards retain observation history',async()=>{
  const f=await fixture();let reads=0;let reader:Store|undefined;
  try{

@@ -35,9 +35,9 @@ test('review reads capture headers for GraphQL and slurped pagination',async()=>
  try{await githubRead(args,'review-read',spawn('HTTP/2.0 429 Too Many Requests\r\nRetry-After: 90\r\n\r\n{"message":"rate limit exceeded"}','',1));throw Error('Expected failure');}catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.retryAt).toBeGreaterThan(Date.now()+80000);}
  }
 });
-test('recognized AO stopped-daemon diagnostics are transient only for session evidence',()=>{
+test('recognized AO stopped-daemon diagnostics are transient only for orchestrator reads',()=>{
  for(const diagnostic of ['AO daemon is not running — start it with `ao start`','AO daemon is not running (stale run-file at /fixture/running.json) — start it with `ao start`']){
- expect(readFailure('orchestrator','session-evidence',diagnostic,1).evidence.classification).toBe('network');
+ for(const operation of ['session-evidence','recovery-facts'])expect(readFailure('orchestrator',operation,diagnostic,1).evidence.classification).toBe('network');
  expect(readFailure('github','review-read',diagnostic,1).evidence.classification).toBe('unknown');
  }
  expect(readFailure('orchestrator','session-evidence','unrecognized failure',1).evidence.classification).toBe('unknown');
