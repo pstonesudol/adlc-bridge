@@ -21,7 +21,7 @@ test('failed checks cannot be stamped with a later body hash without a matching 
   const findings=await templateCIFindings('owner/repo',head,[check],['PR body structure'],'body-B',mustNotRead,mustNotRead,rows);
   expect(findings).toEqual([]);expect(decision({head,descriptionHash:'body-B',metadataCheckEvidence:rows,clear:false,reasons:['CI failed'],findings,failedChecks:[{id:check.id,sha:head,name:check.name}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
  }
- // Production collector has no trustworthy attestation source.
+ // Check metadata alone, without verified workflow evidence, remains unbound.
  expect(await templateCIFindings('owner/repo',head,[check],['PR body structure'],'body-B',mustNotRead,mustNotRead,metadataCheckEvidence([check],head,['PR body structure']))).toEqual([]);
 });
 test('logs are bounded and escaped text is removed; rerun signatures track the actual check version',()=>{

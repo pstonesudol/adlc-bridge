@@ -1051,21 +1051,43 @@ failures may be fixed by editing only a PR description, for example:
 The wizard can collect these names. They are added to the readiness gate as
 required checks, even for existing registered PRs.
 
-**Current production limitation:** GitHub check/job responses do not attest which
-PR description they evaluated, so production evidence has `descriptionHash: null`.
-Configured metadata checks therefore cannot authorize automatic findings or
-PR-description remediation, even when the check succeeds. Otherwise-clear checks
-wait up to five minutes for body-bound evidence and then block for inspection;
-unattested failures block for inspection without sending remediation. This remains
-fail-closed until a trustworthy body-bound attestation source is implemented.
+GitHub check/job responses alone do not attest which description they evaluated.
+The bridge accepts an `ADLC_METADATA_V1` JSON record only from logs fetched from
+a verified, completed `pull_request_target` job. It cross-checks repository, PR,
+head SHA, workflow path, run ID/attempt, check suite, job/check-run URL, check name
+and result against GitHub API records. The workflow source at the run's PR base
+SHA must exactly match the bundled producer template; customized or unverifiable
+workflows cannot authorize evidence. The record's SHA-256 description hash must
+match the exact current UTF-8 body, without whitespace or newline normalization.
+Missing, ambiguous, malformed, mismatched or unavailable evidence fails closed.
+Otherwise-clear checks wait up to five minutes for body-bound evidence and then
+block for inspection; unattested failures cannot send remediation.
+
+`patches/pr-body-attestation.yml` is an **operator-reviewed rollout template**, not
+an active bridge workflow. In a repository already using `scripts/pr-body.mjs`,
+replace its existing PR-body workflow with this template through normal review,
+on the default branch. Retain the existing validator and validation semantics.
+The template executes only the base snapshot (`github.sha`), uses read-only
+permissions, reads event metadata as JSON, emits the exact event-body hash after
+validation, and preserves validation failures. Never check out PR code, interpolate
+PR text into executable source, or add PR-controlled commands to this trusted job.
+Base-branch workflow maintainers are part of the evidence trust boundary. The
+consumer trusts GitHub's `pull_request_target` provenance, not arbitrary log URLs,
+check output or PR-provided attestations. Other validators require a separately
+reviewed producer adaptation retaining these invariants.
+
+Description-only edits trigger the template via `edited`. Authenticated results
+for different body hashes are excluded from current readiness evaluation; unknown
+results and same-body duplicate checks remain ambiguous and block. Legacy checks
+without attestations may therefore still require operator inspection during rollout.
+The bridge does not install workflows, modify rulesets or activate runtime snapshots.
 An empty `prMetadataChecks` policy skips this additional body-evidence gate; it
 does not bypass other required checks or CodeRabbit approval. Clearing the policy
 does not clear an outstanding remediation send: its delivery must be reconciled,
 and any observed description change still requires a fresh CodeRabbit evaluation.
 
-The remediation flow below requires that future attestation support. In addition
-to body evidence, the bridge verifies the failed job’s repository, check-run ID,
-and PR head before reading its failure logs. Only a body-bound failure can send
+In addition to body evidence, the bridge verifies the failed job’s repository,
+check-run ID and PR head before reading its failure logs. Only a body-bound failure can send
 the relevant errors to the existing worker under its current approval and
 `open-pr` grant. The worker must use the current repository template, preserve
 truthful verification evidence, and make description changes only. It may not
@@ -1088,8 +1110,9 @@ Log retrieval checks the installed GitHub CLI version and passes `gh api
 that flag. Escape sequences are stripped before selected failure lines reach
 the worker.
 
-When GitHub returns old and rerun check results for one commit, the bridge passes
-the raw check results through unchanged, without extra provenance REST reads.
+When GitHub returns old and rerun check results for one commit, the bridge keeps
+raw results unchanged except for the authenticated older-description exclusion
+described above. Configured metadata checks require additional provenance reads.
 The native patch verifies workflow/job provenance but cannot supersede production
 attempts: GitHub REST job IDs are attempt-specific
 and do not establish a stable logical-job identity across attempts. Distinct job
