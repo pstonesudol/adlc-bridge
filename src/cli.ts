@@ -41,7 +41,7 @@ import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
 import {withTurnSubmission} from './turn-submission';
-import {assertConfiguredProjectIntakeEnabled} from './project-services';
+import {assertConfiguredProjectIntakeEnabled,assertProjectReferenceIntakeEnabled} from './project-services';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
@@ -301,12 +301,15 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(command==='feature-start'){
         const config=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(config);
         const ti=a.indexOf('--title'),title=ti>=0?req(a[ti+1],'Title'):'Feature plan';
-        const created=await features.create(config,readFileSync(req(a[1],'Requirements file'),'utf8'),title,a.includes('--no-source'));out(created);return out(await features.tick(created.id,config.featurePlanning?.maxAgents));
+        return await withTurnSubmission(async()=>{
+         assertConfiguredProjectIntakeEnabled(config,s);assertProjectReferenceIntakeEnabled(config.linear.projectId,s);
+         const created=await features.create(config,readFileSync(req(a[1],'Requirements file'),'utf8'),title,a.includes('--no-source'));out(created);return out(await features.tick(created.id,config.featurePlanning?.maxAgents));
+        });
       }
       if(command==='feature-list')return out(features.list());
       const id=req(a[0],'Feature ID');
       if(command==='feature-show')return out(features.show(id));
-      if(command==='feature-step')return out(await features.tick(id));
+      if(command==='feature-step')return out(await withTurnSubmission(async()=>{assertProjectReferenceIntakeEnabled(features.get(id).project,s);return features.tick(id);}));
       if(command==='feature-edit')return out(features.setDraft(id,JSON.parse(readFileSync(req(a[1],'Draft file'),'utf8'))));
       if(command==='feature-approve')return out(features.approve(id,req(a[1],'Hash'),req(a[2],'Human'),a.includes('--acknowledge-questions')));
       if(command==='feature-publish')return out(await new FeaturePublish(s,features).publish(id));
@@ -331,7 +334,10 @@ Registered approved review targets can request bounded in-scope fixes from their
      const workflow=new Workflow(store,liveTransport,undefined,!applying),dependencies=new DependencyRecovery(store,workflow);
      if(command==='dependency-status')return out(dependencies.status());
      const config=projectConfiguration(req(a[1],'Config'));validate(config);
-     return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
+     return out(applying?await withTurnSubmission(async()=>{
+      assertProjectReferenceIntakeEnabled(store.get(a[0]).project,store);assertConfiguredProjectIntakeEnabled(config,store);
+      return dependencies.tick(a[0],config,a[2]);
+     }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
    if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
@@ -425,6 +431,7 @@ Registered approved review targets can request bounded in-scope fixes from their
        const config=projectConfiguration(req(a[1],'Config'));validate(config);
        const job=req(a[0],'Job'),target=reviewLoop.get(job);
        if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+       assertProjectReferenceIntakeEnabled(s.get(job).project,s);assertConfiguredProjectIntakeEnabled(config,s);
        new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
        reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
        reviewLoop.setVerification(job,config.verification,config.verificationContext);
@@ -450,7 +457,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const project=req(a[0],'Project'),issue=req(a[1],'Issue'),specification=readFileSync(req(a[2],'Specification file'),'utf8');
       // Intake shares the submission fence: a reconcile reservation must make
       // ingestion fail closed rather than add work mid-reservation.
-      return out({id:await withTurnSubmission(async()=>s.enqueue(project,issue,specification))});
+      return out({id:await withTurnSubmission(async()=>{assertProjectReferenceIntakeEnabled(project,s);return s.enqueue(project,issue,specification);})});
     }
     if(command==='plan'){
       const job=req(a[0],'Job'),revision=latestRevision(s,job);

@@ -32,7 +32,7 @@ export function lifecycleConfirmation(action:LifecycleAction,o:LifecycleOptions,
   // Activity may finish naturally after preview. Identity/ownership must not change.
   workers:inventory.workers.map(w=>[w.session,w.project,w.branch,w.worktree,w.owned,includeTurns?[...(w.turns??[])].sort():null]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))}));
 }
-export async function controlManagedLifecycle(action:LifecycleAction,o:LifecycleOptions,ops:LifecycleOps){
+export async function controlManagedLifecycle(action:LifecycleAction,o:LifecycleOptions,ops:LifecycleOps,deadline=ops.now()+o.timeout*1000){
  const entries=await ops.projects(),ids=o.all?entries.map(x=>x.project):o.project?[o.project]:entries.length===1?[entries[0].project]:[];
  if(!ids.length&&!o.all)throw new OperatorError('Specify a registered project or --all; no project was selected',entries.length?4:3);
  if(ids.some(id=>!entries.some(e=>e.project===id)))throw new OperatorError('Unknown project; use adlc projects',3);
@@ -53,12 +53,12 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   result.preview=true;result.confirm=lifecycleConfirmation(action,o,ids,i);result.note=disruptive?'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.':'Preview only. Re-run without --preview to start or pause coordination; no worker interruption is performed.';return result;
  }
  return ops.turns.run(async()=>{
-  const deadline=ops.now()+o.timeout*1000;
   const time=()=>{if(ops.now()>=deadline)throw Error('Lifecycle timeout; remaining resources are reported. No force escalation was attempted');};
   let confirmed:string|undefined;const allowedTurns=new Map<string,Set<string>>();
-  const read=async()=>{time();const i=await observe();if(!i.complete)throw Error('Worker/process inventory incomplete; backend preserved');if(confirmed&&(lifecycleConfirmation(action,o,ids,i,false)!==confirmed||i.workers.some(w=>(w.turns??[]).some(t=>!allowedTurns.get(w.session)?.has(t)))))throw Error('Worker inventory, ownership or turns changed; preview again; backend preserved');return i;};
+  const read=async()=>{time();const i=await observe();time();if(!i.complete)throw Error('Worker/process inventory incomplete; backend preserved');if(confirmed&&(lifecycleConfirmation(action,o,ids,i,false)!==confirmed||i.workers.some(w=>(w.turns??[]).some(t=>!allowedTurns.get(w.session)?.has(t)))))throw Error('Worker inventory, ownership or turns changed; preview again; backend preserved');return i;};
   const wait=async(test:()=>Promise<boolean>)=>{for(;;){time();if(await test())return;await ops.sleep(Math.min(200,Math.max(1,deadline-ops.now())));}};
   try{
+   time();
    if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error('Confirmation missing or stale; preview the exact action again');confirmed=lifecycleConfirmation(action,o,ids,i,false);for(const w of i.workers)allowedTurns.set(w.session,new Set(w.turns??[]));}
    const start=async()=>{
     time();
@@ -74,10 +74,10 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
      result.backend=b;if(!b.ready)throw Error('Backend readiness/compatibility unverified; project intake was not started');
     }
     for(const id of ids){time();result.services.push(await ops.project('start',id,persistent));}
-    if(o.all||releaseGlobal)ops.turns.resume();
+    time();if(o.all||releaseGlobal)ops.turns.resume();
    };
    if(action==='start'){await start();result.globalIntakePaused=ops.turns.isPaused();result.complete=true;return result;}
-   if(o.all)ops.turns.pause();
+   time();if(o.all)ops.turns.pause();
    for(const id of ids){time();result.services.push(await ops.project('stop',id,persistent));}
    const workers=action==='restart'||o.mode==='workers'||o.mode==='drain'||o.all&&o.mode!=='pause';
    if(workers){
@@ -226,7 +226,7 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
 export async function managedLifecycle(action:LifecycleAction,o:LifecycleOptions,path=registryPath(),state=appState()){
  if(process.platform!=='darwin')throw Error('Managed lifecycle controls require macOS');
  const deadline=Date.now()+o.timeout*1000;
- const run=()=>controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline));
+ const run=()=>controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline),deadline);
  if(action==='status'||o.preview||!o.apply&&(action==='restart'||action==='stop'&&o.mode!=='pause'&&(o.all||o.mode)))return run();
  // A busy tick is not interrupted. Drain may wait for its receipt/fence to
  // settle, but never removes stale locks or assumes delivery was rolled back.

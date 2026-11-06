@@ -265,6 +265,10 @@ the requested managed stack. Project stop defaults to unloading this login only;
 launchd disable, so installed RunAtLoad/KeepAlive definitions may load next login.
 Durable intake pause markers still block bridge polls until explicit start; login
 or an app window is not authorization to dispatch. No plist is moved or deleted.
+The same project pause blocks explicit `ingest`, `dependency-resume`,
+`feature-start`/`feature-step`, `tick-review`, and new `spec-reconcile` replanning
+turns under the submission fence. Read-only inspection and receipt-only recovery
+remain available; a manual submission command does not implicitly restart intake.
 Starting one project checks backend readiness first (starting the registered
 managed dependency only when needed). After an all-stack stop it retains durable
 pause markers for every other project before releasing the global fence; it does

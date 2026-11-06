@@ -48,6 +48,26 @@ test('drain timeout reports remaining workers, leaves intake paused, and never e
  const f=fixture();f.setWorkers([worker({busy:true})]);let error:any;try{await apply(f,'stop',{all:true,mode:'drain',timeout:1});}catch(e){error=e;}
  expect(error).toBeInstanceOf(LifecycleFailure);expect(error.message).toContain('timeout');expect(error.result.workers[0].busy).toBe(true);expect(f.paused()).toBe(true);expect(f.calls.some(x=>x.startsWith('exit:'))).toBe(false);expect(f.calls).not.toContain('backend:stop');
 });
+test('expired lock acquisition budget cannot pause intake or start services',async()=>{
+ for(const action of ['stop','start'] as const){
+  const f=fixture();f.ops.turns.run=async operation=>{await f.ops.sleep(1000);return operation();};
+  await expect(controlManagedLifecycle(action,{all:true,mode:action==='stop'?'pause':undefined,timeout:1},f.ops,1000)).rejects.toThrow('Lifecycle timeout');
+  expect(f.calls).toEqual([]);expect(f.paused()).toBe(false);
+ }
+ // The default controller budget is also captured before fence acquisition.
+ const f=fixture();f.ops.turns.run=async operation=>{await f.ops.sleep(1000);return operation();};await expect(controlManagedLifecycle('stop',{all:true,mode:'pause',timeout:1},f.ops)).rejects.toThrow('Lifecycle timeout');expect(f.calls).toEqual([]);
+});
+test('late drain lock acquisition consumes the original deadline without renewing it',async()=>{
+ const f=fixture(),o={all:true,mode:'drain' as const,timeout:1};f.setWorkers([worker({busy:true})]);const preview=await controlManagedLifecycle('stop',o,f.ops);
+ f.ops.turns.run=async operation=>{await f.ops.sleep(900);return operation();};
+ await expect(controlManagedLifecycle('stop',{...o,apply:true,confirm:preview.confirm},f.ops,1000)).rejects.toThrow('Lifecycle timeout');
+ expect(f.ops.now()).toBe(1000);expect(f.paused()).toBe(true);expect(f.calls).not.toContain('exit:one-1');expect(f.calls).not.toContain('backend:stop');
+});
+test('inventory observation cannot consume the remaining deadline then pause intake',async()=>{
+ const f=fixture(),o={all:true,mode:'workers' as const,timeout:1};const preview=await controlManagedLifecycle('stop',o,f.ops),inventory=f.ops.inventory;
+ f.ops.inventory=async()=>{await f.ops.sleep(1000);return inventory();};
+ await expect(controlManagedLifecycle('stop',{...o,apply:true,confirm:preview.confirm},f.ops,1000)).rejects.toThrow('Lifecycle timeout');expect(f.calls).toEqual([]);expect(f.paused()).toBe(false);
+});
 test('new workers and ownership changes during final reads prevent backend shutdown',async()=>{
  for(const changed of [worker({session:'new'}),worker({owned:false})]){
   const f=fixture();let reads=0;const original=f.ops.inventory;f.ops.inventory=async()=>{if(++reads===3)f.setWorkers([changed]);return original();};await expect(apply(f,'stop',{all:true,timeout:1})).rejects.toThrow();expect(f.calls).not.toContain('backend:stop');

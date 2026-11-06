@@ -8,6 +8,11 @@ import {assertProjectIntakeEnabled} from './turn-submission';
 export const legacyLabel='local.adlc.linear-intake';
 export const registryPath=()=>join(homedir(),'Library/Application Support/ADLC Bridge/state.sqlite');
 export type ProjectService={project:string;name:string;repo:string;linear_project:string;config:string;label:string};
+export function assertProjectReferenceIntakeEnabled(reference:string,s:Store,state?:string){
+ const entries=new ProjectServices(s,false).list().filter(p=>p.linear_project===reference||p.project===reference);
+ if(entries.length>1)throw Error('Ambiguous project intake identity; reconcile the registration before submitting work');
+ assertProjectIntakeEnabled(entries[0]?.project??reference,state);
+}
 export function assertConfiguredProjectIntakeEnabled(c:Pick<ProjectConfig,'linear'|'automation'>,s:Store,state?:string){
  const entries=new ProjectServices(s,false).list().filter(p=>p.linear_project===c.linear.projectId);
  const project=c.automation?.orchestratorProject;
