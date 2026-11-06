@@ -1,4 +1,5 @@
 import {Store} from './core';
+import {assertObservationFence} from './observation-fence';
 import {githubRead,malformed} from './provider-read';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
@@ -59,7 +60,7 @@ export class BranchUpdates{
   if(uncertain)return {state:'blocked',send:false,head:b.head,reason:'Earlier branch update outcome uncertain; inspect before recovery'};
   if(b.behind===0)return null;
   if(b.mergeable===false)return {state:'blocked',send:false,head:b.head,reason:'Feature branch has conflicts with base; human reconciliation required'};
-  if(b.mergeable!==true)return {state:'updating_branch',send:false,head:b.head,reason:'Waiting for GitHub to determine branch mergeability'};
+  if(b.mergeable!==true)return {state:'updating_branch',send:false,head:b.head,mergeabilityUnknown:true,reason:'Waiting for GitHub to determine branch mergeability'};
   if(session.transcript?.controller!=='ready'||session.transcript.turns?.some((t:any)=>['running','queued'].includes(t.state)))return {state:'waiting_for_worker',send:false,head:b.head,reason:'Branch is behind; wait for active worker before updating'};
   const row=this.s.db.query('SELECT * FROM branch_updates WHERE job=? AND head=? AND base=?').get(job,b.head,b.base) as any;
   if(row)return {state:row.reason||Date.now()-row.requested>=10*60*1000?'blocked':'updating_branch',send:false,head:b.head,reason:'Branch update already requested or uncertain; never resend for the same commit/base'};
@@ -76,7 +77,7 @@ export class BranchUpdates{
   if(claim==='limit')return {state:'blocked',send:false,head:b.head,reason:'Automatic branch update limit reached; human inspection required'};
   if(claim!=='claimed')return {state:'updating_branch',send:false,head:b.head,reason:'Another poll reserved the branch update'};
   try{await this.transport.update(repo,pr,b.head);this.s.db.query("UPDATE branch_updates SET state='accepted' WHERE job=? AND head=? AND base=?").run(job,b.head,b.base);this.s.event(job,'feature_branch_update_requested',JSON.stringify({repo,pr,head:b.head,base:b.base,authorizedBy:policy.authorizedBy,mergePR:false}));}
-  catch{this.s.db.query('UPDATE branch_updates SET reason=? WHERE job=? AND head=? AND base=?').run('API outcome uncertain; inspect conflicts, permissions and head before recovery',job,b.head,b.base);return {state:'blocked',send:false,head:b.head,reason:'Branch update failed or outcome uncertain; no automatic retry'};}
+   catch{assertObservationFence();this.s.db.query('UPDATE branch_updates SET reason=? WHERE job=? AND head=? AND base=?').run('API outcome uncertain; inspect conflicts, permissions and head before recovery',job,b.head,b.base);return {state:'blocked',send:false,head:b.head,reason:'Branch update failed or outcome uncertain; no automatic retry'};}
   return {state:'updating_branch',send:false,head:b.head,reason:'Feature branch update requested; new commit requires fresh CI and CodeRabbit clearance'};
  }
 }

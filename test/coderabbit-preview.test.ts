@@ -15,6 +15,7 @@ test('read-only historical preview preserves full custom failure details with no
   const graphqlArgs=['graphql','-f',`query=${BODY_VERSION_QUERY}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2);if(args.shift()!=='api')throw Error('Read only');
+if(args.at(-1)==='--include')args.pop();
 if(JSON.stringify(args)===JSON.stringify(${JSON.stringify(graphqlArgs)})){console.log(JSON.stringify(${JSON.stringify({data:{repository:{pullRequest:f.context.version}}})}));process.exit(0);}
 if(!(args.length===1||args.length===3&&args[0]==='--paginate'&&args[1]==='--slurp'))throw Error('Read only');
 const responses=${JSON.stringify(responses)},key=args.at(-1);if(!Object.hasOwn(responses,key))throw Error('Read only');console.log(JSON.stringify(responses[key]));

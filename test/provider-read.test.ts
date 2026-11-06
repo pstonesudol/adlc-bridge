@@ -1,6 +1,21 @@
 import {test,expect} from 'bun:test';
 import {githubRead,ProviderReadError,readFailure} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('review reads capture headers for GraphQL and slurped pagination',async()=>{
+ for(const args of [['api','graphql','-f','query=query { viewer { login } }'],['api','--paginate','--slurp','fixture']]){
+ let seen:string[]=[];const child=spawn(args.includes('--slurp')?'[HTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"page":1},\nHTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"page":2}]':'HTTP/2.0 200 OK\r\nx-test: yes\r\n\r\n{"data":{"body":"HTTP/2.0 500 spoof"}}');
+ const result=await githubRead(args,'review-read',((argv:any,opts:any)=>{seen=argv;return child(argv,opts);}) as any);
+ expect(seen.at(-1)).toBe('--include');expect(result).toEqual(args.includes('--slurp')?[{page:1},{page:2}]:{data:{body:'HTTP/2.0 500 spoof'}});
+ try{await githubRead(args,'review-read',spawn('HTTP/2.0 429 Too Many Requests\r\nRetry-After: 90\r\n\r\n{"message":"rate limit exceeded"}','',1));throw Error('Expected failure');}catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.retryAt).toBeGreaterThan(Date.now()+80000);}
+ }
+});
+test('recognized AO stopped-daemon diagnostics are transient only for session evidence',()=>{
+ for(const diagnostic of ['AO daemon is not running — start it with `ao start`','AO daemon is not running (stale run-file at /fixture/running.json) — start it with `ao start`']){
+ expect(readFailure('orchestrator','session-evidence',diagnostic,1).evidence.classification).toBe('network');
+ expect(readFailure('github','review-read',diagnostic,1).evidence.classification).toBe('unknown');
+ }
+ expect(readFailure('orchestrator','session-evidence','unrecognized failure',1).evidence.classification).toBe('unknown');
+});
 test('5xx responses with quota remaining ignore reset but honor Retry-After',()=>{
  const response='HTTP/2.0 503 Unavailable\r\nx-ratelimit-remaining: 500\r\nx-ratelimit-reset: 8000000000\r\n';
  expect(readFailure('github','branch-read','',1,undefined,1000,response+'\r\n{}').evidence).toMatchObject({classification:'server'});

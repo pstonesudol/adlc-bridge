@@ -6,6 +6,15 @@ import {readFailure,readEvidence,malformed} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+test('inspected shared cooldown override is audited and separate from job retry',()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','s'),other=s.enqueue('p','j','s'),o=new RecoveryObservation(s,()=>1000);
+ try{
+ o.failed(job,readFailure('github','branch-read','HTTP 429\nRetry-After: 999999999\n',1,undefined,1000));
+ const before=o.status(job);expect(()=>o.overrideCooldown(job,'github',before.sharedNextRead-1)).toThrow('changed');
+ o.overrideCooldown(job,'github',before.sharedNextRead);expect(o.status(job).next_read).toBe(before.next_read);expect(o.status(job).sharedNextRead).toBeNull();expect(o.wait(job)).not.toBeNull();
+ expect(s.db.query("SELECT kind FROM events WHERE kind='operator_shared_cooldown_override'").get()).not.toBeNull();o.retry(job);expect(o.wait(job)).toBeNull();expect(o.status(other)).toBeNull();
+ }finally{s.close();}
+});
 test('alternating providers retain the job circuit budget',()=>{
  const s=new Store(':memory:');let now=100;const job=s.enqueue('p','i','s'),o=new RecoveryObservation(s,()=>now,()=>0.5);
  try{for(let n=1;n<=6;n++){

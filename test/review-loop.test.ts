@@ -242,6 +242,27 @@ test('later read deferrals, including wrapped ancestry errors, remain waiting wi
  }finally{spy.mockRestore();f.s.close();}
  }
 });
+test('expired job lease fences a paused tick after a newer tick completes',async()=>{
+ const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let reads=0;
+ try{
+ const old={...f.e,head:'c'.repeat(40),clear:true,failedChecks:[],findings:[]};
+ f.loop.io.readiness=async()=>{if(++reads===1){await gate;return old;}return {...f.e,clear:true,failedChecks:[],findings:[]};};
+ const first=f.loop.tick(f.id);while(reads===0)await Promise.resolve();
+ setSystemTime(new Date(Date.now()+60*60*1000+1));
+ await f.loop.tick(f.id);const newer={...f.loop.get(f.id)};release();
+ expect(await first).toMatchObject({state:'waiting_for_worker',send:false});expect(f.loop.get(f.id)).toEqual(newer);expect(newer.head).not.toBe(old.head);expect(f.sends()).toBe(0);
+ }finally{release?.();setSystemTime();f.s.close();}
+});
+test('branch updates bound unknown mergeability without conflict recovery',async()=>{
+ const f=templateFixture();try{
+ new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');
+ const original=f.loop.io.readBranchSnapshot;f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),behind:1,mergeable:null});
+ for(let n=1;n<=6;n++){
+ expect((await f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3})).state).toBe(n===6?'blocked':'updating_branch');setSystemTime(new Date(Date.now()+60001));
+ }
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.s.get(f.id).attempts).toBe(0);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
 test('branch-only ticks preserve readiness failure history',async()=>{
  const f=templateFixture();try{
  let branchOnly=false;const original=f.loop.io.readBranchSnapshot;

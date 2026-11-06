@@ -7,6 +7,17 @@ import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('CLI shared cooldown override and job retry remain separate operator actions',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-cooldown-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}'),hash=s.propose(id,'plan');s.approve(id,hash,'human');
+ const o=new RecoveryObservation(s);o.failed(id,readFailure('github','branch-read','HTTP 429\nRetry-After: 999999999\n',1));const expected=o.status(id).sharedNextRead;s.close();
+ const run=(...args:string[])=>Bun.spawnSync([process.execPath,cli,'retry-observation',id,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:path}});
+ expect(run('--override-shared-cooldown','github',String(expected-1)).exitCode).not.toBe(0);
+ const override=run('--override-shared-cooldown','github',String(expected));expect(override.exitCode).toBe(0);expect(JSON.parse(override.stdout.toString())).toMatchObject({readRetry:false,sharedCooldown:'cleared',mutationReplay:false});
+ const inspect=new Store(path);expect(new RecoveryObservation(inspect).status(id)).toMatchObject({failures:1,sharedNextRead:null});inspect.close();
+ expect(run().exitCode).toBe(0);const after=new Store(path);expect(new RecoveryObservation(after).status(id)).toBeNull();after.close();
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('persisted blocked and waiting guidance outranks historical transient observations',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-blocked-'));try{
  const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');

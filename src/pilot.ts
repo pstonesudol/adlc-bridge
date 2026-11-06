@@ -1,4 +1,5 @@
 import {Store,digest} from './core';
+import {fencedIO,assertObservationFence} from './observation-fence';
 import {ReceiptReconciliation} from './receipt-reconciliation';
 import {TaskRouting} from './task-routing';
 import {configureSessionRoute} from './routing-session';
@@ -27,6 +28,7 @@ export async function adoptPilot(s:Store,job:string,session:string){
 // A host-driven tick observes only. No quiet/absent review becomes approval.
 const pilotIO={sessionEvidence,readiness,spawn:Bun.spawn,submit:withTurnSubmission,readBranchSnapshot,worktreeIdentity};
 export async function observePilot(s:Store,job:string,repo:string,pr:number,required:string[],metadataChecks:string[]=[],io=pilotIO){
+ io=fencedIO(io);
  new Lifecycle(s).current(job);
  const r=new Lifecycle(s).run(job);if(!r)throw Error('Adopt existing pilot first');
  const e=await io.sessionEvidence(r.session_id);
@@ -39,7 +41,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
 }
 export async function sendPilotRemediation(s:Store,job:string,head:string,findings:string,repo:string,pr:number,required:string[],policy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,metadataChecks:string[]=[],overrides:Partial<typeof pilotIO>={}){
   assertWorktreeAvailable(s,job);
- const io={...pilotIO,...overrides};
+ const io=fencedIO({...pilotIO,...overrides});
  const l=new Lifecycle(s),r=l.run(job);if(!r)throw Error('Existing pilot required');
  const parsed=JSON.parse(findings);
  const metadataOnly=Array.isArray(parsed)&&parsed.length>0&&parsed.every((f:any)=>f.kind==='pr_description');
@@ -58,12 +60,13 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
  };
  validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));
   return io.submit(async()=>{
+  assertObservationFence();
   assertWorktreeAvailable(s,job);
   const router=new TaskRouting(s),settings=router.settings(job);
  if(settings&&router.get(job,'planning')){
   const phase=`remediation:${head}:${digest(findings).slice(0,16)}`;
   const route=await router.choose(job,phase,digest(JSON.stringify([j.spec,j.plan_hash,head,findings])),`Implement the requested review fixes within the approved task. This is remediation, not review-only feedback. Task: ${j.spec}\nFindings: ${findings}`,settings);
-  await configureSessionRoute(r.session_id,route);router.verified(job,phase);l.current(job);
+  assertObservationFence();await configureSessionRoute(r.session_id,route);assertObservationFence();router.verified(job,phase);l.current(job);
  }
   // Routing/submission may await external work. Refresh evidence inside the
  // submission fence, then reserve synchronously without an intervening await.
@@ -105,6 +108,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
  receipts.reserve({job,plan:j.plan_hash,spec:digest(j.spec),session:r.session_id,client:handle,attempt:`remediation:${attempt.attempt}`});
   const p=io.spawn([AO,'send','--session',r.session_id,'--steer','--client-message-id',handle,'--message',prompt],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ assertObservationFence();
  if(code===0)receipts.accepted(handle);
  s.event(job,'remediation_delivery_attempted',JSON.stringify({head,attempt:attempt.attempt,handle,code}));
  return {...attempt,state:'delivery_uncertain',handle,code,receipt:out};

@@ -2038,7 +2038,20 @@ package and unknown running backend; equal package versions do not prove the sam
 commit or active runtime. Completion prints bash/zsh/fish definitions only; shell
 files are never modified automatically.
 
-New scoped commands use schemaVersion 1 success/error envelopes. Existing flat
+New scoped commands use schemaVersion 1 success/error envelopes. Version 1
+job views use display states `awaiting_plan`, `approval_wait`, `dependency_wait`,
+`working`, `observation_wait`, `blocked`, and `complete`. The nullable
+`observation` object retains historical evidence even when a persisted blocker,
+approval/dependency wait, or completion takes precedence. Its fields are:
+`failures` (consecutive incomplete observations), `nextRetry` (epoch milliseconds,
+or null when no automatic probe is eligible), `error` (nullable secret-safe typed
+provider evidence: provider, operation, timestamp, classification, optional
+exitStatus/httpStatus/retryAt/requestId, and bounded detail), and `evidenceAgeMs`
+(elapsed milliseconds or null for legacy unknown evidence). `observation_wait`
+means an otherwise approved working job is waiting on read-only observation;
+it does not authorize dispatch, Git writes, or approval.
+
+Existing flat
 commands retain legacy text/JSON contracts. Display state `awaiting_plan` means
 no planning dispatch, not an active worker; activity/freshness remain unknown
 without authoritative evidence. Linked DEV-35/43/34/33/51/55 integrations remain
@@ -2086,6 +2099,15 @@ adding/removing labels or blindly repeating an uncertain comment delivery.
 
 After correcting a permanent problem, use `adlc retry-observation JOB`. This
 rearms reads only and does not bypass a shared provider cooldown. Inspect
+`adlc review-status` for the provider's `sharedNextRead` timestamp. To override
+an abnormal shared cooldown after inspecting provider health and retry guidance,
+use `adlc retry-observation JOB --override-shared-cooldown github TIMESTAMP`
+(or `orchestrator`). This compares the exact inspected timestamp, audits the
+override, and clears only that provider's shared cooldown; it does not change
+any job wait. Then use plain `retry-observation JOB` separately as needed. A
+changed timestamp requires inspection again. Neither action replays mutations.
+
+Inspect
 `adlc reconcile-publication` preview separately for uncertain publication; read
 recovery never replays PUTs, pushes, comments, model sends or other mutations.
 Other freshness, scope, approval, ownership, busy-worker and reconciliation gates

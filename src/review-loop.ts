@@ -21,6 +21,7 @@ import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feed
 import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
 import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
+import {assertObservationFence,withObservationFence,fencedIO,ObservationLeaseLost} from './observation-fence';
 import {ReadValidationError} from './provider-read';
 function readStop(error:unknown,fallback:string){
  let cause=error;for(let n=0;n<8;n++){
@@ -162,8 +163,10 @@ export class ReviewLoop{
     if(pending.head===head)return {state:'blocked',send:false,head,reason:'Worker completed remediation without a new commit or metadata change; inspect before retry'};
   }
   record(job:string,result:any,pr?:number){
+  assertObservationFence();
   const signature=digest(JSON.stringify({head:result.head,state:result.state,reason:result.reason}));
   return this.s.db.transaction(()=>{
+   assertObservationFence();
    const t=this.get(job);
    if(t.state==='completed')return {state:'completed',send:false,head:t.head,reason:t.reason};
    // A target rebound during this evaluation keeps its own state; a stale PR
@@ -175,10 +178,12 @@ export class ReviewLoop{
   }).immediate();
  }
    async requestReview(job:string,pr:number,head:string,bodyHash:string){
+    assertObservationFence();
     const t=this.get(job);if(this.completed(job))return false;
     const unresolved=this.uncertainReview(job,pr,head);if(unresolved){this.record(job,unresolved,pr);return false;}
    try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
     const reserved=this.s.db.transaction(()=>{
+     assertObservationFence();
      if(this.completed(job))return false;
      // The caller's PR may have been rebound while it awaited evidence; never
      // request or reserve a review for a PR that is no longer registered.
@@ -192,7 +197,8 @@ export class ReviewLoop{
    if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
    try{await this.postReview(t.repo,pr);}
-   catch(error){this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'},pr);throw error;}
+   catch(error){assertObservationFence();this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'},pr);throw error;}
+  assertObservationFence();
   this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({pr,head,bodyHash}));
   return true;
@@ -200,9 +206,10 @@ export class ReviewLoop{
   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
    const observations=new RecoveryObservation(this.s),release=observations.claim(`job:${job}`,60*60*1000);
    if(!release)return {state:'waiting_for_worker',send:false,reason:'Review evaluation already reserved; no duplicate reads or continuation'};
-   try{return await this.tickReserved(job,branchPolicy,remediationPolicy,policy,config);}finally{release();}
+   try{return await withObservationFence(release.assert,()=>this.tickReserved(job,branchPolicy,remediationPolicy,policy,config));}catch(error){if(error instanceof ObservationLeaseLost)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}finally{release();}
   }
   async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
+   assertObservationFence();const io=fencedIO(this.io);
    const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
@@ -227,8 +234,9 @@ export class ReviewLoop{
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   const observation=new RecoveryObservation(this.s);
   const observedTransport={...branchTransport,
-   read:(repo:string,pr:number)=>observation.read(job,'github',()=>this.io.readBranchSnapshot(repo,pr)),
-   contains:(repo:string,ancestor:string,head:string)=>observation.read(job,'github',()=>this.io.contains(repo,ancestor,head))};
+   update:(repo:string,pr:number,head:string)=>fencedIO(branchTransport).update(repo,pr,head),
+   read:(repo:string,pr:number)=>observation.read(job,'github',()=>io.readBranchSnapshot(repo,pr)),
+   contains:(repo:string,ancestor:string,head:string)=>observation.read(job,'github',()=>io.contains(repo,ancestor,head))};
   const wait=observation?.wait(job);if(wait)return record(wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
@@ -239,12 +247,12 @@ export class ReviewLoop{
    }
   let session,snapshot;
   try{
-   session=await observation.read(job,'orchestrator',()=>this.io.sessionEvidence(run.session_id));
-   snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));
+   session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id));
+   snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
   }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
-   const local=await this.io.worktreeIdentity(this.s,job);
+   const local=await io.worktreeIdentity(this.s,job);
    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
@@ -253,7 +261,7 @@ export class ReviewLoop{
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
-    try{snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));}
+    try{snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));}
     catch(error){return record(readStop(error,'Branch snapshot unavailable'));}
     if(snapshot.behind>0&&snapshot.mergeable===null)return record({...observation.mergeabilityUnknown(job),head:snapshot.head});
     observation.mergeabilityKnown(job);
@@ -266,11 +274,13 @@ export class ReviewLoop{
    }
    try{branch=await new BranchUpdates(this.s,observedTransport).ensure(job,t.repo,t.pr,session,branchPolicy);}
    catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record(readStop(error,'Branch observation unavailable'));}throw error;}
+   if(branch?.mergeabilityUnknown)return record({...observation.mergeabilityUnknown(job),head:branch.head});
+   observation.mergeabilityKnown(job);
    if(branch)return record(branch);
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
-  try{e=await observation.read(job,'github',()=>this.io.readiness(t.repo,t.pr,required,metadataChecks));}
+  try{e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));}
   catch(error){if(error instanceof ReadValidationError)observation.clear(job);return record(readStop(error,'Readiness evidence unavailable'));}
    observation.clear(job);
    const reviewed=this.completed(job);if(reviewed)return reviewed;
@@ -394,6 +404,7 @@ export class ReviewLoop{
   const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
   const stored=this.s.db.transaction(()=>{
+   assertObservationFence();
    const update=this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=?,updated=CURRENT_TIMESTAMP WHERE job=? AND pr=? AND state!='completed'").run(e.head,since,d.state,d.reason,signature,job,t.pr);
    if(!update.changes)return false;
    if(t.last_signature!==signature)this.s.event(job,'review_state_changed',JSON.stringify({repo:t.repo,pr:t.pr,head:e.head,...d}));
@@ -408,8 +419,8 @@ export class ReviewLoop{
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
    const operations=metadataOnly?['open-pr']:['commit','push-feature',...(reviewView.findings.some((f:any)=>f.kind==='pr_description')?['open-pr']:[])];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
-   await this.io.disableNativeFeedback(run.session_id);
-   const result=await this.io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
+   await io.disableNativeFeedback(run.session_id);
+   const result=await io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
    if(result.blocked)return record({state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
    if(result.reused)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
    return {...d,head:e.head,delivery:result};

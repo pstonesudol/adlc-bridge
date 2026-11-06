@@ -1,4 +1,5 @@
 import {existsSync} from 'node:fs';
+import {fencedIO,assertObservationFence} from './observation-fence';
 import {resolve} from 'node:path';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
@@ -36,7 +37,7 @@ const sha=(v:string)=>/^[a-f0-9]{40,64}$/.test(v);
 export class ConflictRecovery{
  io:ConflictIO;
  constructor(public s:Store,overrides:Partial<ConflictIO>={}){
-   this.io={facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides};
+   this.io=fencedIO({facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides});
  }
  install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS conflict_recoveries(
  id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),plan TEXT NOT NULL,worktree TEXT NOT NULL,
@@ -47,6 +48,7 @@ export class ConflictRecovery{
  row(job:string){return recoveryRows(this.s).filter(r=>r.job===job).at(-1);}
  async git(tree:string,...args:string[]){const r=await this.io.command(['git',...args],tree);if(r.code!==0)throw Error(`Git ${args[0]} failed (${r.code}); preserve work and inspect: ${r.err.slice(0,2000)}`);return r.out.trim();}
  auth(job:string,c:any){
+  assertObservationFence();
   validateConflictPolicy(c.conflictRecovery);if(c.conflictRecovery?.enabled!==true)throw Error('Conflict recovery is not explicitly enabled');
   const a=new DeliveryRecovery(this.s,{} as any).authorization(job,c);
   if(!['inspect','fetch','branch','commit','push-feature','merge-base-feature'].every(op=>JSON.parse(a.grant).includes(op)))throw Error('Explicit current merge-base-feature and feature Git grants required; no retroactive grant migration');
@@ -195,6 +197,7 @@ export class ConflictRecovery{
   });
  }
  set(r:any,state:string,detail:any=JSON.parse(r.detail),reason:string|null=null){
+  assertObservationFence();
   if(r.state===state&&r.detail===JSON.stringify(detail)&&r.reason===reason)return;
   const changed=this.s.db.query('UPDATE conflict_recoveries SET state=?,detail=?,reason=? WHERE id=? AND state=? AND detail=? AND reason IS ?').run(state,JSON.stringify(detail),reason,r.id,r.state,r.detail,r.reason);
   if(!changed.changes)throw Error('Recovery stage changed concurrently; inspect current reservation');
@@ -204,6 +207,7 @@ export class ConflictRecovery{
  result(r:any){return {state:r.reason?'blocked':'updating_branch',send:false,head:r.head,reason:r.reason??`Conflict recovery ${r.id}: ${r.state}; prior CI/review clearance is not reusable`,recovery:r.id,stage:r.state};}
  async tick(job:string,c:any,repo:string,pr:number,budget:RemediationPolicy=DEFAULT_REMEDIATION_POLICY){
   return this.io.submit(async()=>{
+   assertObservationFence();
    let r=this.row(job);
    if(r?.state==='completed')r=undefined;
    if(!r){
