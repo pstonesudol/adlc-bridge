@@ -20,7 +20,7 @@ import {worktreeIdentity} from './delivery-evidence';
 import {dispatchedFeedback,ensureReviewFeedback,feedbackKey} from './review-feedback';
 import {ConflictRecovery} from './conflict-recovery';
 import {worktreeReservation} from './worktree-reservation';
-import {RecoveryObservation} from './recovery-observation';
+import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
 
@@ -190,6 +190,11 @@ export class ReviewLoop{
   return true;
  }
   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
+   const observations=new RecoveryObservation(this.s),release=observations.claim(`job:${job}`,60*60*1000);
+   if(!release)return {state:'waiting_for_worker',send:false,reason:'Review evaluation already reserved; no duplicate reads or continuation'};
+   try{return await this.tickReserved(job,branchPolicy,remediationPolicy,policy,config);}finally{release();}
+  }
+  async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
    const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
@@ -212,7 +217,10 @@ export class ReviewLoop{
     return record({state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'});
    }
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
-  const observation=config?.conflictRecovery?.enabled?new RecoveryObservation(this.s):null;
+  const observation=new RecoveryObservation(this.s);
+  const observedTransport={...branchTransport,
+   read:(repo:string,pr:number)=>observation.read(job,'github',()=>this.io.readBranchSnapshot(repo,pr)),
+   contains:(repo:string,ancestor:string,head:string)=>observation.read(job,'github',()=>this.io.contains(repo,ancestor,head))};
   const wait=observation?.wait(job);if(wait)return record(wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
@@ -223,9 +231,9 @@ export class ReviewLoop{
    }
   let session,snapshot;
   try{
-   session=await this.io.sessionEvidence(run.session_id);
-   snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);
-  }catch(e){observation?.failed(job);return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
+   session=await observation.read(job,'orchestrator',()=>this.io.sessionEvidence(run.session_id));
+   snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));
+  }catch(e){return record({state:e instanceof ObservationDeferred?'waiting_for_worker':'blocked',send:false,reason:e instanceof Error?e.message:'Provider evidence unavailable'});}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
    const local=await this.io.worktreeIdentity(this.s,job);
@@ -237,26 +245,26 @@ export class ReviewLoop{
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
-    try{snapshot=await this.io.readBranchSnapshot(t.repo,t.pr);}
-    catch(error){observation?.failed(job);return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
-    if(snapshot.behind>0&&snapshot.mergeable===null){observation?.failed(job);return record({state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; bounded provider observation only, no remediation attempt'});}
+    try{snapshot=await observation.read(job,'github',()=>this.io.readBranchSnapshot(t.repo,t.pr));}
+    catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Branch snapshot unavailable'});}
+    if(snapshot.behind>0&&snapshot.mergeable===null){observation.clear(job);return record({state:'updating_branch',send:false,head:snapshot.head,reason:'Mergeability unknown; successful observation, no remediation attempt'});}
     if(snapshot.mergeable===false&&snapshot.behind>0){
-     try{await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).observeAccepted(job,t.repo,t.pr,snapshot);}
-     catch(error){if(error instanceof BranchObservationFailure)observation?.failed(job);return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
+     try{await new BranchUpdates(this.s,observedTransport).observeAccepted(job,t.repo,t.pr,snapshot);}
+     catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof BranchObservationFailure?'Accepted base update evidence unavailable; inspect published recovery':error instanceof Error?error.message:'Authorization unavailable'});}
      observation?.clear(job);
      try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
      catch(error){return record({state:'blocked',send:false,head:snapshot.head,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
     }
    }
-   try{branch=await new BranchUpdates(this.s,{...branchTransport,contains:this.io.contains,read:(repo,pr)=>this.io.readBranchSnapshot(repo,pr)}).ensure(job,t.repo,t.pr,session,branchPolicy);}
-   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){observation?.failed(job);return record({state:'blocked',send:false,reason:error.message});}throw error;}
-   observation?.clear(job);
-   if(branch)return record(branch);
+   try{branch=await new BranchUpdates(this.s,observedTransport).ensure(job,t.repo,t.pr,session,branchPolicy);}
+   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record({state:'blocked',send:false,reason:error.message});}throw error;}
+   if(branch){observation.clear(job);return record(branch);}
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
-  try{e=await this.io.readiness(t.repo,t.pr,required,metadataChecks);}
+  try{e=await observation.read(job,'github',()=>this.io.readiness(t.repo,t.pr,required,metadataChecks));}
   catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Readiness evidence unavailable'});}
+   observation.clear(job);
    const reviewed=this.completed(job);if(reviewed)return reviewed;
    // Completed jobs no longer satisfy execution approval; handle that terminal
    // observation here rather than relaxing Lifecycle.current's authorization.

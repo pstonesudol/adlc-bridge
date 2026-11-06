@@ -1,4 +1,5 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
+import {readFailure} from '../src/provider-read';
 import {decision,ReviewLoop} from '../src/review-loop';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
@@ -213,21 +214,24 @@ test('second branch read failure invalidates stale readiness and enters durable 
   await f.loop.tick(f.id,undefined,undefined,undefined,config);expect(reads).toBe(2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
-test('accepted ancestry provider errors back off outside conflict path without resetting consecutive failures',async()=>{
+test('six accepted ancestry read failures recover automatically without manual database edits',async()=>{
  const f=templateFixture();try{
   const l=new Lifecycle(f.s);l.grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');
   new (await import('../src/branch-updates')).BranchUpdates(f.s);
   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
-  let reads=0;f.loop.io.contains=async()=>{reads++;throw Error('provider rate limited');};
+  let reads=0;f.loop.io.contains=async()=>{reads++;throw readFailure('github','ancestry','HTTP 503');};
   const c={conflictRecovery:{enabled:true}},p={enabled:true,authorizedBy:'human',maxUpdates:3};
   for(let n=1;n<=6;n++){
-   if(n>1)f.s.db.query('UPDATE recovery_observations SET next_read=0').run();
    expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('blocked');
    expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(n);
    await f.loop.tick(f.id,p,undefined,undefined,c);expect(reads).toBe(n);
+   const row=f.s.db.query('SELECT next_read FROM recovery_observations').get() as any;setSystemTime(new Date(row.next_read+1));
   }
+  f.loop.io.contains=async()=>true;f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];
+  expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('waiting_for_ci');
+  expect(f.s.db.query('SELECT * FROM recovery_observations').get()).toBeNull();
   expect(f.s.get(f.id).attempts).toBe(0);expect(f.sends()).toBe(0);
- }finally{f.s.close();}
+ }finally{setSystemTime();f.s.close();}
 });
 test('identity failures retain specific hints and do not consume provider read retries',async()=>{
  for(const kind of ['session','local','repository','authorization']){
@@ -434,7 +438,7 @@ test('concurrent ticks retain their explicitly supplied check policy despite sha
   f.loop.io.sessionEvidence=async()=>{await gate;return f.session;};f.loop.io.readiness=async(_repo,_pr,required,metadata)=>{seen.push({required,metadata});return f.e;};
   const checks=['Strict metadata'],strict=f.loop.tick(f.id,undefined,undefined,{project:'project',checks}),empty=f.loop.tick(f.id,undefined,undefined,{project:'project',checks:[]});
   checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await Promise.all([strict,empty]);
-  expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']},{required:['CI'],metadata:[]}]);expect(f.sends()).toBe(0);
+  expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']}]);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 test('same-name failures require matching check-run identity and head for remediation or metadata waiting',async()=>{

@@ -23,6 +23,7 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
   // Replace gh entirely; this process has no credentials or network fallback.
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
+if(args.length===3&&args[0]==='api'&&args[2]==='--include')args.pop();
 if(args[0]!=='api')throw Error('Read-only fixture only');
 let result;
 if(args[1]==='graphql'){
@@ -82,6 +83,7 @@ for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-p
   };
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
+if(args.length===3&&args[0]==='api'&&args[2]==='--include')args.pop();
 if(args[0]!=='api')throw Error('Read-only fixture only');
 if(args[1]!=='graphql'){
  if(!(args.length===2||args.length===4&&args[1]==='--paginate'&&args[2]==='--slurp'))throw Error('Read-only fixture only');

@@ -5,6 +5,17 @@ import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
 import {ConflictRecovery} from '../src/conflict-recovery';
 import {ReviewLoop} from '../src/review-loop';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
+
+test('permanent read failures publish one secret-safe operator notice without labels',async()=>{
+ const f=fixture();try{
+ f.running();const observations=new RecoveryObservation(f.s);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 401 Authorization: Bearer PRIVATE',1));
+ const blockers=f.blockers();await blockers.sync(f.config);await blockers.sync(f.config);
+ expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.comments[0].body).toContain('retry-observation');expect(f.comments[0].body).not.toContain('PRIVATE');
+ }finally{f.s.close();}
+});
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};

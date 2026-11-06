@@ -1,4 +1,5 @@
 import {AO} from './orchestrator';
+import {readFailure,malformed,ProviderReadError} from './provider-read';
 import {Store,digest} from './core';
 import {recordReadiness} from './readiness';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
@@ -8,15 +9,23 @@ import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs=RECEIPT_FRESHNESS_MS){
  if(!/^[a-zA-Z0-9_-]+$/.test(session))throw Error('Session ID required');
  if(!Number.isSafeInteger(freshnessMs)||freshnessMs<1)throw Error('Positive receipt freshness window required');
+ try{return await collectSessionEvidence(session,spawn,freshnessMs);}catch(cause){
+ if(cause instanceof ProviderReadError)throw cause;
+ const message=cause instanceof Error?cause.message:'';
+ if(/Invalid|pagination|Turn state changed/.test(message))throw malformed('orchestrator','session-evidence',cause);
+ throw readFailure('orchestrator','session-evidence',/freshness deadline/.test(message)?'timeout':message,undefined,cause);
+ }
+}
+async function collectSessionEvidence(session:string,spawn:typeof Bun.spawn,freshnessMs:number){
  const started=Date.now(),deadline=started+freshnessMs;let before:number|undefined,first:any;const entries:any[]=[];
  for(let page=0;page<100;page++){
  const remaining=deadline-Date.now();if(remaining<1)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
  const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:Math.min(30000,remaining)});
- const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ const [text,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(Date.now()>=deadline)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
- if(code!==0)throw Error('Orchestrator session inspection failed');
- const r=JSON.parse(text);
- if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw Error('Invalid session evidence');
+ if(code!==0)throw readFailure('orchestrator','session-evidence',p.signalCode?'timeout':err,code);
+ let r;try{r=JSON.parse(text);}catch(cause){throw malformed('orchestrator','session-evidence',cause);}
+ if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw malformed('orchestrator','session-evidence');
  if(!first)first=r;
  if(JSON.stringify(r.transcript.turns)!==JSON.stringify(first.transcript.turns))throw Error('Turn state changed during transcript pagination; refresh evidence');
  const batch=r.transcript.entries;

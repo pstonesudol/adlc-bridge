@@ -1,4 +1,5 @@
 import {Store} from './core';
+import {githubRead,malformed} from './provider-read';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
 import {assertWorktreeAvailable} from './worktree-reservation';
@@ -7,19 +8,22 @@ export type BranchSnapshot={head:string;base:string;branch:string;baseBranch:str
 export type BranchTransport={read(repo:string,pr:number):Promise<BranchSnapshot>;update(repo:string,pr:number,head:string):Promise<void>;contains?(repo:string,ancestor:string,head:string):Promise<boolean>};
 export class BranchObservationFailure extends Error{}
 async function providerObservation<T>(read:()=>Promise<T>){try{return await read();}catch(error){throw new BranchObservationFailure('Provider branch/ancestry observation unavailable',{cause:error});}}
-async function gh(args:string[]){const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub branch operation failed; inspect before retry');return JSON.parse(out);}
+async function gh(args:string[]){
+ if(!args.includes('PUT'))return githubRead(args);
+ const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw Error('GitHub branch operation failed; inspect before retry');return JSON.parse(out);
+}
 export async function baseTip(repo:string,branch:string,read=gh){
  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)||typeof branch!=='string'||!branch||/[\s\x00-\x1f]/.test(branch))throw Error('Valid base repository and branch required');
  const b=await read(['api',`repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`]);
- if(b.ref!==`refs/heads/${branch}`||b.object?.type!=='commit'||!/^[a-f0-9]{40,64}$/.test(b.object.sha??''))throw Error('Incomplete current base ref');
+ if(b.ref!==`refs/heads/${branch}`||b.object?.type!=='commit'||!/^[a-f0-9]{40,64}$/.test(b.object.sha??''))throw malformed('github','base-ref');
  return b.object.sha as string;
 }
 export async function readBranchSnapshot(repo:string,pr:number,read=gh){
   const p=await read(['api',`repos/${repo}/pulls/${pr}`]);
-  if(!/^[a-f0-9]{40,64}$/.test(p.head?.sha??'')||!/^[a-f0-9]{40,64}$/.test(p.base?.sha??''))throw Error('Incomplete branch identities');
+  if(!/^[a-f0-9]{40,64}$/.test(p.head?.sha??'')||!/^[a-f0-9]{40,64}$/.test(p.base?.sha??''))throw malformed('github','branch-identities');
   const currentBase=await baseTip(repo,p.base.ref,read);
   const b=await read(['api',`repos/${repo}/compare/${currentBase}...${p.head.sha}`]);
-  if(!Number.isSafeInteger(b.behind_by)||b.behind_by<0)throw Error('Incomplete branch comparison');
+  if(!Number.isSafeInteger(b.behind_by)||b.behind_by<0)throw malformed('github','branch-comparison');
   return {head:p.head.sha,base:currentBase,branch:p.head.ref,baseBranch:p.base.ref,defaultBranch:p.base.repo?.default_branch,headRepo:p.head.repo?.full_name,baseRepo:p.base.repo?.full_name,state:p.state,draft:p.draft,mergeable:p.mergeable,behind:b.behind_by};
  }
 export const branchTransport:BranchTransport={

@@ -72,11 +72,11 @@ test('collector exhausts sequence pages before proving receipt completeness',asy
 });
 test('collector rejects repeated cursor evidence',async()=>{
  const spawn=(()=>({stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:Array.from({length:100},(_,i)=>({sequence:i+1})),turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)})) as typeof Bun.spawn;
- await expect(sessionEvidence('worker',spawn)).rejects.toThrow('pagination');
+ await expect(sessionEvidence('worker',spawn)).rejects.toThrow('orchestrator session-evidence: malformed');
 });
 test('collector rejects a final page returned after the whole freshness deadline',async()=>{
  let options:any;const spawn=((_args:string[],opts:any)=>{options=opts;return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:[{sequence:1}],turns:[]}})).body,stderr:new Response('').body,exited:Bun.sleep(20).then(()=>0)};}) as typeof Bun.spawn;
- await expect(sessionEvidence('worker',spawn,5)).rejects.toThrow('freshness deadline');expect(options.timeout).toBeLessThanOrEqual(5);
+ await expect(sessionEvidence('worker',spawn,5)).rejects.toThrow('orchestrator session-evidence: timeout');expect(options.timeout).toBeLessThanOrEqual(5);
 });
 test('restart and competing store observations retain exact attempt and terminal evidence',()=>{
  const dir=mkdtempSync(join(tmpdir(),'receipt-test-')),path=join(dir,'state.sqlite');

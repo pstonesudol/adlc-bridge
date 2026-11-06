@@ -366,11 +366,11 @@ Registered approved review targets can request bounded in-scope fixes from their
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     const revision=revisionStatus(s,t.job),stale=revision?.blocking===true;
-    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
+    return {...t,observation:new RecoveryObservation(s).status(t.job),reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
   });
    try{
     if(command==='retry-observation'){
-     if(a.length!==1)throw Error('Use retry-observation JOB');lifecycle.current(a[0]);new RecoveryObservation(s).clear(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');return out({job:a[0],readRetry:true,mutationReplay:false});
+     if(a.length!==1)throw Error('Use retry-observation JOB');lifecycle.current(a[0]);new RecoveryObservation(s).retry(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');return out({job:a[0],readRetry:true,mutationReplay:false,sharedCooldown:'retained'});
     }
     if(command==='authorize-base-merge'){
      return out(authorizeBaseMerge(lifecycle,a));

@@ -1,4 +1,5 @@
 import {randomUUID} from 'node:crypto';
+import {RecoveryObservation,transient} from './recovery-observation';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
@@ -160,6 +161,15 @@ export class LinearBlockers{
     if(prior>=0)rows.splice(prior,1);
     rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason:review.reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
    }
+  }
+  const observations=new RecoveryObservation(this.s);
+  for(const j of this.s.list().filter(j=>j.project===c.linear.projectId)){
+   const stop=observations.status(j.id),e=stop?.evidence;
+   if(!e||transient(e))continue;
+   try{new Lifecycle(this.s).current(j.id);}catch{continue;}
+   const reason=`${e.provider} ${e.operation}: ${e.classification}. Inspect provider login status, repository/session visibility and configuration locally; do not paste credentials. After correction run retry-observation ${j.id}; mutation uncertainty remains unchanged.`;
+   try{results.push(await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding:digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification])),applyLabel:false}));handled.add(j.id);}
+   catch(error){results.push({job:j.id,state:'blocked',reason:'Observation blocker notice requires reconciliation; no blind resend'});}
   }
   for(const outcome of rows){
    handled.add(outcome.job);
