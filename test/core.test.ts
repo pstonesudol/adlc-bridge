@@ -48,6 +48,7 @@ test('v1 upgrade accepts matching indexes and rejects conflicting definitions',(
  for(const ddl of [
   'CREATE UNIQUE INDEX events_job_seq ON events(job,seq)',
   'CREATE INDEX events_job_seq ON events(seq,job)',
+  "CREATE INDEX events_job_seq ON events(job,seq) WHERE kind='selected'",
   'CREATE INDEX approvals_job_seq ON events(job,seq)'
  ]) fixture(path=>{
   const db=new Database(path);db.exec(legacy);db.exec(ddl);

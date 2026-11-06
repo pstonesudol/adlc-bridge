@@ -66,7 +66,7 @@ export class Store {
           if(existing.tbl_name!==table)throw Error(`Conflicting index definition: ${name}`);
           const entry=(this.db.query('SELECT * FROM pragma_index_list(?)').all(table) as any[]).find((x:any)=>x.name===name);
           const actual=entry?(this.db.query('SELECT name FROM pragma_index_info(?) ORDER BY seqno').all(name) as any[]).map((x:any)=>x.name):[];
-          if(!entry||entry.unique!==0||actual.length!==columns.length||actual.some((c:string,i:number)=>c!==columns[i]))throw Error(`Conflicting index definition: ${name}`);
+          if(!entry||entry.unique!==0||entry.partial!==0||actual.length!==columns.length||actual.some((c:string,i:number)=>c!==columns[i]))throw Error(`Conflicting index definition: ${name}`);
           return true;
         };
         if(!matches('events_job_seq','events',['job','seq']))this.db.exec('CREATE INDEX events_job_seq ON events(job,seq);');
