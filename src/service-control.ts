@@ -73,7 +73,8 @@ async function controlProject(action:string,project:string|undefined,apply:boole
    const current=await status(),def=readDefinition(plist);
    if(apply&&current.loaded&&options.requireEnabled){
     const disabled=await run(['print-disabled',domain]);
-    if(disabled.code!==0||!disabled.stdout.includes(`"${label}" => false`))throw Error('Service enabled state is unverified; use explicit service configuration workflow');
+    const entries=disabled.stdout.split('\n').map(line=>line.trim().match(/^"([^"]+)"\s*=>\s*(.*?)\s*$/)).filter(entry=>entry?.[1]===label);
+    if(disabled.code!==0||entries.length!==1||!['enabled','false'].includes(entries[0]![2]))throw Error('Service enabled state is unverified; use explicit service configuration workflow');
    }
    // Verify quiescence before updating a loaded definition, not just at bootout.
    const verify=()=>assertPollQuiescent(current,entry.config,def.ProgramArguments[1],options.pollState);
