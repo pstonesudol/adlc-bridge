@@ -11,31 +11,29 @@ export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs
  if(!Number.isSafeInteger(freshnessMs)||freshnessMs<1)throw Error('Positive receipt freshness window required');
  try{return await collectSessionEvidence(session,spawn,freshnessMs);}catch(cause){
  if(cause instanceof ProviderReadError)throw cause;
- const message=cause instanceof Error?cause.message:'';
- if(/Invalid|pagination|Turn state changed/.test(message))throw malformed('orchestrator','session-evidence',cause);
- throw readFailure('orchestrator','session-evidence',/freshness deadline/.test(message)?'timeout':message,undefined,cause);
+ throw readFailure('orchestrator','session-evidence','unknown',undefined,cause);
  }
 }
 async function collectSessionEvidence(session:string,spawn:typeof Bun.spawn,freshnessMs:number){
  const started=Date.now(),deadline=started+freshnessMs;let before:number|undefined,first:any;const entries:any[]=[];
  for(let page=0;page<100;page++){
- const remaining=deadline-Date.now();if(remaining<1)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
+ const remaining=deadline-Date.now();if(remaining<1)throw readFailure('orchestrator','session-evidence','timeout');
  const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:Math.min(30000,remaining)});
  const [text,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
- if(Date.now()>=deadline)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
+ if(Date.now()>=deadline)throw readFailure('orchestrator','session-evidence','timeout');
  if(code!==0)throw readFailure('orchestrator','session-evidence',p.signalCode?'timeout':err,code);
  let r;try{r=JSON.parse(text);}catch(cause){throw malformed('orchestrator','session-evidence',cause);}
  if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw malformed('orchestrator','session-evidence');
  if(!first)first=r;
- if(JSON.stringify(r.transcript.turns)!==JSON.stringify(first.transcript.turns))throw Error('Turn state changed during transcript pagination; refresh evidence');
+ if(JSON.stringify(r.transcript.turns)!==JSON.stringify(first.transcript.turns))throw malformed('orchestrator','session-evidence',new Error('Turn state changed during transcript pagination; refresh evidence'));
  const batch=r.transcript.entries;
- if(batch.some((x:any)=>!Number.isSafeInteger(x.sequence)||(before!==undefined&&x.sequence>=before))||new Set(batch.map((x:any)=>x.sequence)).size!==batch.length)throw Error('Invalid transcript pagination sequence');
+ if(batch.some((x:any)=>!Number.isSafeInteger(x.sequence)||(before!==undefined&&x.sequence>=before))||new Set(batch.map((x:any)=>x.sequence)).size!==batch.length)throw malformed('orchestrator','session-evidence',new Error('Invalid transcript pagination sequence'));
  entries.unshift(...batch);
  if(r.transcript.hasMoreBefore===false||r.transcript.hasMoreBefore===undefined&&batch.length<100){first.transcript.entries=entries;first.receiptObservation={observed:started,complete:true};return first;}
- if(!batch.length)throw Error('Transcript page has no pagination cursor');
+ if(!batch.length)throw malformed('orchestrator','session-evidence',new Error('Transcript page has no pagination cursor'));
  before=Math.min(...batch.map((x:any)=>x.sequence));
  }
- throw Error('Transcript pagination limit reached; receipt evidence incomplete');
+ throw malformed('orchestrator','session-evidence',new Error('Transcript pagination limit reached; receipt evidence incomplete'));
 }
 // Capturing an agent plan never approves it. The caller selects a concrete entry;
 // human approval remains bound to the specification+plan hash in Store.approve.

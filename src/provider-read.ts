@@ -19,7 +19,8 @@ export function readFailure(provider:ReadEvidence['provider'],operation:string,r
  const classification:ReadClass=httpStatus===401?'authentication':httpStatus===429||/secondary rate limit|rate limit exceeded|abuse detection/i.test(rateEvidence)?'throttled':httpStatus===403?'permission':httpStatus===404?'missing':httpStatus&&httpStatus>=500?'server':/timed? ?out|timeout|ETIMEDOUT/i.test(raw)?'timeout':/ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|network is unreachable|could not resolve|connection reset|error connecting/i.test(raw)?'network':'unknown';
  const retry=protocol.match(/^retry-after:[ \t]*(\d+)[ \t]*\r?$/im),reset=protocol.match(/^x-ratelimit-reset:[ \t]*(\d+)[ \t]*\r?$/im);
  const requestId=protocol.match(/^x-github-request-id:[ \t]*([A-F0-9: -]{1,100})\r?$/im)?.[1]?.trim();
- const hint=Math.max(retry?now+Number(retry[1])*1000:0,reset?Number(reset[1])*1000:0);
+ const remaining=protocol.match(/^x-ratelimit-remaining:[ \t]*(\d+)[ \t]*\r?$/im);
+ const hint=Math.max(retry?now+Number(retry[1])*1000:0,reset&&remaining&&Number(remaining[1])===0?Number(reset[1])*1000:0);
  return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(Number.isSafeInteger(hint)&&hint>now?{retryAt:hint}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
 }
 export function readEvidence(error:unknown,provider:ReadEvidence['provider']='github',operation='observation'):ReadEvidence{

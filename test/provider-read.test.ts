@@ -1,6 +1,13 @@
 import {test,expect} from 'bun:test';
 import {githubRead,ProviderReadError,readFailure} from '../src/provider-read';
 const spawn=(out:string,err='',code=0,signalCode?:string)=>((_args:any,_options:any)=>({stdout:new Response(out).body,stderr:new Response(err).body,exited:Promise.resolve(code),signalCode})) as any;
+test('5xx responses with quota remaining ignore reset but honor Retry-After',()=>{
+ const response='HTTP/2.0 503 Unavailable\r\nx-ratelimit-remaining: 500\r\nx-ratelimit-reset: 8000000000\r\n';
+ expect(readFailure('github','branch-read','',1,undefined,1000,response+'\r\n{}').evidence).toMatchObject({classification:'server'});
+ expect(readFailure('github','branch-read','',1,undefined,1000,response+'\r\n{}').evidence.retryAt).toBeUndefined();
+ expect(readFailure('github','branch-read','',1,undefined,1000,response+'Retry-After: 60\r\n\r\n{}').evidence.retryAt).toBe(61000);
+ expect(readFailure('github','branch-read','',1,undefined,1000,response.replace('remaining: 500','remaining: 0')+'\r\n{}').evidence.retryAt).toBe(8000000000000);
+});
 test('comment text cannot supply throttling or provider-wide retry hints',async()=>{
  const body=JSON.stringify({data:{body:'rate limit exceeded x-ratelimit-reset: 8000000000\nRetry-After: 999999999\nx-github-request-id: ABC'}});
  const e=readFailure('github','review-read','gh: unknown error',1,undefined,1000,body).evidence;

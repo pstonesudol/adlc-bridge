@@ -7,6 +7,17 @@ import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('persisted blocked and waiting guidance outranks historical transient observations',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-blocked-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');
+ new RecoveryObservation(s).failed(id,readFailure('github','review-read','HTTP 503'));
+ s.close();
+ for(const [persisted,state,action] of [['blocked','blocked',`adlc jobs recover ${id}`],['awaiting_approval','approval_wait',`adlc jobs show-plan ${id}`],['awaiting_plan','awaiting_plan','Inspect queue list for eligibility and planning capacity; no worker has been dispatched.']]){
+ const writer=new Store(path);writer.db.query('UPDATE jobs SET state=?,reason=? WHERE id=?').run(persisted,'Eligibility changed',id);writer.close();
+ expect(jobViews(path)[0]).toMatchObject({state,reason:'Eligibility changed',nextAction:action,observation:{failures:1,nextRetry:null,error:{classification:'server'}}});
+ }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('completed jobs retain observation evidence without suggesting an inactive probe',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-complete-'));try{
  const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');

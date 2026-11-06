@@ -2,6 +2,7 @@ import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {ReceiptReconciliation,evaluateReceipt} from '../src/receipt-reconciliation';
 import {sessionEvidence} from '../src/session-evidence';
+import {ProviderReadError} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -64,6 +65,14 @@ test('late nonterminal and contradictory terminal receipts do not erase cancella
 });
 test('accepted entry without a native turn is not execution',()=>{
  const {s,b,e}=fixture();try{delete e.transcript.entries[0].turnId;expect(evaluateReceipt(b,e).state).toBe('accepted');}finally{s.close();}
+});
+test('unexpected spawn and stream failures are unknown without interpreting their messages',async()=>{
+ for(const mode of ['spawn','stream']){
+ const cause=new Error('Invalid pagination timeout freshness deadline ETIMEDOUT');
+ const spawn=(()=>{if(mode==='spawn')throw cause;return {stdout:new ReadableStream({start(controller){controller.error(cause);}}),stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ try{await sessionEvidence('worker',spawn);throw Error('Expected failure');}
+ catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe('unknown');expect((error as Error).cause).toBe(cause);}
+ }
 });
 test('collector exhausts sequence pages before proving receipt completeness',async()=>{
  const calls:string[][]=[];

@@ -52,7 +52,7 @@ test('classification and safe evidence, including nested cause',()=>{
  expect(readEvidence(new Error('wrapper',{cause:error}))).toEqual(error.evidence);
  }
  expect(malformed('orchestrator','session-evidence').evidence.classification).toBe('malformed');
- expect(readFailure('github','branch-read','HTTP 429\nRetry-After: 60\nx-ratelimit-reset: 90\nx-github-request-id: ABC:123\n',1,undefined,1000).evidence).toMatchObject({retryAt:90000,requestId:'ABC:123'});
+ expect(readFailure('github','branch-read','HTTP 429\nRetry-After: 60\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 90\nx-github-request-id: ABC:123\n',1,undefined,1000).evidence).toMatchObject({retryAt:90000,requestId:'ABC:123'});
 });
 test('shared capacity, lease dedupe, manual retry and permanent failures',async()=>{
  const s=new Store(':memory:');let now=100;const o=new RecoveryObservation(s,()=>now,()=>0.5),a=s.enqueue('p','a','s'),b=s.enqueue('q','b','s');
