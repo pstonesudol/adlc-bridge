@@ -1,10 +1,9 @@
 import {test,expect} from 'bun:test';
-import {classifyOpenCode,type ClassifierTransport} from '../src/routing-config';
+import {classifyOpenCode,connectClassifier,type ClassifierTransport} from '../src/routing-config';
 import {TaskRouting} from '../src/task-routing';
 import {Store} from '../src/core';
 import {routingConfig,settings} from './routing-fixture';
-import {Service} from '@opencode/client/service';
-import {mkdtempSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,cpSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join} from 'node:path';
 
 const answer=()=>Response.json({data:{text:JSON.stringify({choice:'implement',confidence:0.99})}});
@@ -23,18 +22,39 @@ test('classifier sends private task data only in a stateless generation HTTP bod
  }});
  try{const result=await classifyOpenCode('authorized/classifier/nested','private Linear fixture',routingConfig,transport({connect:async()=>({url:server.url.toString(),headers:{authorization:'Bearer fixture-only'}}),fetch}));expect(result.choice).toBe('implement');expect(calls).toBe(1);}finally{server.stop(true);}
 });
-test('pinned native client discovers/authenticates only the temporary service without changing its registration',async()=>{
- const dir=mkdtempSync(join(tmpdir(),'adlc-service-fixture-')),file=join(dir,'service.json'),paths:string[]=[];
- const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
-  expect(request.headers.get('authorization')).toBe('Basic '+Buffer.from('opencode:fixture-only').toString('base64'));
-  const path=new URL(request.url).pathname;paths.push(path);
-  if(path==='/api/info')return Response.json({version:'2.2.5',pid:process.pid});
-  expect(path).toBe('/api/experimental/generate/text');expect((await request.json()).prompt).toContain('private fixture');return answer();
- }});
- const registration=JSON.stringify({version:'2.2.5',pid:process.pid,url:server.url.toString(),password:'fixture-only'});writeFileSync(file,registration,{mode:0o600});
- try{const result=await classifyOpenCode('authorized/classifier','private fixture',routingConfig,transport({connect:async()=>{
-  const endpoint=await Service.discover({file,version:version=>version.startsWith('2.')});if(!endpoint)throw Error('Fixture discovery failed');return {url:endpoint.url,headers:Service.headers(endpoint)??{}};
- },fetch}));expect(result.choice).toBe('implement');expect(paths).toEqual(['/api/info','/api/experimental/generate/text']);expect(readFileSync(file,'utf8')).toBe(registration);}finally{server.stop(true);rmSync(dir,{recursive:true,force:true});}
+test('ADLC loads service discovery lazily and passes authentication through its supported boundary',async()=>{
+ const calls:string[]=[],endpoint={url:'http://127.0.0.1:12345',auth:{type:'basic' as const,username:'opencode',password:'fixture-only'}},headers={authorization:'fixture-only header'};
+ const result=await connectClassifier(async()=>{calls.push('load');return {Service:{
+  async discover(options){calls.push('discover');expect(options.version('2.2.5')).toBe(true);expect(options.version('1.9.0')).toBe(false);expect(options.version('3.0.0')).toBe(false);return endpoint;},
+  headers(value){calls.push('headers');expect(value).toBe(endpoint);return headers;}
+ }};});
+ expect(calls).toEqual(['load','discover','headers']);expect(result.url).toBe(endpoint.url);expect(result.headers).toBe(headers);
+});
+test('service boundary rejects unavailable discovery and supports anonymous local service headers',async()=>{
+ await expect(connectClassifier(async()=>({Service:{discover:async()=>undefined,headers(){throw Error('No endpoint may be authenticated');}}}))).rejects.toThrow('Start an authorized OpenCode V2 service');
+ const result=await connectClassifier(async()=>({Service:{discover:async()=>({url:'http://127.0.0.1:12345'}),headers:()=>undefined}}));expect(result.headers).toEqual({});
+});
+test('missing optional client becomes configured failure fallback without persisting import diagnostics',async()=>{
+ const s=new Store(':memory:');try{
+  const connect=()=>connectClassifier(async()=>{throw Error('Cannot find module @opencode/client/service; private fixture detail');});
+  const router=new TaskRouting(s,async()=>({config:routingConfig,classify:request=>classifyOpenCode('authorized/classifier',request,routingConfig,transport({connect}))})),job=s.enqueue('p','i','task');
+  const route=await router.choose(job,'implementation','binding','task',settings);expect(route.model).toBe('opencode-go/flash');expect(route.reason).toBe('classifier-unavailable');expect(JSON.stringify(router.list())).not.toContain('private fixture detail');
+ }finally{s.close();}
+});
+test('real default loader retains planning and failure fallback without installed client or OpenChamber',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-no-client-'));
+ try{
+  cpSync(join(import.meta.dir,'../src'),join(dir,'src'),{recursive:true});
+  const configFile=join(dir,'routing.json');writeFileSync(configFile,JSON.stringify({...routingConfig,version:1,harness:'opencode-v2',classifier:{adapter:'opencode',model:'authorized/classifier'}}));
+  writeFileSync(join(dir,'probe.ts'),`import {Store} from './src/core';import {TaskRouting} from './src/task-routing';
+const s=new Store(':memory:');try{const router=new TaskRouting(s),job=s.enqueue('p','i','spec'),settings=${JSON.stringify({...settings,configFile})};
+const planning=await router.choose(job,'planning','plan-binding','plan',settings,'planning');
+const implementation=await router.choose(job,'implementation','implementation-binding','task',settings);
+console.log(JSON.stringify({planning,implementation,routes:router.list()}));}finally{s.close();}`);
+  const proc=Bun.spawn([process.execPath,'--no-install',join(dir,'probe.ts')],{cwd:dir,env:{HOME:dir,PATH:process.env.PATH},stdout:'pipe',stderr:'pipe'});
+  const output=await new Response(proc.stdout).text(),error=await new Response(proc.stderr).text();expect(error).toBe('');expect(await proc.exited).toBe(0);
+  const result=JSON.parse(output);expect(result.planning.model).toBe('openai/luna');expect(result.implementation.model).toBe('opencode-go/flash');expect(result.implementation.reason).toBe('classifier-unavailable');expect(JSON.stringify(result.routes)).not.toContain('Cannot find module');
+ }finally{rmSync(dir,{recursive:true,force:true});}
 });
 test('deadline bounds discovery even if connection never settles',async()=>{
  let called=false;

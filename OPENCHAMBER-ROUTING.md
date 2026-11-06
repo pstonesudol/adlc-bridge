@@ -61,6 +61,14 @@ aborts HTTP and cancels the response stream even if a transport fails to settle.
 Response bodies are limited to 1 MiB. No classifier child process is created, so
 there is no child process tree to terminate or inherited stdout to keep open.
 Task data is never placed in process arguments. No automatic inference retries occur.
+
+The default `bun test` suite is dependency-free: it exercises the ADLC service
+loader boundary, real loopback HTTP generation, deadlines and failure fallback
+without requiring an installed client or OpenChamber. After installing the pinned
+project dependency, also run `bun test ./test/routing-client.integration.ts` for
+the native client's discovery/authentication contract. This explicit integration
+test fails if the client is missing; it never silently skips. It uses only a
+temporary authenticated loopback service/registration, not real logins or inference.
 Malformed/unknown/disabled categories, low confidence and classifier failures use
 only the configured fallback and record the reason; a missing fallback blocks.
 

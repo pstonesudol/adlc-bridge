@@ -25,10 +25,12 @@ export function effectiveRouting(settings:RoutingSettings){
 }
 type ClassifierConnection={url:string;headers:HeadersInit};
 export type ClassifierTransport={connect:()=>Promise<ClassifierConnection>;fetch:typeof fetch;timeoutMs:number};
-async function connectClassifier():Promise<ClassifierConnection>{
+type ClassifierEndpoint={url:string;auth?:{type:'basic';username:string;password:string}};
+export type ClassifierService={discover:(options:{version:(version:string)=>boolean})=>Promise<ClassifierEndpoint|undefined>;headers:(endpoint:ClassifierEndpoint)=>HeadersInit|undefined};
+export async function connectClassifier(loadService:()=>Promise<{Service:ClassifierService}>=()=>import('@opencode/client/service')):Promise<ClassifierConnection>{
  // Supported discovery/authentication only; never start, stop, or copy credentials
  // from a service. Do not fall back to a tool-capable run/session endpoint.
- const {Service}=await import('@opencode/client/service');
+ const {Service}=await loadService();
  const endpoint=await Service.discover({version:version=>version.startsWith('2.')});
  if(!endpoint)throw Error('Start an authorized OpenCode V2 service before enabling classification');
  return {url:endpoint.url,headers:Service.headers(endpoint)??{}};
