@@ -1,7 +1,8 @@
 import {existsSync,lstatSync,readFileSync,mkdirSync,rmSync,renameSync,unlinkSync} from 'node:fs';
 import {join,dirname,isAbsolute,relative,sep} from 'node:path';
 import {tmpdir} from 'node:os';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
+import {readUpdateHistory,type RetainedIntent,type HistoryEvidence} from './update-history';
 import {appState,installationRecord} from './install-state';
 import {atomicFile} from './atomic-file';
 import {distributionFiles,distributionVersion,installBridge} from './install';
@@ -27,7 +28,7 @@ export type TestEvidence={passed:boolean;skipped:boolean;detail:string};
 export type MigrationEvidence={required:boolean;compatible:boolean;rollbackSafe:boolean;detail:string};
 export type Classification='hot'|'backend'|'schema';
 export type PriorService={project:string;loaded:boolean};
-export type UpdateIntent={version:1;stage:string;candidate:string;fromVersion:string;classification:Classification;priorServices:PriorService[];backendStopped:boolean;installed:boolean;startedAt:string;updatedAt:string;error?:string};
+export type UpdateIntent=RetainedIntent&{version:1;stage:string;candidate:string;fromVersion:string;classification:Classification;priorServices:PriorService[];backendStopped:boolean;installed:boolean;startedAt:string;updatedAt:string;error?:string};
 export type InstalledUpdateState={version:1;commit:string|null;contentVersion:string;classification:Classification;rollbackSafe:boolean;restartRequired:boolean;previousSource:string;previousVersion:string;previousCommit:string|null;dbHash:string|null;activatedAt:string};
 
 export const UPDATE_STAGES=['staged','stopping','quiesced','installing','starting','verifying','completed','deferred','rolled-back','failed','operator-action-required'] as const;
@@ -166,9 +167,18 @@ function installedVersion(state:string){
  const parsed=readJson(manifest);if(!Array.isArray(parsed.files))throw Error('Installed snapshot manifest is invalid');
  return {record,files:parsed.files as string[]};
 }
-function readIntent(state:string):UpdateIntent|undefined{const path=join(state,'update-intent.json');if(!existsSync(path))return;const intent=readJson(path);if(intent.version!==1||typeof intent.stage!=='string')throw Error('Update intent is invalid; operator action required');return intent;}
-function writeIntent(state:string,intent:UpdateIntent){atomicFile(join(state,'update-intent.json'),JSON.stringify(intent,null,2)+'\n');return intent;}
-function advance(state:string,intent:UpdateIntent,stage:string,extra:Partial<UpdateIntent>={}){return writeIntent(state,{...(readIntent(state)??intent),...extra,stage,updatedAt:new Date().toISOString()});}
+function readIntent(state:string):UpdateIntent|undefined{const path=join(state,'update-intent.json');if(!existsSync(path))return;const intent=readJson(path);if(intent.version!==1||typeof intent.stage!=='string'||(intent.historyVersion!==undefined&&(intent.historyVersion!==1||!Array.isArray(intent.history)||!Array.isArray(intent.transitions))))throw Error('Update intent is invalid; operator action required');return intent;}
+function writeIntent(state:string,intent:UpdateIntent){
+ const previous=readIntent(state),{history:ignored,...record}=intent;
+ const history=previous?.history??[];
+ if(previous&&(!intent.attemptId||previous.attemptId!==intent.attemptId)){const {history:oldHistory,...prior}=previous;history.push(prior);}
+ const value={...record,attemptId:intent.attemptId??randomUUID(),historyVersion:1 as const,history,transitions:intent.transitions??[{stage:intent.stage,at:intent.startedAt}]};
+ atomicFile(join(state,'update-intent.json'),JSON.stringify(value,null,2)+'\n');return value;
+}
+function advance(state:string,intent:UpdateIntent,stage:string,extra:Omit<Partial<UpdateIntent>,'evidence'>&{evidence?:Partial<HistoryEvidence>}={}){
+ const current=readIntent(state)??intent,updatedAt=new Date().toISOString();
+ return writeIntent(state,{...current,...extra,evidence:current.evidence?{...current.evidence,...extra.evidence}:extra.evidence,stage,updatedAt,transitions:[...(current.transitions??[]),{stage,at:updatedAt}]});
+}
 function readInstalledState(state:string):InstalledUpdateState|undefined{const path=join(state,'update-state.json');if(!existsSync(path))return;const value=readJson(path);if(value.version!==1||(typeof value.commit!=='string'&&value.commit!==null))throw Error('Installed update state is invalid; operator action required');return value;}
 function writeInstalledState(state:string,value:InstalledUpdateState){atomicFile(join(state,'update-state.json'),JSON.stringify(value,null,2)+'\n');return value;}
 function acquireLock(state:string){
@@ -227,6 +237,7 @@ function writeAutoAttempt(state:string,now:number){atomicFile(join(state,'update
 
 export class UpdateManager{
  constructor(public io:UpdateIO,public turns:TurnBarrier=turnBarrier(io.state())){}
+ history(project?:string){return readUpdateHistory(this.io.state(),project);}
  private notify(event:string,key:string,detail?:Record<string,unknown>){try{this.io.notify(event,key,detail);}catch(error){console.error('Update notification needs inspection:',error instanceof Error?error.message:String(error));}}
  policy(){const policy=readUpdatePolicy(this.io.state());if(!policy)throw Error('Update policy is not configured; run update-config POLICY_JSON --apply first');return policy;}
  async status(){
@@ -279,7 +290,16 @@ export class UpdateManager{
   if(options.automatic&&policy.mode!=='automatic')throw Error('Automatic update adoption is not enabled; apply updates explicitly');
   if(options.automatic){const last=readAutoRecord(state);if(last?.attemptedAt&&this.io.now()-Date.parse(last.attemptedAt)<policy.cadenceSeconds*1000)return {skipped:true,reason:'Update cadence has not elapsed'};writeAutoAttempt(state,this.io.now());}
   const plan=await this.preview();if(plan.upToDate)return {upToDate:true};
-  if(plan.blockers.length)throw Error(`Update is not ready: ${plan.blockers.join('; ')}`);
+  if(plan.blockers.length){
+   const release=acquireLock(state);
+   try{
+    const existing=readIntent(state);
+    if(existing&&(activeStages.has(existing.stage)||existing.stage==='operator-action-required'))throw Error('A prior update requires explicit operator recovery');
+    const now=new Date().toISOString();
+    writeIntent(state,{version:1,stage:'failed',candidate:plan.candidate.commit,fromVersion:plan.installedVersion,classification:plan.classification,priorServices:[],backendStopped:false,installed:false,startedAt:now,updatedAt:now,evidence:{operation:'apply',sourceCommit:plan.candidate.commit,candidateSnapshot:plan.staged.version},error:'Preflight verification failed'});
+   }finally{release();}
+   throw Error(`Update is not ready: ${plan.blockers.join('; ')}`);
+  }
   this.notify('update-available',plan.candidate.commit,{ref:plan.candidate.ref,classification:plan.classification});
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and inspect it before updating');
   const release=acquireLock(state);
@@ -289,7 +309,7 @@ export class UpdateManager{
    if(installedVersion(state).record.version!==plan.installedVersion)throw Error('Installed version changed after preview; re-run the update');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; inspect services and update-intent.json, then use update-rollback or explicit operator recovery`);
    if(existing?.stage==='operator-action-required')throw Error('A prior update requires explicit operator recovery; inspect services and update-intent.json before retrying');
-   const intent=writeIntent(state,{version:1,stage:'staged',candidate:plan.candidate.commit,fromVersion:plan.installedVersion,classification:plan.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+   const intent=writeIntent(state,{version:1,stage:'staged',candidate:plan.candidate.commit,fromVersion:plan.installedVersion,classification:plan.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString(),evidence:{operation:'apply',sourceCommit:plan.candidate.commit,candidateSnapshot:plan.staged.version,migration:plan.classification==='schema'?'compatibility-verified':'not-required',backendRestart:plan.classification==='hot'?'not-required':undefined}});
    if(!wasPaused)this.turns.pause();
    let prior:PriorService[]=[];let backendStopped=false;let leavePaused=false;let installAttempted=false;
    try{
@@ -297,11 +317,11 @@ export class UpdateManager{
     const backup=join(state,'backups',`update-${plan.candidate.commit}`);mkdirSync(backup,{recursive:true,mode:0o700});atomicFile(join(backup,'prior.json'),JSON.stringify({candidate:plan.candidate.commit,fromVersion:plan.installedVersion,classification:plan.classification,priorServices:prior,reattachment:plan.reattachment??null},null,2)+'\n');
     for(const service of prior)if(service.loaded)await this.io.stack.project('stop',service.project);
     let blockers:{session:string;reason:string}[]=[];
-    try{blockers=await this.io.stack.blockers();}catch(error){throw new UpdateDeferred(`Worker activity is unknown: ${error instanceof Error?error.message:String(error)}`);}
-    if(blockers.length)throw new UpdateDeferred(`Update deferred until idle: ${blockerSummary(blockers)}`);
+    try{blockers=await this.io.stack.blockers();}catch(error){throw new UpdateDeferred(`Worker activity is unknown: ${error instanceof Error?error.message:String(error)}`,'activity-unknown');}
+    if(blockers.length)throw new UpdateDeferred(`Update deferred until idle: ${blockerSummary(blockers)}`,'workers-busy');
     advance(state,intent,'quiesced');
     if(plan.classification!=='hot'){
-     if(!plan.reattachment?.safe)throw new UpdateDeferred(plan.reattachment?.detail??'Controller reattachment safety is unverified; backend restart deferred');
+     if(!plan.reattachment?.safe)throw new UpdateDeferred(plan.reattachment?.detail??'Controller reattachment safety is unverified; backend restart deferred','reattachment-unverified');
      const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready for a guarded backend restart');
      await this.io.stack.backendStop();backendStopped=true;advance(state,intent,'quiesced',{backendStopped:true});
     }
@@ -311,15 +331,16 @@ export class UpdateManager{
     if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version)throw Error('Staged candidate changed after verification; no installation attempted');
     installAttempted=true;
     const result=await this.io.install(true,plan.staged.root,this.io.launcher());
-    advance(state,intent,'starting',{installed:true});
+    advance(state,intent,'starting',{installed:true,evidence:{installedSnapshot:plan.staged.version}});
     if(backendStopped)await this.io.stack.backendStart();
+    if(backendStopped)advance(state,intent,'starting',{evidence:{backendRestart:'completed'}});
     const baselineDb=this.io.dbHash();
     for(const service of prior)if(service.loaded){await startService(service.project);}
     advance(state,intent,'verifying');
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Activated runtime is not healthy');
     for(const service of prior)if(service.loaded){const status=await this.io.stack.project('service-status',service.project);if(!status?.loaded)throw Error(`Project ${service.project} did not restore after activation`);}
     writeInstalledState(state,{version:1,commit:plan.candidate.commit,contentVersion:plan.staged.version,classification:plan.classification,rollbackSafe:(plan.migration?.rollbackSafe??true)&&(plan.classification!=='schema'||baselineDb!==null),restartRequired:plan.classification==='hot'&&!!result?.runtimeRestartRequired,previousSource:join(state,'versions',plan.installedVersion),previousVersion:plan.installedVersion,previousCommit:readInstalledState(state)?.commit??null,dbHash:baselineDb,activatedAt:new Date().toISOString()});
-    advance(state,intent,'completed');
+    advance(state,intent,'completed',{evidence:{health:'passed',rollbackSafe:(plan.migration?.rollbackSafe??true)&&(plan.classification!=='schema'||baselineDb!==null),databaseBaseline:baselineDb!==null}});
     this.notify('activated',plan.candidate.commit,{version:plan.staged.version,classification:plan.classification});
     if(!wasPaused)this.turns.resume();
     return {activated:true,candidate:plan.candidate.commit,version:plan.staged.version,classification:plan.classification,restoredServices:prior,install:result};
@@ -346,13 +367,13 @@ export class UpdateManager{
       this.notify('operator-action-required',plan.candidate.commit,{reason:`Intake restoration failed: ${recovery.map(item=>item.message).join('; ')}`});
       throw new Error(`Update deferred, but prior intake could not be fully restored. Intake remains paused; inspect services and update-intent.json: ${recovery.map(item=>item.message).join('; ')}`,{cause:error});
      }
-     advance(state,intent,'deferred',{error:error instanceof Error?error.message:String(error)});
+     advance(state,intent,'deferred',{error:error instanceof Error?error.message:String(error),evidence:{deferredReason:error.reason}});
      this.notify('waiting-for-idle',plan.candidate.commit,{reason:error instanceof Error?error.message:String(error)});
      if(!wasPaused)this.turns.resume();
      return {deferred:true,reason:error instanceof Error?error.message:String(error),candidate:plan.candidate.commit};
     }
     const stage=recovery.length?'operator-action-required':rolledBack?'rolled-back':'failed';
-    advance(state,intent,stage,{error:error instanceof Error?error.message:String(error)});leavePaused=recovery.length>0;
+    advance(state,intent,stage,{error:error instanceof Error?error.message:String(error),evidence:{...(rolledBack?{restoredSnapshot:plan.installedVersion}:{}),...(readIntent(state)?.stage==='verifying'?{health:'failed' as const}:{})}});leavePaused=recovery.length>0;
     this.notify(stage==='operator-action-required'?'operator-action-required':rolledBack?'rolled-back':'failed',plan.candidate.commit,{reason:error instanceof Error?error.message:String(error)});
     if(!leavePaused&&!wasPaused)this.turns.resume();
     const steps=recovery.length?`Intake remains paused. Inspect update-intent.json, ${join(state,'backups')} and service-status; recovery errors: ${recovery.map(item=>item.message).join('; ')}`:`Prior runtime restored; inspect update-intent.json and logs`;
@@ -371,7 +392,7 @@ export class UpdateManager{
    if(installed.classification==='schema'&&(installed.dbHash===null||this.io.dbHash()!==installed.dbHash))throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; explicit operator recovery is required`);
    const source=installed.previousSource;const rel=typeof source==='string'&&isAbsolute(source)?relative(join(state,'versions'),source):'..';if(typeof source!=='string'||!rel||rel.startsWith('..')||isAbsolute(rel)||rel.includes(sep)||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
-   const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+   const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString(),evidence:{operation:'rollback',sourceCommit:installed.previousCommit,candidateSnapshot:installed.previousVersion,rollbackSafe:installed.rollbackSafe,migration:installed.classification==='schema'?'compatibility-verified':'not-required',backendRestart:installed.classification==='hot'?'not-required':undefined}});
    if(!wasPaused)this.turns.pause();
    let prior:PriorService[]=[];let leavePaused=false,backendStopped=false;
    try{
@@ -381,18 +402,19 @@ export class UpdateManager{
     if(installed.classification!=='hot'){
      const reattachment=await this.io.reattachment?.();if(!reattachment?.safe)throw new Error(reattachment?.detail??'Controller reattachment safety is unverified; rollback backend restart deferred');
      const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Managed Orchestrator is not ready for a guarded rollback restart');
-     await this.io.stack.backendStop();backendStopped=true;
+     await this.io.stack.backendStop();backendStopped=true;advance(state,intent,'quiesced',{backendStopped:true});
     }
     advance(state,intent,'installing');
     await this.io.install(true,source,launcher);
-    advance(state,intent,'starting');
+    advance(state,intent,'starting',{installed:true,evidence:{installedSnapshot:installed.previousVersion}});
     if(backendStopped)await this.io.stack.backendStart();
+    if(backendStopped)advance(state,intent,'starting',{evidence:{backendRestart:'completed'}});
     for(const service of prior)if(service.loaded)await startService(service.project);
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Restored runtime is not healthy');
     // A successful rollback is terminal for this record; never leave metadata
     // that could authorize another restore from an empty or stale source.
     if(existsSync(join(state,'update-state.json')))unlinkSync(join(state,'update-state.json'));
-    advance(state,intent,'rolled-back');
+    advance(state,intent,'rolled-back',{evidence:{restoredSnapshot:installed.previousVersion,health:'passed'}});
     this.notify('rolled-back',installed.commit,{version:installed.previousVersion});
     if(!wasPaused)this.turns.resume();
     return {rolledBack:true,version:installed.previousVersion,restoredServices:prior};
@@ -407,4 +429,6 @@ export class UpdateManager{
   }finally{release();}
  }
 }
-class UpdateDeferred extends Error{}
+class UpdateDeferred extends Error{
+ constructor(message:string,public reason:NonNullable<HistoryEvidence['deferredReason']>){super(message);}
+}

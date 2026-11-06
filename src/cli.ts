@@ -3,6 +3,8 @@ import {installBridge} from './install';
 import {maintenance} from './maintenance';
 import {installRuntime} from './runtime-install';
 import {UpdateManager,liveUpdateIO,validateUpdatePolicy,writeUpdatePolicy} from './update';
+import {readUpdateHistory,parseHistoryArgs,formatUpdateHistory,UPDATE_HISTORY_HELP} from './update-history';
+import {appState} from './install-state';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
@@ -118,6 +120,12 @@ async function main(){
     return out(await installBridge(a.includes('--apply'),undefined,bin));
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
+  if(command==='update'){
+   if(a[0]!=='history')throw Error(`Use ${UPDATE_HISTORY_HELP}`);
+   if(a.length===2&&['--help','-h'].includes(a[1]))return console.log(UPDATE_HISTORY_HELP);
+   const options=parseHistoryArgs(a.slice(1)),history=readUpdateHistory(appState(),options.project);
+   return options.json?out(history):console.log(formatUpdateHistory(history));
+  }
   if(command==='update-config'){
    if(a.length!==1&&!(a.length===2&&a[1]==='--apply'))throw Error('Use update-config POLICY_JSON [--apply]');
    const policy=JSON.parse(readFileSync(req(a[0],'Policy file'),'utf8'));
@@ -173,6 +181,8 @@ async function main(){
   update-apply [--automatic]           guarded activation only after authoritative idleness
   update-auto                          opt-in cadence check; never schedules itself
   update-rollback                      restore the prior compatible verified snapshot
+  update history [--project PROJECT] [--json]
+                                       read-only, redacted shared-runtime timeline
   start --all | stop --all | status --all
                                        full background stack; stop requires idle workers
   projects                             list registered project services

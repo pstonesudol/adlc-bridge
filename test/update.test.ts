@@ -5,8 +5,90 @@ import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
 import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,evaluateCheckRuns,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
 import {installBridge} from '../src/install';
+import {formatUpdateHistory,parseHistoryArgs,readUpdateHistory} from '../src/update-history';
 
 const repo='acme/adlc';
+test('history retains activation, rollback and repeated attempts in the existing intent',async()=>{
+ const f=fixture({version:'b'.repeat(16)});try{
+  await f.manager.apply();await f.manager.rollback();await f.manager.apply();
+  const history=f.manager.history('two');expect(history.entries).toHaveLength(3);
+  expect(new Set(history.entries.map(e=>e.attemptId)).size).toBe(3);
+  expect(history.entries.map(e=>e.outcome)).toEqual(['completed','rolled-back','completed']);
+  expect(history.entries[0]).toMatchObject({sourceCommit:'a'.repeat(40),candidateSnapshot:'b'.repeat(16),installedSnapshot:'b'.repeat(16),health:'passed',backendRestart:'not-required',states:{running:'unknown'},scope:{sharedRuntime:true,projects:['one','two'],projectsKnown:true}});
+  expect(history.entries[1].operation).toBe('rollback');
+  expect(history.entries[1].rollback.reason).toContain('consumed');
+  expect(history.entries[2].transitions.map(t=>t.stage)).toContain('verifying');
+  expect(history.entries[0].completedAt).not.toBeNull();
+  expect(f.manager.history('unrelated').entries).toHaveLength(3);
+  expect(f.manager.history('unrelated').scope).toContain('never hides');
+ }finally{f.close();}
+});
+test('history captures deferred, failed preflight, failed health and partial recovery',async()=>{
+ const deferred=fixture({blockers:[{session:'worker',reason:'running secret-token'}]});try{
+  await deferred.manager.apply();expect(deferred.manager.history().entries[0]).toMatchObject({outcome:'deferred',health:'unknown',states:{installed:'unknown'}});
+  expect(JSON.stringify(deferred.manager.history())).not.toContain('secret-token');
+ }finally{deferred.close();}
+ const failed=fixture({tests:{passed:false,skipped:false,detail:'secret-password'}});try{
+  await expect(failed.manager.apply()).rejects.toThrow();expect(failed.manager.history().entries[0].outcome).toBe('failed');
+  expect(failed.installs).toEqual([]);
+ }finally{failed.close();}
+ const partial=fixture({files:['src/cli.ts','src/serve-orchestrator.py'],failBackendStarts:1});try{
+  partial.setFail(true);await expect(partial.manager.apply()).rejects.toThrow();
+  expect(partial.manager.history().entries[0].outcome).toBe('operator-action-required');
+ }finally{partial.close();}
+ const health=fixture();try{
+  const backend=health.io.stack.backend;let n=0;health.io.stack.backend=async()=>++n===1?{ready:false,managed:true} as any:backend();
+  await expect(health.manager.apply()).rejects.toThrow();
+  expect(health.manager.history().entries[0]).toMatchObject({outcome:'rolled-back',health:'failed'});
+ }finally{health.close();}
+});
+test('backend history preserves restart confirmation and migration compatibility constraints',async()=>{
+ const f=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:false,detail:'private'}});try{
+  await f.manager.apply();expect(f.manager.history().entries[0]).toMatchObject({backendRestart:'completed',health:'passed',migration:'compatibility-verified-execution-unknown',rollback:{recordedCompatible:false,currentAvailability:'unknown'}});
+  expect(f.manager.history().entries[0].rollback.reason).toContain('prohibits');
+ }finally{f.close();}
+});
+test('history inspection is read-only and does not construct operational IO',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();const path=join(f.state,'update-intent.json'),before=readFileSync(path,'utf8');
+  const calls=f.calls.slice(),installs=f.installs.slice(),notifications=f.notifications.slice();
+  for(const name of ['resolve','stage','checks','tests','install','dbHash','notify','launcher'] as const)(f.io as any)[name]=()=>{throw Error('history invoked operational IO');};
+  Object.defineProperty(f.io,'stack',{get(){throw Error('history read live services');}});
+  expect(f.manager.history().entries).toHaveLength(1);
+  expect(readFileSync(path,'utf8')).toBe(before);expect(f.calls).toEqual(calls);expect(f.installs).toEqual(installs);expect(f.notifications).toEqual(notifications);
+ }finally{f.close();}
+});
+test('legacy history is unknown and is retained without promoting legacy completion',async()=>{
+ const f=fixture();try{
+  const path=join(f.state,'update-intent.json');
+  expect(f.manager.history()).toMatchObject({history:'unknown',entries:[]});
+  writeFileSync(path,JSON.stringify({version:1,stage:'completed',candidate:'a'.repeat(40),fromVersion:'old',startedAt:'2026-11-01T00:00:00.000Z',updatedAt:'2026-11-01T00:00:01.000Z',error:'secret'}),{mode:0o600});
+  expect(f.manager.history().entries[0]).toMatchObject({evidence:'legacy-partial',outcome:'unknown',completedAt:null,health:'unknown'});
+  await f.manager.apply();expect(f.manager.history().entries).toHaveLength(2);
+  expect(f.manager.history().entries[0].outcome).toBe('unknown');
+ }finally{f.close();}
+});
+test('history allowlist redacts arbitrary strings and malformed records without rewriting them',()=>{
+ const f=fixture();try{
+  const path=join(f.state,'update-intent.json'),secret='https://token:password@example.com/private';
+  const raw={version:1,historyVersion:1,history:[],attemptId:secret,stage:'verifying',candidate:secret,startedAt:secret,updatedAt:secret,priorServices:[{project:secret}],evidence:{operation:'apply',sourceCommit:secret,candidateSnapshot:secret,backendRestart:secret,health:secret},error:secret,transitions:[{stage:secret,at:secret}]};
+  writeFileSync(path,JSON.stringify(raw),{mode:0o600});
+  const history=f.manager.history(secret);expect(history.entries[0]).toMatchObject({outcome:'unknown',completedAt:null});
+  expect(JSON.stringify(history)).not.toContain(secret);expect(formatUpdateHistory(history)).not.toContain(secret);
+  writeFileSync(path,'{invalid');expect(f.manager.history().history).toBe('unknown');expect(readFileSync(path,'utf8')).toBe('{invalid');
+  writeFileSync(path,JSON.stringify({...raw,historyVersion:2}));expect(f.manager.history().history).toBe('unknown');
+ }finally{f.close();}
+});
+test('history options and CLI JSON/help are stable and missing state remains absent',()=>{
+ expect(parseHistoryArgs(['--json','--project','one'])).toEqual({json:true,project:'one'});
+ for(const args of [['--project'],['--project','--json'],['--json','--json'],['--apply'],['one']])expect(()=>parseHistoryArgs(args)).toThrow('adlc update history');
+ const f=fixture();try{
+  const missing=join(f.root,'missing');const run=(args:string[])=>Bun.spawnSync(['bun','src/cli.ts','update','history',...args],{env:{...process.env,HOME:missing}});
+  const json=run(['--json']);expect(json.exitCode).toBe(0);expect(JSON.parse(json.stdout.toString())).toMatchObject({version:1,history:'unknown',entries:[]});
+  expect(run(['--help']).stdout.toString().trim()).toBe('adlc update history [--project PROJECT] [--json]');
+  expect(run(['--apply']).exitCode).not.toBe(0);expect(existsSync(join(missing,'Library','Application Support','ADLC Bridge'))).toBe(false);
+ }finally{f.close();}
+});
 test('verification rejects malformed objects and automatic policies without named checks',()=>{
  for(const verification of [null,[],42,'CI'])expect(()=>policy({verification})).toThrow('JSON object');
  for(const verification of [{},{requiredCheck:['CI']},{requiredChecks:[]}])expect(()=>policy({mode:'automatic',verification})).toThrow('at least one');
