@@ -214,8 +214,16 @@ Your repository's own workflows may independently deploy when a human merges.
 
 ```sh
 adlc start --all     # start managed Orchestrator, then all project intake services
-adlc stop --all      # pause intake, check workers, stop the managed backend
-adlc status --all    # show backend and all registered intake services
+adlc stop --all      # PREVIEW full shutdown; does not stop anything yet
+adlc status --all    # backend, intake, owned workers, shared sessions, child processes
+adlc services stop PROJECT              # pause this project's intake only
+adlc services stop --all --pause         # pause all intake; keep workers/backend
+adlc services stop --all --drain --timeout 120 --json
+# Review the returned confirm hash, then repeat the exact scope/mode/timeout:
+adlc services stop --all --drain --timeout 120 --apply --confirm HASH --json
+adlc services start PROJECT             # re-enable only this project's intake
+adlc services restart PROJECT --drain   # PREVIEW; apply with returned hash
+adlc services stop PROJECT --workers    # PREVIEW explicit worker interruption
 ```
 
 Full-stack controls require a registered, hash-pinned Orchestrator background
@@ -224,12 +232,43 @@ service on this Mac. They use the owner-only
 (`executable`, `sha256`, `serviceLabel`, `launcher`) and the matching installed
 LaunchAgent. They preserve unrelated Orchestrator installations and services.
 
-`stop --all` disables the managed services across subsequent logins;
-`start --all` re-enables them. Stop pauses **all registered project intake** first,
-then checks every live session's activity and conversation turns. Active, queued,
-unknown, or unreadable worker state refuses backend shutdown and leaves intake
-paused. Finish or stop those workers in Orchestrator, then retry. Do not submit
-new worker requests during shutdown. There is no force-stop flag.
+Grouped `services start|stop|restart|status` accepts `PROJECT`, `--project PROJECT`,
+or explicit `--all`. Flat `start`, `stop`, `restart`, and `status --all` are aliases;
+flat `status --project PROJECT` retains its existing **job-status** meaning.
+Use `services status --project PROJECT` for lifecycle status. `service-status`
+retains its legacy intake-only inspection (including all projects without an ID).
+Without a scope, lifecycle commands select only an unambiguous registered project.
+
+**Stop modes:** project stop defaults to intake-only pause. `--pause` explicitly
+keeps workers and backend running, including with `--all`, and works even when
+worker APIs are unavailable. `--drain` stops new coordination, waits for already
+queued/active native turns, then exits verified owned agents in place. Drain does
+not run further coordination stages, issue new turns, approve work, or wait for
+an entire multi-stage ticket to finish. `--workers` explicitly interrupts owned
+agents through AO's session-preserving `exit-agent` API. Never use session kill,
+worktree cleanup, process-name matching, or replacement sessions to restart work.
+Full `stop --all` without a mode refuses busy/queued/unknown workers and exits
+only verified idle owned agents before stopping the managed backend.
+
+Full shutdown, drain, explicit worker stop, and restart are **preview-only** until
+`--apply --confirm HASH`. A confirmation binds action, scope, mode, persistence,
+timeout and the observed session identities/ownership and native turn IDs. Existing
+turns may finish during drain; newly queued work requires a fresh preview. If these change, preview
+again. `--preview` is available for non-disruptive start/pause too. The default
+timeout is 30 seconds; `--timeout` accepts 1–3600. Timeout or partial failure reports
+remaining observed resources and exits nonzero, without escalating to force-kill.
+An uncertain exit acknowledgement requires inspection of the original session.
+
+All-stack stop defaults to persistent disable-at-login; `start --all` re-enables
+the requested managed stack. Project stop defaults to unloading this login only;
+`--disable-login` explicitly persists its launchd disable. `--temporary` suppresses
+launchd disable, so installed RunAtLoad/KeepAlive definitions may load next login.
+Durable intake pause markers still block bridge polls until explicit start; login
+or an app window is not authorization to dispatch. No plist is moved or deleted.
+Starting one project checks backend readiness first (starting the registered
+managed dependency only when needed). After an all-stack stop it retains durable
+pause markers for every other project before releasing the global fence; it does
+not re-enable their services or resume their workers.
 
 Every bridge-owned session creation and turn delivery shares an inter-process
 barrier with shutdown. Planning, implementation and feature-agent reservations
@@ -237,8 +276,9 @@ stay inside that same barrier through submission; rejected acquisition leaves
 requests pending rather than falsely recording an uncertain delivery.
 Stop holds it from intake unload and the final inventory scan through
 backend shutdown and leaves submissions paused until a successful `start --all`.
-A delivery already holding it refuses shutdown before unloading any intake
-service, instead of interrupting the send. Retry once that delivery settles.
+A delivery already holding it refuses ordinary shutdown before unloading any
+intake service, instead of interrupting the send. Drain can wait within its timeout
+for that fence to settle, never breaking or deleting a held lock.
 Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
 they cannot unload a poll process while it owns an in-flight submission.
 Each complete CLI poll tick also holds the fence through provider mutations and
@@ -260,11 +300,40 @@ This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle
 during shutdown as well.
 
-These commands control background services. The desktop window may remain open;
-run `start --all` before reopening it when the stack is off. Worktrees, durable
-queue, session history, and credentials are preserved. `status --all` is read-only.
-A backend startup failure does not start intake. The existing commands below
-retain their project and queue meanings:
+These commands control background services, not desktop windows. Closing a window
+does not stop agents/services or prove memory release; stopping intake alone
+releases only its poll process. Exiting agents can release their controller memory;
+backend shutdown can release daemon memory. UI memory, unrelated apps, detached
+processes and OS caches remain outside that guarantee. The window may stay open;
+run `start --all` before reopening it when the stack is off.
+
+Status is read-only and separates intake services, owned workers, shared/external
+sessions, and observed daemon descendants (PID plus process start time). It never
+claims that every process on the Mac is off. Missing/unreadable native inventory
+is **unknown**, not an empty worker list. A stopped/crashed daemon cannot attest
+current session/child state, so status may return incomplete evidence even when
+launchd reports unloaded. Backend shutdown refuses live unowned/shared sessions,
+including idle sessions. Project scope never stops the shared backend.
+
+Stop and status validate project/registry/controller/service identity without
+requiring valid execution-policy settings. Unsupported branch-update limits or
+newer runtime options cannot prevent safe pause/diagnosis; malformed JSON, changed
+identity and altered service definitions still fail closed. Start uses full
+configuration validation and verifies poll startup acknowledgements.
+
+Restart stops the selected scope then starts dependencies before intake; it is
+not a reset/retry operation. Worktrees (including uncommitted changes), durable
+queue, session history, approvals, delivery receipts and attempt history survive.
+Exited/interrupted workers are **not automatically resumed**: inspect the existing
+session and use the approved job recovery/resume workflow after current scope and
+receipt reconciliation. No lifecycle command resends a prompt or creates a worker.
+A partial start leaves global intake paused and reports the successful steps;
+fix the reported problem, inspect status, then explicitly retry start.
+
+Live macOS shutdown/start integration must be validated by a separately authorized
+operator using disposable managed sessions/services. Mocked launchd tests do not
+prove live compatibility and no existing live session may be interrupted by a
+coding worker. The existing commands below retain their project and queue meanings:
 
 ```sh
 adlc projects
@@ -285,11 +354,10 @@ It polls approximately every 60 seconds. `loaded: true, running: false` normally
 means it is enabled and waiting between polls. Start is idempotent; it does not
 force another tick when already loaded.
 
-**Stopping coordination does not stop existing Orchestrator workers**, close
-Orchestrator, or disable a repository's GitHub workflows. Stop individual workers
-through Orchestrator when needed. `stop` unloads the service for the current login;
-the installed LaunchAgent may load again at the next login. To keep it off across
-logins, stop it and move its plist out of `~/Library/LaunchAgents` until needed.
+**Project stop without a worker mode does not stop existing Orchestrator workers**,
+close Orchestrator, or disable a repository's GitHub workflows. Use the previewed
+`--drain` or explicit `--workers` workflow when worker exit is intended, and
+`--disable-login` rather than moving installed service definitions.
 
 The configured project uses a machine-local `config/<project>.json`. A
 `ready-queue` standing policy can authorize every eligible **Todo + agent-ready**
@@ -1915,8 +1983,10 @@ select a candidate or dispatch work. Legacy flat commands retain their existing
 JSON/text output and operational error behavior for scripts.
 
 Compatibility aliases: `projects list` → `projects`; `routing show/preview` →
-`routing`; `services start/stop/status/config` →
-`start/stop/service-status/service-config`; `diagnostics doctor/readiness/runtime-check/ao-status`
+`routing`; `services start/stop/restart` → `start/stop/restart`;
+`services status` is the richer lifecycle inspection, while flat `service-status`
+retains intake-only output; `services config` → `service-config`;
+`diagnostics doctor/readiness/runtime-check/ao-status`
 → the corresponding flat command. `jobs show-plan/approvals/recover/cleanup/resume/approve/dependency-status/review-status`
 map to `show-plan/approvals/recover/cleanup/resume-job/approve-job/dependency-status/review-status`.
 Their existing explicit authorization, confirmation and argument requirements
@@ -1958,9 +2028,9 @@ Config commands require explicit project selection. Registered Orchestrator IDs
 and unambiguous registered Linear IDs resolve to the same project. Job lookup
 also supports a stored Linear ID when no registry entry exists. Exact job IDs
 take precedence over issue/ticket matches. `services list` is an alias of
-`projects`; `jobs show` aliases operator job status. Unsupported `--project` on
-legacy grouped service aliases is rejected, never silently discarded: use
-`services status PROJECT` or the documented positional legacy service command.
+`projects`; `jobs show` aliases operator job status. Lifecycle commands accept
+`--project PROJECT` or a positional project, but never both. `services config`
+retains its positional project requirement. No selector is silently discarded.
 
 Writable settings and defaults:
 

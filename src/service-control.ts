@@ -26,9 +26,9 @@ export async function launch(args:string[],spawn=Bun.spawn){
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  return {stdout,stderr,code};
 }
-export async function registeredProjects(readOnly=false,home=homedir(),path=registryPath(),read=readDefinition){
+export async function registeredProjects(readOnly=false,home=homedir(),path=registryPath(),read=readDefinition,recovery=false){
  const s=readOnly?(existsSync(path)?Store.readonly(path):new Store(':memory:')):new Store(path);
- try{const registry=new ProjectServices(s,!readOnly),legacy=registry.discoverLegacy(home,read,!readOnly),entries=registry.list();if(legacy&&!entries.some(p=>p.project===legacy.project))entries.push(legacy);return entries.map(p=>({...p,definitionInstalled:existsSync(join(home,'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
+ try{const registry=new ProjectServices(s,!readOnly),legacy=registry.discoverLegacy(home,read,!readOnly,recovery),entries=registry.list();if(legacy&&!entries.some(p=>p.project===legacy.project))entries.push(legacy);return entries.map(p=>({...p,definitionInstalled:existsSync(join(home,'Library/LaunchAgents',`${p.label}.plist`))}));}finally{s.close();}
 }
 export async function reloadService(apply:boolean,loaded:boolean,domain:string,target:string,plist:string,run:(args:string[])=>Promise<{code:number}>=launch,beforeUnload:()=>Promise<void>=async()=>{}){
  if(!apply||!loaded)return false;
@@ -59,6 +59,7 @@ async function controlProject(action:string,project:string|undefined,apply:boole
    const entry=registry.select(project,extra),projectConfig=registry.verify(entry,!recovery);
    if(options.previewPollingSeconds!==undefined){if(action!=='service-config'||apply)throw Error('Proposed settings are preview-only');projectConfig.pollingIntervalSeconds=options.previewPollingSeconds;effectiveSettings(projectConfig);}
    let settings:ReturnType<typeof effectiveSettings>|undefined,settingsError:string|undefined;
+   if(recovery)try{registry.verify(entry,true);}catch{settingsError='Runtime configuration is invalid for start; identity-validated recovery/diagnostics only';}
    try{settings=effectiveSettings(projectConfig);}catch(e){if(!recovery)throw e;settingsError=e instanceof Error?e.message:'Invalid runtime settings';}
   const label=entry.label,domain=`gui/${process.getuid()}`,target=`${domain}/${label}`,plist=join(home,'Library/LaunchAgents',`${label}.plist`);
   if(existsSync(plist))registry.assertInstalled(readDefinition(plist),label,entry.config,!readOnly);

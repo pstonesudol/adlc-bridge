@@ -30,7 +30,8 @@ test('core CLI scoped commands share project identity, JSON and safe errors',()=
   }
   expect(JSON.parse(readFileSync(config,'utf8')).automation.maxPlanning).toBeUndefined();
   const applied=run('config','set','automation.maxPlanning','8','--project','p','--apply','--json');expect(applied.exitCode).toBe(0);expect(JSON.parse(readFileSync(config,'utf8')).automation.maxPlanning).toBe(8);
-  for(const args of [['config','get','routing.harness','--project','p'],['config','show','--project','p','--project','other'],['services','stop','--project','other']])expect(run(...args).exitCode).toBe(2);
+  for(const args of [['config','get','routing.harness','--project','p'],['config','show','--project','p','--project','other']])expect(run(...args).exitCode).toBe(2);
+  expect(run('services','stop','--project','other').exitCode).toBe(3);
   expect(run('projects','--json').exitCode).toBe(0);
   expect(run('jobs','list','--state','awaiting_plan','--project','p','--json').exitCode).toBe(0);
   expect(run('completion','fish').stdout.toString()).toContain('complete -c adlc');

@@ -29,10 +29,12 @@ export function assertDefinition(def:any,label:string,config:string,controller=j
  throw Error('Service definition does not match this project; existing service preserved');
 }
 function validateServiceConfig(c:any,validateRuntime:boolean){
- // Bypass only the two runtime settings for recovery; preserve all older checks.
- const {pollingIntervalSeconds,...base}=c;
- const {maxPlanning,...automation}=c.automation??{};
- validate(validateRuntime?c:{...base,automation});
+ if(validateRuntime){validate(c);return;}
+ // Recovery never dispatches. Validate the trusted identity, not mutable
+ // execution policy (including settings introduced by a newer runtime).
+ if(c?.version!==1||typeof c.name!=='string'||!c.name.trim()||typeof c.repo!=='string'||!isAbsolute(c.repo))throw Error('Invalid project configuration');
+ projectServiceLabel(c.automation?.orchestratorProject);
+ for(const key of ['projectId','teamId','readyStateId','readyLabelId'])if(!/^[0-9a-f-]{36}$/i.test(c.linear?.[key]??''))throw Error(`Verified Linear ${key} UUID required`);
 }
 export class ProjectServices{
  private discoveredControllers=new Map<string,string>();
