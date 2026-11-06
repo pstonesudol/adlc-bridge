@@ -45,6 +45,24 @@ test('native routing sets model before effort, confirms read-only mode and rejec
  await expect(configureSessionRoute('session',route,async()=>({session:{harness:'opencode-v2',status:'working'}}))).rejects.toThrow('idle');
 });
 
+test('legacy unqualified routes cannot authorize delivery for a revised job',async()=>{
+ const s=new Store(':memory:'),id=s.enqueue('p','i','spec');
+ try{
+ const router=new TaskRouting(s,async()=>({config:routingConfig,classify:async()=>({choice:'implement',confidence:1})}));
+ await router.choose(id,'planning',digest('spec'),'plan',settings,'planning');const hash=s.propose(id,'plan');
+ await router.choose(id,'implementation',digest(JSON.stringify(['spec',hash])),'implement',settings);
+ s.approve(id,hash,'human');router.approve(id,hash);
+ expect(router.approved(id,hash)?.model).toBe('openai/sol');
+ // A revision recorded by an earlier build leaves routing rows and approvals
+ // under the unqualified phase names. They cannot be proven to cover it.
+ s.db.query("INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES ('legacy',?,'old','new','summary','pending')").run(id);
+ expect(()=>router.approved(id,hash)).toThrow('Legacy routing');
+ // Routing that never stored a route still reports none rather than failing.
+ const plain=s.enqueue('p','plain','spec');
+ s.db.query("INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES ('legacy-plain',?,'old','new','summary','pending')").run(plain);
+ expect(router.approved(plain,digest('plan'))).toBeNull();
+ }finally{s.close();}
+});
 test('remediation uses the approved routing policy even after OpenChamber preferences change',async()=>{
  const s=new Store(':memory:'),id=s.enqueue('p','i','spec');let changed=false;
  try{

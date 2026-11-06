@@ -38,6 +38,30 @@ test('v1 upgrade preserves records, indexes and repeated opens',()=>fixture(path
     } finally {s.close();}
   }
 }));
+test('v1 upgrade accepts matching indexes and rejects conflicting definitions',()=>{
+ fixture(path=>{
+  const db=new Database(path);db.exec(legacy);
+  db.exec('CREATE INDEX events_job_seq ON events(job,seq); CREATE INDEX approvals_job_seq ON approvals(job,seq);');db.close();
+  const s=new Store(path);
+  try {expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:2});} finally {s.close();}
+ });
+ for(const ddl of [
+  'CREATE UNIQUE INDEX events_job_seq ON events(job,seq)',
+  'CREATE INDEX events_job_seq ON events(seq,job)',
+  "CREATE INDEX events_job_seq ON events(job,seq) WHERE kind='selected'",
+  'CREATE INDEX approvals_job_seq ON events(job,seq)'
+ ]) fixture(path=>{
+  const db=new Database(path);db.exec(legacy);db.exec(ddl);
+  const before=records(db),schema=db.query('SELECT * FROM sqlite_master ORDER BY name').all();db.close();
+  expect(()=>new Store(path)).toThrow('Conflicting index definition');
+  const check=new Database(path,{readonly:true});
+  try {
+   expect(records(check)).toEqual(before);
+   expect(check.query('SELECT * FROM sqlite_master ORDER BY name').all()).toEqual(schema);
+   expect(check.query('PRAGMA user_version').get()).toEqual({user_version:1});
+  } finally {check.close();}
+ });
+});
 test('unsupported and failed upgrades preserve data and roll back DDL',()=>{
   for(const setup of ['PRAGMA user_version=99','CREATE TABLE approvals_job_seq (sentinel TEXT)']) fixture(path=>{
     const db=new Database(path);db.exec(legacy);db.exec(setup);

@@ -56,10 +56,23 @@ export class Store {
       this.db.query('SELECT id,project,issue,spec,state,plan,plan_hash,approved_hash,actor,attempts,reason,updated FROM jobs LIMIT 0').all();
       this.db.query('SELECT seq,job,kind,detail,at FROM events LIMIT 0').all();
       this.db.query('SELECT seq,job,plan_hash,actor,at FROM approvals LIMIT 0').all();
-      if (version < 2) this.db.exec(`
-        CREATE INDEX events_job_seq ON events(job,seq);
-        CREATE INDEX approvals_job_seq ON approvals(job,seq);
-        PRAGMA user_version=2;`);
+      if (version < 2) {
+        // An index with the right name may still have the wrong definition (for
+        // example UNIQUE or different columns). Validate before advancing the
+        // version so a conflicting database fails here instead of on a later write.
+        const matches=(name:string,table:string,columns:string[])=>{
+          const existing=this.db.query("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(name) as any;
+          if(!existing)return false;
+          if(existing.tbl_name!==table)throw Error(`Conflicting index definition: ${name}`);
+          const entry=(this.db.query('SELECT * FROM pragma_index_list(?)').all(table) as any[]).find((x:any)=>x.name===name);
+          const actual=entry?(this.db.query('SELECT name FROM pragma_index_info(?) ORDER BY seqno').all(name) as any[]).map((x:any)=>x.name):[];
+          if(!entry||entry.unique!==0||entry.partial!==0||actual.length!==columns.length||actual.some((c:string,i:number)=>c!==columns[i]))throw Error(`Conflicting index definition: ${name}`);
+          return true;
+        };
+        if(!matches('events_job_seq','events',['job','seq']))this.db.exec('CREATE INDEX events_job_seq ON events(job,seq);');
+        if(!matches('approvals_job_seq','approvals',['job','seq']))this.db.exec('CREATE INDEX approvals_job_seq ON approvals(job,seq);');
+        this.db.exec('PRAGMA user_version=2;');
+      }
     }).immediate();
     installRevisions(this);
     } catch (error) { this.db.close(); throw error; }
