@@ -102,6 +102,17 @@ test('transient reservation reads back off before a conflict recovery row exists
  expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
  }finally{setSystemTime();f.close();}
 },60000);
+test('shared provider cooldown defers an unreserved conflict tick without provider reads',async()=>{
+ const f=await fixture();let reads=0;
+ const unavailable=async()=>{reads++;throw Error('Provider read attempted during shared cooldown');};
+ const gated={...f.io,facts:unavailable,snapshot:unavailable,evidence:unavailable};
+ try{
+ new RecoveryObservation(f.s).failed('other-job',readFailure('github','branch-read','HTTP 429\nRetry-After: 60\n',1));
+ const result=await new ConflictRecovery(f.s,gated as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ expect(reads).toBe(0);expect(f.recovery.row(f.job)).toBeUndefined();expect(f.sends()).toBe(0);
+ }finally{f.close();}
+},60000);
 test('reserved manual preview is read-only and guards retain observation history',async()=>{
  const f=await fixture();let reads=0;let reader:Store|undefined;
  try{

@@ -114,8 +114,8 @@ export class ConflictRecovery{
    }catch(e){this.set(r,'manual_verifying',d,e instanceof Error?e.message:'Verification uncertain');throw e;}
   });
  }
- async preview(job:string,c:any,repo:string,pr:number){
-  const x=await this.inspect(job,c,repo,pr);assertWorktreeAvailable(this.s,job);this.pending(job);
+ async preview(job:string,c:any,repo:string,pr:number,observations?:RecoveryObservation){
+  const x=await this.inspect(job,c,repo,pr,observations);assertWorktreeAvailable(this.s,job);this.pending(job);
   if(!x.facts.clean||x.facts.head!==x.b.head)throw Error('Dirty or divergent worktree; preserve edits/history for operator reconciliation');
   await this.noOperation(x.facts.worktree);
   if(x.b.mergeable!==false||x.b.behind<1)throw Error('Confirmed base conflict required');
@@ -218,9 +218,12 @@ export class ConflictRecovery{
     // An earlier transient read failure holds this job before any reservation;
     // never retry every poll or consume the mutation budget for a read.
     const backoff=new RecoveryObservation(this.s).readWait(job);if(backoff)return backoff;
+    // Pre-reservation reads share the provider lease and cooldown with the
+    // reserved stage; a shared cooldown defers them before any provider call.
+    const observations=new RecoveryObservation(this.s);
     try{
-     const p=await this.preview(job,c,repo,pr);
-     const x=await this.inspect(job,c,repo,pr);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
+     const p=await this.preview(job,c,repo,pr,observations);
+     const x=await this.inspect(job,c,repo,pr,observations);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
      this.install();
      r=this.s.db.transaction(()=>{
       assertWorktreeAvailable(this.s,job);this.pending(job);const a=this.auth(job,c);
@@ -233,13 +236,9 @@ export class ConflictRecovery{
       return this.row(job);
      }).immediate();
     }catch(error){
-     // Reads before the reservation are observation-backed like the reserved
-     // stage; validation and uncertainty failures keep their existing handling.
-     if(error instanceof ProviderReadError||error instanceof ObservationDeferred){
-      assertObservationFence();const observations=new RecoveryObservation(this.s);
-      if(error instanceof ProviderReadError)observations.failed(job,error);
-      return {...(observations.readWait(job)??{state:'waiting_for_worker',send:false,reason:error.message})};
-     }
+     // The observation-backed reads already recorded one failure per attempt;
+     // never record it twice here. Validation and uncertainty keep their path.
+     if(error instanceof ProviderReadError||error instanceof ObservationDeferred)return {...(observations.readWait(job)??{state:'waiting_for_worker',send:false,reason:error.message})};
      throw error;
     }
    }
