@@ -247,7 +247,7 @@ export class ReviewLoop{
    }
   let session,snapshot;
   try{
-   session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id));
+   session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
    snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
   }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
   try{

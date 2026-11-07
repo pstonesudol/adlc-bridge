@@ -11,10 +11,17 @@ test('posted observation notice is rechecked hourly without duplicates',async()=
  const f=fixture();try{
  f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
  const blockers=f.blockers();await blockers.sync(f.config);expect(f.creates).toBe(1);
- const created=Date.parse(f.comments[0].createdAt),before=f.calls;
+ const checked=Date.parse((f.s.db.query('SELECT checked FROM blocker_notices WHERE job=?').get(f.id) as any).checked);
+ expect(Number.isFinite(checked)).toBe(true);
+ const before=f.calls;
  await blockers.sync(f.config);expect(f.calls).toBe(before);expect(f.creates).toBe(1);
- setSystemTime(new Date(created+60*60*1000+1));await blockers.sync(f.config);
+ setSystemTime(new Date(checked+60*60*1000+1));await blockers.sync(f.config);
  expect(f.calls).toBeGreaterThan(before);expect(f.creates).toBe(1);
+ const rechecked=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(rechecked);expect(f.creates).toBe(1);
+ // A legacy row without a checked timestamp is rechecked once, then throttled.
+ f.s.db.query('UPDATE blocker_notices SET checked=NULL WHERE job=?').run(f.id);
+ const legacy=f.calls;await blockers.sync(f.config);expect(f.calls).toBeGreaterThan(legacy);expect(f.creates).toBe(1);
+ const settled=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(settled);
  }finally{setSystemTime();f.s.close();}
 });
 test('transient or unapproved observations publish no notice',async()=>{
