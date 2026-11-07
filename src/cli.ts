@@ -124,6 +124,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
    const watchdog=new ActionWatchdog(s);
    for(const target of reviewLoop.list(c.linear.projectId) as any[]){
     reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
+    if(target.state==='completed')continue;
     watchdog.scheduleReview(target.job,c);
    }
    for(const action of watchdog.due(c.linear.projectId)){

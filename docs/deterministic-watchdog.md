@@ -8,8 +8,8 @@ executor, worker creation, sender, or automatic replacement/recovery worker.
 
 ## Production integration
 
-`createCLIPollTick` schedules registered review targets and selects at most four
-due actions, oldest first, within the existing sequential
+`createCLIPollTick` skips completed review targets, schedules the remaining
+registered targets and selects at most four due actions, oldest first, within the existing sequential
 `runPollTick` / `withTurnSubmission` scope. Poll and serve use that same path;
 `serveLoop` remains cadence-only. The selected `ReviewLoop.tick` replaces its
 initial session/branch reads with `ActionWatchdog.observeReview`. It does not
@@ -89,6 +89,49 @@ shared cooldown, uncertain mutation receipts and all mutation-specific gates.
 Other escalations require their existing supervised inspection/recovery path;
 there is no generic watchdog reset command.
 
+### Operator path for an unchanged-binding escalation
+
+Most `escalated` outcomes intentionally remain stopped for the same binding.
+There is one scheduler exception: `human_required` can resume **read-only
+observation** after the recorded blocker ceases to be `human`, `dependency_wait`
+or `unsupported`, current eligibility passes, no worktree reservation exists,
+and cumulative budget remains. This accommodates a supervised review changing
+a blocked target back to a legitimate wait on the same head. Counters and
+mutation receipts are retained. Other outcomes, including `evaluation_uncertain`,
+do not revive merely because a target state, description or elapsed time changes.
+
+1. Inspect `adlc jobs status JOB --json` for the exact action, binding, outcome
+   and budget. For a recovery reservation, also inspect `adlc recovery-status`.
+2. For `blocker: provider_wait` with `outcome: unsupported` or
+   `retry_exhausted`, correct the provider problem and explicitly run
+   `adlc retry-observation JOB`. This is the supported same-binding re-arm;
+   shared cooldowns, cumulative budgets and mutation receipts are retained.
+   Permanent failures recorded by the review loop's later reads (such as a
+   readiness HTTP 401) use this same provider-error classification and path.
+3. For other escalations, resolve the reported approval, scope, human-input,
+   dependency or receipt blocker through its existing supported interface.
+   Then, when a supervised evaluation is appropriate, explicitly run
+   `adlc tick-review JOB CONFIG` (add `--runtime RUNTIME_JSON` when required by
+   the project's verification configuration). This command is **effectful**:
+   it runs the existing review path under the submission fence with current
+   project/pause/approval checks and existing receipt and readiness gates.
+   It is not a force-retry or a way to clear uncertain delivery.
+4. Inspect job status again. `tick-review` does not directly reset a watchdog
+   row. On the next poll, a `human_required` action may resume observation under
+   the guards above if the supervised evaluation cleared its recorded blocker.
+   All other unchanged-binding escalations stay stopped unless the explicit
+   provider-read retry applies; further evaluations remain supervised operations.
+   A genuinely new binding can receive its own action on a later poll, subject
+   to the retained job budget; an A → B → A recurrence remains stopped. Do not
+   manufacture a head/spec/configuration change to reset the scheduler.
+
+For `budget_exhausted` there is no watchdog budget extension/reset command in
+this foundation. `extend-budget` concerns remediation, not this observation
+budget. After inspection, the same explicit supervised review path is available;
+it does not refill the automatic budget. If a prerequisite cannot be resolved
+through an existing supported interface, leave the action stopped for human
+handling. This limitation is intentional; no automatic recovery is added.
+
 ## Uncertain effects and scope boundaries
 
 The action ledger never marks a mutation absent, accepted or completed. Existing
@@ -115,7 +158,10 @@ point.
 `adlc jobs status JOB --json` exposes persisted `watchdog` identity, next action,
 due time, attempts/budget, failure count, outcome, escalation reason and evidence
 age. Human-readable job status includes a concise watchdog line. Absence of the
-new tables returns `watchdog: null`. These paths use `Store.readonly`, perform
+new tables returns `watchdog: null`. Completed jobs/review targets also return
+`watchdog: null`; retained historical actions are neither displayed as current
+blockers nor selected as due work. Invalid binding/evidence JSON is represented
+as `null` without repairing the stored row. These paths use `Store.readonly`, perform
 no provider IO, claims, migrations, cooldown repairs or cleanup, and label
 evidence persisted-only. Evidence contains hashes, identifiers and fixed
 classification/activity codes; no transcripts, prompts, credentials or raw

@@ -150,6 +150,52 @@ test('status is persisted-only, tolerates absent tables and changes no database 
   const old=new Store(join(f.root,'old.sqlite'));const job=old.enqueue('p','old','spec');old.close();expect(jobViews(join(f.root,'old.sqlite'))[0].watchdog).toBeNull();expect(job).toBeTruthy();
  }finally{f.close();}
 });
+test('corrupt or legacy status JSON becomes null without writes or provider reads',()=>{
+ const f=fixture(true);try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  for(const [binding,evidence] of [['{','{"version":1}'],['{"job":"fixture"}','not-json'],['',''],['null',null]]){
+   f.s.db.query('UPDATE watchdog_actions SET binding=?,evidence=? WHERE id=?').run(binding,evidence,a.id);
+   f.s.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');const before=readFileSync(f.path),stored=f.w.get(a.id);
+   const view=jobViews(f.path)[0];
+   expect(view.watchdog?.binding).toEqual(binding==='{"job":"fixture"}'?{job:'fixture'}:null);
+   expect(view.watchdog?.evidence).toEqual(evidence==='{"version":1}'?{version:1}:null);
+   expect(humanJobs([view])).toContain('Watchdog:');expect(readFileSync(f.path)).toEqual(before);
+   expect(f.w.get(a.id)).toEqual(stored);expect(f.reads()).toBe(0);
+  }
+ }finally{f.close();}
+});
+test('completed targets are skipped by the production poll without creating a human-blocker action',()=>{
+ const f=fixture(true);try{
+  f.s.db.query("UPDATE review_targets SET state='completed' WHERE job=?").run(f.job);
+  f.s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(f.job);
+  const script=`
+import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
+import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
+const s=new Store(${JSON.stringify(f.path)}),loop=new ReviewLoop(s),config=${JSON.stringify(f.c)};
+loop.tick=async()=>{throw Error('Completed target must not be evaluated');};
+const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>[],linearToken:()=>'',out:()=>{}}});
+await tick();await tick();s.close();`;
+  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');
+  expect(f.s.db.query('SELECT * FROM watchdog_actions').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM watchdog_budgets').all()).toEqual([]);
+  const views=jobViews(f.path);expect(views[0]).toMatchObject({state:'complete',watchdog:null});
+  expect(humanJobs(views)).not.toContain('Watchdog:');expect(humanJobs(views)).not.toContain('authority_unavailable');
+ }finally{f.close();}
+});
+test('actions retained before completion are neither due nor shown as current human blockers',()=>{
+ for(const terminal of ['job','review'] as const){const f=fixture(true);try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  if(terminal==='job')f.s.db.query("UPDATE jobs SET state='done' WHERE id=?").run(f.job);
+  else f.s.db.query("UPDATE review_targets SET state='completed' WHERE job=?").run(f.job);
+  f.w.finishReview(a.id,{state:'completed'});expect(f.w.get(a.id).state).toBe('pending');
+  expect(f.w.due('p')).toEqual([]);expect(jobViews(f.path)[0].watchdog).toBeNull();
+  // Even a retained escalation from older code is historical after completion.
+  f.s.db.query("UPDATE watchdog_actions SET state='escalated',next_action='escalate',blocker='human',outcome='authority_unavailable' WHERE id=?").run(a.id);
+  expect(jobViews(f.path)[0].watchdog).toBeNull();expect(f.w.get(a.id).state).toBe('escalated');expect(f.reads()).toBe(0);
+ }finally{f.close();}}
+});
 test('production ReviewLoop uses scheduled read bundle and existing receipt reconciliation, with no sender on accepted uncertain work',async()=>{
  const f=fixture();try{
   const l=new Lifecycle(f.s),j=f.s.get(f.job),receipts=new ReceiptReconciliation(f.s);
@@ -172,6 +218,77 @@ test('provider rearm preserves budget, shared capacity and mutation uncertainty;
   expect(f.w.scheduleReview(f.job,f.c).state).toBe('pending');
   await f.w.observeReview(a.id,f.c,f.io);expect(actionStatus(f.s,f.job)?.attempts).toBe(2);
   f.w.finishReview(a.id);retryWatchdogObservation(f.s,f.job,f.now());expect(f.w.get(a.id).outcome).toBe('evaluation_uncertain');
+ }finally{f.close();}
+});
+test('unchanged-binding escalation stays latched across polls, elapsed time and restart',()=>{
+ const f=fixture(true);let second:Store|undefined;try{
+  const a=f.w.scheduleReview(f.job,f.c);f.w.finishReview(a.id);
+  const stopped=f.w.get(a.id);f.advance(24*60*60*1000);
+  second=new Store(f.path);const restarted=new ActionWatchdog(second,f.now,()=>0.5,f.root);
+  expect(restarted.scheduleReview(f.job,f.c)).toEqual(stopped);
+  retryWatchdogObservation(second,f.job,f.now());expect(restarted.scheduleReview(f.job,f.c)).toEqual(stopped);
+  expect(restarted.due('p')).toEqual([]);expect(actionStatus(second,f.job)?.attempts).toBe(0);expect(f.reads()).toBe(0);
+ }finally{second?.close();f.close();}
+});
+test('supervised review clears a same-head human blocker and bounded polling resumes',async()=>{
+ const f=fixture();try{
+  f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(f.snapshot.head,f.job);
+  let failed=true,sends=0;
+  f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),readiness:async()=>({head:f.snapshot.head,clear:false,reasons:[],findings:[],failedChecks:failed?[{name:'CI'}]:[],pendingChecks:failed?[]:['CI'],missingChecks:[]}) as any,sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
+  const a=f.w.scheduleReview(f.job,f.c);
+  const blocked=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,blocked);
+  expect(blocked.state).toBe('blocked');expect(f.w.get(a.id)).toMatchObject({state:'escalated',outcome:'human_required',attempts:1});
+  expect(f.w.scheduleReview(f.job,f.c).state).toBe('escalated');
+  failed=false;
+  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c)).state).toBe('waiting_for_ci');
+  const resumed=f.w.scheduleReview(f.job,f.c);
+  expect(resumed).toMatchObject({id:a.id,binding:a.binding,state:'pending',next_action:'observe',outcome:'blocker_cleared',attempts:1});
+  expect(f.w.due('p').map(r=>r.id)).toEqual([a.id]);
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
+  expect(result.state).toBe('waiting_for_ci');expect(actionStatus(f.s,f.job)?.attempts).toBe(2);expect(sends).toBe(0);
+ }finally{f.close();}
+});
+test('same-binding human_required rearm still requires eligibility, no reservation and remaining budget',()=>{
+ for(const guard of ['human','dependency','eligibility','reservation','budget'] as const){const f=fixture();try{
+  if(guard==='eligibility'){
+   const policy={mode:'ready-queue',id:'policy',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'};Object.assign(f.c,{approval:policy});new ApprovalPolicyStore(f.s);const j=f.s.get(f.job);
+   f.s.db.query('INSERT INTO queue_eligibility VALUES (?,?,?,?,?)').run(f.job,'p',digest(j.spec),1,f.now());
+   f.s.db.query('INSERT INTO policy_authorizations(job,plan_hash,spec_hash,policy_hash,policy_id,authorized_by,scope) VALUES (?,?,?,?,?,?,?)').run(f.job,j.plan_hash,digest(j.spec),digest(JSON.stringify(policy)),policy.id,'human',JSON.stringify(policy.scope));
+  }
+  const a=f.w.scheduleReview(f.job,f.c);f.s.db.query("UPDATE review_targets SET state='blocked' WHERE job=?").run(f.job);f.w.finishReview(a.id,{state:'blocked'});
+  const stopped=f.w.get(a.id);expect(stopped.outcome).toBe('human_required');
+  if(guard!=='human')f.s.db.query("UPDATE review_targets SET state='waiting_for_ci' WHERE job=?").run(f.job);
+  if(guard==='dependency'){f.s.db.exec('CREATE TABLE worker_outcomes(job TEXT,plan_hash TEXT,outcome TEXT)');f.s.db.query("INSERT INTO worker_outcomes VALUES (?,?,'blocked_dependency')").run(f.job,f.s.get(f.job).plan_hash);}
+  if(guard==='eligibility')f.advance(120001);
+  if(guard==='reservation'){f.s.db.exec('CREATE TABLE conflict_recoveries(id TEXT,job TEXT,state TEXT,worktree TEXT)');f.s.db.query("INSERT INTO conflict_recoveries VALUES ('recovery',?,'delivery_uncertain','/worktree')").run(f.job);}
+  if(guard==='budget')f.s.db.query('UPDATE watchdog_budgets SET attempts=max_attempts WHERE job=?').run(f.job);
+  expect(f.w.scheduleReview(f.job,f.c)).toEqual(stopped);expect(f.w.due('p')).toEqual([]);expect(f.reads()).toBe(0);
+ }finally{f.close();}}
+});
+test('clearing a blocker does not automatically revive any other escalation outcome',()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);f.w.finishReview(a.id);
+  for(const outcome of ['evaluation_uncertain','unsupported','retry_exhausted','stale','recurrent_binding','authority_unavailable','budget_exhausted']){
+   f.s.db.query('UPDATE watchdog_actions SET outcome=? WHERE id=?').run(outcome,a.id);const stopped=f.w.get(a.id);
+   expect(f.w.scheduleReview(f.job,f.c)).toEqual(stopped);expect(f.w.due('p')).toEqual([]);
+  }
+  expect(f.reads()).toBe(0);
+ }finally{f.close();}
+});
+test('readiness 401 recorded by the review loop can be explicitly rearmed by retry-observation CLI',async()=>{
+ const f=fixture(true);try{
+  let sends=0;const receipts=new ReceiptReconciliation(f.s),j=f.s.get(f.job);
+  receipts.reserve({job:f.job,plan:j.plan_hash,spec:digest(j.spec),session:'session',client:'uncertain-original',attempt:'implementation'});receipts.accepted('uncertain-original');
+  const original=receipts.get('uncertain-original');
+  f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),readiness:async()=>{throw readFailure('github','readiness','HTTP 401');},sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
+  const a=f.w.scheduleReview(f.job,f.c);
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
+  expect(result.state).toBe('blocked');expect(new RecoveryObservation(f.s).status(f.job)?.evidence.classification).toBe('authentication');
+  expect(f.w.get(a.id)).toMatchObject({state:'escalated',blocker:'provider_wait',outcome:'unsupported',attempts:1});expect(f.w.get(a.id).reason).toContain('retry-observation');
+  const retry=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'retry-observation',f.job],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root,ADLC_DB:f.path},stdout:'pipe',stderr:'pipe'});
+  expect(retry.exitCode).toBe(0);expect(retry.stderr.toString()).toBe('');expect(JSON.parse(retry.stdout.toString())).toMatchObject({readRetry:true,mutationReplay:false});
+  expect(f.w.scheduleReview(f.job,f.c)).toMatchObject({id:a.id,state:'pending',next_action:'observe',outcome:'operator_read_retry',attempts:1});
+  expect(new RecoveryObservation(f.s).status(f.job)).toBeNull();expect(receipts.get('uncertain-original')).toEqual(original);expect(sends).toBe(0);
  }finally{f.close();}
 });
 test('a recurring superseded binding escalates visibly, without resetting its job budget',async()=>{
