@@ -33,11 +33,15 @@ export class ReceiptReconciliation{
  get(client:string):any{return this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_receipts'").get()?this.s.db.query('SELECT * FROM delivery_receipts WHERE client=?').get(client):null;}
  list(job?:string):any[]{if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_receipts'").get())return [];const rows=(job?this.s.db.query('SELECT * FROM delivery_receipts WHERE job=?').all(job):this.s.db.query('SELECT * FROM delivery_receipts').all()) as any[];return rows.map(r=>({...r,ageMs:r.observed===null?null:Date.now()-r.observed}));}
  accepted(client:string){this.s.db.query("UPDATE delivery_receipts SET state='accepted' WHERE client=? AND state='reserved'").run(client);}
- inspect(b:DeliveryBinding,e:any,persist=true){
+  inspect(b:DeliveryBinding,e:any,persist=true){return this.inspectBound(b,e,persist,true);}
+  // Receipt-only operator recovery validates historical provenance separately.
+  // This never changes the reservation or grants current execution authority.
+  inspectOriginal(b:DeliveryBinding,e:any,persist=false){return this.inspectBound(b,e,persist,false);}
+  private inspectBound(b:DeliveryBinding,e:any,persist:boolean,current:boolean){
   const previous=this.get(b.client),j=this.s.get(b.job);
   let result=evaluateReceipt(b,e);
   if(previous?.state==='accepted'&&result.code==='receipt_absent')result={...result,state:'accepted',reason:'Host accepted send; provider confirmation delayed; wait without resending'};
-  if(!previous||['job','plan','spec','session','attempt'].some(k=>previous[k]!==b[k as keyof DeliveryBinding])||j.plan_hash!==b.plan||digest(j.spec)!==b.spec)result={...result,state:'unknown',code:'binding_mismatch',reason:'Missing or changed dispatch binding; inspect original attempt without replay'};
+   if(!previous||['job','plan','spec','session','attempt'].some(k=>previous[k]!==b[k as keyof DeliveryBinding])||current&&(j.plan_hash!==b.plan||digest(j.spec)!==b.spec))result={...result,state:'unknown',code:'binding_mismatch',reason:'Missing or changed dispatch binding; inspect original attempt without replay'};
   if(previous?.turn&&result.turn&&previous.turn!==result.turn)result={...result,state:'unknown',code:'turn_identity_conflict',reason:'Conflicting native turn identity; inspect original attempt'};
   if(previous?.observed&&result.observed&&previous.observed>result.observed)result={...result,state:'unknown',code:'observation_out_of_order',reason:'Out-of-order receipt observation; refresh before proceeding'};
   if(['completed','failed','cancelled'].includes(previous?.state)&&result.state!==previous.state)result={...result,state:'unknown',code:'terminal_contradiction',reason:'Contradictory terminal receipt; preserve original evidence and inspect'};

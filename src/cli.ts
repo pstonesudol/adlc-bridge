@@ -53,6 +53,7 @@ import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
 import {SpecRecovery} from './spec-recovery';
+import {RemediationReceipts} from './remediation-receipts';
 import {PlanReconciliation} from './plan-reconciliation';
 import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revisions';
 import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
@@ -304,6 +305,7 @@ async function main(){
                                        preview/confirm completed same-spec plan replacement; no approval
 reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
 spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning only after a spec edit
+receipt-reconcile JOB CONFIG ATTEMPT [--confirm HASH] settle an original completed remediation receipt only; never resend or approve
   dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
   dependency-resume JOB CONFIG HASH    confirm unchanged evidence using existing continuation
   dependency-status                    durable waits, failed evidence and next action
@@ -388,6 +390,14 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(!existsSync(db))throw Error('Existing database required');
     const applying=a.length===5,store=new Store(db,!applying);
     try{return out(await new PlanReconciliation(store,new Workflow(store,liveTransport,undefined,!applying)).reconcile(req(a[0],'Job'),config,Number(a[2]),a[4]));}finally{store.close();}
+   }
+   if(command==='receipt-reconcile'){
+    if(a.length!==3&&!(a.length===5&&a[3]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[4])))throw Error('Use receipt-reconcile JOB CONFIG ATTEMPT [--confirm HASH]');
+    const attempt=Number(a[2]);if(!Number.isSafeInteger(attempt)||attempt<1)throw Error('Positive original remediation attempt required');
+    const config=projectConfiguration(a[1]);validate(config);
+    if(!existsSync(db))throw Error('Existing database required');
+    const store=new Store(db,a.length===3);
+    try{return out(await new RemediationReceipts(store,new Workflow(store,liveTransport,undefined,true)).reconcile(a[0],attempt,config,a[4]));}finally{store.close();}
    }
    if(command==='spec-reconcile'){
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-reconcile JOB CONFIG [--confirm HASH]');

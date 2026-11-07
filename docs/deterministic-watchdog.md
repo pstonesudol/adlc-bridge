@@ -274,3 +274,54 @@ failure exhaustion across head changes, and retained cadence across restart.
 Run `bun test`. These tests do not demonstrate a live unattended pilot, install
 or activate the feature, or authorize service operation. Activation remains an
 explicit reviewed operator action; merging remains human-only.
+
+### Original remediation receipts (DEV-84 / DEV-69)
+
+The ordinary review tick uses `ReceiptReconciliation.inspect` for uncertain
+worker remediation. Exact accepted/queued/running receipts wait; a completed
+receipt settles delivery and proceeds through the unchanged current-head review
+gates. Failed/cancelled receipts escalate. Unknown, missing, stale, incomplete,
+out-of-order or contradictory evidence remains blocked with its receipt code.
+Another active attempt or native turn blocks reconciliation. No elapsed wait,
+new head, restart or missing transcript permits a resend or clears a receipt.
+
+When a requirements edit has invalidated approval, ordinary execution cannot
+interpret the historical receipt as current approval. Instead, explicitly run:
+
+```
+adlc receipt-reconcile JOB CONFIG ATTEMPT
+adlc receipt-reconcile JOB CONFIG ATTEMPT --confirm HASH
+```
+
+Preview is read-only, including on disk. Confirmation takes the existing turn
+submission fence and obtains another fresh complete inventory. The hash binds
+the original job, plan/spec, attempt, client, worker project/session/branch and
+worktree reservation, prior ledger, current requirement revision chain and exact
+completed native turn. A refreshed collection time alone does not change the
+hash; changed bindings, receipts, competing attempts or requirements do. Stale
+and out-of-order inventories are still refused. This command never sends a turn,
+rebinds ownership, changes the PR, restores an approval or changes a budget.
+Conflict-recovery attempts retain their existing reconciliation interface.
+
+Legacy remediation rows without a delivery ledger require corroborating retained
+execution/planning ownership and original plan/spec provenance. After an edit,
+the recorded invalidation and its dispatch snapshot must prove that same original
+binding, and the pending revision chain must reach the current requirements.
+Missing history fails closed; a matching client string alone is insufficient.
+Confirmation records only a proved completed fact, not an invented reservation
+or permission to resend. Prior audit events remain intact; the confirmation
+event records original bindings, prior receipt/remediation state and terminal
+identities, never transcript text, prompts or provider error bodies.
+
+After successful historical reconciliation, separately preview and confirm
+`adlc spec-reconcile JOB CONFIG`. Normal revised-plan capture and fresh approval
+are still mandatory in the same owner session. Before a requirements edit, the
+next step is the existing supervised `tick-review JOB CONFIG`, not readiness by
+receipt alone. Neither command grants merge permission.
+
+Persisted-only `adlc jobs status JOB --json` includes `receipts` with codes,
+observation age and the exact next preview command. Human status displays
+unsettled receipts too. Unobserved/legacy ages are explicitly unknown rather
+than guessed. Inspection performs no provider reads, migrations or reconciliation.
+Incident case 7 and focused legacy/changed-requirement tests are offline evidence,
+not a live pilot, installation or activation.

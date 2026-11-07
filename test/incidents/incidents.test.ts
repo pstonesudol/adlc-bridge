@@ -1,12 +1,12 @@
 /** DEV-78 incident acceptance matrix. Runner: bun test test/incidents
- * Status: 12 active, 0 skip, 1 todo (13 tests).
+ * Status: 13 active, 0 skip, 0 todo (13 tests).
  * 1 duplicate/cancelled CI (#150): active DEV-77
  * 2 skipped current-head review + stale CHANGES_REQUESTED (#30): active DEV-65
  * 3 missing body-bound attestation: active DEV-70 (wait for provider evidence)
  * 4 repairable required CI: active DEV-80
  * 5 transient provider read/backoff: active DEV-56
  * 6 terminated/stuck worker: active DEV-83, safe human escalation, no resend
- * 7 uncertain worker receipt: todo DEV-78 follow-up, receipt ticket unassigned;
+ * 7 uncertain worker receipt: active DEV-84;
  *   uncertain review-request receipt already runs as a separate safety case
  * 8 in-scope findings and human decision: active, never infer approval
  */
@@ -124,7 +124,30 @@ for(const kind of ['terminated','stuck'])test(`6 DEV-83: ${kind} worker escalate
   expect(f.calls).toEqual([]);f.assertSafe();
 }));
 
-test.todo('7 later receipt ticket (unassigned): uncertain worker send reconciles accepted/completed receipt, reaches ready_for_human with exactly one send');
+test('7 DEV-84: lost worker reply reconciles accepted/running/completed receipt with exactly one send',()=>replay(async f=>{
+ Object.assign(f.evidence,{clear:false,reasons:['CHANGES_REQUESTED'],findings:[{path:'src/example.ts',body:'Fix null handling'}]});
+ const spawn=f.io.spawn;f.io.spawn=(args:string[])=>({...spawn(args),exited:Promise.resolve(1)});
+ expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');
+ const entry=f.session.transcript.entries[0],turn=f.session.transcript.turns[0];
+ f.session.transcript.entries=[];
+ expect(await f.loop.tick(f.id)).toMatchObject({state:'needs_reconciliation',delivery:{code:'receipt_absent'}});
+ f.session.transcript.entries=[entry];
+ const read=f.loop.io.sessionEvidence;
+ f.loop.io.sessionEvidence=async()=>{f.session.receiptObservation={complete:false,observed:Date.now()-120001};return f.session;};
+ expect(await f.loop.tick(f.id)).toMatchObject({state:'needs_reconciliation',delivery:{code:'observation_stale_or_incomplete'}});
+ f.loop.io.sessionEvidence=read;
+ delete entry.turnId;f.session.transcript.turns=[];
+ expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_worker',delivery:{state:'accepted',code:'client_accepted_unconfirmed'}});
+ entry.turnId=turn.id;f.session.transcript.turns=[turn];
+ for(const state of ['queued','running']){turn.state=state;expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_worker',delivery:{state}});}
+ f.complete();f.evidence.clear=false;f.evidence.findings=[];f.evidence.reasons=['Explicit latest-SHA CodeRabbit approval missing'];
+ expect((await f.loop.tick(f.id)).state).not.toBe('ready_for_human');
+ setSystemTime(new Date(Date.now()+31*60000));f.evidence.clear=true;
+ for(let n=0;n<3;n++)expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
+ expect(f.calls.filter(c=>c.kind==='send')).toHaveLength(1);
+ expect(f.s.db.query('SELECT state FROM remediation WHERE job=?').get(f.id)).toEqual({state:'completed'});
+ expect(f.s.get(f.id).attempts).toBe(1);f.assertSafe();
+}));
 
 test('7 safety: lost review-request reply reconciles matching receipt without duplicate mutation',()=>replay(async f=>{
  Object.assign(f.evidence,{clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],reviewSchedule:{head:f.evidence.head,signature:'config',blocker:null,incremental:false}});
