@@ -28,6 +28,7 @@ export function incident(){
  const forbidden=(kind:string)=>{calls.push({kind,key:kind});throw Error(`Forbidden incident capability: ${kind}`);};
  const io:any={
   readiness:async()=>evidence,
+  readCIFailure:async()=> 'FAIL src/example.ts\nAssertionError: expected true',
   sessionEvidence:async()=>session,
   readBranchSnapshot:async()=>({head:evidence.head,base:'b'.repeat(40),branch:reservation.branch,baseBranch:'main',defaultBranch:'main',headRepo:'fixture/repo',baseRepo:'fixture/repo',state:'open',draft:false,mergeable:true,behind:0}),
   worktreeIdentity:async()=>({tree:'/incident-worktree',branch:reservation.branch,head:evidence.head}),

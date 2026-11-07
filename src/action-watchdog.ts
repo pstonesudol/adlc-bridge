@@ -118,14 +118,15 @@ export class ActionWatchdog{
    return this.get(id);
   }).immediate();
  }
- finishReview(id:string,result?:{state?:string},evaluated=true){
+  finishReview(id:string,result?:{state?:string;reason?:string},evaluated=true){
   const a=this.get(id);if(!a||a.state==='superseded'||a.state==='escalated'&&a.outcome!=='human_required'||completed(this.s,a.job))return;
   const blocker=classifyBlocker(this.s,a.job),read=row(this.s,'recovery_observations',a.job);
   // Observation success must never reset consecutive effectful evaluation failures.
   if(evaluated){
    const failures=result?.state?0:row(this.s,'watchdog_evaluations',a.job).failures+1;
    const slow=a.state==='escalated'||idle(this.s,a.job)||['human','dependency_wait','unsupported'].includes(blocker);
-   const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs;
+    const ciBackoff=result?.state==='waiting_for_ci'&&result.reason?.includes(': transient;')?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**Math.min(a.attempts,4)):WATCHDOG_LIMITS.intervalMs;
+    const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:ciBackoff;
    this.s.db.query('UPDATE watchdog_evaluations SET failures=?,next_tick=? WHERE job=?').run(failures,this.now()+delay,a.job);
    if(failures){
     if(failures>=WATCHDOG_LIMITS.maxEvaluationFailures)this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');

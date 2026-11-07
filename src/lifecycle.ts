@@ -1,5 +1,6 @@
 import {ApprovalPolicyStore} from './approval-policy';
 import {Store,digest} from './core';
+import {remediationFingerprint} from './ci-failures';
 import {DEFAULT_REMEDIATION_POLICY,remediationPolicy,remediationSummary,type RemediationPolicy,type RemediationSummary} from './remediation';
 import {adoptedDelivery} from './delivery-identity';
 import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation';
@@ -279,7 +280,7 @@ export class Lifecycle {
       assertWorktreeAvailable(this.s,job);
       this.current(job);const r=this.run(job);
       if(!r||r.state!=='running'||r.owner!=='orchestrator')throw Error('Active agent-owned run required');
-      const hash=digest(findings),budget=this.ensureBudget(job,policy);
+      const hash=remediationFingerprint(findings),budget=this.ensureBudget(job,policy);
       const previous=this.s.db.query('SELECT * FROM remediation WHERE job=? AND head=? AND findings_hash=?').get(job,head,hash) as any;
       if(previous)return {...previous,reused:true,budget:this.summarizeBudget(job,budget,policy)};
       const uncertain=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job);

@@ -11,6 +11,7 @@ import {metadataCheckNames} from './linear';
 import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
 import {ReviewRequests,ReviewRateLimit,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,type ReviewSchedule} from './coderabbit-scheduling';
 import {readFailure} from './provider-read';
+import {classifyCIFailure,readCIFailure,ciFinding,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 
 function metadataFailureCovered(e:any,check:any,bodyBound=true){
   return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.check===check.name&&f.checkId===check.id&&f.sha===e.head&&(!bodyBound||metadataFailureBodyCovered(e,f)));
@@ -39,10 +40,10 @@ import {ActionWatchdog} from './action-watchdog';
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
- if(e.failedChecks.length&&!e.failedChecks.every((c:any)=>metadataFailureCovered(e,c)))return {state:'blocked',send:false,reason:'Required CI failed; inspect failure and ticket scope before remediation'};
+ if(e.failedChecks.length&&!e.failedChecks.every((c:any)=>metadataFailureCovered(e,c)||e.findings.some((f:any)=>f.source==='required-ci'&&f.checkId===c.id&&f.sha===e.head&&f.check===c.name)))return {state:'blocked',send:false,reason:`Required CI ${e.failedChecks.map((c:any)=>c.name).join(', ')}: unknown; current failure diagnosis required`};
  if(e.findings.length){
   if(e.findings.some((f:any)=>f.kind!=='pr_description'&&!scopeAllows(f.path,allowedPaths)))return {state:'blocked',send:false,reason:'Review findings exceed approved file scope'};
-  return {state:'remediation_pending',send:true,reason:e.failedChecks.length?'Actionable PR-template CI failure':'Actionable latest-SHA CodeRabbit findings'};
+   return {state:'remediation_pending',send:true,reason:e.failedChecks.length?'Actionable current-head required CI failure':'Actionable latest-SHA CodeRabbit findings'};
  }
  // Unresolved threads that cannot become a CodeRabbit remediation are never
  // resolved by waiting or by requesting another full review. Surface exactly
@@ -73,7 +74,7 @@ export async function postFullReview(repo:string,pr:number,marker='',spawn=Bun.s
 export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
-const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,contains:branchTransport.contains!};
+const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,readCIFailure,contains:branchTransport.contains!};
 export class ReviewLoop{
  io:typeof reviewIO;
  requests:ReviewRequests;
@@ -452,7 +453,29 @@ export class ReviewLoop{
   ];
   // Only feedback never handed to this worker is actionable. Metadata findings
   // keep their existing path untouched.
-  const reviewView={...e,findings:[...e.findings.filter((f:any)=>f.kind!=='review_thread'),...freshThreadFindings],remainingFeedback};
+   const reviewView={...e,findings:[...e.findings.filter((f:any)=>f.kind!=='review_thread'),...freshThreadFindings],remainingFeedback};
+   const failures=e.failedChecks.filter((c:any)=>!metadataFailureCovered(e,c));
+   if(failures.length){
+    // Keep the current-head wait origin durable even when diagnosis returns
+    // early. Otherwise every transient poll would restart its escalation clock.
+    this.s.db.query("UPDATE review_targets SET head=?,head_since=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,since,job,t.pr);
+    const paths=JSON.parse(t.allowed_paths),grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+    const authorized=!!(t.remediate&&grant?.plan_hash===l.current(job).plan_hash&&['commit','push-feature'].every(op=>JSON.parse(grant.operations).includes(op)));
+    if(failures.length>8)return record({state:'blocked',send:false,head:e.head,reason:`Required CI ${failures.slice(0,8).map((c:any)=>c.name).join(', ')}: unknown; too many failed checks for bounded diagnosis`});
+    const blockers:{transient:boolean;reason:string}[]=[];
+    for(const c of failures){
+     const identity=!e.reasons.includes('Head changed')&&snapshot.head===e.head&&Number.isSafeInteger(c.id)&&c.id>0&&c.sha===e.head&&c.conclusion==='failure'&&!e.pendingChecks.includes(c.name)&&failures.filter((x:any)=>x.name===c.name).length===1;
+     const diagnosis=classifyCIFailure(identity?await io.readCIFailure(t.repo,c):null,paths);
+     l.current(job);
+     const reason=`Required CI ${c.name} (#${c.id}, ${e.head}): ${authorized?diagnosis.classification:'unauthorized'}; ${authorized?diagnosis.reason:'current scoped commit/push authorization required'}`;
+     if(!authorized||diagnosis.classification!=='repairable')blockers.push({transient:authorized&&diagnosis.classification==='transient',reason});
+     else reviewView.findings.push(ciFinding(c,diagnosis));
+    }
+    if(blockers.length)return record({state:blockers.every(b=>b.transient)&&Date.now()-since<30*60000?'waiting_for_ci':'blocked',send:false,head:e.head,reason:blockers.map(b=>b.reason).join('; ')});
+    // A log read cannot authorize a stale run/head. Re-read logical identities.
+    const fresh=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));
+    if(fresh.head!==e.head||failures.some((c:any)=>fresh.failedChecks.filter((x:any)=>sameFailedCheck(c,x)).length!==1||fresh.pendingChecks.includes(c.name)))return record({state:'blocked',send:false,head:e.head,reason:`Required CI ${failures.map((c:any)=>c.name).join(', ')}: unknown; failure identity changed during diagnosis`});
+   }
   const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
   const signature=digest(JSON.stringify({head:e.head,state:d.state,reason:d.reason}));
   const stored=this.s.db.transaction(()=>{
@@ -471,9 +494,12 @@ export class ReviewLoop{
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');
    const operations=metadataOnly?['open-pr']:['commit','push-feature',...(reviewView.findings.some((f:any)=>f.kind==='pr_description')?['open-pr']:[])];
    const j=l.current(job);if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
-   await io.disableNativeFeedback(run.session_id);
-   const result=await io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
-   if(result.blocked)return record({state:'blocked',send:false,head:e.head,reason:result.reason,budget:result.budget});
+    let result;
+    try{
+     await io.disableNativeFeedback(run.session_id);
+     result=await io.sendPilotRemediation(this.s,job,e.head,JSON.stringify(reviewView.findings),t.repo,t.pr,required,remediationPolicy,metadataChecks);
+    }catch(error){if(error instanceof CIFailureBlocked)return record({state:'blocked',send:false,head:e.head,reason:error.message});throw error;}
+    if(result.blocked)return record({state:'blocked',send:false,head:e.head,reason:failures.length?`Required CI ${failures.map((c:any)=>c.name).join(', ')}: ${result.reason}`:result.reason,budget:result.budget});
    if(result.reused)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Concurrent remediation reservation already exists; reconcile before retry'});
    return {...d,head:e.head,delivery:result};
   }
