@@ -1,11 +1,11 @@
 /** DEV-78 incident acceptance matrix. Runner: bun test test/incidents
- * Status: 10 active, 2 skip, 1 todo (13 tests).
+ * Status: 12 active, 0 skip, 1 todo (13 tests).
  * 1 duplicate/cancelled CI (#150): active DEV-77
  * 2 skipped current-head review + stale CHANGES_REQUESTED (#30): active DEV-65
  * 3 missing body-bound attestation: active DEV-70 (wait for provider evidence)
  * 4 repairable required CI: active DEV-80
  * 5 transient provider read/backoff: active DEV-56
- * 6 terminated/stuck worker: 2 skips, DEV-78 follow-up, liveness ticket unassigned
+ * 6 terminated/stuck worker: active DEV-83, safe human escalation, no resend
  * 7 uncertain worker receipt: todo DEV-78 follow-up, receipt ticket unassigned;
  *   uncertain review-request receipt already runs as a separate safety case
  * 8 in-scope findings and human decision: active, never infer approval
@@ -108,13 +108,20 @@ test('5 transient provider failure persists seeded backoff, performs no early re
  }finally{random.mockRestore();}
 }));
 
-for(const kind of ['terminated','stuck'])test.skip(`6 later liveness ticket (unassigned): ${kind} worker recovers without operator`,()=>replay(async f=>{
+for(const kind of ['terminated','stuck'])test(`6 DEV-83: ${kind} worker escalates without duplicate worker or send`,()=>replay(async f=>{
  f.session.session.isTerminated=kind==='terminated';f.session.transcript.controller=kind==='stuck'?'running':'ready';
  f.evidence.clear=false;f.evidence.findings=[{path:'src/example.ts',body:'Repair bounded finding'}];
- await f.loop.tick(f.id);
- // Future production recovery must establish a live worker before this step.
- expect(f.calls.filter(c=>c.kind==='send')).toHaveLength(1);
- f.complete();expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');f.assertSafe();
+  if(kind==='stuck')f.session.transcript.turns=[{id:'abandoned',state:'running'}];
+  await f.loop.tick(f.id);
+  setSystemTime(new Date(Date.now()+31*60000));
+  for(let i=0;i<3;i++){
+   const result=await f.loop.tick(f.id);
+   expect(result).toMatchObject({state:'blocked',send:false});
+   expect(result.reason).toContain(`Worker ${kind}`);
+   expect(result.reason).toContain('fake-session');
+   expect(result.reason).toContain('/incident-worktree');
+  }
+  expect(f.calls).toEqual([]);f.assertSafe();
 }));
 
 test.todo('7 later receipt ticket (unassigned): uncertain worker send reconciles accepted/completed receipt, reaches ready_for_human with exactly one send');

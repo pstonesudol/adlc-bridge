@@ -662,7 +662,7 @@ test('prior PR stays historical until the revised handoff, then review reconcili
   expect(revisedHandoff(f.s,f.job)).toBe(true);
   const head='a'.repeat(40),evidence={head,observedHead:head,required:['CI'],checks:[],review:null,unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true,descriptionHash:'d',findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],clear:false,reasons:[]};
   f.s.db.query("INSERT INTO remediation(job,head,findings_hash,attempt,state) VALUES (?,?,?,?,?)").run(f.job,head,'findings',1,'delivery_uncertain');
-  const after=await new ReviewLoop(f.s,undefined,{sessionEvidence:async()=>({session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[],entries:[]}}),readBranchSnapshot:async()=>({branch:f.e.session.branch,head,state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),worktreeIdentity:async()=>({branch:f.e.session.branch,head}),readiness:async()=>evidence} as any).tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
+  const after=await new ReviewLoop(f.s,undefined,{sessionEvidence:async()=>({receiptObservation:{complete:true,observed:Date.now()},session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',turns:[],entries:[]}}),readBranchSnapshot:async()=>({branch:f.e.session.branch,head,state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),worktreeIdentity:async()=>({branch:f.e.session.branch,head}),readiness:async()=>evidence} as any).tick(f.job,undefined,undefined,{project:'p',checks:[]},config);
   expect(after?.state).toBe('needs_reconciliation');expect(after?.reason).toMatch(/remediation delivery is uncertain|dispatch binding/);
  }finally{f.s.close();}
 });
@@ -772,7 +772,7 @@ test('a revised handoff must belong to the registered review target PR',async()=
   // reported ready and its stored state reflects the fresh review cycle.
   const evidence={required:['CI'],checks:[],review:null,unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true,descriptionHash:'d',findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],clear:false,reasons:[]};
   const isolated=new ReviewLoop(f.s,undefined,{
-   sessionEvidence:async()=>({session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:9,url:'https://github.com/owner/repo/pull/9'}]},transcript:{controller:'ready',turns:[],entries:[]}}),
+   sessionEvidence:async()=>({receiptObservation:{complete:true,observed:Date.now()},session:{id:'owner',projectId:'project',branch:f.e.session.branch,isTerminated:false,prs:[{number:9,url:'https://github.com/owner/repo/pull/9'}]},transcript:{controller:'ready',turns:[],entries:[]}}),
    readBranchSnapshot:async()=>({branch:f.e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),
    worktreeIdentity:async()=>({branch:f.e.session.branch,head:'a'.repeat(40)}),
    readiness:async()=>evidence,

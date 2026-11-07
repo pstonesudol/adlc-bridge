@@ -29,7 +29,7 @@ export function incident(){
  const io:any={
   readiness:async()=>evidence,
   readCIFailure:async()=> 'FAIL src/example.ts\nAssertionError: expected true',
-  sessionEvidence:async()=>session,
+   sessionEvidence:async()=>{session.receiptObservation={complete:true,observed:Date.now()};return session;},
   readBranchSnapshot:async()=>({head:evidence.head,base:'b'.repeat(40),branch:reservation.branch,baseBranch:'main',defaultBranch:'main',headRepo:'fixture/repo',baseRepo:'fixture/repo',state:'open',draft:false,mergeable:true,behind:0}),
   worktreeIdentity:async()=>({tree:'/incident-worktree',branch:reservation.branch,head:evidence.head}),
   contains:async()=>forbidden('unexpected-ancestry'),

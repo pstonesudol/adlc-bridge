@@ -9,6 +9,7 @@ import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {worktreeReservation} from './worktree-reservation';
 import {assertDeliveryTarget} from './delivery-identity';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
+import {observeLiveness,livenessStatus} from './worker-liveness';
 
 export type BlockerClass='ci_wait'|'reviewer_wait'|'worker_wait'|'dependency_wait'|'provider_wait'|'intake_paused'|'receipt_uncertain'|'human'|'unsupported'|'none';
 export type ActionContract=
@@ -18,7 +19,7 @@ export type ActionContract=
  |{kind:'escalate';blocker:BlockerClass};
 export type ActionBinding=Readonly<{job:string;project:string;spec:string;revision:string|null;plan:string|null;session:string|null;owner:string|null;repo:string|null;pr:number|null;head:string|null;authority:string;ownership:string;target:string;configuration:string}>;
 export type ActionRow={id:string;job:string;project:string;binding:string;next_action:'observe'|'defer'|'escalate';blocker:BlockerClass;state:'pending'|'claimed'|'escalated'|'superseded';due_at:number;attempts:number;max_attempts:number;failures:number;token:string|null;lease_until:number|null;outcome:string;reason:string;observed_at:number|null;evidence:string|null};
-export const WATCHDOG_LIMITS={perTick:4,maxAttempts:240,maxFailures:6,maxEvaluationFailures:6,intervalMs:60000,idleMs:15*60000,leaseMs:120000} as const;
+export const WATCHDOG_LIMITS={perTick:4,maxAttempts:240,maxFailures:6,maxEvaluationFailures:6,intervalMs:60000,idleMs:15*60000,livenessMs:30*60000,leaseMs:120000} as const;
 export function evaluateAction(blocker:BlockerClass,due:number,now:number):ActionContract{
  if(['human','dependency_wait','unsupported'].includes(blocker))return {kind:'escalate',blocker};
  return due>now?{kind:'defer',blocker}:{kind:'observe',operation:'review-evidence'};
@@ -69,7 +70,7 @@ export function actionStatus(s:Store,job:string,now=Date.now()){
  const r=s.db.query("SELECT * FROM watchdog_actions WHERE job=? AND state!='superseded' ORDER BY rowid DESC LIMIT 1").get(job) as ActionRow|null;
  if(!r)return null;
  const b=row(s,'watchdog_budgets',job);
- return {id:r.id,operation:'review-evidence',nextAction:r.next_action,blocker:r.blocker,state:r.state,dueAt:r.state==='escalated'?null:r.due_at,attempts:b?.attempts??r.attempts,maxAttempts:b?.max_attempts??r.max_attempts,failures:r.failures,evaluation:row(s,'watchdog_evaluations',job),outcome:r.outcome,reason:r.reason,evidence:statusJSON(r.evidence),evidenceAgeMs:r.observed_at===null?null:Math.max(0,now-r.observed_at),binding:statusJSON(r.binding),freshness:'persisted-only',recoverySupported:false};
+ return {id:r.id,operation:'review-evidence',nextAction:r.next_action,blocker:r.blocker,state:r.state,dueAt:r.state==='escalated'?null:r.due_at,attempts:b?.attempts??r.attempts,maxAttempts:b?.max_attempts??r.max_attempts,failures:r.failures,evaluation:row(s,'watchdog_evaluations',job),liveness:livenessStatus(s,job),outcome:r.outcome,reason:r.reason,evidence:statusJSON(r.evidence),evidenceAgeMs:r.observed_at===null?null:Math.max(0,now-r.observed_at),binding:statusJSON(r.binding),freshness:'persisted-only',recoverySupported:false};
 }
 // Existing explicit read retry may rearm provider observations, never uncertain
 // review effects, superseded actions, receipts or cumulative job budgets.
@@ -129,8 +130,10 @@ export class ActionWatchdog{
      // cadence: at ages 0, 1, 3, 7 and 15 minutes, delay 1, 2, 4, 8 and 15.
      const age=Math.max(0,this.now()-(row(this.s,'review_targets',a.job)?.head_since??this.now()));
      const steps=Math.min(4,Math.floor(Math.log2(1+age/WATCHDOG_LIMITS.intervalMs)));
-     const ciBackoff=result?.state==='waiting_for_ci'&&result.reason?.includes(': transient;')?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**steps):WATCHDOG_LIMITS.intervalMs;
-    const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:ciBackoff;
+     const live=livenessStatus(this.s,a.job),liveAge=live?Math.max(0,this.now()-live.since):0;
+     const liveSteps=Math.min(4,Math.floor(Math.log2(1+liveAge/WATCHDOG_LIMITS.intervalMs)));
+     const waitBackoff=result?.state==='waiting_for_ci'&&result.reason?.includes(': transient;')?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**steps):result?.state==='waiting_for_worker'&&live&&['busy','idle_no_delivery'].includes(live.classification)?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**liveSteps):WATCHDOG_LIMITS.intervalMs;
+    const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:waitBackoff;
    this.s.db.query('UPDATE watchdog_evaluations SET failures=?,next_tick=? WHERE job=?').run(failures,this.now()+delay,a.job);
    if(failures){
     if(failures>=WATCHDOG_LIMITS.maxEvaluationFailures)this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');
@@ -139,6 +142,8 @@ export class ActionWatchdog{
    }
   }
   if(!result?.state)return;
+  const live=livenessStatus(this.s,a.job);
+  if(result.state==='blocked'&&live&&['terminated','stuck','unknown'].includes(live.classification)){this.stop(id,'human',`worker_${live.classification}`,result.reason??'Worker requires inspection');return;}
   if(read&&['human','unsupported'].includes(blocker)){this.stop(id,'provider_wait','unsupported','Provider read failure requires inspection; use retry-observation JOB after correcting access; no mutation replay');return;}
   if(['human','dependency_wait','unsupported'].includes(blocker)){this.stop(id,blocker,'human_required','Existing review or worker blocker requires human inspection; automatic recovery is unsupported');return;}
   this.s.db.query("UPDATE watchdog_actions SET due_at=MAX(due_at,?),blocker=? WHERE id=? AND state='pending'").run(Math.max(this.now()+(idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),read?.next_read??0),blocker,id);
@@ -203,10 +208,11 @@ export class ActionWatchdog{
    check();
    const snapshot=await observations.read(a.job,'github',async()=>{try{const result=await io.readBranchSnapshot(binding.repo!,binding.pr!);check();return result;}catch(error){check();throw error;}},false);
    check();
-   if(session?.session?.id!==binding.session||session.session.isTerminated!==false||session.session.projectId!==row(this.s,'planning_runs',a.job)?.project||!Array.isArray(session.transcript?.turns)||!Array.isArray(session.transcript?.entries)||!session.session.prs?.some((p:any)=>p.number===binding.pr&&p.url===`https://github.com/${binding.repo}/pull/${binding.pr}`)||snapshot?.headRepo!==binding.repo||snapshot?.baseRepo!==binding.repo||snapshot?.state!=='open'||!/^[a-f0-9]{40,64}$/i.test(snapshot?.head??''))throw new UnsupportedAction();
+   if(session?.session?.id!==binding.session||typeof session.session.isTerminated!=='boolean'||session.session.projectId!==row(this.s,'planning_runs',a.job)?.project||!Array.isArray(session.transcript?.turns)||!Array.isArray(session.transcript?.entries)||(session.session.isTerminated!==true&&!session.session.prs?.some((p:any)=>p.number===binding.pr&&p.url===`https://github.com/${binding.repo}/pull/${binding.pr}`))||snapshot?.headRepo!==binding.repo||snapshot?.baseRepo!==binding.repo||snapshot?.state!=='open'||!/^[a-f0-9]{40,64}$/i.test(snapshot?.head??''))throw new UnsupportedAction();
    const observed=session.receiptObservation?.observed;
    if(session.receiptObservation?.complete!==true||!Number.isSafeInteger(observed)||observed>this.now()||this.now()-observed>RECEIPT_FRESHNESS_MS)throw new UnsupportedAction();
    assertDeliveryTarget(this.s,a.job,session.session,binding.repo!,binding.pr!,snapshot);
+   observeLiveness(this.s,a.job,session,snapshot.head,WATCHDOG_LIMITS.livenessMs,this.now());
    const activity=session.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))?'active_or_queued':session.transcript.controller==='ready'?'idle':'unknown';
    this.s.db.query("UPDATE watchdog_actions SET state='pending',next_action='defer',due_at=?,token=NULL,lease_until=NULL,failures=0,outcome='observed',reason='Fresh observation only; existing review and receipt gates still apply',observed_at=?,evidence=? WHERE id=? AND token=?").run(this.now()+(idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),this.now(),JSON.stringify({version:1,source:'session-and-branch',activity,head:snapshot.head,mutationAuthority:false}),id,token);
    return {session,snapshot};

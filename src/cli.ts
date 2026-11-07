@@ -123,9 +123,11 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
    const watchdog=new ActionWatchdog(s);
    for(const target of reviewLoop.list(c.linear.projectId) as any[]){
-    reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
-    if(target.state==='completed')continue;
-    watchdog.scheduleReview(target.job,c);
+    try{
+     reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
+     if(target.state==='completed')continue;
+     watchdog.scheduleReview(target.job,c);
+    }catch{console.error(`Review scheduling failed for ${target.job}; remaining targets continue`);}
    }
    for(const action of watchdog.due(c.linear.projectId,undefined,true)){
     let evaluated=false;
@@ -144,7 +146,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
      evaluated=true;
      const review=await reviewLoop.tick(action.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c);
      watchdog.finishReview(action.id,review);io.out({job:action.job,review});
-    }catch(e){watchdog.finishReview(action.id,undefined,evaluated);console.error(e instanceof Error?e.message:'Review tick failed');}
+    }catch(e){try{watchdog.finishReview(action.id,undefined,evaluated);}catch{console.error(`Review settlement failed for ${action.job}; remaining targets continue`);}console.error(e instanceof Error?e.message:'Review tick failed');}
    }
  });
 }
