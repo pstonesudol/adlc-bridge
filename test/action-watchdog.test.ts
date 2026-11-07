@@ -1,0 +1,260 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {Store,digest} from '../src/core';
+import {Planning} from '../src/planning';
+import {Lifecycle} from '../src/lifecycle';
+import {ReviewLoop} from '../src/review-loop';
+import {ActionWatchdog,actionStatus,evaluateAction,retryWatchdogObservation,WATCHDOG_LIMITS} from '../src/action-watchdog';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
+import {ReceiptReconciliation} from '../src/receipt-reconciliation';
+import {turnBarrier,setProjectIntakePaused} from '../src/turn-submission';
+import {jobViews,humanJobs} from '../src/operator-cli';
+import {ApprovalPolicyStore} from '../src/approval-policy';
+
+function fixture(disk=false){
+ const root=mkdtempSync(join(tmpdir(),'adlc-watchdog-')),path=disk?join(root,'state.sqlite'):':memory:',s=new Store(path);
+ let now=1_000_000,reads=0;
+ const job=s.enqueue('p','issue','spec'),p=new Planning(s),r=p.reserve(job,'ao');p.gate(job,'ao','session',r.branch,'/worktree');
+ const hash=s.propose(job,'plan');s.approve(job,hash,'human');const l=new Lifecycle(s);l.grantGit(job,hash,['inspect','commit','push-feature','open-pr'],'human');l.adoptSupervised(job,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
+ const loop=new ReviewLoop(s,async()=>{throw Error('No review requests expected');});loop.configureMetadataChecks('p',[]);loop.register(job,'owner/repo',1,['CI'],['src/**'],true);
+ const c={linear:{projectId:'p'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'}},w=new ActionWatchdog(s,()=>now,()=>0.5,root);
+ const session:any={receiptObservation:{complete:true,observed:now},session:{id:'session',projectId:'ao',isTerminated:false,branch:r.branch,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};
+ const snapshot:any={head:'a'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,branch:r.branch,base:'b'.repeat(40),baseBranch:'main',defaultBranch:'main',mergeable:true,behind:0};
+ const io={sessionEvidence:async()=>{reads++;session.receiptObservation={complete:true,observed:now};return session;},readBranchSnapshot:async()=>{reads++;return snapshot;}};
+ return {root,path,s,job,loop,c,w,session,snapshot,io,now:()=>now,advance:(ms=60000)=>now+=ms,reads:()=>reads,close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
+}
+test('closed contract distinguishes legitimate waits from human/unsupported recovery',()=>{
+ for(const blocker of ['ci_wait','reviewer_wait','worker_wait','provider_wait','receipt_uncertain'] as const){expect(evaluateAction(blocker,10,10)).toEqual({kind:'observe',operation:'review-evidence'});expect(evaluateAction(blocker,11,10).kind).toBe('defer');}
+ for(const blocker of ['human','dependency_wait','unsupported'] as const)expect(evaluateAction(blocker,0,10).kind).toBe('escalate');
+});
+test('due observation reserves before provider IO, persists bounded next due and no mutation authority',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);let reserved=false;
+  const result=await f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{reserved=f.w.get(a.id).state==='claimed'&&f.w.get(a.id).attempts===1;return f.io.sessionEvidence();}});
+  expect(reserved).toBe(true);expect(result.snapshot.head).toBe(f.snapshot.head);
+  expect(actionStatus(f.s,f.job,f.now())).toMatchObject({attempts:1,maxAttempts:240,outcome:'observed',dueAt:f.now()+60000,evidence:{activity:'idle',mutationAuthority:false}});
+  await expect(f.w.observeReview(a.id,f.c,f.io)).rejects.toThrow();expect(f.reads()).toBe(2);expect(f.w.due('p')).toEqual([]);
+  f.advance();await f.w.observeReview(a.id,f.c,f.io);expect(f.reads()).toBe(4);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+ }finally{f.close();}
+});
+test('two connections claim once; restart preserves due, reservation and cumulative budget',async()=>{
+ const f=fixture(true);let second:Store|undefined;try{
+  const a=f.w.scheduleReview(f.job,f.c);second=new Store(f.path);const other=new ActionWatchdog(second,f.now,()=>0.5,f.root);
+  let release!:(value:any)=>void;const pending=new Promise(resolve=>release=resolve);
+  const first=f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:()=>pending});
+  await expect(other.observeReview(a.id,f.c,f.io)).rejects.toThrow();expect(f.reads()).toBe(0);
+  release(f.session);await first;second.close();second=new Store(f.path);
+  const restarted=new ActionWatchdog(second,f.now,()=>0.5,f.root);expect(restarted.due('p')).toEqual([]);expect(actionStatus(second,f.job,f.now())?.attempts).toBe(1);
+  f.advance();expect(restarted.due('p')).toHaveLength(1);
+ }finally{second?.close();f.close();}
+});
+test('expired read claim may be reobserved; old in-flight read cannot finish or overwrite new evidence',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);let release!:(value:any)=>void;const pending=new Promise(resolve=>release=resolve);
+  const old=f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:()=>pending}).catch(error=>error);
+  f.advance(10*60*1000+1);await f.w.observeReview(a.id,f.c,f.io);release(f.session);expect(await old).toBeInstanceOf(Error);
+  expect(actionStatus(f.s,f.job,f.now())).toMatchObject({attempts:2,outcome:'observed'});expect(f.reads()).toBe(2);
+ }finally{f.close();}
+});
+for(const field of ['spec','plan','revision','session','owner','pr','head','grant','approval'] as const)test(`exact ${field} binding revalidated after await; stale evidence never escapes`,async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{
+   if(field==='spec')f.s.db.query("UPDATE jobs SET spec='changed' WHERE id=?").run(f.job);
+   if(field==='plan')f.s.db.query("UPDATE jobs SET plan_hash='changed' WHERE id=?").run(f.job);
+   if(field==='revision')f.s.db.query("INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary) VALUES ('revision',?,'a','b','changed')").run(f.job);
+   if(field==='session'||field==='owner')f.s.db.query(`UPDATE runs SET ${field==='session'?'session_id':'owner'}='changed' WHERE job=?`).run(f.job);
+   if(field==='pr')f.s.db.query('UPDATE review_targets SET pr=2 WHERE job=?').run(f.job);
+   if(field==='head')f.s.db.query("UPDATE review_targets SET head='changed' WHERE job=?").run(f.job);
+   if(field==='grant')f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.job);
+   if(field==='approval')f.s.db.query('UPDATE jobs SET approved_hash=NULL WHERE id=?').run(f.job);
+   return f.session;
+  }})).rejects.toThrow('changed');
+  expect(f.reads()).toBe(0);expect(actionStatus(f.s,f.job,f.now())).toMatchObject({state:'escalated',outcome:'stale'});
+ }finally{f.close();}
+});
+test('revoked authority before claim, global/project pause before claim and pause during read all prevent use',async()=>{
+ for(const mode of ['revoked','global','project','during'] as const){const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  if(mode==='revoked')f.s.db.query('DELETE FROM git_grants WHERE job=?').run(f.job);
+  if(mode==='global')turnBarrier(f.root).pause();
+  if(mode==='project')setProjectIntakePaused('ao',true,f.root);
+  await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{if(mode==='during')turnBarrier(f.root).pause();return f.io.sessionEvidence();}})).rejects.toThrow();
+  expect(f.reads()).toBe(mode==='during'?1:0);expect(actionStatus(f.s,f.job,f.now())?.nextAction).toBe(mode==='revoked'?'escalate':'defer');
+ }finally{f.close();}}
+});
+test('active and queued workers can only be observed; transcript loss cannot enable recovery',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);f.session.transcript.turns=[{id:'t',state:'queued'}];
+  await f.w.observeReview(a.id,f.c,f.io);expect(actionStatus(f.s,f.job,f.now())?.evidence.activity).toBe('active_or_queued');
+  f.advance();delete f.session.transcript;await expect(f.w.observeReview(a.id,f.c,f.io)).rejects.toThrow();
+  expect(actionStatus(f.s,f.job,f.now())?.nextAction).toBe('escalate');expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.close();}
+});
+test('typed transient reads share capacity and stop at retry budget; unknown and permanent reads escalate without diagnostics',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  const fail=async()=>{throw readFailure('orchestrator','session-read','ETIMEDOUT SECRET');};
+  for(let n=1;n<=6;n++){
+   await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:fail})).rejects.toThrow();
+   expect(actionStatus(f.s,f.job,f.now())?.attempts).toBe(n);
+   if(n<6){expect(f.w.due('p')).toEqual([]);const status=new RecoveryObservation(f.s,f.now,()=>0.5).status(f.job);expect(status.sharedNextRead).toBeGreaterThan(f.now());f.advance(status.next_read-f.now());}
+  }
+  expect(actionStatus(f.s,f.job,f.now())).toMatchObject({outcome:'retry_exhausted',nextAction:'escalate'});
+  expect(JSON.stringify(actionStatus(f.s,f.job,f.now()))).not.toContain('SECRET');
+ }finally{f.close();}
+ for(const error of [Error('SECRET'),readFailure('github','read','HTTP 401 SECRET')]){const g=fixture();try{const a=g.w.scheduleReview(g.job,g.c);await expect(g.w.observeReview(a.id,g.c,{...g.io,readBranchSnapshot:async()=>{throw error;}})).rejects.toThrow();expect(actionStatus(g.s,g.job,g.now())?.nextAction).toBe('escalate');expect(JSON.stringify(actionStatus(g.s,g.job))).not.toContain('SECRET');}finally{g.close();}}
+});
+test('provider cooldown defers another action without IO; job budget survives head/plan changes',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c),observations=new RecoveryObservation(f.s,f.now,()=>0.5);
+  observations.failed(f.job,readFailure('orchestrator','read','HTTP 429',1,undefined,f.now()),'orchestrator');
+  await expect(f.w.observeReview(a.id,f.c,f.io)).rejects.toThrow('deferred');expect(f.reads()).toBe(0);
+  f.s.db.query('UPDATE watchdog_budgets SET attempts=max_attempts WHERE job=?').run(f.job);
+  f.s.db.query("UPDATE review_targets SET head='new-head' WHERE job=?").run(f.job);
+  const next=f.w.scheduleReview(f.job,f.c);expect(next.id).not.toBe(a.id);expect(next.outcome).toBe('budget_exhausted');expect(actionStatus(f.s,f.job)?.attempts).toBe(240);
+ }finally{f.close();}
+});
+test('bounded candidates are project-scoped and oldest due first; unknown effectful tick outcome stops',()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  for(let i=1;i<=6;i++){const job=f.s.enqueue(i===6?'other':'p',`i${i}`,'spec');f.s.db.query('INSERT INTO watchdog_actions SELECT ?,?,?,binding,next_action,blocker,state,?,attempts,max_attempts,failures,token,lease_until,outcome,reason,observed_at,evidence FROM watchdog_actions WHERE id=?').run(`a${i}`,job,i===6?'other':'p',f.now()-i,a.id);}
+  expect(f.w.due('p').map(a=>a.id)).toEqual(['a5','a4','a3','a2']);expect(f.w.due('other')).toHaveLength(1);
+  f.w.finishReview(a.id);expect(actionStatus(f.s,f.job)?.outcome).toBe('evaluation_uncertain');expect(f.w.due('p').some(x=>x.id===a.id)).toBe(false);
+ }finally{f.close();}
+});
+test('uncertain mutation receipts remain unchanged across observations, lease expiry, absent/contradictory transcripts',async()=>{
+ const f=fixture();try{
+  const receipts=new ReceiptReconciliation(f.s),j=f.s.get(f.job),binding={job:f.job,plan:j.plan_hash,spec:digest(j.spec),session:'session',client:'original-send',attempt:'implementation'};
+  receipts.reserve(binding);receipts.accepted(binding.client);
+  const before=receipts.get(binding.client),a=f.w.scheduleReview(f.job,f.c);
+  for(const state of ['absent','queued','running','completed','contradictory']){
+   f.session.receiptObservation={complete:true,observed:Date.now()};f.session.transcript.entries=state==='absent'?[]:[{clientMessageId:binding.client,turnId:'turn'}];
+   f.session.transcript.turns=state==='contradictory'?[{id:'turn',state:'completed'},{id:'turn',state:'running'}]:state==='absent'?[]:[{id:'turn',state}];
+   await f.w.observeReview(a.id,f.c,f.io);expect(receipts.get(binding.client)).toEqual(before);f.advance(WATCHDOG_LIMITS.leaseMs+1);
+  }
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+ }finally{f.close();}
+});
+test('status is persisted-only, tolerates absent tables and changes no database bytes',async()=>{
+ const f=fixture(true);try{
+  const a=f.w.scheduleReview(f.job,f.c);await f.w.observeReview(a.id,f.c,f.io);
+  f.s.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');const before=readFileSync(f.path),reads=f.reads();
+  const views=jobViews(f.path);expect(views[0].watchdog).toMatchObject({attempts:1,freshness:'persisted-only'});expect(humanJobs(views)).toContain('observations 1/240');
+  expect(readFileSync(f.path)).toEqual(before);expect(f.reads()).toBe(reads);
+  const ro=Store.readonly(f.path);expect(()=>new ActionWatchdog(ro)).toThrow('writable');ro.close();
+  const old=new Store(join(f.root,'old.sqlite'));const job=old.enqueue('p','old','spec');old.close();expect(jobViews(join(f.root,'old.sqlite'))[0].watchdog).toBeNull();expect(job).toBeTruthy();
+ }finally{f.close();}
+});
+test('production ReviewLoop uses scheduled read bundle and existing receipt reconciliation, with no sender on accepted uncertain work',async()=>{
+ const f=fixture();try{
+  const l=new Lifecycle(f.s),j=f.s.get(f.job),receipts=new ReceiptReconciliation(f.s);
+  receipts.reserve({job:f.job,plan:j.plan_hash,spec:digest(j.spec),session:'session',client:`adlc-fix-${f.job.slice(0,12)}-1`,attempt:'remediation:1'});
+  f.s.db.query("INSERT INTO remediation VALUES (?,?,?,1,'delivery_uncertain')").run(f.job,f.snapshot.head,'findings');
+  let sends=0;f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
+  const a=f.w.scheduleReview(f.job,f.c);
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
+  expect(result).toMatchObject({state:'needs_reconciliation'});expect(sends).toBe(0);expect(f.reads()).toBe(2);expect(l.run(f.job).session_id).toBe('session');
+  expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+ }finally{f.close();}
+});
+test('provider rearm preserves budget, shared capacity and mutation uncertainty; other escalations remain stopped',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{throw readFailure('orchestrator','read','HTTP 401');}})).rejects.toThrow();
+  f.s.db.query("UPDATE review_targets SET state='blocked' WHERE job=?").run(f.job);
+  expect(f.w.scheduleReview(f.job,f.c).blocker).toBe('provider_wait');
+  const observations=new RecoveryObservation(f.s,f.now);observations.retry(f.job);retryWatchdogObservation(f.s,f.job,f.now());
+  expect(f.w.scheduleReview(f.job,f.c).state).toBe('pending');
+  await f.w.observeReview(a.id,f.c,f.io);expect(actionStatus(f.s,f.job)?.attempts).toBe(2);
+  f.w.finishReview(a.id);retryWatchdogObservation(f.s,f.job,f.now());expect(f.w.get(a.id).outcome).toBe('evaluation_uncertain');
+ }finally{f.close();}
+});
+test('a recurring superseded binding escalates visibly, without resetting its job budget',async()=>{
+ const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);await f.w.observeReview(a.id,f.c,f.io);
+  f.s.db.query("UPDATE review_targets SET head='new-head' WHERE job=?").run(f.job);f.w.scheduleReview(f.job,f.c);
+  f.s.db.query('UPDATE review_targets SET head=NULL WHERE job=?').run(f.job);f.w.scheduleReview(f.job,f.c);
+  expect(actionStatus(f.s,f.job)).toMatchObject({outcome:'recurrent_binding',nextAction:'escalate',attempts:1});
+ }finally{f.close();}
+});
+test('stale/incomplete native evidence and configuration drift are never usable',async()=>{
+ for(const mode of ['stale','incomplete','project','configuration','closed-pr'] as const){const f=fixture();try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{
+   if(mode==='stale')f.session.receiptObservation.observed=f.now()-120001;
+   if(mode==='incomplete')f.session.receiptObservation.complete=false;
+   if(mode==='project')f.session.session.projectId='another-project';
+   if(mode==='configuration')f.c.githubRepo='different/repo';
+   if(mode==='closed-pr')f.snapshot.state='closed';
+   return f.session;
+  }})).rejects.toThrow();expect(actionStatus(f.s,f.job)?.state).toBe('escalated');
+ }finally{f.close();}}
+});
+test('restart after durable read reservation, before IO or after IO-before-record, permits reads only',async()=>{
+ const f=fixture(true);let restarted:Store|undefined;try{
+  const a=f.w.scheduleReview(f.job,f.c);
+  // Persist exactly the crash boundary written by the production claim. No
+  // mutation adapter exists at either side of this reservation.
+  f.s.db.query("UPDATE watchdog_actions SET state='claimed',token='lost-process',lease_until=?,attempts=1,outcome='read_reserved' WHERE id=?").run(f.now()+120000,a.id);
+  f.s.db.query('UPDATE watchdog_budgets SET attempts=1 WHERE job=?').run(f.job);
+  restarted=new Store(f.path);const w=new ActionWatchdog(restarted,f.now,()=>0.5,f.root);
+  expect(w.due('p')).toEqual([]);f.advance(120001);await w.observeReview(a.id,f.c,f.io);
+  expect(actionStatus(restarted,f.job)).toMatchObject({attempts:2,outcome:'observed'});
+  expect(restarted.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{restarted?.close();f.close();}
+});
+test('production poll uses one bounded sequential path and retains due times across ticks',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-watchdog-poll-'));
+ try{
+  const script=`
+import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
+import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {Planning} from ${JSON.stringify(join(import.meta.dir,'../src/planning.ts'))};
+import {Lifecycle} from ${JSON.stringify(join(import.meta.dir,'../src/lifecycle.ts'))};
+import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
+const s=new Store(':memory:'),p=new Planning(s),l=new Lifecycle(s),sessions={},snapshots={},jobs={};let reads=0,sends=0,polls=0;
+const fail=async()=>{sends++;throw Error('Unexpected mutation');};
+const loop=new ReviewLoop(s,fail,{sessionEvidence:async(id)=>{reads++;return {...sessions[id],receiptObservation:{complete:true,observed:Date.now()}};},readBranchSnapshot:async(repo,pr)=>snapshots[pr],worktreeIdentity:async(s,job)=>({tree:'/worktree-'+job,branch:jobs[job].branch,head:'a'.repeat(40)}),readiness:async()=>({head:'a'.repeat(40),clear:false,reasons:['Waiting for CI'],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[]}),disableNativeFeedback:fail,sendPilotRemediation:fail});
+for(let i=1;i<=6;i++){const job=s.enqueue('p','issue-'+i,'spec'),r=p.reserve(job,'ao');p.gate(job,'ao','session-'+i,r.branch,'/worktree-'+job);const hash=s.propose(job,'plan');s.approve(job,hash,'human');l.grantGit(job,hash,['inspect','commit','push-feature','open-pr'],'human');l.adoptSupervised(job,{id:'session-'+i,correlation:r.correlation,worktree:'/worktree-'+job,controller:'running'});loop.register(job,'owner/repo',i,['CI'],['src/**'],true);jobs[job]=r;sessions['session-'+i]={session:{id:'session-'+i,projectId:'ao',branch:r.branch,isTerminated:false,prs:[{number:i,url:'https://github.com/owner/repo/pull/'+i}]},transcript:{controller:'ready',entries:[],turns:[]}};snapshots[i]={head:'a'.repeat(40),base:'b'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,branch:r.branch,baseBranch:'main',defaultBranch:'main',behind:0,mergeable:true};s.db.query('UPDATE review_targets SET head=? WHERE job=?').run('a'.repeat(40),job);}
+const config={linear:{projectId:'p'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'},requiredChecks:['CI']};
+const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>{polls++;return [];},linearToken:()=>'',out:()=>{}}});
+await tick();const first=reads;await tick();const second=reads;await tick();console.log(JSON.stringify({first,second,reads,sends,polls,actions:s.db.query('SELECT count(*) AS n FROM watchdog_actions').get().n}));s.close();`;
+  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root},stdout:'pipe',stderr:'pipe'});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({first:4,second:6,reads:6,sends:0,polls:3,actions:6});
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('standing-policy expiry and reduced inspect grants fail closed before provider IO',async()=>{
+ for(const mode of ['expired','policy-changed','inspect-removed'] as const){const f=fixture();try{
+  const policy={mode:'ready-queue',id:'policy',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'};Object.assign(f.c,{approval:policy});
+  new ApprovalPolicyStore(f.s);const j=f.s.get(f.job);
+  f.s.db.query('INSERT INTO queue_eligibility VALUES (?,?,?,?,?)').run(f.job,'p',digest(j.spec),1,f.now());
+  f.s.db.query('INSERT INTO policy_authorizations(job,plan_hash,spec_hash,policy_hash,policy_id,authorized_by,scope) VALUES (?,?,?,?,?,?,?)').run(f.job,j.plan_hash,digest(j.spec),digest(JSON.stringify(policy)),policy.id,'human',JSON.stringify(policy.scope));
+  const a=f.w.scheduleReview(f.job,f.c);expect(a.state).toBe('pending');
+  if(mode==='expired')f.advance(120001);
+  if(mode==='policy-changed')policy.authorizedBy='changed';
+  if(mode==='inspect-removed')f.s.db.query('UPDATE git_grants SET operations=? WHERE job=?').run(JSON.stringify(['commit','push-feature','open-pr']),f.job);
+  await expect(f.w.observeReview(a.id,f.c,f.io)).rejects.toThrow();expect(f.reads()).toBe(0);
+ }finally{f.close();}}
+});
+test('existing worktree recovery reservation is an explicit unsupported state, never cleared or invoked',()=>{
+ const f=fixture();try{
+  f.s.db.exec('CREATE TABLE conflict_recoveries(id TEXT,job TEXT,state TEXT,worktree TEXT)');
+  f.s.db.query("INSERT INTO conflict_recoveries VALUES ('recovery',?,'delivery_uncertain','/worktree')").run(f.job);
+  const a=f.w.scheduleReview(f.job,f.c);expect(a).toMatchObject({state:'escalated',blocker:'unsupported'});
+  expect(f.w.due('p')).toEqual([]);expect(f.s.db.query('SELECT state FROM conflict_recoveries').get()).toEqual({state:'delivery_uncertain'});expect(f.reads()).toBe(0);
+ }finally{f.close();}
+});
+test('separate projects share the existing provider cooldown and cannot create parallel reads',async()=>{
+ const f=fixture();try{
+  const job=f.s.enqueue('q','issue-q','spec-q'),p=new Planning(f.s),r=p.reserve(job,'ao-q');p.gate(job,'ao-q','session-q',r.branch,'/worktree-q');const hash=f.s.propose(job,'plan-q');f.s.approve(job,hash,'human');const l=new Lifecycle(f.s);l.grantGit(job,hash,['inspect'],'human');l.adoptSupervised(job,{id:'session-q',correlation:r.correlation,worktree:'/worktree-q',controller:'running'});f.loop.register(job,'owner/repo',2,['CI'],['src/**']);
+  const c={...f.c,linear:{projectId:'q'},automation:{orchestratorProject:'ao-q'}},a=f.w.scheduleReview(f.job,f.c),b=f.w.scheduleReview(job,c);
+  await expect(f.w.observeReview(a.id,f.c,{...f.io,sessionEvidence:async()=>{throw readFailure('orchestrator','read','HTTP 429',1,undefined,f.now());}})).rejects.toThrow();
+  await expect(f.w.observeReview(b.id,c,f.io)).rejects.toThrow('deferred');expect(f.reads()).toBe(0);
+  expect(actionStatus(f.s,job)).toMatchObject({nextAction:'defer',outcome:'shared_capacity'});
+ }finally{f.close();}
+});

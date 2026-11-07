@@ -2310,6 +2310,14 @@ malformed, missing-resource and authentication/permission failures require
 inspection and an explicit read retry; unknown errors are never called quota
 failures. A successful read is not approval or permission to write.
 
+Automatic review polling also uses the [deterministic watchdog action ledger](docs/deterministic-watchdog.md):
+at most four due review candidates per tick, durable read-only observation claims,
+six transient retries per action and a cumulative 240-observation job budget.
+These tighter automatic limits sit above the shared provider controls described
+below. `jobs status JOB --json` exposes persisted next action/due/budget and
+escalation evidence without writes. The ledger adds no recovery sender or model
+conductor and never resets uncertain mutation receipts.
+
 Failure history spans providers and survives branch-only ticks until readiness
 collection succeeds. Unknown mergeability uses a separate durable one-minute
 wait, not the provider-failure or remediation budget. After six unknown results,

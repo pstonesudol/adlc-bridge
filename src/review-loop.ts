@@ -34,6 +34,7 @@ function readStop(error:unknown,fallback:string){
 }
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
+import {ActionWatchdog} from './action-watchdog';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
@@ -223,13 +224,14 @@ export class ReviewLoop{
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({pr,head,bodyHash}));
   return true;
  }
-  async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
+   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
    const observations=new RecoveryObservation(this.s),release=observations.claim(`job:${job}`,60*60*1000);
    if(!release)return {state:'waiting_for_worker',send:false,reason:'Review evaluation already reserved; no duplicate reads or continuation'};
-   try{return await withObservationFence(release.assert,()=>this.tickReserved(job,branchPolicy,remediationPolicy,policy,config));}catch(error){if(error instanceof ObservationLeaseLost)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}finally{release();}
+    try{return await withObservationFence(release.assert,()=>this.tickReserved(job,branchPolicy,remediationPolicy,policy,config,action));}catch(error){if(error instanceof ObservationLeaseLost)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}finally{release();}
   }
-  async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any){
-   assertObservationFence();const io=fencedIO(this.io);
+   async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
+    assertObservationFence();const io=fencedIO(this.io);
+    if(action)try{action.watchdog.assertReviewAction(action.id,job,config);}catch(error){if(error instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}
    const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
@@ -267,8 +269,11 @@ export class ReviewLoop{
    }
   let session,snapshot;
   try{
-   session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
-   snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
+    if(action){({session,snapshot}=await action.watchdog.observeReview(action.id,config,io));}
+    else{
+     session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
+     snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
+    }
   }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');

@@ -58,6 +58,7 @@ import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revis
 import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
 import {modernCommand,dispatchOperator} from './operator-dispatch';
 import {projectEntries,selectProject} from './operator-discovery';
+import {ActionWatchdog,retryWatchdogObservation} from './action-watchdog';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
@@ -120,11 +121,17 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   const linearUpdates=await linearLifecycle.sync(c);if(linearUpdates.length)io.out({linearStatuses:linearUpdates});
   const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
-  for(const target of reviewLoop.list(c.linear.projectId) as any[]){
-   reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
-   if(target.state==='completed')continue;
-   try{io.out({job:target.job,review:await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c)});}catch(e){console.error(e instanceof Error?e.message:'Review tick failed');}
-  }
+   const watchdog=new ActionWatchdog(s);
+   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+    reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
+    watchdog.scheduleReview(target.job,c);
+   }
+   for(const action of watchdog.due(c.linear.projectId)){
+    try{
+     const review=await reviewLoop.tick(action.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c,{watchdog,id:action.id});
+     watchdog.finishReview(action.id,review);io.out({job:action.job,review});
+    }catch(e){watchdog.finishReview(action.id);console.error(e instanceof Error?e.message:'Review tick failed');}
+   }
  });
 }
 async function main(){
@@ -435,7 +442,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      if(a.length!==1&&!(a.length===4&&a[1]==='--override-shared-cooldown'))throw Error('Use retry-observation JOB [--override-shared-cooldown github|orchestrator EXPECTED_NEXT_READ]');
      lifecycle.current(a[0]);const observation=new RecoveryObservation(s);
      if(a.length===4){observation.overrideCooldown(a[0],a[2],Number(a[3]));return out({job:a[0],readRetry:false,mutationReplay:false,sharedCooldown:'cleared',jobWait:'retained; retry-observation JOB separately'});}
-     s.db.transaction(()=>{observation.retry(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');}).immediate();
+     s.db.transaction(()=>{observation.retry(a[0]);retryWatchdogObservation(s,a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');}).immediate();
      return out({job:a[0],readRetry:true,mutationReplay:false,sharedCooldown:'retained'});
     }
     if(command==='authorize-base-merge'){
