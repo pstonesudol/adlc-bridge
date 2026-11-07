@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 #
-# Adapted from Honey Summer's CodeRabbit configuration for ADLC Bridge.
+# Repository-specific review policy for ADLC Bridge.
 language: en-US
 
 reviews:
@@ -17,7 +17,7 @@ reviews:
     Then open a line, exactly in this form, with one verdict:
 
     **Verdict: MERGE** — merge as it stands. No blocking finding; every claim
-    the change makes is covered by a test, a check, or stated evidence.
+    the change makes is supported by verified evidence appropriate to that claim.
 
     **Verdict: NEEDS_FIX** — do not merge. A correctness, security, authorization,
     data-loss or automation-safety defect exists. Name the file, the failing
@@ -36,8 +36,13 @@ reviews:
 
     Precedence when more than one applies: NEEDS_FIX, then NEEDS_DECISION,
     then NEEDS_EVIDENCE, then MERGE. Style, naming and docstring findings never
-    change the verdict; list them as follow-ups instead. Never choose MERGE
+    change the verdict; leave style and formatting to CI. Never choose MERGE
     while an unresolved major or critical finding stands.
+
+    Report actionable findings introduced or materially worsened by this diff:
+    identify the file, failure path, impact, and smallest corrective action.
+    Do not report unrelated pre-existing issues as regressions or repeat the
+    same root cause across multiple comments.
 
     After the verdict line, state plainly:
     - **Blocking:** every independent action required before merge, on one
@@ -48,15 +53,19 @@ reviews:
       scheduled jobs, or provider-side configuration.
 
     Do not claim tests were run without execution evidence: a CI result or
-    command output supplied in the pull request. A test diff shows coverage, not
-    execution. Do not repeat the pull request title as the summary.
+    attributable command output with its runtime, result, and revision. PR prose
+    and pasted claims alone are not verified execution evidence. CI evidence
+    must come from the expected check/provider on the current PR head; stale,
+    duplicate, ambiguous, or untrusted results do not satisfy approval gates.
+    A test diff shows coverage, not execution. Do not repeat the pull request
+    title as the summary.
     MERGE is a recommendation for a human, never permission for automation to
     merge, enable auto-merge, bypass protections, or deploy.
 
   review_status: true
   poem: false
-  sequence_diagrams: true
-  estimate_code_review_effort: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
   assess_linked_issues: true
 
   auto_review:
@@ -64,8 +73,12 @@ reviews:
     # Batch commits before requesting another review to reduce review churn.
     auto_incremental_review: false
     drafts: false
-    # Keep long-running remediation PRs under review until a decision is reached.
-    auto_pause_after_reviewed_commits: 0
+    # Limit review churn without changing current-head approval requirements.
+    auto_pause_after_reviewed_commits: 2
+    ignore_title_keywords:
+      - "WIP"
+      - "[skip review]"
+      - "DO NOT MERGE"
 
   path_filters:
     - "!bun.lock"
@@ -74,6 +87,7 @@ reviews:
     - "!node_modules/**"
     - "!dist/**"
     - "!coverage/**"
+    - "!patches/**"
     - "!**/*.png"
     - "!**/*.jpg"
     - "!**/*.jpeg"
@@ -101,9 +115,27 @@ reviews:
           not duplicate workers, PRs, tickets, or state transitions.
         - Review/remediation loops must remain bounded and must not treat stale
           checks or reviews for an earlier commit as evidence for the current head.
+        - Duplicate or ambiguous GitHub checks, reviews, or summaries must not
+          be selected as authoritative success; verify identity and head binding.
         - Preserve user changes, existing services, credentials, and local config.
         - Unit tests do not prove live provider access or runtime compatibility;
           require explicit evidence for claims about installed integrations.
+
+        SQLite durability and upgrades:
+        - Review transaction boundaries, atomic state transitions, concurrent
+          writers, crash/restart recovery, and retry idempotency for lost updates
+          or duplicate external effects. Never equate a provider write with a
+          committed local state transition after a partial failure.
+        - Schema upgrades must preserve existing data and be versioned and safe
+          to retry; reject silent database resets or destructive fallback paths.
+        - Migrations belong in reviewed code with explicit operator commands,
+          never implicit edits to live databases by coding workers.
+
+        Runtime boundaries:
+        - Source changes do not activate the pinned installed runtime. Do not
+          edit installed snapshots, launchd definitions, or live state as part of
+          a coding task. Install/apply, stack controls, cleanup, and recovery need
+          explicit operator authorization; do not change global agent policies.
 
         Secrets and execution:
         - Do not log tokens, credentials, auth bodies, or private configuration.
@@ -140,8 +172,9 @@ reviews:
         - Third-party actions must stay pinned to a full commit SHA with the
           version in a comment.
         - Permissions stay least-privilege; a write scope needs a reason.
-        - Never introduce pull_request_target with a checkout of untrusted code
-          while secrets are in scope.
+        - Never execute untrusted PR code in pull_request_target or another
+          privileged context with secrets or write tokens. Checkouts, shell
+          interpolation, artifacts, and cache handoffs must preserve that boundary.
         - Never add automated merging or deployment by the bridge.
 
   pre_merge_checks:
@@ -157,6 +190,9 @@ reviews:
           If a behaviour could not be verified, say so and say why.
           For a change with no user-reachable behaviour, state the applicable
           verification and its result, or explain why it was not possible.
+          These description requirements are attestations, not proof of execution.
+          Confirm execution separately using attributable logs or current-head CI
+          from the expected provider; do not accept prose or a test diff as proof.
           Mocked/unit evidence must not be presented as proof of live provider
           access, installed runtime compatibility, or service operation.
 

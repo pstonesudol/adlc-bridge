@@ -4,6 +4,7 @@ function installation(state:string){const p=join(state,'installation.json');if(!
  const st=lstatSync(p);if(!st.isFile()||st.isSymbolicLink()||st.uid!==process.getuid?.()||(st.mode&0o077)!==0)throw Error('Installation record must be owner-only');
  const c=JSON.parse(readFileSync(p,'utf8'));if(typeof c.cli!=='string'||!c.cli.startsWith(join(state,'versions')+'/')||!c.cli.endsWith('/src/cli.ts'))throw Error('Invalid installed CLI');return c;
 }
+export function installationRecord(state=appState()){return installation(state);}
 export function installedCLI(){return installation(appState())?.cli as string|undefined;}
 export function verifiedInstallationSource(state=appState()){
  const c=installation(state);if(!c)return;

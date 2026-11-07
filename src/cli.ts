@@ -2,6 +2,9 @@
 import {installBridge} from './install';
 import {maintenance} from './maintenance';
 import {installRuntime} from './runtime-install';
+import {UpdateManager,liveUpdateIO,validateUpdatePolicy,writeUpdatePolicy} from './update';
+import {readUpdateHistory,parseHistoryArgs,formatUpdateHistory,UPDATE_HISTORY_HELP} from './update-history';
+import {appState} from './install-state';
 import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
@@ -124,6 +127,13 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
  });
 }
 async function main(){
+  if(command==='update'){
+   if(a.length===1&&['--help','-h'].includes(a[0]))return console.log(UPDATE_HISTORY_HELP);
+   if(a[0]!=='history')throw Error(`Use ${UPDATE_HISTORY_HELP}`);
+   if(a.length===2&&['--help','-h'].includes(a[1]))return console.log(UPDATE_HISTORY_HELP);
+   const options=parseHistoryArgs(a.slice(1)),history=readUpdateHistory(appState(),options.project);
+   return options.json?out(history):console.log(formatUpdateHistory(history));
+  }
    if(command==='help'||a.includes('--help')||a.includes('-h')){groupHelp=operatorHelp(command==='help'?a[0]:groups[command]?command:undefined);command='help';}
    else if(lifecycleRequested||command==='services'&&['start','stop','restart','status'].includes(a[0])){
     const verb=command==='services'?a.shift()!:command;
@@ -169,6 +179,22 @@ async function main(){
     return out(await installBridge(a.includes('--apply'),undefined,bin));
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
+  if(command==='update-config'){
+   if(a.length!==1&&!(a.length===2&&a[1]==='--apply'))throw Error('Use update-config POLICY_JSON [--apply]');
+   const policy=JSON.parse(readFileSync(req(a[0],'Policy file'),'utf8'));
+   if(!a.includes('--apply'))return out({valid:true,applied:false,policy:validateUpdatePolicy(policy)});
+   return out({valid:true,applied:true,policy:writeUpdatePolicy(policy)});
+  }
+  if(command.startsWith('update-')){
+   const manager=new UpdateManager(liveUpdateIO());
+   if(command==='update-status'&&a.length===0)return out(await manager.status());
+   if(command==='update-check'&&a.length===0)return out(await manager.check());
+   if(command==='update-preview'&&a.length===0)return out(await manager.preview());
+   if(command==='update-apply'&&(a.length===0||(a.length===1&&a[0]==='--automatic')))return out(await manager.apply({automatic:a.includes('--automatic')}));
+   if(command==='update-auto'&&a.length===0)return out(await manager.apply({automatic:true}));
+   if(command==='update-rollback'&&a.length===0)return out(await manager.rollback());
+   throw Error('Unsupported update command or option');
+  }
   if(command==='setup'){
     const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
     if(a.includes('--export'))return out(sanitizedSetup(c,r));
@@ -200,6 +226,15 @@ async function main(){
   install [--apply] [--bin PATH]        preview or install stable bridge snapshot
   install-runtime --binary PATH [--apply]
                                        register reproducibly built Orchestrator daemon
+  update-config POLICY_JSON [--apply]  validate or write trusted update policy; manual default
+  update-status                        installed, source and running identities; pending work
+  update-check                         resolve the exact authoritative candidate commit
+  update-preview                       stage and verify candidate; no install or restart
+  update-apply [--automatic]           guarded activation only after authoritative idleness
+  update-auto                          opt-in cadence check; never schedules itself
+  update-rollback                      restore the prior compatible verified snapshot
+  update history [--project PROJECT] [--json]
+                                       read-only, redacted shared-runtime timeline
   start --all | stop --all | status --all | restart --all
                                        managed stack; disruptive actions preview first
   projects                             list registered project services

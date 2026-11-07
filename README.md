@@ -848,6 +848,126 @@ from the source checkout to activate it. The installed CLI remembers that source
 path. A source edit or PR merge alone does not activate new controller code.
 This separation is necessary when the bridge manages its own repository.
 
+### Safe runtime updates (DEV-51)
+
+#### Read-only update history
+
+```sh
+adlc update history
+adlc update history --project PROJECT --json
+adlc update history --help
+```
+
+History reads the existing owner-only `update-intent.json` without creating state,
+querying providers/services, or executing activation/recovery. JSON has a stable
+`version: 1` envelope, `history`, `reason`, `scope`, `nextCommands` and `entries`.
+Entries include attempt identity, exact known commit/snapshot hashes, timestamps,
+transitions, outcome, deferred/failure category, restart/migration/health evidence
+and recorded rollback compatibility. Text uses the same redacted projection.
+Raw errors, configuration, service definitions and paths are deliberately omitted;
+inspect protected local evidence separately when needed.
+
+New apply/rollback attempts retain prior attempts and transitions in that same
+intent file (no independent ledger). Preflight verification failures are recorded;
+failures before a candidate can be verified/reserved may have no attempt record.
+Inspection never upgrades legacy records. Missing/overwritten legacy history and
+interrupted effects are **unknown**, not synthesized success. Snapshot installation
+and a successful readiness check do not prove which bridge/backend identities are
+actually running. Migration compatibility evidence does not prove migration execution.
+Health refers to the existing readiness/service checks, not an end-to-end activation.
+
+`--project` annotates observed project membership but never hides shared-runtime
+operations or their cross-project impact. Legacy project scope can be unknown.
+Recorded rollback compatibility is **not current authorization**: snapshot presence,
+database changes, quiescence and reattachment must be rechecked by the explicit
+`adlc update-rollback` command. History only suggests `adlc update-status` and
+`adlc update-preview`; preview stages/verifies but does not activate. Neither is
+executed by history. Interrupted/ambiguous records require explicit operator recovery.
+Retained evidence is not silently pruned and the intent file can grow over time.
+Separately authorized controlled end-to-end activation is still required before
+claiming unattended updates are supported.
+
+Updates are manual by default. A policy pins an authenticated GitHub remote and
+an authoritative branch or immutable release; ticket, PR or comment text never
+supplies executable instructions.
+
+```json
+{
+  "version": 1,
+  "repository": "pstonesudol/adlc-bridge",
+  "remote": "git@github.com:pstonesudol/adlc-bridge.git",
+  "ref": "main",
+  "refKind": "branch",
+  "cadenceSeconds": 3600,
+  "mode": "manual",
+  "verification": {
+    "requiredChecks": ["CI"],
+    "allowCandidateTests": false
+  },
+  "maintenance": { "blockIntakeDuringActivation": true }
+}
+```
+
+```sh
+adlc update-config ./update-policy.json          # validate only
+adlc update-config ./update-policy.json --apply  # write owner-only policy
+adlc update-status                               # source, installed and running identities
+adlc update-check                                # resolve the exact candidate commit
+adlc update-preview                              # stage and verify; no install or restart
+adlc update-apply                                # guarded activation when idle
+adlc update-rollback                             # restore the prior compatible snapshot
+```
+
+`update-preview` fetches into an isolated checkout under
+`~/Library/Application Support/ADLC Bridge/updates/work`. It never stashes,
+resets or switches a developer checkout or worker worktree. It pins the commit,
+verifies required GitHub checks for that exact commit, checks package and bridge
+entrypoint compatibility, and classifies the change:
+
+- `hot`: bridge code only; the backend stays running.
+- `backend`: native launcher or scripts changed; a supported graceful backend
+  restart is required.
+- `schema`: migration or patch changed; explicit compatible migration and
+  restore evidence is required or the update fails closed.
+
+Candidate test execution is disabled unless `allowCandidateTests` is explicitly
+enabled; required checks remain authoritative. Missing, pending or unsuccessful
+checks block activation. Schema changes without compatible migration evidence
+never activate.
+
+`update-apply` acquires the shared submission fence, records a durable intent,
+stops previously loaded intake, and re-checks authoritative worker activity.
+The control scope remains exclusive through activation, recovery and verification;
+concurrent stack starts cannot remove its pause. An existing operator pause is
+preserved and refuses apply/rollback until explicit operator reconciliation.
+Active turns, queued turns, uncertain delivery, pending mutations or unknown
+activity defer the update, restore the prior intake, and notify `waiting for
+idle`. Unknown activity is treated as busy. Backend or schema activation also
+requires authoritative controller-reattachment evidence; without it the update
+defers. An idle attached controller is never assumed reconnectable and is not
+restarted. After activation, the CLI verifies backend readiness and every
+previously enabled project service. The prior loaded/disabled state is restored
+exactly.
+
+A failure restores the previous verified snapshot and services when rollback is
+safe. If a schema migration is not reversible, or the database changed after
+activation, rollback is refused: intake remains paused where required, backups
+and the durable intent are preserved, and the error names the recovery steps.
+A hot update that migrates the native launcher reports `restartRequired`; it
+does not claim the backend restarted. Use the guarded full-stack controls to
+activate that launcher migration.
+Interrupted intents, held update locks and ambiguous concurrent attempts must be
+inspected manually; they are never retried automatically. Notifications are
+deduplicated in `update-notifications.json`.
+
+Automatic cadence is opt-in only (`"mode": "automatic"` plus a separately
+invoked `adlc update-auto`). Creating the policy or this section schedules
+nothing. Unattended adoption is **not claimed as supported** until an operator
+authorizes and completes a controlled end-to-end activation. Native Orchestrator
+backend upgrades remain explicit, versioned and trust-verified through
+`install-runtime`; bridge updates do not silently replace vendor binaries and
+never merge PRs, deploy managed applications or expand permissions.
+
 ### Reproduce the pinned Orchestrator daemon
 
 The signed Orchestrator app is preserved. `patches/orchestrator-ci-reruns.patch`
