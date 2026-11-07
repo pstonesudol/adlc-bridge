@@ -1,4 +1,4 @@
-import {latestWorkflowChecks} from './check-runs';
+import {latestWorkflowChecks,checkState} from './check-runs';
 import {githubRead,ReadValidationError} from './provider-read';
 import {templateLogReader} from './gh-logs';
 import {templateCIFindings,templateSignature,metadataBodyCovered} from './pr-template-ci';
@@ -73,6 +73,14 @@ export function coderabbitRateLimited(checks:any[],head:string){
  return checks.some((c:any)=>c?.app?.slug==='coderabbitai'&&c.head_sha===head&&/rate[\s_-]?limit/i.test(`${c.output?.title??''} ${c.output?.summary??''} ${c.output?.text??''}`));
 }
 export function metadataFindings(...args:Parameters<typeof customCheckEvidence>){return customCheckEvidence(...args).findings;}
+export function requiredCheckState(checks:any[],head:string,required:string[]){
+ const current=latestWorkflowChecks(checks).filter(c=>required.includes(c.name)&&c.head_sha===head&&c.app?.slug==='github-actions');
+ return {
+  failedChecks:current.filter(c=>checkState(c)==='failure').map(c=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url})),
+  pendingChecks:[...new Set(current.filter(c=>checkState(c)==='pending'||current.filter(other=>other.name===c.name).length!==1).map(c=>c.name))],
+  missingChecks:required.filter(n=>!current.some(c=>c.name===n))
+ };
+}
 export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[]) {
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1)throw Error('Valid owner/repository and PR number required');
   required=[...new Set([...required,...metadataChecks])];
@@ -135,7 +143,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   final=observed;
   checks=currentMetadataChecks(checks,bodyEvidence,final.body??'');
   const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,
-    checks:checks.map((c:any)=>({name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
+    checks:checks.map((c:any)=>({id:c.id,started_at:c.started_at,completed_at:c.completed_at,name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
     review:latest?{sha:latest.commit_id,author:latest.user.login,state:latest.state}:null,
     unresolved,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
@@ -146,10 +154,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(comparison.behind_by>0){gate.clear=false;gate.reasons.push('Feature branch is behind base');}
   if(final.base.ref!==first.base.ref||await baseTip(repo,final.base.ref)!==currentBase){gate.clear=false;gate.reasons.push('Base branch changed during review collection');}
   if(final.state!=='open' || final.draft || final.mergeable!==true){gate.clear=false;gate.reasons.push('PR closed, draft, conflicted or mergeability unknown');}
-  const requiredChecks=checks.filter((c:any)=>required.includes(c.name)&&c.head_sha===first.head.sha&&c.app?.slug==='github-actions');
-  const failedChecks=requiredChecks.filter((c:any)=>c.status==='completed'&&!['success','neutral','skipped'].includes(c.conclusion)).map((c:any)=>({id:c.id,sha:c.head_sha,name:c.name,conclusion:c.conclusion,url:c.details_url}));
-  const pendingChecks=requiredChecks.filter((c:any)=>c.status!=='completed').map((c:any)=>c.name);
-  const missingChecks=required.filter(n=>!requiredChecks.some((c:any)=>c.name===n));
+   const {failedChecks,pendingChecks,missingChecks}=requiredCheckState(checks,first.head.sha,required);
     const currentBodyEvidence=bodyEvidence.filter(row=>checks.some(c=>c.id===row.checkId));
     const descriptionHash=digest(final.body??'');
     if(metadataChecks.length&&!metadataBodyCovered({head:first.head.sha,descriptionHash,metadataCheckEvidence:currentBodyEvidence},metadataChecks)){
