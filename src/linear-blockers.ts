@@ -5,6 +5,7 @@ import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
 import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} from './spec-revisions';
+import {readinessFor,applicableResolution} from './readiness';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -128,6 +129,17 @@ export class LinearBlockers{
    const results:any[]=[];
     const recoveries=recoveryRows(this.s);
     const handled=new Set<string>();
+   // Invalid planning evidence is a reconciliation gate, not an invitation to
+   // approve it. Reuse this publisher's durable dedupe and uncertainty handling.
+   for(const j of this.s.list().filter(j=>j.project===c.linear.projectId&&j.state==='awaiting_approval')){
+    const r=readinessFor(this.s,j.id),current=this.s.get(j.id);
+    if((r?.valid&&r.plan_hash===current.plan_hash&&r.spec_hash===digest(current.spec))||applicableResolution(this.s,j.id))continue;
+    const reason=`Current plan evidence requires reconciliation: ${r?.reason??'missing or stale readiness'}. Preview plan-reconcile JOB CONFIG SEQUENCE for a corrected completed ready plan in the same session with unchanged requirements; use spec-reconcile after requirement changes. Work is not awaiting ordinary plan approval and has not resumed.`;
+    const outcome={job:j.id,plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'};
+    handled.add(j.id);const prior=rows.findIndex(x=>x.job===j.id);if(prior>=0)rows.splice(prior,1);
+    try{results.push(await this.leave(j.id,outcome,c,{heading:'plan evidence reconciliation required',guard:()=>{const fresh=this.s.get(j.id);if(fresh.plan_hash!==current.plan_hash||fresh.spec!==current.spec||fresh.state!=='awaiting_approval'||JSON.stringify(readinessFor(this.s,j.id))!==JSON.stringify(r)||applicableResolution(this.s,j.id))throw Error('Plan evidence gate changed before publication');}}));}
+    catch(error){results.push({job:j.id,state:'blocked',reason:error instanceof Error?error.message:'Plan evidence notice failed'});}
+   }
    for(const recovery of recoveries.filter(r=>r.state==='completed'&&!recoveries.some(later=>later.job===r.job&&later.created>r.created))){
     const j=this.s.get(recovery.job);if(j.project!==c.linear.projectId||j.plan_hash!==recovery.plan)continue;
     const detail=JSON.parse(recovery.detail);

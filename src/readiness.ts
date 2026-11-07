@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 export type ReadinessState='ready'|'needs-input'|'blocked-by-dependency';
 export type QuestionKind='requirement'|'dependency'|'security-scope';
 export type PlanQuestion={id:string;question:string;kind:QuestionKind};
-export type PlanDependency={ref:string;reason:string};
+export type PlanDependency={ref:string;reason:string;blocking?:boolean};
 export type ReadinessAssessment={
   state:ReadinessState|'invalid';
   valid:boolean;
@@ -55,7 +55,10 @@ function dependencies(value:unknown):PlanDependency[]|null{
     if(!item||typeof item!=='object')return null;
     const ref=text((item as any).ref,300);if(!ref||seen.has(ref))return null;seen.add(ref);
     const reason=text((item as any).reason,2000)??'Referenced dependency must be resolved';
-    result.push({ref,reason});
+    if((item as any).blocking!==undefined&&typeof (item as any).blocking!=='boolean')return null;
+    // The dependencies array historically meant blocking. Coordination-only
+    // references must explicitly opt out; never infer prerequisites from prose.
+    if((item as any).blocking!==false)result.push({ref,reason});
   }
   return result;
 }
@@ -75,7 +78,7 @@ export function assessPlan(plan:string):ReadinessAssessment{
   if(parsed?.version!==1)return invalid('Unsupported plan readiness receipt version');
   if(typeof parsed?.readiness!=='string'||!states.has(parsed.readiness))return invalid('Plan readiness must be ready, needs-input or blocked-by-dependency');
   if(!questionsValue||!dependenciesValue||!risksValue)return invalid('Plan readiness receipt has malformed questions, dependencies or risks');
-  if(parsed.readiness==='ready'&&(questionsValue.length||dependenciesValue.length))return invalid('Ready plan cannot carry blocking questions or dependencies');
+  if(parsed.readiness==='ready'&&(questionsValue.length||dependenciesValue.length))return invalid('Ready plan cannot carry blocking questions or dependencies; use blocked-by-dependency for prerequisites, or blocking:false for design coordination only. Capture a corrected completed same-session plan with plan-reconcile.');
   if(parsed.readiness==='needs-input'&&questionsValue.length===0)return invalid('needs-input plan requires at least one concrete question');
   if(parsed.readiness==='blocked-by-dependency'&&dependenciesValue.length===0)return invalid('blocked-by-dependency plan requires at least one dependency reference');
   return {state:parsed.readiness,valid:true,source:'receipt',reason:null,questions:questionsValue,dependencies:dependenciesValue,risks:risksValue};
@@ -231,6 +234,7 @@ export function standingReady(s:Store,job:string){
  const j=s.get(job),r=readinessFor(s,job);
  if(!r?.valid||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))return false;
  if(r.state==='ready')return true;
+ if(['needs-input','blocked-by-dependency'].includes(r.state)&&!r.questions.some((q:PlanQuestion)=>q.kind==='security-scope')&&applicableResolution(s,job)?.source==='human-answer')return true;
  if(r.state!=='blocked-by-dependency'||r.questions.length||!hasTable(s,'planning_dependency_waits'))return false;
  const wait=s.db.query("SELECT * FROM planning_dependency_waits WHERE job=? AND plan=? AND state='resolved'").get(job,j.plan_hash) as any,resolution=applicableResolution(s,job);
  return !!wait&&resolution?.source==='dependency-satisfied'&&resolution.actor==='verified-planning-dependency-observer'&&JSON.parse(resolution.detail).planningDependencyEvidence===JSON.parse(wait.evidence).id;
@@ -266,6 +270,7 @@ export const PLAN_STATUS_INSTRUCTION=[
   'End the plan with exactly one machine-readable readiness receipt on its own line:',
   '<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready|needs-input|blocked-by-dependency","questions":[{"id":"q1","question":"...","kind":"requirement|dependency|security-scope"}],"dependencies":[{"ref":"ISSUE-OR-REF","reason":"..."}],"risks":["..."]} -->',
   'Use ready only when no requirement, dependency or security/scope decision is unresolved; ordinary non-blocking risks belong in risks and do not block. Use needs-input for missing decisions or approved wording and blocked-by-dependency for named external dependencies. Never fabricate an answer to make the plan ready.',
+  'The dependencies array denotes execution prerequisites (blocking:true by default for legacy receipts). For design coordination only, omit the reference from dependencies or explicitly set blocking:false. Linked tickets and prose references alone are not execution prerequisites.',
   discoveryInstruction()
 ].join('\n');
 export const WORKER_STATUS_INSTRUCTION=[

@@ -5,6 +5,7 @@ import {ApprovalPolicyStore,featureGit} from './approval-policy';
 import {validScopes} from './file-scope';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {latestRevision} from './spec-revisions';
+import {readinessFor,applicableResolution} from './readiness';
 export type ApprovalSurface={enabled:boolean;approverIds:string[];scope:string[]};
 export type ApprovalConfig=WorkflowConfig&{linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};statusSync?:{inProgress:string;inReview:string};planApproval?:ApprovalSurface};
 // Only presentation whitespace at the outside is ignored (including NBSP).
@@ -32,6 +33,8 @@ export class LinearApprovals{
   const j=this.s.get(job),p=new ApprovalPolicyStore(this.s),q=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;
   if(j.state!=='awaiting_approval'||!j.plan||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!q?.ready||q.project!==c.linear.projectId||q.spec_hash!==digest(j.spec)||Date.now()-q.observed>120000||q.observed>Date.now()+5000)throw Error('Fresh eligible captured plan required');
   if(c.approval?.mode==='ready-queue'&&!p.requiresManual(job))throw Error('Ticket no longer requires manual approval');
+  const readiness=readinessFor(this.s,job);
+  if((!readiness?.valid||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))&&!applicableResolution(this.s,job))throw Error(`Plan evidence requires reconciliation before approval: ${readiness?.reason??'missing or stale readiness'}. Preview plan-reconcile for corrected completed same-session evidence.`);
   const issue=await readLinearIssue(j.issue,this.api);
    if(issue?.id!==j.issue||issue.team?.id!==c.linear.teamId||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((x:any)=>x.id===c.linear.readyLabelId)||!issue.state?.id||![c.linear.readyStateId,c.statusSync?.inProgress,c.statusSync?.inReview].includes(issue.state.id))throw Error('Ticket is no longer eligible for plan approval');
   if(j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Ticket requirements changed; approval refused');

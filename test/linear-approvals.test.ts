@@ -35,6 +35,12 @@ test('publishes one plan; exact human reply approves once, implementation starts
  await f.surface.sync(f.c);await f.w.tick(f.c);expect(f.counts().sends).toBe(1);
  }finally{f.s.close();}
 });
+test('invalid plan evidence cannot publish a misleading manual approval notice',async()=>{
+ const f=fixture();try{
+  const hash=f.s.propose(f.id,'Revised plan without readiness');recordReadiness(f.s,f.id,'Revised plan without readiness',hash,digest(f.s.get(f.id).spec));
+  const result=(await f.surface.sync(f.c))[0];expect(result.state).toBe('approval_blocked');expect(result.reason).toContain('plan-reconcile');expect(f.counts().creates).toBe(0);
+ }finally{f.s.close();}
+});
 test('unrevised plans preserve the legacy approval notice binding and pending token',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-approval-')),path=join(dir,'state.db'),f=fixture(path);let reopened:Store|undefined,closed=false;
  try{
@@ -107,7 +113,7 @@ test('plan or scope changes generate a new challenge; old approval cannot author
 });
 
 test('new plan hash and expired eligibility cannot consume an old approval',async()=>{
- const f=fixture();try{await f.surface.sync(f.c);f.approve();f.s.propose(f.id,'Revised plan');
+ const f=fixture();try{await f.surface.sync(f.c);f.approve();const revised='Revised plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->',hash=f.s.propose(f.id,revised);recordReadiness(f.s,f.id,revised,hash,digest(f.s.get(f.id).spec));
  expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');expect(f.counts().creates).toBe(2);
  await f.surface.sync(f.c);expect(f.s.get(f.id).state).toBe('awaiting_approval');
  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']),Date.now()-121000,new Set(['issue']));
