@@ -3,7 +3,7 @@ import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import
 import {Store,digest} from '../src/core';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
 import {Planning} from '../src/planning';
-import {recordReadiness,activeResolution,clarificationDiscovery} from '../src/readiness';
+import {recordReadiness,activeResolution,clarificationDiscovery,standingReady} from '../src/readiness';
 import {LinearBlockers} from '../src/linear-blockers';
 import {LinearClarifications,validateClarifications} from '../src/linear-clarifications';
 import {LinearApprovals} from '../src/linear-approvals';
@@ -168,6 +168,30 @@ test('planning replies resolve readiness but never approve or start implementati
   await f.adapter().sync(config);const answer=f.reply('listing-42');f.confirm();await f.adapter().sync(config);
   expect(activeResolution(f.s,f.id).source).toBe('human-answer');expect(f.s.get(f.id).state).toBe('awaiting_approval');expect(f.s.get(f.id).approved_hash).toBeNull();expect(f.w.implementation(f.id)).toBeNull();expect(f.sends).toHaveLength(0);
   expect(f.comments.at(-1).body).toContain('awaits plan approval');answer.editedAt='2026-11-02T12:00:00Z';await f.adapter().sync(config);expect(activeResolution(f.s,f.id)).toBeNull();
+ }finally{f.s.close();}
+});
+test('DEV-23 multi-question answers reevaluate standing policy and dispatch exactly once after adapter restart',async()=>{
+ for(const manual of [false,true]){const f=await fixture(':memory:',true);try{
+  const c:any={...config,approval:{mode:'ready-queue',id:'standing',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'}};
+  const plan=f.s.get(f.id).plan.replace('"questions":[{"id":"q1","question":"What is the exact listing ID?","kind":"requirement"}]','"questions":[{"id":"q1","question":"What is the exact listing ID?","kind":"requirement"},{"id":"q2","question":"Which existing ruleset?","kind":"requirement"}]');
+  const hash=f.s.propose(f.id,plan);recordReadiness(f.s,f.id,plan,hash,digest(f.s.get(f.id).spec));
+  const policy=new ApprovalPolicyStore(f.s);policy.snapshot('p',new Set(['issue']),Date.now(),manual?new Set(['issue']):new Set());
+  await f.adapter().sync(c);f.reply(`Clarification ${f.reference()}\nq1: listing-42`);await f.adapter().sync(c);expect(standingReady(f.s,f.id)).toBe(false);
+  await f.w.tick(c);expect(f.sends).toHaveLength(0);
+  f.reply(`Clarification ${f.reference()}\nq2: Existing main ruleset`);f.confirm();await Promise.all([f.adapter().sync(c),f.adapter().sync(c)]);
+  expect(standingReady(f.s,f.id)).toBe(true);expect(f.sends).toHaveLength(0);
+  expect(f.comments.at(-1).body).toContain(manual?'plan-approval-required':'standing-policy evaluation');
+  await f.adapter().preflight(c);await f.w.tick(c);await f.w.tick(c);await f.adapter().sync(c);
+  expect(f.sends).toHaveLength(manual?0:1);expect(f.s.get(f.id).state).toBe(manual?'awaiting_approval':'approved');
+  expect(f.w.implementation(f.id)?.actor??null).toBe(manual?null:'standing-policy:standing');
+ }finally{f.s.close();}}
+});
+test('invalid ready-with-dependency plans publish a deduplicated reconciliation gate, not approval',async()=>{
+ const f=await fixture(':memory:',true);try{
+  const plan='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[{"ref":"DEV-23","reason":"Design coordination"}],"risks":[]} -->',hash=f.s.propose(f.id,plan);
+  recordReadiness(f.s,f.id,plan,hash,digest(f.s.get(f.id).spec));
+  await f.blockers.sync(config);await f.blockers.sync(config);
+  expect(f.comments).toHaveLength(1);expect(f.comments[0].body).toContain('plan-reconcile');expect(f.comments[0].body).toContain('blocking:false');expect(f.comments[0].body).toContain('not awaiting ordinary plan approval');expect(f.sends).toHaveLength(0);
  }finally{f.s.close();}
 });
 test('permission-sensitive answers and nonanswers cannot be confirmed into scope or resolution',async()=>{

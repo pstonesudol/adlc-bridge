@@ -2395,3 +2395,24 @@ distinct reviewed commits; when its threshold may have been reached, inspect the
 provider's pause state rather than automatically resuming. Disabled automatic
 review is never overridden, even if a description keyword could opt in.
 These blockers do not grant approval. Merges remain human-only.
+
+## Same-spec planning evidence recovery
+
+When a captured plan has invalid readiness (for example, `ready` with blocking
+dependencies), obtain a corrected completed plan from the **same planning
+session**. Preview `adlc plan-reconcile JOB CONFIG SEQUENCE`, then confirm the
+unchanged preview with `adlc plan-reconcile JOB CONFIG SEQUENCE --confirm HASH`.
+Preview is read-only; confirmation preserves the previous plan/readiness/route
+evidence in event history and captures the selected plan without approval or a
+new model turn. Fresh unchanged eligible ticket requirements, exact completed
+transcript evidence, current ownership/routes and an idle session are required.
+Existing approvals, execution reservations and uncertain deliveries are never
+overwritten. Requirement changes use `spec-reconcile` instead.
+
+The readiness receipt's `dependencies` array means **blocking execution
+prerequisites**, including legacy entries without a `blocking` field. Omit
+coordination-only links from that array or use `blocking:false`; prose links do
+not create execution prerequisites. `ready` with blocking dependencies is invalid.
+Validated clarification resolutions are reevaluated by the normal standing-policy
+poll, not treated as new authority. `plan-approval-required` still requires explicit
+approval of the current plan. Changed requirements or scope require replanning.

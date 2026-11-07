@@ -5,6 +5,7 @@ import type {Workflow,WorkflowConfig} from './workflow';
 import {LinearBlockers,type BlockerConfig} from './linear-blockers';
 import {readLinearIssue} from './linear-api';
 import {readinessFor,resolutionBinding,recordResolution,activeResolution,clarificationDiscovery} from './readiness';
+import {ApprovalPolicyStore} from './approval-policy';
 import {inspectHumanAnswer,type ClarificationContext,type ClarificationQuestion,type HumanComment} from './clarification-answers';
 
 export type ClarificationConfig=WorkflowConfig&BlockerConfig&{
@@ -205,7 +206,7 @@ export class LinearClarifications{
     for(const a of p.answers){
      // Conservative escalation, never interpret permission-sensitive text as a
      // new grant even if followed by the unchanged-scope confirmation command.
-     if(permissionSensitive(a.text)){state='replan';break;}
+     if(permissionSensitive(a.text)||context.questions.find(q=>q.id===a.question)?.kind==='security-scope'){state='replan';break;}
      if(/^(?:tbd|unknown|not sure|i don.t know|pending|later|your answer)\.?$/i.test(a.text))continue;
      const question=context.questions.find(q=>q.id===a.question)!;
      if(/^(yes|no|ok|okay)\.?$/i.test(a.text)&&!/^(may|can|should|is|are|do|does|will|would)\b/i.test(question.question))continue;
@@ -268,12 +269,27 @@ export class LinearClarifications{
   const issue=await readLinearIssue(j.issue,this.blockers.api);this.ticket(j,c,issue);
   const outcome=this.workflow.outcomes(job);
   const otherBlocker=outcome&&['failed','uncertain','needs_reconciliation'].includes(outcome.outcome);
-  let message='answer received; awaits plan approval. Work has not resumed.';
+   let message='answer received; awaits plan approval. Work has not resumed.';
+   let gate='awaiting_plan_approval';
+   if(!continuation){
+    const r=readinessFor(this.s,job),planning=this.workflow.planning(job),implementation=this.workflow.implementation(job);
+    if(!r?.valid||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec)){
+     gate='plan_reconciliation_required';message=`answer received; current plan evidence is stale or invalid: ${r?.reason??'current readiness evidence missing'}. Preview plan-reconcile for a corrected completed same-session plan; work has not resumed.`;
+    }else if(planning?.state==='needs_reconciliation'){
+     gate='plan_reconciliation_required';message=`answer received; planning reconciliation required: ${planning.reason}. Work has not resumed.`;
+    }else if(implementation){
+     gate=implementation.state;message=`answer received; implementation delivery gate: ${implementation.state}${implementation.reason?`: ${implementation.reason}`:''}. Existing delivery is retained; no resend.`;
+    }else{
+     const policy=new ApprovalPolicyStore(this.s).evaluate(job,c.linear.projectId,c.approval);
+     if(policy.allowed){gate='awaiting_standing_policy';message='answer received; awaits existing standing-policy evaluation on the next poll, then the idle-session delivery gate. Work has not resumed.';}
+     else if(c.approval?.mode==='ready-queue'){gate='awaiting_gate';message=`answer received; awaits plan approval or eligibility gate: ${policy.reason}. Work has not resumed.`;}
+    }
+   }
   if(continuation)message=['delivery_accepted','completed'].includes(continuation.state)?'answer received; work resumed in the existing session.':'answer received; continuation delivery requires reconciliation. It will not be resent.';
   if(!otherBlocker&&(!continuation||['delivery_accepted','completed'].includes(continuation.state)))await this.blockers.retract(job,c);
   const source=snapshot??{outcome:{plan_hash:j.plan_hash,outcome:'running',questions:'[]',dependencies:'[]'}} as Snapshot;
   await this.acknowledge(job,c,source,row,message);
-  return {job,state:continuation?.state??'awaiting_plan_approval',reference:stored.reference};
+   return {job,state:continuation?.state??gate,reference:stored.reference};
  }
  /** Run after intake but before any approved initial implementation dispatch.
   * API uncertainty stops the tick; accepted evidence cannot silently go stale
