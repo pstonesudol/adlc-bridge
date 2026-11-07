@@ -9,6 +9,8 @@ import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
 import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
+import {ReviewRequests,ReviewRateLimit,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,type ReviewSchedule} from './coderabbit-scheduling';
+import {readFailure} from './provider-read';
 
 function metadataFailureCovered(e:any,check:any,bodyBound=true){
   return Number.isSafeInteger(check.id)&&check.id>0&&check.sha===e.head&&e.findings.some((f:any)=>f.source==='github-ci'&&f.kind==='pr_description'&&f.check===check.name&&f.checkId===check.id&&f.sha===e.head&&(!bodyBound||metadataFailureBodyCovered(e,f)));
@@ -59,9 +61,12 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.pendingChecks?.length||e.missingChecks?.length)return {state:'waiting_for_ci',send:false,reason:`Waiting for CI: ${[...(e.pendingChecks??[]),...(e.missingChecks??[])].join(', ')}`};
  return {state:'waiting_for_coderabbit',send:false,reason:e.reasons.join('; ')};
 }
-async function postFullReview(repo:string,pr:number){
- const p=Bun.spawn(['gh','api','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f','body=@coderabbitai full review'],{stdout:'pipe',stderr:'pipe',timeout:30000});
+export async function postFullReview(repo:string,pr:number,marker='',spawn=Bun.spawn){
+ const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=@coderabbitai full review${marker?'\n\n'+marker:''}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ if(code!==0){const failure=readFailure('github','review-request',_err,code,undefined,Date.now(),_out).evidence;
+  if(failure.classification==='throttled'&&[403,429].includes(failure.httpStatus??0))throw new ReviewRateLimit(failure.retryAt);
+ }
  if(code!==0)throw Error('Full review request delivery uncertain; inspect before retry');
 }
 export function reviewDisplay(state:string){
@@ -70,6 +75,7 @@ export function reviewDisplay(state:string){
 const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,contains:branchTransport.contains!};
 export class ReviewLoop{
  io:typeof reviewIO;
+ requests:ReviewRequests;
  constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
@@ -94,8 +100,9 @@ export class ReviewLoop{
     CREATE TABLE full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
     INSERT OR IGNORE INTO full_review_requests(job,pr,head,body_hash,state,requested)
      SELECT l.job,COALESCE((SELECT t.pr FROM review_targets t WHERE t.job=l.job),0),l.head,l.body_hash,l.state,l.requested FROM full_review_requests_legacy l;
-    DROP TABLE full_review_requests_legacy;`);
+   DROP TABLE full_review_requests_legacy;`);
   }).immediate();
+  this.requests=new ReviewRequests(s);
  }
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
@@ -177,29 +184,41 @@ export class ReviewLoop{
    return result;
   }).immediate();
  }
-   async requestReview(job:string,pr:number,head:string,bodyHash:string){
+   async requestReview(job:string,pr:number,head:string,bodyHash:string,expected?:any){
     assertObservationFence();
-    const t=this.get(job);if(this.completed(job))return false;
+    const t=this.get(job);if(this.completed(job)||!t||t.pr!==pr)return false;
     const unresolved=this.uncertainReview(job,pr,head);if(unresolved){this.record(job,unresolved,pr);return false;}
-   try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
+    try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
+    const fresh=await this.io.readiness(t.repo,pr,JSON.parse(t.required_checks),this.metadataChecks(job));
+    assertObservationFence();
+    const schedule:ReviewSchedule|undefined=fresh.reviewSchedule;
+     if(fresh.head!==head||fresh.descriptionHash!==bodyHash&&fresh.descriptionVersion!==bodyHash||!schedule||schedule.blocker||fresh.coderabbitPending||fresh.findings?.length||fresh.failedChecks?.length||fresh.pendingChecks?.length||fresh.missingChecks?.length||expected&&schedule.signature!==expected.reviewSchedule?.signature){
+     this.record(job,{state:'blocked',send:false,head,reason:schedule?.blocker??'CodeRabbit review unavailable: identity, head, configuration or description changed before request; re-evaluate'},pr);return false;
+    }
     const reserved=this.s.db.transaction(()=>{
      assertObservationFence();
-     if(this.completed(job))return false;
+      if(this.completed(job))return false;
+      new Lifecycle(this.s).current(job);
      // The caller's PR may have been rebound while it awaited evidence; never
      // request or reserve a review for a PR that is no longer registered.
      const target=this.get(job);if(!target||target.pr!==pr)return false;
      if(this.uncertainReview(job,pr,head))return false;
-   const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
+    if(!this.requests.claim(job,t.repo,pr,schedule))return false;
+    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
     this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason='Full review request delivery uncertain; reconcile before retry' WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),job,pr);
    return true;
   }).immediate();
    if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
-   try{await this.postReview(t.repo,pr);}
-   catch(error){assertObservationFence();this.record(job,{state:'needs_reconciliation',send:false,head,reason:'Full review request delivery uncertain; reconcile before retry'},pr);throw error;}
+   const marker=`<!-- adlc-coderabbit-request:${digest(JSON.stringify([t.repo,pr,head]))} -->`;
+   try{await this.postReview(t.repo,pr,marker);}
+   catch(error){assertObservationFence();
+     if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);this.s.db.query("DELETE FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
+    this.record(job,{state:'needs_reconciliation',send:false,head,reason:'CodeRabbit review unavailable: full review request delivery uncertain; reconcile before retry'},pr);throw error;}
   assertObservationFence();
-  this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
+   this.s.db.transaction(()=>{this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
+   this.requests.settle(t.repo,pr,head,'accepted',marker);}).immediate();
   this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({pr,head,bodyHash}));
   return true;
  }
@@ -288,6 +307,13 @@ export class ReviewLoop{
    // observation here rather than relaxing Lifecycle.current's authorization.
    try{if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');}
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
+   const receipt=this.requests.get(t.repo,t.pr,e.head);
+   if(receipt?.state==='delivery_uncertain'){
+    const marker=`<!-- adlc-coderabbit-request:${digest(JSON.stringify([t.repo,t.pr,e.head]))} -->`;
+    const matched=e.requestComments?.filter((c:any)=>c.body===`@coderabbitai full review\n\n${marker}`&&Date.parse(c.created)>=receipt.requested&&c.author&&c.id);
+    if(matched?.length===1){this.requests.settle(t.repo,t.pr,e.head,'accepted',String(matched[0].id));this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain'").run(job,t.pr,e.head);}
+    else return record({state:'needs_reconciliation',send:false,head:e.head,reason:'CodeRabbit review unavailable: request outcome uncertain; reconcile matching request evidence before retry'});
+   }
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
    const outcome=this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get()?this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any:null;
@@ -352,11 +378,23 @@ export class ReviewLoop{
    // Request one fresh pass when old review evidence cannot clear an otherwise
   // idle PR. Pending CI and actionable findings must be handled first.
   const waitStart=Math.max(waiting?.started??0,deliveryWait?.started??0);
+  const schedule:ReviewSchedule|undefined=e.reviewSchedule;
+  if(schedule?.blocker)return record({state:'blocked',send:false,head:e.head,reason:schedule.blocker});
+  const scheduleWait=schedule?this.requests.wait(t.repo,t.pr,schedule):null;
+  if(schedule&&session.transcript.controller!=='ready')this.s.db.query('UPDATE coderabbit_waits SET started=? WHERE repo=? AND pr=? AND head=?').run(Date.now(),t.repo,t.pr,e.head);
+  const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
+  if(schedule&&idle&&!e.clear&&!waiting){
+   const request=this.requests.get(t.repo,t.pr,e.head),age=Date.now()-(request?.state==='accepted'?request.requested:scheduleWait!.started);
+   if(request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:`CodeRabbit review unavailable: confirmed rate-limit rejection; ${request.attempts>=3?'three attempts exhausted; operator inspection required':`cooldown until ${new Date(request.next_attempt).toISOString()}`}`});
+   if(age>=REVIEW_TIMEOUT_MS&&request?.state!=='rate_limited')return record({state:'blocked',send:false,head:e.head,reason:'CodeRabbit review unavailable: no eligible current-head approval after 30 minutes; inspect scheduling and request evidence'});
+   if(schedule.incremental||Date.now()-scheduleWait!.started<REVIEW_GRACE_MS||session.transcript.controller!=='ready')return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:schedule.incremental?'Waiting for automatic incremental CodeRabbit review':'Waiting for final remediation batch and five-minute CodeRabbit grace period'});
+  }
   // Only an established obligation gate supplies a current-head/body baseline;
   // the zero fallback is not evidence that an existing review covers an edit.
   const blockerAlreadyFresh=!!(customObligation&&waiting&&waitStart>0&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
-  if(!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&e.coderabbitPresent&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
-   const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey);
+  if(!schedule?.incremental&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
+   const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey,e);
+   const stopped=this.get(job);if(stopped?.state==='blocked'&&stopped.reason?.startsWith('CodeRabbit review unavailable:'))return record({state:'blocked',send:false,head:e.head,reason:stopped.reason});
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    if(requested){
      const headUpdate=this.s.db.query("UPDATE review_targets SET head=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,job,t.pr);
@@ -372,7 +410,8 @@ export class ReviewLoop{
    if(waiting&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length){
     const reviewStarted=Math.max(waiting.started,deliveryWait?.started??0);
     const freshBlocker=customObligation&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>reviewStarted;
-    if(!freshBlocker&&!e.coderabbitPending&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,t.pr,e.head,reviewBodyKey);
+    if(!freshBlocker&&!e.coderabbitPending&&!schedule?.incremental&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=reviewStarted||customObligation&&!e.coderabbitBodyReviewed))await this.requestReview(job,t.pr,e.head,reviewBodyKey,e);
+    const stopped=this.get(job);if(stopped?.state==='blocked'&&stopped.reason?.startsWith('CodeRabbit review unavailable:'))return record({state:'blocked',send:false,head:e.head,reason:stopped.reason});
     const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=?').get(job,t.pr,e.head,reviewBodyKey) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
