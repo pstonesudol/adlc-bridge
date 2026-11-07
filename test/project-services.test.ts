@@ -74,7 +74,7 @@ test('registered recovery tolerates only invalid runtime settings and preserves 
  const f=fixture();try{
   const entry=f.registry.register(f.config('one','00000000-0000-0000-0000-000000000004'));
   const original=JSON.parse(readFileSync(entry.config,'utf8'));
-  for(const override of [{pollingIntervalSeconds:0},{automation:{...original.automation,maxPlanning:33}}]){
+  for(const override of [{pollingIntervalSeconds:0},{automation:{...original.automation,maxPlanning:33}},{branchUpdate:{enabled:true,authorizedBy:'operator',maxUpdates:500}},{remediation:{maxAttempts:'newer-schema'}}]){
    const invalid={...original,...override};writeFileSync(entry.config,JSON.stringify(invalid));
    expect(()=>f.registry.verify(entry)).toThrow();
    expect(f.registry.verify(entry,false)).toEqual(invalid);
