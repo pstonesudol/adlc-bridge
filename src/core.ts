@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {installRevisions,recordRevision,observeLegacyRevision,latestRevision} from './spec-revisions';
+import {latestWorkflowChecks} from './check-runs';
 
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
@@ -130,7 +131,7 @@ export class Store {
   close() { this.db.close(); }
 }
 
-export type Check = { name: string; sha: string; app: string; status: string; conclusion: string | null };
+export type Check = { name: string; sha: string; app: string; status: string; conclusion: string | null; id?:number; started_at?:string|null; completed_at?:string|null };
 export type ReviewEvidence = {
   head: string; observedHead: string; required: string[]; checks: Check[];
   review: { sha: string; author: string; state: string } | null;
@@ -143,11 +144,12 @@ export function reviewGate(e: ReviewEvidence): { clear: boolean; reasons: string
   if (!e.head || e.head !== e.observedHead) reasons.push('Head changed');
   if (!e.checksComplete || !e.threadsComplete || !e.reviewComplete) reasons.push('Incomplete evidence');
   if (!e.required.length) reasons.push('Required checks not configured');
+  const resolved=latestWorkflowChecks(e.checks.map(c=>({...c,head_sha:c.sha,app:{slug:c.app}})));
   for (const name of e.required) {
-    const checks = e.checks.filter(c => c.name === name && c.sha === e.head && c.app === 'github-actions');
+    const checks = resolved.filter(c => c.name === name && c.sha === e.head && c.app.slug === 'github-actions');
     if (checks.length !== 1 || checks[0].status !== 'completed' || checks[0].conclusion !== 'success') reasons.push(`Required check not clear: ${name}`);
   }
-  const bot = e.checks.filter(c => c.app === 'coderabbitai' && c.name === 'CodeRabbit' && c.sha === e.head);
+  const bot = resolved.filter(c => c.app.slug === 'coderabbitai' && c.name === 'CodeRabbit' && c.sha === e.head);
   if (bot.length !== 1 || bot[0].status !== 'completed' || bot[0].conclusion !== 'success') reasons.push('CodeRabbit check not clear');
   if (!e.review || e.review.sha !== e.head || e.review.author !== 'coderabbitai[bot]' || e.review.state !== 'APPROVED') reasons.push('Explicit latest-SHA CodeRabbit approval missing');
   if (e.unresolved !== 0) reasons.push('Unresolved or unknown findings');
