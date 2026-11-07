@@ -60,7 +60,8 @@ export class DependencyRecovery{
   for(const d of definition.prerequisites){await visit(d.issue);const reaches=(id:string,seen=new Set<string>()):boolean=>id===root||!seen.has(id)&&(seen.add(id), (graph[id]??[]).some(n=>reaches(n,seen)));if(reaches(d.issue))throw Error('Configured/Linear dependency cycle');}
   return Object.fromEntries(Object.entries(graph).sort(([a],[b])=>a.localeCompare(b)));
  }
- async preview(job:string,c:any){
+  async preview(job:string,c:any){
+   if(c.dependencyRecovery?.jobs?.find((d:DependencyJob)=>d.issue===this.s.get(job).issue)?.stage==='planning')return this.workflow.planningDependencies.preview(job,c) as any;
   const definition=this.definition(job,c),auth=this.authorization(job,c),j=this.s.get(job),o=this.workflow.outcomes(job);
    if(!currentOutcome(this.s,job,o)||o.session_id!==auth.session||o.outcome!=='blocked_dependency'||o.source!=='receipt'||JSON.parse(o.questions).length)throw Error('Current structured dependency-only worker blocker required; unresolved questions use clarification/replanning');
   const readiness=readinessFor(this.s,job);
@@ -80,7 +81,7 @@ export class DependencyRecovery{
    if(!currentOutcome(this.s,job,this.workflow.outcomes(job))||JSON.stringify(this.workflow.outcomes(job))!==JSON.stringify(o)||JSON.stringify(this.authorization(job,c))!==JSON.stringify(auth))throw Error('Dependency blocker or authorization changed during observation');
   return {mode:'preview_only',id,confirmation:digest(JSON.stringify([proof,facts,retained])),proof,facts,retained,nextAction:'Verify/fetch exact base, fast-forward clean feature only, and use existing guarded continuation. Unsafe evidence requires operator reconciliation.'};
  }
-  async tick(job:string,c:any,confirmation?:string){return this.submit(async()=>{
+  async tick(job:string,c:any,confirmation?:string){if(c.dependencyRecovery?.jobs?.find((d:DependencyJob)=>d.issue===this.s.get(job).issue)?.stage==='planning')return this.workflow.planningDependencies.tick(job,c,confirmation);return this.submit(async()=>{
    this.install();
    settleDependencyWait(this.s,job);
    const prior=this.rows().find(r=>r.job===job);

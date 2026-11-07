@@ -214,7 +214,7 @@ export function assertApprovalReadiness(s:Store,job:string,actor:string,acknowle
   const j=s.get(job);let readiness=readinessFor(s,job);
   if(j.plan&&(!readiness||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))){recordReadiness(s,job,j.plan,j.plan_hash,digest(j.spec));readiness=readinessFor(s,job);}
   if(standing){
-   if(!readiness||!readiness.valid||readiness.state!=='ready'||readiness.plan_hash!==j.plan_hash)throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
+   if(!standingReady(s,job))throw Error('Actionable plan required; resolve outstanding questions or dependencies before standing approval');
    return readiness;
   }
   const resolved=applicableResolution(s,job);
@@ -225,6 +225,15 @@ export function assertApprovalReadiness(s:Store,job:string,actor:string,acknowle
    s.event(job,'plan_readiness_acknowledged',actor);
   }
   return readiness;
+}
+/** Preserve the source receipt; only verified planning evidence promotes it. */
+export function standingReady(s:Store,job:string){
+ const j=s.get(job),r=readinessFor(s,job);
+ if(!r?.valid||r.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))return false;
+ if(r.state==='ready')return true;
+ if(r.state!=='blocked-by-dependency'||r.questions.length||!hasTable(s,'planning_dependency_waits'))return false;
+ const wait=s.db.query("SELECT * FROM planning_dependency_waits WHERE job=? AND plan=? AND state='resolved'").get(job,j.plan_hash) as any,resolution=applicableResolution(s,job);
+ return !!wait&&resolution?.source==='dependency-satisfied'&&resolution.actor==='verified-planning-dependency-observer'&&JSON.parse(resolution.detail).planningDependencyEvidence===JSON.parse(wait.evidence).id;
 }
 export function recordResolution(s:Store,job:string,source:string,actor:string,detail:string){
   ensureReadinessStore(s);

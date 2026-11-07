@@ -1,5 +1,44 @@
 # ADLC Bridge
 
+### Planning dependency observation
+
+Dependency bindings may opt into `stage: "planning"` (omitted stage retains
+the approved-worker continuation path). A planning binding uses the existing
+`dependencyRecovery.enabled`, `baseBranch`, `jobs[].issue`, `planHash`,
+`specHash`, and exact prerequisite repository/PR/capability SHA-256 fields.
+It additionally requires `project` equal to the configured Linear project,
+`contractReview: {"actor": "named reviewer", "compatibility": "why this exact
+captured plan remains valid against the pinned interfaces"}`, and a reviewed
+`headSha` for each prerequisite PR. Configuration is operator-controlled, never
+inferred from ticket comments. Do not put literal placeholder values into live
+configuration.
+
+Pin an in-development PR only after reviewing its interface contract and the
+existing plan. The observer waits for that exact head to merge into the exact
+base and checks the pinned capability contents there. Any head or capability
+change fails closed: review it and explicitly update configuration, or use the
+existing same-session replanning flow with fresh approval if the plan changes.
+Hashes are never learned or silently rewritten by polling. Host-runtime
+prerequisites remain unsupported without authoritative installation proof;
+source merge is not runtime activation.
+
+`dependency-preview JOB CONFIG` inspects planning evidence without requiring a
+run or implementation grant. `dependency-resume JOB CONFIG HASH` records only
+the verified planning resolution; normal workflow polling evaluates current
+approval policy and eligibility. `dependency-status` exposes `planningWaits`
+separately from implementation waits. Missing configuration reports a wait,
+not a promise of auto-resume. `plan-approval-required` still requires explicit
+current human approval. Original plan text, receipt, and reservation are kept.
+
+Observation never fetches, switches, merges, or updates the planning worktree.
+If implementation needs source synchronization that its real scoped grant
+does not allow, an operator must reconcile under separate authorization; no
+grant is fabricated to make progress. Changed plan/spec/config/base evidence
+between approval and delivery blocks delivery for reconciliation. Accepted or
+uncertain implementation delivery is owned by the existing dispatcher and is
+never resent by this observer. Runtime installation and PR merging remain
+separate human actions.
+
 ## Configuration-driven verification and setup (v1)
 
 Project JSON keeps repository/Linear mappings, approval and routing policies, and
