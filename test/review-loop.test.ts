@@ -1,6 +1,7 @@
 import {test,expect,setSystemTime,spyOn} from 'bun:test';
 import {readFailure,ReadValidationError} from '../src/provider-read';
 import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
+import {ObservationLeaseLost} from '../src/observation-fence';
 import {decision,ReviewLoop} from '../src/review-loop';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
@@ -802,6 +803,29 @@ test('metadata-only remediation does not require container runtime context',asyn
   f.loop.setVerification(f.id,{version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}});
   expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
   expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a pre-send lease rejection releases the unsent remediation attempt for a later retry',async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings),before=f.s.get(f.id).attempts;
+  await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],{...f.io,spawn:()=>{throw new ObservationLeaseLost(false);}})).rejects.toBeInstanceOf(ObservationLeaseLost);
+  expect(f.s.get(f.id).attempts).toBe(before);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM review_feedback').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM delivery_receipts').all()).toEqual([]);
+  expect(f.s.db.query('SELECT consumed,no_progress,last_attempt FROM remediation_budget WHERE job=?').get(f.id)).toMatchObject({consumed:0,no_progress:0,last_attempt:null});
+  expect(f.s.db.query("SELECT kind FROM events WHERE kind='remediation_released_unsent'").get()).not.toBeNull();
+  const retried=await sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],f.io);
+  expect(retried).toMatchObject({state:'delivery_uncertain',attempt:1});expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a possible post-send lease loss keeps delivery uncertainty',async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings);
+  await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],{...f.io,spawn:()=>{throw new ObservationLeaseLost(true);}})).rejects.toBeInstanceOf(ObservationLeaseLost);
+  expect(f.s.db.query('SELECT state FROM remediation').all()).toEqual([{state:'delivery_uncertain'}]);
+  expect(f.s.get(f.id).attempts).toBe(1);
+  expect(f.s.db.query('SELECT attempt FROM review_feedback').all()).toEqual([{attempt:1}]);
  }finally{f.s.close();}
 });
 test('a duplicate remediation reservation never spawns a second worker for the same feedback',async()=>{
