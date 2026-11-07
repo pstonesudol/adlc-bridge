@@ -129,7 +129,13 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
    }
    for(const action of watchdog.due(c.linear.projectId)){
     try{
-     const review=await reviewLoop.tick(action.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c,{watchdog,id:action.id});
+     const observation=await reviewLoop.tick(action.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c,{watchdog,id:action.id});
+     if(observation.state!=='observed'){watchdog.finishReview(action.id,observation);io.out({job:action.job,observation});continue;}
+     // Separate existing effectful evaluation, under this same poll/submission
+     // fence. It collects its own fresh evidence and retains its own budgets,
+     // authorization and mutation receipts; the read action authorizes none.
+     assertConfiguredProjectIntakeEnabled(c,s);
+     const review=await reviewLoop.tick(action.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c);
      watchdog.finishReview(action.id,review);io.out({job:action.job,review});
     }catch(e){watchdog.finishReview(action.id);console.error(e instanceof Error?e.message:'Review tick failed');}
    }

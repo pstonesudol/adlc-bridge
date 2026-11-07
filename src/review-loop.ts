@@ -231,7 +231,16 @@ export class ReviewLoop{
   }
    async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
     assertObservationFence();const io=fencedIO(this.io);
-    if(action)try{action.watchdog.assertReviewAction(action.id,job,config);}catch(error){if(error instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}
+    if(action){
+     try{action.watchdog.assertReviewAction(action.id,job,config);}catch(error){if(error instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}
+     // A watchdog action ends at observation. Never enter receipt reconciliation,
+     // branch updates, review requests, remediation or recovery from this path.
+     const wait=new RecoveryObservation(this.s).wait(job);if(wait)return wait;
+     try{
+      const {snapshot}=await action.watchdog.observeReview(action.id,config,io);
+      return {state:'observed',send:false,head:snapshot.head,reason:'Read-only review evidence persisted; no review effects evaluated',mergeEnabled:false};
+     }catch(error){return readStop(error,'Watchdog observation unavailable');}
+    }
    const terminal=this.completed(job);if(terminal)return terminal;
   // Capture this caller's policy before any await; concurrent project polls must
   // not replace the check requirements for an already-running tick.
@@ -269,11 +278,8 @@ export class ReviewLoop{
    }
   let session,snapshot;
   try{
-    if(action){({session,snapshot}=await action.watchdog.observeReview(action.id,config,io));}
-    else{
-     session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
-     snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
-    }
+    session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
+    snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
   }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
   try{
    if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');

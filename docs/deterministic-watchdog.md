@@ -11,16 +11,26 @@ executor, worker creation, sender, or automatic replacement/recovery worker.
 `createCLIPollTick` skips completed review targets, schedules the remaining
 registered targets and selects at most four due actions, oldest first, within the existing sequential
 `runPollTick` / `withTurnSubmission` scope. Poll and serve use that same path;
-`serveLoop` remains cadence-only. The selected `ReviewLoop.tick` replaces its
-initial session/branch reads with `ActionWatchdog.observeReview`. It does not
-perform an extra copy of those reads. Existing later verification reads remain
-necessary for mutation-specific preconditions.
+`serveLoop` remains cadence-only. With an action, `ReviewLoop.tick` only calls
+`ActionWatchdog.observeReview`, validates/persists the session/branch evidence
+and returns `observed` before entering normal review evaluation. It does not
+reconcile mutation receipts, update review readiness, update branches, request
+reviews, send remediation or run conflict recovery.
+
+Only after that successful return does the same sequential poll invoke the
+existing `ReviewLoop.tick` **without an action** for that target. This separate
+effectful step collects its own fresh evidence, including new session/branch
+reads; it does not reuse the observation as mutation authority. A failed or
+deferred observation skips the effectful step. Both calls remain inside the
+same poll/submission fence, and each uses the existing review-evaluation lease.
+There is no second sender, timer or background review loop.
 
 **The whole review tick is effectful and is not a retryable observation.** The
-watchdog reserves only its closed read adapter. Later branch updates, review
-requests and remediation remain in their existing executors with their existing
-authorization, delivery reservations, fences and receipt reconciliation.
-An unsettled exception from the surrounding tick escalates rather than being
+watchdog reserves only its closed read adapter. The separate ordinary review
+step retains existing authorization, remediation/branch/review-request budgets,
+delivery reservations, fences and receipt reconciliation. The observation budget
+counts only read-action reservations; it grants no mutation budget or permission.
+An unsettled exception from the separate effectful step escalates rather than being
 classified as a transient read error. No readiness, GitHub approval, Changes
 Requested, skipped/neutral review or human-only merge rule is changed.
 

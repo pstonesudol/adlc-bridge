@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';
+import {test,expect,spyOn} from 'bun:test';
 import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -13,6 +13,8 @@ import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {turnBarrier,setProjectIntakePaused} from '../src/turn-submission';
 import {jobViews,humanJobs} from '../src/operator-cli';
 import {ApprovalPolicyStore} from '../src/approval-policy';
+import {BranchUpdates,branchTransport} from '../src/branch-updates';
+import {ConflictRecovery} from '../src/conflict-recovery';
 
 function fixture(disk=false){
  const root=mkdtempSync(join(tmpdir(),'adlc-watchdog-')),path=disk?join(root,'state.sqlite'):':memory:',s=new Store(path);
@@ -196,17 +198,49 @@ test('actions retained before completion are neither due nor shown as current hu
   expect(jobViews(f.path)[0].watchdog).toBeNull();expect(f.w.get(a.id).state).toBe('escalated');expect(f.reads()).toBe(0);
  }finally{f.close();}}
 });
-test('production ReviewLoop uses scheduled read bundle and existing receipt reconciliation, with no sender on accepted uncertain work',async()=>{
+test('read action leaves mutation receipts unchanged; separate ordinary review reconciles without resending',async()=>{
  const f=fixture();try{
   const l=new Lifecycle(f.s),j=f.s.get(f.job),receipts=new ReceiptReconciliation(f.s);
   receipts.reserve({job:f.job,plan:j.plan_hash,spec:digest(j.spec),session:'session',client:`adlc-fix-${f.job.slice(0,12)}-1`,attempt:'remediation:1'});
   f.s.db.query("INSERT INTO remediation VALUES (?,?,?,1,'delivery_uncertain')").run(f.job,f.snapshot.head,'findings');
-  let sends=0;f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
-  const a=f.w.scheduleReview(f.job,f.c);
-  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
-  expect(result).toMatchObject({state:'needs_reconciliation'});expect(sends).toBe(0);expect(f.reads()).toBe(2);expect(l.run(f.job).session_id).toBe('session');
+   let sends=0;f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
+   const a=f.w.scheduleReview(f.job,f.c);
+   const before=receipts.list(f.job).map(({ageMs,...r})=>r),target=f.loop.get(f.job);
+   expect(await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).toMatchObject({state:'observed',send:false});
+   expect(receipts.list(f.job).map(({ageMs,...r})=>r)).toEqual(before);expect(f.loop.get(f.job)).toEqual(target);
+   const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(a.id,result);
+   expect(result).toMatchObject({state:'needs_reconciliation'});expect(sends).toBe(0);expect(f.reads()).toBe(4);expect(l.run(f.job).session_id).toBe('session');
   expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
  }finally{f.close();}
+});
+test('watchdog action returns before branch update, review request, remediation and conflict recovery entrypoints',async()=>{
+ for(const conflict of [false,true]){const f=fixture();const spies:any[]=[];try{
+  Object.assign(f.c,{conflictRecovery:{enabled:true}});f.snapshot.behind=2;f.snapshot.mergeable=!conflict;
+  const forbidden=async()=>{throw Error('Effectful path reached from observation');};
+  spies.push(spyOn(BranchUpdates.prototype,'ensure').mockImplementation(forbidden),spyOn(BranchUpdates.prototype,'observeAccepted').mockImplementation(forbidden),spyOn(branchTransport,'update').mockImplementation(forbidden),spyOn(ConflictRecovery.prototype,'tick').mockImplementation(forbidden),spyOn(f.loop,'requestReview').mockImplementation(forbidden),spyOn(f.loop.io,'sendPilotRemediation').mockImplementation(forbidden),spyOn(f.loop.io,'disableNativeFeedback').mockImplementation(forbidden),spyOn(f.loop.io,'readiness').mockImplementation(forbidden));
+  f.loop.io={...f.loop.io,...f.io};const a=f.w.scheduleReview(f.job,f.c),target=f.loop.get(f.job);
+  const result=await f.loop.tick(f.job,{enabled:true,authorizedBy:'human',maxUpdates:2},undefined,undefined,f.c,{watchdog:f.w,id:a.id});
+  expect(result).toMatchObject({state:'observed',send:false});for(const spy of spies)expect(spy).not.toHaveBeenCalled();
+  expect(f.loop.get(f.job)).toEqual(target);expect(f.w.get(a.id).outcome).toBe('observed');expect(f.reads()).toBe(2);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+ }finally{for(const spy of spies)spy.mockRestore();f.close();}}
+});
+test('separate ordinary review preserves authorized branch updates and never replays uncertain effects',async()=>{
+ for(const uncertain of [false,true]){const f=fixture();let update:any;try{
+  const policy={enabled:true,authorizedBy:'human',maxUpdates:2};Object.assign(f.c,{branchUpdate:policy});
+  new Lifecycle(f.s).grantGit(f.job,f.s.get(f.job).plan_hash,['inspect','fetch','commit','push-feature','open-pr'],'human');
+  f.snapshot.behind=1;f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head})};
+  update=spyOn(branchTransport,'update').mockImplementation(async()=>{if(uncertain)throw Error('Reply lost after request');});
+  const a=f.w.scheduleReview(f.job,f.c);
+  expect((await f.loop.tick(f.job,policy,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).state).toBe('observed');
+  expect(update).not.toHaveBeenCalled();expect(f.s.db.query("SELECT name FROM sqlite_master WHERE name='branch_updates'").get()).toBeNull();
+  const result=await f.loop.tick(f.job,policy,undefined,undefined,f.c);f.w.finishReview(a.id,result);
+  expect(result.state).toBe(uncertain?'blocked':'updating_branch');expect(update).toHaveBeenCalledTimes(1);
+  const receipt=f.s.db.query('SELECT * FROM branch_updates WHERE job=?').get(f.job) as any;
+  expect(receipt.state).toBe(uncertain?'delivery_uncertain':'accepted');
+  await f.loop.tick(f.job,policy,undefined,undefined,f.c);
+  expect(update).toHaveBeenCalledTimes(1);expect(f.s.db.query('SELECT * FROM branch_updates WHERE job=?').get(f.job)).toEqual(receipt);
+ }finally{update?.mockRestore();f.close();}}
 });
 test('provider rearm preserves budget, shared capacity and mutation uncertainty; other escalations remain stopped',async()=>{
  const f=fixture();try{
@@ -236,7 +270,8 @@ test('supervised review clears a same-head human blocker and bounded polling res
   let failed=true,sends=0;
   f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),readiness:async()=>({head:f.snapshot.head,clear:false,reasons:[],findings:[],failedChecks:failed?[{name:'CI'}]:[],pendingChecks:failed?[]:['CI'],missingChecks:[]}) as any,sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
   const a=f.w.scheduleReview(f.job,f.c);
-  const blocked=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,blocked);
+  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).state).toBe('observed');
+  const blocked=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(a.id,blocked);
   expect(blocked.state).toBe('blocked');expect(f.w.get(a.id)).toMatchObject({state:'escalated',outcome:'human_required',attempts:1});
   expect(f.w.scheduleReview(f.job,f.c).state).toBe('escalated');
   failed=false;
@@ -244,7 +279,8 @@ test('supervised review clears a same-head human blocker and bounded polling res
   const resumed=f.w.scheduleReview(f.job,f.c);
   expect(resumed).toMatchObject({id:a.id,binding:a.binding,state:'pending',next_action:'observe',outcome:'blocker_cleared',attempts:1});
   expect(f.w.due('p').map(r=>r.id)).toEqual([a.id]);
-  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
+  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).state).toBe('observed');
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(a.id,result);
   expect(result.state).toBe('waiting_for_ci');expect(actionStatus(f.s,f.job)?.attempts).toBe(2);expect(sends).toBe(0);
  }finally{f.close();}
 });
@@ -282,7 +318,8 @@ test('readiness 401 recorded by the review loop can be explicitly rearmed by ret
   const original=receipts.get('uncertain-original');
   f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),readiness:async()=>{throw readFailure('github','readiness','HTTP 401');},sendPilotRemediation:async()=>{sends++;throw Error('Must not send');}};
   const a=f.w.scheduleReview(f.job,f.c);
-  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id});f.w.finishReview(a.id,result);
+  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).state).toBe('observed');
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(a.id,result);
   expect(result.state).toBe('blocked');expect(new RecoveryObservation(f.s).status(f.job)?.evidence.classification).toBe('authentication');
   expect(f.w.get(a.id)).toMatchObject({state:'escalated',blocker:'provider_wait',outcome:'unsupported',attempts:1});expect(f.w.get(a.id).reason).toContain('retry-observation');
   const retry=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'retry-observation',f.job],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root,ADLC_DB:f.path},stdout:'pipe',stderr:'pipe'});
@@ -325,7 +362,7 @@ test('restart after durable read reservation, before IO or after IO-before-recor
   expect(restarted.db.query('SELECT * FROM remediation').all()).toEqual([]);
  }finally{restarted?.close();f.close();}
 });
-test('production poll uses one bounded sequential path and retains due times across ticks',()=>{
+test('production poll separates read actions from ordinary evaluation under one fence and retains due times',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-watchdog-poll-'));
  try{
   const script=`
@@ -334,16 +371,40 @@ import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
 import {Planning} from ${JSON.stringify(join(import.meta.dir,'../src/planning.ts'))};
 import {Lifecycle} from ${JSON.stringify(join(import.meta.dir,'../src/lifecycle.ts'))};
 import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
-const s=new Store(':memory:'),p=new Planning(s),l=new Lifecycle(s),sessions={},snapshots={},jobs={};let reads=0,sends=0,polls=0;
+import {BranchUpdates,branchTransport} from ${JSON.stringify(join(import.meta.dir,'../src/branch-updates.ts'))};
+import {ConflictRecovery} from ${JSON.stringify(join(import.meta.dir,'../src/conflict-recovery.ts'))};
+import {existsSync} from 'node:fs';import {join} from 'node:path';import {appState} from ${JSON.stringify(join(import.meta.dir,'../src/install-state.ts'))};
+const s=new Store(':memory:'),p=new Planning(s),l=new Lifecycle(s),sessions={},snapshots={},jobs={},phases=[];let reads=0,sends=0,polls=0,inAction=false,ordinaryReads=0,branchEvaluations=0;
 const fail=async()=>{sends++;throw Error('Unexpected mutation');};
-const loop=new ReviewLoop(s,fail,{sessionEvidence:async(id)=>{reads++;return {...sessions[id],receiptObservation:{complete:true,observed:Date.now()}};},readBranchSnapshot:async(repo,pr)=>snapshots[pr],worktreeIdentity:async(s,job)=>({tree:'/worktree-'+job,branch:jobs[job].branch,head:'a'.repeat(40)}),readiness:async()=>({head:'a'.repeat(40),clear:false,reasons:['Waiting for CI'],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[]}),disableNativeFeedback:fail,sendPilotRemediation:fail});
+const loop=new ReviewLoop(s,fail,{sessionEvidence:async(id)=>{reads++;return {...sessions[id],receiptObservation:{complete:true,observed:Date.now()}};},readBranchSnapshot:async(repo,pr)=>snapshots[pr],worktreeIdentity:async(s,job)=>({tree:'/worktree-'+job,branch:jobs[job].branch,head:'a'.repeat(40)}),readiness:async()=>{if(inAction)throw Error('Read action reached readiness evaluation');ordinaryReads++;return {head:'a'.repeat(40),clear:false,reasons:['Waiting for CI'],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[]};},disableNativeFeedback:fail,sendPilotRemediation:fail});
+for(const [object,name] of [[BranchUpdates.prototype,'ensure'],[branchTransport,'update'],[ConflictRecovery.prototype,'tick'],[loop,'requestReview'],[loop.io,'sendPilotRemediation']]){const original=object[name];object[name]=function(...args){if(inAction)throw Error('Read action reached '+name);if(name==='ensure')branchEvaluations++;return original.apply(this,args);};}
+const originalTick=loop.tick.bind(loop);loop.tick=async(...args)=>{inAction=!!args[5];const phase=inAction?'observe':'review';if(!existsSync(join(appState(),'turn-submission.lock')))throw Error('Poll fence missing');try{const result=await originalTick(...args);if(inAction&&result.state!=='observed')throw Error('Read action did not return before effects');phases.push([args[0],phase]);return result;}finally{inAction=false;}};
 for(let i=1;i<=6;i++){const job=s.enqueue('p','issue-'+i,'spec'),r=p.reserve(job,'ao');p.gate(job,'ao','session-'+i,r.branch,'/worktree-'+job);const hash=s.propose(job,'plan');s.approve(job,hash,'human');l.grantGit(job,hash,['inspect','commit','push-feature','open-pr'],'human');l.adoptSupervised(job,{id:'session-'+i,correlation:r.correlation,worktree:'/worktree-'+job,controller:'running'});loop.register(job,'owner/repo',i,['CI'],['src/**'],true);jobs[job]=r;sessions['session-'+i]={session:{id:'session-'+i,projectId:'ao',branch:r.branch,isTerminated:false,prs:[{number:i,url:'https://github.com/owner/repo/pull/'+i}]},transcript:{controller:'ready',entries:[],turns:[]}};snapshots[i]={head:'a'.repeat(40),base:'b'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,branch:r.branch,baseBranch:'main',defaultBranch:'main',behind:0,mergeable:true};s.db.query('UPDATE review_targets SET head=? WHERE job=?').run('a'.repeat(40),job);}
 const config={linear:{projectId:'p'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'},requiredChecks:['CI']};
 const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>{polls++;return [];},linearToken:()=>'',out:()=>{}}});
-await tick();const first=reads;await tick();const second=reads;await tick();console.log(JSON.stringify({first,second,reads,sends,polls,actions:s.db.query('SELECT count(*) AS n FROM watchdog_actions').get().n}));s.close();`;
+await tick();const first=reads;await tick();const second=reads;await tick();const paired=phases.length===12&&phases.every(([job,phase],i)=>phase===(i%2?'review':'observe')&&(i%2===0||job===phases[i-1][0]));console.log(JSON.stringify({first,second,reads,sends,polls,paired,ordinaryReads,branchEvaluations,actions:s.db.query('SELECT count(*) AS n FROM watchdog_actions').get().n}));s.close();`;
   const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root},stdout:'pipe',stderr:'pipe'});
-  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({first:4,second:6,reads:6,sends:0,polls:3,actions:6});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({first:8,second:12,reads:12,sends:0,polls:3,paired:true,ordinaryReads:6,branchEvaluations:6,actions:6});
  }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('production poll never follows a failed or deferred read action with effectful evaluation',()=>{
+ for(const mode of ['failed','deferred']){const f=fixture(true);try{
+  const script=`
+import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
+import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
+import {RecoveryObservation} from ${JSON.stringify(join(import.meta.dir,'../src/recovery-observation.ts'))};
+import {readFailure} from ${JSON.stringify(join(import.meta.dir,'../src/provider-read.ts'))};
+const s=new Store(${JSON.stringify(f.path)}),config=${JSON.stringify(f.c)};let actions=0,reviews=0,reads=0;
+new RecoveryObservation(s);if(${JSON.stringify(mode)}==='deferred')s.db.query('INSERT INTO observation_capacity VALUES (?,?)').run('orchestrator',Date.now()+60000);
+const loop=new ReviewLoop(s,async()=>{throw Error('Must not request review');},{sessionEvidence:async()=>{reads++;throw readFailure('orchestrator','session','HTTP 401');}});
+const original=loop.tick.bind(loop);loop.tick=async(...args)=>{if(args[5])actions++;else{reviews++;throw Error('Failed/deferred action must not start ordinary evaluation');}return original(...args);};
+const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>[],linearToken:()=>'',out:()=>{}}});
+await tick();await tick();console.log(JSON.stringify({actions,reviews,reads}));s.close();`;
+  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({actions:1,reviews:0,reads:mode==='failed'?1:0});
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+ }finally{f.close();}}
 });
 test('standing-policy expiry and reduced inspect grants fail closed before provider IO',async()=>{
  for(const mode of ['expired','policy-changed','inspect-removed'] as const){const f=fixture();try{
