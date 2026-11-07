@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {customCheckEvidence} from '../src/coderabbit-checks';
 import {decision} from '../src/review-loop';
-import {customFixture} from './coderabbit-fixture';
+import {customFixture,pr30CustomFixture} from './coderabbit-fixture';
 test('PR108 regression: green run plus custom Verification Evidence error is scoped remediation, never approval',()=>{
  const f=customFixture(),e=f.evidence();
  expect(e.blocker).toBeNull();expect(e.findings).toHaveLength(1);
@@ -76,41 +76,48 @@ for(const change of ['missing-commit','malformed-commit','edited-summary','edite
  if(change==='pending-run')f.context.checks[0].status='in_progress';
  expect(f.evidence().findings).toEqual([]);if(change==='pending-run')expect(f.evidence().blocker).toBeNull();else expect(f.evidence().blocker).toBeTruthy();
 });
-test('a known stale-head bot review waits for the current-head run rather than becoming a custom blocker',()=>{
+test('a known stale-head bot review stays historical instead of becoming a custom blocker',()=>{
  const f=customFixture();f.review.commit_id='b'.repeat(40);f.context.checks=[];
  f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
  const e=f.evidence();expect(e).toEqual({findings:[],blocker:null,bodyReviewed:false});
  expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],failedChecks:[],pendingChecks:[],missingChecks:[]},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false});
- expect(customCheckEvidence(f.review,f.head,f.comments).blocker).toBeTruthy();
+ expect(customCheckEvidence(f.review,f.head,f.comments)).toEqual({findings:[],blocker:null,bodyReviewed:false});
 });
-test('a valid stale summary waits for exactly one pending current-head run',()=>{
+test('a stale summary never blocks currency, even with multiple current-head runs',()=>{
  const f=customFixture();f.review.commit_id='b'.repeat(40);
  f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
  f.context.checks[0].status='in_progress';
  expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
  f.context.checks.push({...f.context.checks[0],id:31});
- expect(f.evidence()).toMatchObject({findings:[],bodyReviewed:false});expect(f.evidence().blocker).toBeTruthy();
+ // Historical review evidence cannot supply a current custom-check failure.
+ expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
  f.context.checks.pop();f.context.checks[0].status='completed';
- expect(f.evidence().blocker).toBeTruthy();
+ expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
 });
 for(const length of [39,...Array.from({length:23},(_,i)=>i+41),64,65])test(`unsupported commit length ${length} fails closed rather than becoming stale evidence`,()=>{
  const f=customFixture();f.review.commit_id='b'.repeat(length);f.context.checks=[];
  expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toBeTruthy();
 });
-for(const state of ['current-summary','missing-summary-head','edited-old-summary','completed-current-run','pending-current-run'])test(`stale review cannot discard ambiguous/current evidence: ${state}`,()=>{
- const f=customFixture();f.review.commit_id='b'.repeat(40);
+for(const state of ['current-summary','missing-summary-head','edited-old-summary','completed-current-run','pending-current-run'])test(`stale review is historical while the same evidence fails closed for a current review: ${state}`,()=>{
+ const f=customFixture();
  if(state!=='completed-current-run'&&state!=='pending-current-run')f.context.checks=[];
  if(state==='pending-current-run')f.context.checks[0].status='in_progress';
  if(state==='missing-summary-head')f.comments[0].body=f.comments[0].body.replace('**Commit**','**Unknown**');
  if(state==='edited-old-summary'){
-  f.comments[0].body=f.comments[0].body.replace(f.head,f.review.commit_id);
+  f.comments[0].body=f.comments[0].body.replace(f.head,'b'.repeat(40));
   f.comments[0].updated_at='2026-11-01T01:03:00Z';
  }
- // Current summary contains an unsupported error: it must not be skipped just
- // because the effective review still refers to the previous head.
+ // Current summary contains an unsupported error: it must not be skipped for a
+ // current review even though the effective review still refers to the head.
  f.comments[0].body=f.comments[0].body.replace('| Verification Evidence |','| Unsupported check |');
- const e=f.evidence();expect(e.findings).toEqual([]);expect(e.blocker).toBeTruthy();
- expect(decision({...e,customCheckBlocker:e.blocker,clear:false,reasons:[],failedChecks:[],findings:[{path:'src/fix.ts',body:'unrelated fix'}]},['src/**'],0)).toMatchObject({state:'blocked',send:false});
+ const current=f.evidence();
+ if(state==='pending-current-run')expect(current.blocker).toBeNull();
+ else{expect(current.findings).toEqual([]);expect(current.blocker).toBeTruthy();}
+ // The same evidence for an older submitted review is historical: it cannot
+ // block currency, and it still cannot clear the gate.
+ f.review.commit_id='b'.repeat(40);
+ const stale=f.evidence();expect(stale).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ expect(decision({...stale,customCheckBlocker:null,clear:false,reasons:['Explicit latest-SHA CodeRabbit approval missing'],failedChecks:[],findings:[]},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',send:false});
 });
 test('unrelated newer bot command replies never replace the summary; edits change evidence identity',()=>{
  const f=customFixture(),original=f.evidence().findings[0];
@@ -131,4 +138,16 @@ for(const text of ['Run `go test ./...` and record the result.','The log output 
 for(const ending of ['Incomplete…','Incomplete...','**Incomplete…**','**Incomplete...**','[truncated]','[incomplete]','[TRUNCATED]','<dl><dd>Incomplete… </dd> </dl>','<p>Incomplete... </p>','<p><strong>Incomplete…</strong></p>'])test(`trailing truncation marker still fails closed: ${ending}`,()=>{
  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('Never invent results.',ending);
  expect(f.evidence().findings).toEqual([]);expect(f.evidence().blocker).toContain('missing or truncated');
+});
+test('PR #30 skipped current-head run plus stale CHANGES_REQUESTED is historical, not a custom blocker',()=>{
+ const f=pr30CustomFixture();
+ expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ // The same evidence for a current review still fails closed on Inconclusive.
+ const current=pr30CustomFixture();current.review.commit_id=current.head;
+ const result=current.evidence();expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toContain('unclassifiable');
+});
+test('a stale review with a missing custom summary is historical rather than a currency blocker',()=>{
+ const f=pr30CustomFixture();f.review.body='Pre-merge checks failed. Please resolve the failing checks before merging.';
+ f.comments=[];
+ expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
 });

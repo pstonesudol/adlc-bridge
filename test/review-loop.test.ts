@@ -99,7 +99,74 @@ test('missing current-head review gets one request after grace, retries only con
   f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0').run();await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
   await f.loop.tick(f.id);expect(calls).toBe(2);
   f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
-  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',reason:'CodeRabbit review unavailable: no eligible current-head approval after 30 minutes; inspect scheduling and request evidence'});
+  const escalated=await f.loop.tick(f.id);
+  expect(escalated).toMatchObject({state:'blocked',send:false});
+  expect(escalated.reason).toContain(`head ${'a'.repeat(40)}`);
+  expect(escalated.reason).toContain("Safe next action: post one '@coderabbitai full review'");
+  expect(escalated.reason).not.toContain('ambiguous');
+ }finally{f.s.close();}
+});
+function pr30Schedule(head:string){
+ return {head,signature:`pr30-${head}`,blocker:null,incremental:false,evidence:{classification:'stale-submitted-review',recoverable:true,review:{id:5810360982,state:'CHANGES_REQUESTED',commit:'b'.repeat(40),submittedAt:Date.now()-10000,stale:true},check:{id:128433345849,name:'CodeRabbit',status:'completed',conclusion:'skipped',startedAt:Date.now()-1000,completedAt:Date.now()},runs:1,reviewedCommits:1,pauseThreshold:2,incremental:false}} as any;
+}
+function pr30LoopFixture(){
+ const f=templateFixture();
+ f.loop.configureMetadataChecks('project',[]);
+ const schedule=pr30Schedule(f.head);f.e.reviewSchedule=schedule;
+ Object.assign(f.e,{findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,customCheckBlocker:null,clear:false,reasons:['CodeRabbit check not clear','Explicit latest-SHA CodeRabbit approval missing'],botReviewSubmittedAt:Date.now()-10000});
+ f.loop.requests.wait('owner/repo',1,schedule);f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
+ return f;
+}
+test('PR #30 shape requests one fresh review, survives concurrent ticks and a restart without duplication',async()=>{
+ const f=pr30LoopFixture();try{
+  const first=await f.loop.tick(f.id);
+  expect(first).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(first.reason).not.toContain('ambiguous');expect(f.reviews()).toBe(1);
+  expect(f.s.db.query('SELECT attempts,state FROM coderabbit_requests').get()).toEqual({attempts:1,state:'accepted'});
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);await f.loop.tick(f.id);
+  expect(f.reviews()).toBe(1);
+  expect(f.s.db.query('SELECT attempts,state FROM coderabbit_requests').get()).toEqual({attempts:1,state:'accepted'});
+  // A restarted loop reads the same durable accepted receipt and never reposts.
+  const restarted=new ReviewLoop(f.s,async()=>{throw Error('must not repost');},f.loop.io as any);
+  restarted.configureMetadataChecks('project',[]);restarted.register(f.id,'owner/repo',1,['CI'],['src/**'],true);
+  expect((await restarted.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  expect(f.reviews()).toBe(1);
+ }finally{f.s.close();}
+});
+test('a skipped or neutral current-head check never clears the gate',()=>{
+ for(const conclusion of ['skipped','neutral'])expect(reviewGate({head:'a'.repeat(40),observedHead:'a'.repeat(40),required:['CI'],checks:[{name:'CodeRabbit',sha:'a'.repeat(40),app:'coderabbitai',status:'completed',conclusion},{name:'CI',sha:'a'.repeat(40),app:'github-actions',status:'completed',conclusion:'success'}],review:{sha:'a'.repeat(40),author:'coderabbitai[bot]',state:'APPROVED'},unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true}).clear).toBe(false);
+});
+test('a provider rate limit is reported with exact evidence and is not requested blindly',async()=>{
+ const f=pr30LoopFixture();try{
+  const evidence=(f.e.reviewSchedule as any).evidence;evidence.classification='rate-limited';evidence.recoverable=true;
+  const result=await f.loop.tick(f.id);
+  expect(result).toMatchObject({state:'waiting_for_coderabbit',send:false});expect(f.reviews()).toBe(0);
+  expect(result.reason).toContain(`head ${f.head}`);expect(result.reason).toContain('check 128433345849');
+  expect(result.reason).toContain('provider is rate limiting');expect(result.reason).not.toContain('ambiguous');
+  f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-31*60*1000);
+  const bounded=await f.loop.tick(f.id);
+  expect(bounded).toMatchObject({state:'blocked',send:false});expect(bounded.reason).toContain('provider is rate limiting');
+ }finally{f.s.close();}
+});
+test('a current CHANGES_REQUESTED review never spends a fresh request',async()=>{
+ const f=pr30LoopFixture();try{
+  const evidence=(f.e.reviewSchedule as any).evidence;
+  evidence.classification='current-review';evidence.recoverable=false;evidence.review={id:10,state:'CHANGES_REQUESTED',commit:f.head,submittedAt:Date.now()-1000,stale:false};
+  const result=await f.loop.tick(f.id);
+  expect(result).toMatchObject({state:'waiting_for_coderabbit',send:false});expect(f.reviews()).toBe(0);
+  expect(result.reason).not.toContain('identity, head, configuration');
+ }finally{f.s.close();}
+});
+test('an uncertain PR #30 request is reconciled before any retry',async()=>{
+ const f=pr30LoopFixture();try{
+  let posts=0,marker='';f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('reply lost');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('reply lost');
+  expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
+  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+  expect(posts).toBe(1);
+  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai full review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+  expect(posts).toBe(1);
  }finally{f.s.close();}
 });
 test('automatic incremental mode waits without manual requests and configuration drift blocks even clear evidence',async()=>{
@@ -826,6 +893,14 @@ test('carried-forward review thread dispatches exactly one provenance-bound reme
   // Dispositions are durable: a restarted loop reads the same identity.
   const restarted=new ReviewLoop(f.s,async()=>{},f.loop.io as any);
   expect((await restarted.tick(f.id)).state).toBe('blocked');expect(f.sends()).toBe(1);
+ }finally{f.s.close();}
+});
+test('a stale CHANGES_REQUESTED review still surfaces its unresolved thread for remediation',async()=>{
+ const f=threadFixture();try{
+  const schedule=pr30Schedule(f.head);schedule.evidence.review={id:10,state:'CHANGES_REQUESTED',commit:'b'.repeat(40),submittedAt:Date.now()-1000,stale:true};
+  f.e.reviewSchedule=schedule;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(f.sends()).toBe(1);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}
 });
 for(const missing of ['initial','withdrawn','invalid'])test(`container remediation validates context before reservation/feedback claim: ${missing}`,async()=>{

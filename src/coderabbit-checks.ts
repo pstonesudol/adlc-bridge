@@ -32,9 +32,20 @@ function ambiguousDetailsTable(text:string){
 export function customCheckEvidence(review:any,head:string,comments:any[],context?:{repo:string;pr:number;body:string;version:any;checks:any[]}){
  const empty={findings:[] as any[],blocker:null as string|null,bodyReviewed:false};
  const summaries=comments.filter(c=>bot(c.user)&&typeof c.body==='string'&&c.body.includes('<!-- pre_merge_checks_walkthrough_start -->'));
- if(!summaries.length)return review?.state==='CHANGES_REQUESTED'&&/Pre-merge checks failed/i.test(review.body??'')?{...empty,blocker:'CodeRabbit custom-check details are missing; obtain the complete current bot summary'}:empty;
+ // With no bot summary there is no custom-check failure to remediate. A current
+ // CHANGES_REQUESTED that claims a pre-merge failure still needs its missing
+ // details; a stale or unrelated review is historical.
+ if(!summaries.length)return review&&review.commit_id===head&&review.state==='CHANGES_REQUESTED'&&/Pre-merge checks failed/i.test(review.body??'')?{...empty,blocker:'CodeRabbit custom-check details are missing; obtain the complete current bot summary'}:empty;
+ // A submitted review for an older head is historical. Its custom-check summary
+ // cannot prove a current-head failure and must not park the target on a generic
+ // currency blocker. Inline findings from the same review remain available as
+ // review-thread candidates; the explicit review gate still refuses clearance.
+ if(!review)return empty;
+ if(!bot(review.user))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} is not authored by the trusted CodeRabbit bot; inspect the review before retry`};
+ if(typeof review.commit_id!=='string'||!/^[a-f0-9]{40}$/.test(review.commit_id))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} has no usable commit binding; inspect the review before retry`};
+ if(review.commit_id!==head)return empty;
  // Never choose a random newer bot reply or silently fall back to an old summary.
- if(summaries.length!==1)return {...empty,blocker:'CodeRabbit custom-check summary provenance is ambiguous'};
+ if(summaries.length!==1)return {...empty,blocker:`CodeRabbit custom-check summary provenance is ambiguous: ${summaries.length} bot summaries (${summaries.map((s:any)=>s.id).join(', ')}); inspect and retain one current summary`};
  const summary=summaries[0],section=customCheckSection(summary.body);
  if(!section)return {...empty,blocker:'CodeRabbit custom-check section is incomplete'};
  // Inspect the check table, not examples/commands in the full-details prose.
@@ -60,22 +71,13 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  const recentStart='<!-- recent_review_start -->',recentEnd='<!-- recent_review_end -->';
  const recent=summary.body.split(recentStart).length===2&&summary.body.split(recentEnd).length===2&&summary.body.indexOf(recentEnd)>summary.body.indexOf(recentStart)?summary.body.split(recentStart)[1].split(recentEnd)[0]:null;
  const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
- // A known older bot review is waiting evidence, not a current custom-check
- // failure. Missing/malformed provenance must still take the fail-closed path.
- if(context&&bot(review?.user)&&review.user.id===summary.user.id&&typeof review.commit_id==='string'&&/^[a-f0-9]{40}$/.test(review.commit_id)&&review.commit_id!==head){
-  const staleSummary=commits.length===1&&commits[0][1]===context.repo&&commits[0][2]===review.commit_id&&summary.issue_url===`https://api.github.com/repos/${context.repo}/issues/${context.pr}`&&Number.isFinite(time(summary.updated_at))&&Number.isFinite(time(review.submitted_at))&&time(summary.updated_at)<=time(review.submitted_at);
-  const currentRuns=context.checks.filter(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head);
-  const singlePendingRun=currentRuns.length===1&&currentRuns[0].status!=='completed';
-  if(staleSummary&&(!currentRuns.length||singlePendingRun))return empty;
-  return {...empty,blocker:'CodeRabbit custom-check summary or run currency is ambiguous for the stale review; obtain current-head review evidence'};
- }
  if(unclassified)return blocked('pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary');
  if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
  if(version?.headRefOid!==head||version.body!==body||!Number.isFinite(time(version.createdAt))||!(version.lastEditedAt===null||Number.isFinite(time(version.lastEditedAt))))return blocked('current description version is unavailable');
  const runs=checks.filter(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.name==='CodeRabbit');
- if(runs.length!==1)return blocked('review run is ambiguous');
+ if(runs.length!==1)return blocked(`review run is ambiguous: ${runs.length} current-head runs (${runs.map(r=>r.id).join(', ')||'none'}); inspect the CodeRabbit runs before retry`);
  const run=runs[0],start=time(run.started_at),end=time(run.completed_at),submitted=time(review.submitted_at),edited=time(summary.updated_at);
  if(run.status!=='completed'||!Number.isSafeInteger(run.id)||![start,end,submitted,edited].every(Number.isFinite)||end<start||submitted<start||submitted>end||edited<start||edited>end||time(version.lastEditedAt??version.createdAt)>start)return blocked('summary or description changed outside the current completed review run');
  if(commits.length!==1||commits[0][1]!==repo||commits[0][2]!==head||summary.issue_url!==`https://api.github.com/repos/${repo}/issues/${pr}`)return blocked('summary run does not identify this PR and head');
