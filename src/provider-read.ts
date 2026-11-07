@@ -53,8 +53,8 @@ export async function githubRead(args:string[],operation='branch-read',spawn=Bun
  const p=spawn(['gh',...args,...(include?['--include']:[])],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  let parsed:ReturnType<typeof githubOutput>;
- try{parsed=githubOutput(out);}catch(cause){if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,cause);throw cause;}
- if(code!==0)throw readFailure('github',operation,p.signalCode?'timeout':err,code,undefined,Date.now(),parsed.protocol+parsed.json);
+ try{parsed=githubOutput(out);}catch(cause){if(code!==0)throw readFailure('github',operation,p.signalCode==='SIGTERM'?'timeout':err,code,cause);throw cause;}
+ if(code!==0)throw readFailure('github',operation,p.signalCode==='SIGTERM'?'timeout':err,code,undefined,Date.now(),parsed.protocol+parsed.json);
  try{return JSON.parse(parsed.json);}catch(cause){throw malformed('github',operation,cause);}
  }catch(cause){if(cause instanceof ProviderReadError)throw cause;throw readFailure('github',operation,'',undefined,cause);}
 }

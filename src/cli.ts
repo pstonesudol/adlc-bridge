@@ -375,7 +375,8 @@ Registered approved review targets can request bounded in-scope fixes from their
      if(a.length!==1&&!(a.length===4&&a[1]==='--override-shared-cooldown'))throw Error('Use retry-observation JOB [--override-shared-cooldown github|orchestrator EXPECTED_NEXT_READ]');
      lifecycle.current(a[0]);const observation=new RecoveryObservation(s);
      if(a.length===4){observation.overrideCooldown(a[0],a[2],Number(a[3]));return out({job:a[0],readRetry:false,mutationReplay:false,sharedCooldown:'cleared',jobWait:'retained; retry-observation JOB separately'});}
-     observation.retry(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');return out({job:a[0],readRetry:true,mutationReplay:false,sharedCooldown:'retained'});
+     s.db.transaction(()=>{observation.retry(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');}).immediate();
+     return out({job:a[0],readRetry:true,mutationReplay:false,sharedCooldown:'retained'});
     }
     if(command==='authorize-base-merge'){
      return out(authorizeBaseMerge(lifecycle,a));

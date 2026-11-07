@@ -85,3 +85,9 @@ test('untyped transport failures stay unknown despite transient-looking text',as
  catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe('unknown');expect((error as Error).cause).toBe(cause);}
  }
 });
+test('only SIGTERM classifies a killed read as a timeout',async()=>{
+ for(const [signal,classification] of [['SIGTERM','timeout'],['SIGKILL','unknown']] as const){
+ try{await githubRead(['api','fixture'],'branch-read',spawn('HTTP/2.0 200 OK\r\nx-partial: value','',137,signal));throw Error('Expected failure');}
+ catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe(classification);expect((error as ProviderReadError).evidence.exitStatus).toBe(137);}
+ }
+});

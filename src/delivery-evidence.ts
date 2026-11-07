@@ -12,8 +12,8 @@ export const command:ProcessRunner=async(args,cwd)=>{
  // GitHub and Orchestrator reads carry typed, secret-safe evidence so a
  // transient failure can be retried instead of becoming a permanent reason.
  if(code!==0){
- if(args[0]==='gh')throw readFailure('github','recovery-facts',p.signalCode?'timeout':err,code);
- if(args[0]===AO)throw readFailure('orchestrator','recovery-facts',p.signalCode?'timeout':err,code);
+ if(args[0]==='gh')throw readFailure('github','recovery-facts',p.signalCode==='SIGTERM'?'timeout':err,code);
+ if(args[0]===AO)throw readFailure('orchestrator','recovery-facts',p.signalCode==='SIGTERM'?'timeout':err,code);
  throw Error(`Required evidence unavailable: ${args[0]} ${args[1]}`);
  }
  return out.trim();

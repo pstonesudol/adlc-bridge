@@ -29,7 +29,7 @@ async function collectSessionEvidence(session:string,spawn:typeof Bun.spawn,fres
  const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:Math.min(30000,remaining)});
  const [text,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(Date.now()>=deadline)throw readFailure('orchestrator','session-evidence','timeout');
- if(code!==0)throw readFailure('orchestrator','session-evidence',p.signalCode?'timeout':err,code);
+ if(code!==0)throw readFailure('orchestrator','session-evidence',p.signalCode==='SIGTERM'?'timeout':err,code);
  let r;try{r=JSON.parse(text);}catch(cause){throw malformed('orchestrator','session-evidence',cause);}
  if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw malformed('orchestrator','session-evidence');
  if(!first)first=r;
