@@ -6,6 +6,7 @@ import {attestMetadataChecks,currentMetadataChecks} from './metadata-attestation
 import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
+import {collectReviewSchedule} from './coderabbit-scheduling';
 
 async function gh(args: string[]): Promise<any> {
   return githubRead(args,'review-read');
@@ -157,7 +158,13 @@ export async function readiness(repo:string, number:number, required:string[],me
     const metadataFindingsCI=await templateCIFindings(repo,first.head.sha,checks,metadataChecks,descriptionHash,path=>gh(['api',path]),templateLogReader(),currentBodyEvidence);
   findings.push(...metadataFindingsCI);
   const botChecks=checks.filter((c:any)=>c.app?.slug==='coderabbitai'&&c.head_sha===first.head.sha);
+  const reviewSchedule=await collectReviewSchedule(repo,final,currentBase,comments,reviews,checks,gh);
+  const scheduleFinal=await gh(['api',`${base}/pulls/${number}`]);
+  if(scheduleFinal.head?.sha!==final.head.sha||scheduleFinal.base?.ref!==final.base.ref||scheduleFinal.body!==final.body||scheduleFinal.draft!==final.draft||scheduleFinal.state!=='open'||await baseTip(repo,final.base.ref)!==currentBase)reviewSchedule.blocker='CodeRabbit review unavailable: PR or base changed during configuration collection';
+  if(reviewSchedule.blocker){gate.clear=false;gate.reasons.push(reviewSchedule.blocker);}
+  if(final.head.sha!==first.head.sha){gate.clear=false;reviewSchedule.blocker='CodeRabbit review unavailable: head changed during collection';}
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
+    reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login})),
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
     coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
     metadataCheckEvidence:currentBodyEvidence,

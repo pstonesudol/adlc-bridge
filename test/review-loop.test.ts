@@ -11,6 +11,7 @@ import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import
 import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
+import {ReviewRateLimit} from '../src/coderabbit-scheduling';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -42,7 +43,7 @@ test('full review requests survive lost replies without duplicate comments',asyn
  const s=new Store(':memory:'),p=new Planning(s),id=s.enqueue('p','i','spec'),r=p.reserve(id,'project');
  p.gate(id,'project','session',r.branch,'/worktree');const hash=s.propose(id,'plan');s.approve(id,hash,'human');
  new Lifecycle(s).adoptSupervised(id,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
- let calls=0;const loop=new ReviewLoop(s,async()=>{calls++;throw Error('Reply lost');});loop.register(id,'owner/repo',1,['CI'],['a'],true);
+ let calls=0;const loop=new ReviewLoop(s,async()=>{calls++;throw Error('Reply lost');},{readiness:async()=>({head:'sha',descriptionHash:'body',reviewSchedule:{head:'sha',signature:'config',blocker:null,incremental:false}}) as any});loop.configureMetadataChecks('p',[]);loop.register(id,'owner/repo',1,['CI'],['a'],true);
  await expect(loop.requestReview(id,loop.get(id).pr,'sha','body')).rejects.toThrow('lost');
  expect(await loop.requestReview(id,loop.get(id).pr,'sha','body')).toBe(false);expect(calls).toBe(1);
  expect((s.db.query('SELECT state FROM full_review_requests').get() as any).state).toBe('delivery_uncertain');s.close();
@@ -64,12 +65,52 @@ function templateFixture(){
   return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
  }};
  const loop=new ReviewLoop(s,async()=>{reviews++;},{readBranchSnapshot:io.readBranchSnapshot,worktreeIdentity:io.worktreeIdentity,readiness:io.readiness,sessionEvidence:io.sessionEvidence,disableNativeFeedback:async()=>({}),sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)} as any);
+ e.reviewSchedule={head,signature:'config',blocker:null,incremental:false};
  loop.configureMetadataChecks('project',['PR body structure']);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
+ loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
+test('missing current-head review gets one request after grace, retries only confirmed throttling, then blocks specifically',async()=>{
+ const f=templateFixture();try{
+  Object.assign(f.e,{findings:[],failedChecks:[],reasons:['Explicit latest-SHA CodeRabbit approval missing'],coderabbitPresent:false});f.loop.configureMetadataChecks('project',[]);
+  f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now());
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(0);
+  f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
+  let calls=0;f.loop.postReview=async()=>{if(++calls===1)throw new ReviewRateLimit(Date.now()+60000);};
+  await f.loop.tick(f.id);await f.loop.tick(f.id);expect(calls).toBe(1);
+  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0').run();await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
+  await f.loop.tick(f.id);expect(calls).toBe(2);
+  f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',reason:'CodeRabbit review unavailable: no eligible current-head approval after 30 minutes; inspect scheduling and request evidence'});
+ }finally{f.s.close();}
+});
+test('automatic incremental mode waits without manual requests and configuration drift blocks even clear evidence',async()=>{
+ const f=templateFixture();try{
+  Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);f.e.reviewSchedule.incremental=true;
+  await f.loop.tick(f.id);expect(f.reviews()).toBe(0);
+  f.e.clear=true;f.e.reviewSchedule.blocker='CodeRabbit review unavailable: head/base policy differs';expect((await f.loop.tick(f.id)).state).toBe('blocked');expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
+test('configuration revalidation prevents posting after policy changes',async()=>{
+ const f=templateFixture();try{
+  Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);
+  const expected={...f.e,reviewSchedule:{...f.e.reviewSchedule}};f.e.reviewSchedule.signature='changed';
+  expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash,expected)).toBe(false);expect(f.reviews()).toBe(0);expect(f.loop.get(f.id).state).toBe('blocked');
+ }finally{f.s.close();}
+});
+test('matching marked comment reconciles uncertain request without replay or inferring approval',async()=>{
+ const f=templateFixture();try{
+  Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);
+  let marker='',posts=0;f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('lost');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('lost');
+  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai full review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(posts).toBe(1);
+  expect(f.loop.requests.get('owner/repo',1,f.head).state).toBe('accepted');expect(f.e.clear).toBe(false);
+ }finally{f.s.close();}
+});
 function customLoopFixture(){
  const f=templateFixture(),custom=customFixture();
  f.loop.configureMetadataChecks('project',[]);
@@ -396,7 +437,7 @@ test('removing metadata policy cannot bypass an uncertain description send or it
   expect(f.s.db.query('SELECT * FROM description_delivery_gates').all()).toHaveLength(1);await f.loop.tick(f.id);expect(f.reviews()).toBe(1);expect(f.sends()).toBe(1);
   f.loop.configureMetadataChecks('project',['Alternative']);f.e.metadataCheckEvidence=bodyEvidence(f.e,['Alternative']);expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');f.loop.configureMetadataChecks('project',[]);
   f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
-  f.e.descriptionHash='another-body';f.e.botReviewSubmittedAt=Date.now()-1000;expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(2);
+  f.e.descriptionHash='another-body';f.e.botReviewSubmittedAt=Date.now()-1000;expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(f.reviews()).toBe(1);
  }finally{f.s.close();}
 });
 test('clearing metadata policy after delivery reconciliation still requires review of the delivered description',async()=>{
@@ -647,8 +688,10 @@ test('a review request for an unregistered PR posts nothing',async()=>{
   expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(0);
   expect(f.loop.get(f.id).pr).toBe(registered);
   // The registered PR still requests normally.
-  expect(await f.loop.requestReview(f.id,registered,f.head,'body')).toBe(true);
-  expect(calls).toEqual([['owner/repo',registered]]);
+  f.e.findings=[];f.e.failedChecks=[];
+  expect(await f.loop.requestReview(f.id,registered,f.head,f.e.descriptionHash)).toBe(true);
+  expect(calls[0].slice(0,2)).toEqual(['owner/repo',registered]);
+  expect(calls[0][2]).toContain('adlc-coderabbit-request:');
  }finally{f.s.close();}
 });
 test('a target rebound during a tick keeps the old PR decision unwritten',async()=>{
@@ -703,11 +746,12 @@ test('failed review requests revoke stale ready state but retain their reservati
   expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(f.loop.get(f.id).state).toBe('needs_reconciliation');expect(requests).toBe(1);expect(f.sends()).toBe(0);
   f.e.clear=true;f.e.botReviewSubmittedAt=Date.now()+1000;expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');expect(requests).toBe(1);
   // Simulate explicit reconciliation of the delivery receipt, not a resend.
-  f.s.db.query("UPDATE full_review_requests SET state='accepted'").run();expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(requests).toBe(1);
+  f.s.db.query("UPDATE full_review_requests SET state='accepted'").run();f.s.db.query("UPDATE coderabbit_requests SET state='accepted'").run();expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(requests).toBe(1);
  }finally{f.s.close();}}
 });
 test('a late failed review request cannot reopen a concurrently completed target',async()=>{
  const f=templateFixture();try{
+  f.e.findings=[];f.e.failedChecks=[];
   let terminal:any;f.loop.postReview=async()=>{f.loop.record(f.id,{state:'completed',send:false,head:f.head,reason:'Merge observed'});terminal=f.loop.get(f.id);throw Error('Late GitHub failure');};
   await expect(f.loop.requestReview(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash)).rejects.toThrow('Late GitHub failure');expect(f.loop.get(f.id)).toEqual(terminal);expect(f.s.db.query('SELECT state FROM full_review_requests').get()).toEqual({state:'delivery_uncertain'});
  }finally{f.s.close();}
@@ -730,7 +774,7 @@ test('description edits cannot escape same-head review-request uncertainty or tr
   // Even a separately accepted receipt for the new body cannot mask the old
   // same-head uncertain delivery. Every outstanding receipt must be reconciled.
   f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,f.loop.get(f.id).pr,f.head,f.e.descriptionHash,'accepted',Date.now());expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
-  f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
+  f.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND head=? AND body_hash=?").run(f.id,f.head,originalBody);f.s.db.query("UPDATE coderabbit_requests SET state='accepted'").run();expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(posts).toBe(1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 // #4/#5-shaped carried-forward thread: unresolved, mapped to current code, but

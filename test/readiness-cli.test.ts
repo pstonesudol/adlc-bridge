@@ -2,14 +2,16 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,writeFileSync,existsSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {digest} from '../src/core';
 import {REVIEW_THREADS_QUERY,REVIEW_THREAD_COMMENTS_QUERY} from '../src/github';
+import {CONFIG_QUERY} from '../src/coderabbit-scheduling';
 
 test('real readiness CLI gates otherwise-successful metadata checks on body evidence, but not an empty policy',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-readiness-cli-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
-  const pr={head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
+  const pr={number:1,changed_files:1,labels:[],head:{sha:head,repo:{full_name:'owner/repo'}},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
   const checks=['CI','Metadata','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
   const review={user:{login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
   const responses:any={
+   'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/a.ts'}]],
    'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
@@ -20,6 +22,8 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
   const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}}}}}};
   const query=REVIEW_THREADS_QUERY;
   const graphqlArgs=['api','graphql','-f',`query=${query}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
+  const configArgs=['api','graphql','-f',`query=${CONFIG_QUERY}`,'-f','owner=owner','-f','name=repo','-f',`hy=${head}:.coderabbit.yaml`,'-f',`hm=${head}:.coderabbit.yml`,'-f',`by=${base}:.coderabbit.yaml`,'-f',`bm=${base}:.coderabbit.yml`];
+  const configGraphql={data:{repository:{defaultBranchRef:{name:'main'},hy:{oid:'blob',text:'reviews: {}'},hm:null,by:{oid:'blob',text:'reviews: {}'},bm:null}}};
   // Replace gh entirely; this process has no credentials or network fallback.
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
@@ -28,8 +32,8 @@ if(args[0]!=='api')throw Error('Read-only fixture only');
 let result;
 if(args[1]==='graphql'){
  // Field flags are allowed only for this exact read-only query and variables.
- if(JSON.stringify(args)!==JSON.stringify(${JSON.stringify(graphqlArgs)}))throw Error('Read-only fixture only');
- result=${JSON.stringify(graphql)};
+ if(JSON.stringify(args)===JSON.stringify(${JSON.stringify(configArgs)}))result=${JSON.stringify(configGraphql)};
+ else {if(JSON.stringify(args)!==JSON.stringify(${JSON.stringify(graphqlArgs)}))throw Error('Read-only fixture only');result=${JSON.stringify(graphql)};}
 }else{
  // REST accepts only plain or paginated GET argument shapes: no -f/-F,
  // --field/--raw-field, method overrides, inputs, or attached flag forms.

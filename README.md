@@ -2365,3 +2365,33 @@ remain in force. Recovering reads does not clear those blockers or reset attempt
 Source changes do not activate the pinned live runtime. After human review and
 manual merge, an operator must follow the guarded runtime activation workflow;
 coding workers must not install, activate, restart or deploy the live bridge.
+# CodeRabbit review recovery
+
+Review scheduling uses GitHub-hosted `.coderabbit.yaml` (or `.coderabbit.yml`)
+from the PR head, as documented by CodeRabbit's
+[YAML configuration guide](https://docs.coderabbit.ai/getting-started/yaml-configuration).
+It does not read the local checkout or require a duplicate project mode setting.
+ADLC clearance still requires its configured checks and explicit current-head bot
+approval. Head/base YAML differences block clearance until trusted base policy is
+reconciled; a feature branch cannot weaken its own clearance policy.
+
+Automatic incremental reviews are awaited, not manually requested. With automatic
+review enabled and incremental review disabled, an idle worker and five-minute
+stable-head/config grace period precede a request. Accepted or uncertain requests
+consume the repository/PR/head budget, even across description edits and restarts.
+Confirmed HTTP 403/429 rate-limit rejection permits retry after the persisted
+provider cooldown (at least one minute; default 30 minutes), with at most three
+attempts per head. Unknown outcomes are never retried blindly. Matching marked
+GitHub request comments can reconcile uncertain delivery; otherwise operator
+inspection is required. Missing review evidence after 30 minutes yields a specific
+CodeRabbit blocker through the existing optional Linear blocker synchronization.
+
+Conservative fallback: missing/competing filenames, malformed or inherited YAML,
+unsupported filters/branch expressions, unavailable changed-file evidence, and
+intentional exclusions block rather than guessing or requesting reviews. Supported
+path filters use ordinary repository-relative `*`, `**` and `?` globs; complex
+patterns require operator reconciliation. Auto-pause uses a conservative count of
+distinct reviewed commits; when its threshold may have been reached, inspect the
+provider's pause state rather than automatically resuming. Disabled automatic
+review is never overridden, even if a description keyword could opt in.
+These blockers do not grant approval. Merges remain human-only.

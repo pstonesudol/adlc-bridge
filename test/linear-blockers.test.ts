@@ -179,13 +179,13 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
  }finally{f.s.close();}
 });
-test('ambiguous custom-check provenance publishes a concrete deduplicated blocker instead of approval timeout',async()=>{
+for(const reason of ['CodeRabbit custom-check failure: full Verification Evidence explanation/resolution is missing or truncated','CodeRabbit review unavailable: automatic review disabled','CodeRabbit review unavailable: request outcome uncertain'])test(`concrete review blocker is deduplicated: ${reason}`,async()=>{
  const f=fixture();try{
   new ReviewLoop(f.s);f.running();
   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree) VALUES (?,?,?,?,?,?)').run(f.id,'owned',f.s.get(f.id).plan_hash,'running','session','/worktree');
-  f.s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head,state,reason,head_since) VALUES (?,?,?,?,?,?,?,?,?,?)").run(f.id,'owner/repo',1,'["CI"]','["src/**"]',1,'a'.repeat(40),'blocked','CodeRabbit custom-check failure: full Verification Evidence explanation/resolution is missing or truncated',Date.now());
+  f.s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,remediate,head,state,reason,head_since) VALUES (?,?,?,?,?,?,?,?,?,?)").run(f.id,'owner/repo',1,'["CI"]','["src/**"]',1,'a'.repeat(40),reason.includes('uncertain')?'needs_reconciliation':'blocked',reason,Date.now());
   await f.blockers().sync(f.config);await f.blockers().sync(f.config);
-  expect(f.creates).toBe(1);expect(f.comments[0].body).toContain('explanation/resolution is missing or truncated');expect(f.comments[0].body).toContain('Do not post secrets');expect(f.labels).toContain(labelId);
+  expect(f.creates).toBe(1);expect(f.comments[0].body).toContain(reason);expect(f.comments[0].body).toContain('Do not post secrets');expect(f.labels).toContain(labelId);
  }finally{f.s.close();}
 });
 for(const stale of ['spec-reset','approval-revoked','new-plan','tampered-plan','stale-run','missing-run','human-owned'])test(`superseded review blocker is not published: ${stale}`,async()=>{
