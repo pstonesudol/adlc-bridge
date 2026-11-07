@@ -87,6 +87,21 @@ test('reserved conflict recovery retries transient orchestrator facts failures a
  expect(f.sends()).toBe(1);
  }finally{setSystemTime();f.close();}
 },60000);
+test('transient reservation reads back off before a conflict recovery row exists',async()=>{
+ const f=await fixture();let fail=true;
+ const facts=async()=>{if(fail)throw readFailure('github','recovery-facts','HTTP 503',1);return f.io.facts(f.job,f.config);};
+ try{
+ const first=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(first).toMatchObject({state:'waiting_for_worker',send:false,reason:expect.stringContaining('backoff')});expect(f.recovery.row(f.job)).toBeUndefined();expect(f.sends()).toBe(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status).toMatchObject({failures:1,evidence:{provider:'github',classification:'server'}});
+ let reads=0;const counted=async()=>{reads++;return f.io.facts(f.job,f.config);};
+ expect((await new ConflictRecovery(f.s,{...f.io,facts:counted} as any).tick(f.job,f.config,'owner/repo',1)).state).toBe('waiting_for_worker');
+ expect(reads).toBe(0);expect(f.recovery.row(f.job)).toBeUndefined();
+ fail=false;setSystemTime(new Date(status.next_read+1));
+ expect((await new ConflictRecovery(f.s,{...f.io,facts:counted} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
 test('reserved manual preview is read-only and guards retain observation history',async()=>{
  const f=await fixture();let reads=0;let reader:Store|undefined;
  try{

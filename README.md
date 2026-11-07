@@ -2059,9 +2059,9 @@ planned, not success-shaped placeholders; existing guarded engine commands remai
 available as documented elsewhere.
 # Read-only observation recovery
 
-Review-loop GitHub branch/ancestry/readiness reads, reserved conflict-recovery
-delivery facts and Orchestrator session evidence have durable observation
-recovery, separate from remediation and all
+Review-loop GitHub branch/ancestry/readiness reads, conflict-recovery delivery
+facts (before and after reservation) and Orchestrator session evidence have
+durable observation recovery, separate from remediation and all
 mutation receipts. Evidence stores provider, safe operation, time, classification,
 exit/HTTP status and available retry/request identifiers. Raw stderr, credentials,
 URLs and response bodies are not retained; diagnostics are an allowlisted summary.

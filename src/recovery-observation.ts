@@ -20,7 +20,11 @@ export class RecoveryObservation{
  status(job:string){const r=this.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(job) as any;if(!r)return null;let evidence;try{evidence=JSON.parse(r.reason);}catch{}const capacity=evidence?.provider?this.s.db.query('SELECT next_read FROM observation_capacity WHERE provider=?').get(evidence.provider) as any:null;return {...r,evidence:evidence?.classification?evidence:null,evidenceAgeMs:evidence?.timestamp?Math.max(0,this.now()-evidence.timestamp):null,sharedNextRead:capacity?.next_read??null};}
  wait(job:string){const merge=this.s.db.query('SELECT * FROM mergeability_waits WHERE job=?').get(job) as any;
  if(merge&&(merge.waits>=6||this.now()<merge.next_read))return {state:merge.waits>=6?'blocked':'updating_branch',send:false,reason:merge.waits>=6?`Mergeability remained unknown for six observations; inspect GitHub branch state, then retry-observation ${job}. No mutation replay.`:`Mergeability unknown; next read at ${new Date(merge.next_read).toISOString()}`};
- const r=this.status(job);if(!r)return null;
+ return this.readWait(job);
+ }
+ // Provider observations only: callers that have not reserved anything yet still
+ // honour the shared read backoff instead of retrying every poll.
+ readWait(job:string){const r=this.status(job);if(!r)return null;
  const permanent=r.evidence&&!transient(r.evidence);
  if(permanent||this.now()<r.next_read)return {state:permanent?'blocked':'waiting_for_worker',send:false,reason:permanent?`${r.evidence.provider} ${r.evidence.classification}: inspect provider login, repository/session access and configuration; then retry-observation ${job}. No mutation will be replayed.`:`Read observation backoff until ${new Date(r.next_read).toISOString()}; no mutation will be replayed`,observation:r};
  return null;

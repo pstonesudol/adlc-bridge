@@ -215,19 +215,33 @@ export class ConflictRecovery{
    let r=this.row(job);
    if(r?.state==='completed')r=undefined;
    if(!r){
-    const p=await this.preview(job,c,repo,pr);
-    const x=await this.inspect(job,c,repo,pr);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
-    this.install();
-    r=this.s.db.transaction(()=>{
-     assertWorktreeAvailable(this.s,job);this.pending(job);const a=this.auth(job,c);
-     if(a.plan!==p.plan)throw Error('Approval changed before reservation');
-     if(recoveryRows(this.s).filter(r=>r.job===job).length>=c.conflictRecovery.maxRecoveries)throw Error('Conflict recovery limit reached; operator inspection required');
-     const id=digest(JSON.stringify([job,p.plan,repo,pr,p.head,p.base]));
-     const attempt=new Lifecycle(this.s).reserveRemediation(job,p.head,`base-conflict:${id}`,budget) as any;
-     if(attempt.blocked||attempt.reused)throw Error(attempt.reason??'Recovery already reserved; never replay');
-     this.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,job,p.plan,p.worktree,a.session,repo,pr,x.b.branch,x.b.baseBranch,p.head,p.base,JSON.stringify(c.conflictRecovery),'reserved',`adlc-conflict-${id}`,attempt.attempt,JSON.stringify({paths:JSON.parse(a.paths)}),null,Date.now());
-     return this.row(job);
-    }).immediate();
+    // An earlier transient read failure holds this job before any reservation;
+    // never retry every poll or consume the mutation budget for a read.
+    const backoff=new RecoveryObservation(this.s).readWait(job);if(backoff)return backoff;
+    try{
+     const p=await this.preview(job,c,repo,pr);
+     const x=await this.inspect(job,c,repo,pr);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
+     this.install();
+     r=this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);this.pending(job);const a=this.auth(job,c);
+      if(a.plan!==p.plan)throw Error('Approval changed before reservation');
+      if(recoveryRows(this.s).filter(r=>r.job===job).length>=c.conflictRecovery.maxRecoveries)throw Error('Conflict recovery limit reached; operator inspection required');
+      const id=digest(JSON.stringify([job,p.plan,repo,pr,p.head,p.base]));
+      const attempt=new Lifecycle(this.s).reserveRemediation(job,p.head,`base-conflict:${id}`,budget) as any;
+      if(attempt.blocked||attempt.reused)throw Error(attempt.reason??'Recovery already reserved; never replay');
+      this.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,job,p.plan,p.worktree,a.session,repo,pr,x.b.branch,x.b.baseBranch,p.head,p.base,JSON.stringify(c.conflictRecovery),'reserved',`adlc-conflict-${id}`,attempt.attempt,JSON.stringify({paths:JSON.parse(a.paths)}),null,Date.now());
+      return this.row(job);
+     }).immediate();
+    }catch(error){
+     // Reads before the reservation are observation-backed like the reserved
+     // stage; validation and uncertainty failures keep their existing handling.
+     if(error instanceof ProviderReadError||error instanceof ObservationDeferred){
+      assertObservationFence();const observations=new RecoveryObservation(this.s);
+      if(error instanceof ProviderReadError)observations.failed(job,error);
+      return {...(observations.readWait(job)??{state:'waiting_for_worker',send:false,reason:error.message})};
+     }
+     throw error;
+    }
    }
    if(r.repo!==repo||r.pr!==pr)throw Error('Recovery target mismatch');
    if(r.state==='reserved'){const wait=new RecoveryObservation(this.s).wait(job);if(wait)return {...wait,recovery:r.id,stage:r.state};}
