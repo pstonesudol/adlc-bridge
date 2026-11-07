@@ -61,7 +61,7 @@ export function capturePlan(s:Store,job:string,r:any,sequence:number,expectRevis
  const entry=r.transcript?.entries?.find((e:any)=>e.sequence===sequence);
  if(!entry||entry.kind!=='message'||entry.role!=='assistant'||entry.origin!=='provider'||entry.streaming||!entry.text?.trim())throw Error('Completed assistant plan entry required');
  if(j.plan===entry.text&&j.plan_hash===digest(JSON.stringify([j.spec,entry.text])))return {hash:j.plan_hash,approved:j.state==='approved',session:r.session.id,sequence,readiness:recordReadiness(s,job,entry.text,j.plan_hash,digest(j.spec))};
- if(j.state!=='awaiting_plan')throw Error('Existing plan requires explicit reconciliation before replacement');
+ if(j.state!=='awaiting_plan')throw Error('Existing plan requires explicit reconciliation before replacement; preview plan-reconcile JOB CONFIG SEQUENCE for completed same-spec evidence, or spec-reconcile after requirement changes');
  return s.db.transaction(()=>{
  const hash=s.propose(job,entry.text,expectRevision);
  s.db.query("UPDATE planning_runs SET session_id=?,state='plan_captured' WHERE job=?").run(r.session.id,job);

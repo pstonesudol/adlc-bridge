@@ -53,6 +53,7 @@ import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
 import {SpecRecovery} from './spec-recovery';
+import {PlanReconciliation} from './plan-reconciliation';
 import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revisions';
 import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
 import {modernCommand,dispatchOperator} from './operator-dispatch';
@@ -276,6 +277,8 @@ async function main(){
   ingest PROJECT ISSUE SPEC_FILE        local ingestion
   plan JOB PLAN_FILE                    submit plan
   capture-plan JOB SESSION SEQUENCE     capture a specific Orchestrator plan; no approval
+  plan-reconcile JOB CONFIG SEQUENCE [--confirm HASH]
+                                       preview/confirm completed same-spec plan replacement; no approval
 reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
 spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning only after a spec edit
   dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
@@ -356,6 +359,13 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{s.close();}
   }
   if(command==='status'&&!existsSync(db))return out({jobs:[],intents:[],executionEnabled:false});
+   if(command==='plan-reconcile'){
+    if(a.length!==3&&!(a.length===5&&a[3]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[4])))throw Error('Use plan-reconcile JOB CONFIG SEQUENCE [--confirm HASH]');
+    const config=projectConfiguration(req(a[1],'Config'));validate(config);
+    if(!existsSync(db))throw Error('Existing database required');
+    const applying=a.length===5,store=new Store(db,!applying);
+    try{return out(await new PlanReconciliation(store,new Workflow(store,liveTransport,undefined,!applying)).reconcile(req(a[0],'Job'),config,Number(a[2]),a[4]));}finally{store.close();}
+   }
    if(command==='spec-reconcile'){
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-reconcile JOB CONFIG [--confirm HASH]');
     const config=projectConfiguration(a[1]);validate(config);
