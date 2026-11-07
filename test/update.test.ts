@@ -186,6 +186,18 @@ test('schema rollback requires a baseline captured before intake restarts',async
   }finally{f.close();}
  }
 });
+test('schema rollback refuses committed writes still present only in the WAL',async()=>{
+ const f=fixture({files:['src/cli.ts','patches/001.sql'],migration:{required:true,compatible:true,rollbackSafe:true,detail:'compatible'}});
+ const path=join(f.state,'state.sqlite'),database=new Database(path);
+ try{
+  database.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence (value TEXT); PRAGMA wal_checkpoint(TRUNCATE);');
+  f.io.dbHash=()=>dbHash(path);await f.manager.apply();
+  const main=readFileSync(path),baseline=dbHash(path);expect(baseline).not.toBeNull();
+  database.exec("INSERT INTO evidence VALUES ('committed after activation')");
+  expect(readFileSync(path).equals(main)).toBe(true);expect(dbHash(path)).not.toBe(baseline);
+  await expect(f.manager.rollback()).rejects.toThrow('Database changed after activation');expect(f.installs).toHaveLength(1);
+ }finally{database.close();f.close();}
+});
 test('apply refuses staged content changed by candidate tests',async()=>{
  const f=fixture();try{
   let modified=false;const stage=f.io.stage;
