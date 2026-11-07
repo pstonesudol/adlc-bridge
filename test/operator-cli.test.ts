@@ -12,7 +12,13 @@ test('CLI shared cooldown override and job retry remain separate operator action
  const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}'),hash=s.propose(id,'plan');s.approve(id,hash,'human');
  const o=new RecoveryObservation(s);o.failed(id,readFailure('github','branch-read','HTTP 429\nRetry-After: 999999999\n',1));const expected=o.status(id).sharedNextRead;s.close();
  const run=(...args:string[])=>Bun.spawnSync([process.execPath,cli,'retry-observation',id,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:path}});
- expect(run('--override-shared-cooldown','github',String(expected-1)).exitCode).not.toBe(0);
+ const stale=run('--override-shared-cooldown','github',String(expected-1));
+ expect(stale.exitCode).not.toBe(0);expect(stale.stderr.toString()).toContain('Shared cooldown changed; inspect before overriding');
+ const unchanged=new Store(path);expect(new RecoveryObservation(unchanged).status(id).sharedNextRead).toBe(expected);unchanged.close();
+ for(const args of [['--override-shared-cooldown','linear',String(expected)],['--override-shared-cooldown','github',`${expected}x`]]){
+  const invalid=run(...args);expect(invalid.exitCode).not.toBe(0);expect(invalid.stderr.toString()).toContain('Provider and inspected cooldown timestamp required');
+ }
+ const still=new Store(path);expect(new RecoveryObservation(still).status(id).sharedNextRead).toBe(expected);still.close();
  const override=run('--override-shared-cooldown','github',String(expected));expect(override.exitCode).toBe(0);expect(JSON.parse(override.stdout.toString())).toMatchObject({readRetry:false,sharedCooldown:'cleared',mutationReplay:false});
  const inspect=new Store(path);expect(new RecoveryObservation(inspect).status(id)).toMatchObject({failures:1,sharedNextRead:null});inspect.close();
  expect(run().exitCode).toBe(0);const after=new Store(path);expect(new RecoveryObservation(after).status(id)).toBeNull();after.close();

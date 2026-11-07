@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
@@ -7,6 +7,28 @@ import {ConflictRecovery} from '../src/conflict-recovery';
 import {ReviewLoop} from '../src/review-loop';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
+test('posted observation notice is rechecked hourly without duplicates',async()=>{
+ const f=fixture();try{
+ f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ const blockers=f.blockers();await blockers.sync(f.config);expect(f.creates).toBe(1);
+ const created=Date.parse(f.comments[0].createdAt),before=f.calls;
+ await blockers.sync(f.config);expect(f.calls).toBe(before);expect(f.creates).toBe(1);
+ setSystemTime(new Date(created+60*60*1000+1));await blockers.sync(f.config);
+ expect(f.calls).toBeGreaterThan(before);expect(f.creates).toBe(1);
+ }finally{setSystemTime();f.s.close();}
+});
+test('transient or unapproved observations publish no notice',async()=>{
+ const f=fixture();try{
+ f.running();const observations=new RecoveryObservation(f.s);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 503',1));
+ await f.blockers().sync(f.config);
+ expect(f.comments.some(c=>c.body.includes('provider observation recovery required'))).toBe(false);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ f.s.db.query("UPDATE jobs SET state='awaiting_plan' WHERE id=?").run(f.id);
+ await f.blockers().sync(f.config);
+ expect(f.comments.some(c=>c.body.includes('provider observation recovery required'))).toBe(false);
+ }finally{f.s.close();}
+});
 test('observation notice does not retain an old-plan owned blocker label',async()=>{
  const f=fixture();try{
  const blockers=f.blockers();await blockers.sync(f.config);expect(f.labels).toContain(labelId);
@@ -14,6 +36,7 @@ test('observation notice does not retain an old-plan owned blocker label',async(
  f.s.db.query("UPDATE jobs SET state='approved',plan=?,plan_hash=?,approved_hash=? WHERE id=?").run(plan,hash,hash,f.id);
  new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
  await blockers.sync(f.config);expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.labels).toContain('ready');
+ expect(f.comments[1].body).toContain('## ADLC: provider observation recovery required');
  }finally{f.s.close();}
 });
 

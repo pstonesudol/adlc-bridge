@@ -1,5 +1,5 @@
 import {existsSync} from 'node:fs';
-import {fencedIO,assertObservationFence} from './observation-fence';
+import {fencedIO,assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
 import {ProviderReadError} from './provider-read';
 import {resolve} from 'node:path';
@@ -238,6 +238,7 @@ export class ConflictRecovery{
     }catch(error){
      // The observation-backed reads already recorded one failure per attempt;
      // never record it twice here. Validation and uncertainty keep their path.
+     if(error instanceof ObservationLeaseLost)throw error;
      if(error instanceof ProviderReadError||error instanceof ObservationDeferred)return {...(observations.readWait(job)??{state:'waiting_for_worker',send:false,reason:error.message})};
      throw error;
     }
@@ -252,6 +253,8 @@ export class ConflictRecovery{
    }
    const previousReadFailures=r.state==='reserved'?new RecoveryObservation(this.s).status(job)?.failures??0:0;
    try{return await this.advance(r,c);}catch(error){
+    // A lost lease is not a recovery failure; the owner of the lease decides.
+    if(error instanceof ObservationLeaseLost)throw error;
     if(r.state==='reserved'&&(error instanceof ProviderReadError||error instanceof ObservationDeferred)){
      assertObservationFence();const observations=new RecoveryObservation(this.s);
      if(error instanceof ProviderReadError&&(observations.status(job)?.failures??0)===previousReadFailures)observations.failed(job,error);
@@ -304,6 +307,9 @@ export class ConflictRecovery{
   const x=await this.guard(r,c);
   if(r.state==='reserved'){
    if(!x.facts.clean||x.facts.head!==r.head)throw Error('Dirty or divergent worktree before merge');
+   // The complete guarded observation succeeded, so only this job's read
+   // backoff resets. The shared provider cooldown and receipts are unchanged.
+   new RecoveryObservation(this.s).clear(r.job);
    await this.noOperation(r.worktree);
    this.set(r,'fetching',d);
    await this.git(r.worktree,'fetch','--no-tags','origin',`refs/heads/${r.branch}`,`refs/heads/${r.base_branch}`);

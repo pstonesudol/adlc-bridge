@@ -1,5 +1,5 @@
 import {Store} from './core';
-import {assertObservationFence} from './observation-fence';
+import {assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {githubRead,malformed} from './provider-read';
 import {Lifecycle} from './lifecycle';
 import {assertDeliveryTarget} from './delivery-identity';
@@ -77,7 +77,14 @@ export class BranchUpdates{
   if(claim==='limit')return {state:'blocked',send:false,head:b.head,reason:'Automatic branch update limit reached; human inspection required'};
   if(claim!=='claimed')return {state:'updating_branch',send:false,head:b.head,reason:'Another poll reserved the branch update'};
   try{await this.transport.update(repo,pr,b.head);this.s.db.query("UPDATE branch_updates SET state='accepted' WHERE job=? AND head=? AND base=?").run(job,b.head,b.base);this.s.event(job,'feature_branch_update_requested',JSON.stringify({repo,pr,head:b.head,base:b.base,authorizedBy:policy.authorizedBy,mergePR:false}));}
-   catch{assertObservationFence();this.s.db.query('UPDATE branch_updates SET reason=? WHERE job=? AND head=? AND base=?').run('API outcome uncertain; inspect conflicts, permissions and head before recovery',job,b.head,b.base);return {state:'blocked',send:false,head:b.head,reason:'Branch update failed or outcome uncertain; no automatic retry'};}
+   catch(error){
+    // A fence rejection before the request leaves nothing delivered: release
+    // only this claim so a later owner may retry without false uncertainty.
+    if(error instanceof ObservationLeaseLost&&error.sent===false){
+     this.s.db.query("DELETE FROM branch_updates WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,b.head,b.base);
+     throw error;
+    }
+    assertObservationFence();this.s.db.query('UPDATE branch_updates SET reason=? WHERE job=? AND head=? AND base=?').run('API outcome uncertain; inspect conflicts, permissions and head before recovery',job,b.head,b.base);return {state:'blocked',send:false,head:b.head,reason:'Branch update failed or outcome uncertain; no automatic retry'};}
   return {state:'updating_branch',send:false,head:b.head,reason:'Feature branch update requested; new commit requires fresh CI and CodeRabbit clearance'};
  }
 }

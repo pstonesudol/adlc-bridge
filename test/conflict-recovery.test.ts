@@ -55,7 +55,9 @@ test('reserved conflict recovery retries six read failures before any mutation',
  const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);setSystemTime(new Date(status.next_read+1));
  }
  fail=false;expect((await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
- expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);expect(new RecoveryObservation(f.s).status(f.job)?.failures).toBe(6);
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ // A complete guarded observation resets only the job's read failure history.
+ expect(new RecoveryObservation(f.s).status(f.job)).toBeNull();
  }finally{setSystemTime();f.close();}
 },60000);
 test('reserved conflict recovery retries transient facts read failures after GitHub recovers',async()=>{
@@ -112,6 +114,49 @@ test('shared provider cooldown defers an unreserved conflict tick without provid
  expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
  expect(reads).toBe(0);expect(f.recovery.row(f.job)).toBeUndefined();expect(f.sends()).toBe(0);
  }finally{f.close();}
+},60000);
+async function reservedWithReadFailure(f:any){
+ let reads=0;const snapshot=async()=>{if(++reads===3)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ return snapshot;
+}
+const mutating=(commands:string[][])=>commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref','commit','push'].includes(a[1]));
+test('reserved conflict recovery blocks a permanent provider failure without Git mutations',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ const mark=f.commands.length,before=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(before.next_read+1));
+ const facts=async()=>{throw readFailure('github','recovery-facts','HTTP 401',1);};
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('blocked');expect(result?.reason).toContain('authentication');
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(before.failures+1);expect(after.evidence.classification).toBe('authentication');
+ expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery keeps an untyped facts failure terminal without an observation',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);
+ const mark=f.commands.length,before=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(before.next_read+1));
+ const facts=async()=>{throw Error('Untyped facts failure');};
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('blocked');expect(result?.reason).toContain('Untyped facts failure');
+ expect(f.recovery.row(f.job).reason).toContain('Untyped facts failure');
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(before.failures);expect(after.evidence).toEqual(before.evidence);
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery defers a shared cooldown without recording a failure',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);
+ const status=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(status.next_read+1));
+ new RecoveryObservation(f.s).failed('other-job',readFailure('github','branch-read','HTTP 429\nRetry-After: 600\n',1));
+ const mark=f.commands.length;
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(status.failures);expect(after.evidence).toEqual(status.evidence);
+ expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ }finally{setSystemTime();f.close();}
 },60000);
 test('reserved manual preview is read-only and guards retain observation history',async()=>{
  const f=await fixture();let reads=0;let reader:Store|undefined;
