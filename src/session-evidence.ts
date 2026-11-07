@@ -1,32 +1,56 @@
 import {AO} from './orchestrator';
+import {readFailure,malformed,ProviderReadError} from './provider-read';
 import {Store,digest} from './core';
 import {recordReadiness} from './readiness';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 
 // Receipt evidence is valid only while the whole collection remains fresh. Bound
 // each page by the remaining window so a hung page cannot outlive the evidence.
+class TurnStateChanged extends Error{}
+const TURN_CONSISTENCY_ATTEMPTS=3;
 export async function sessionEvidence(session:string,spawn=Bun.spawn,freshnessMs=RECEIPT_FRESHNESS_MS){
  if(!/^[a-zA-Z0-9_-]+$/.test(session))throw Error('Session ID required');
  if(!Number.isSafeInteger(freshnessMs)||freshnessMs<1)throw Error('Positive receipt freshness window required');
- const started=Date.now(),deadline=started+freshnessMs;let before:number|undefined,first:any;const entries:any[]=[];
+ for(let attempt=0;attempt<TURN_CONSISTENCY_ATTEMPTS;attempt++){
+  try{return await collectSessionEvidence(session,spawn,freshnessMs);}catch(cause){
+   // Pages may legitimately carry different page-local turns. Only a turn whose
+   // own evidence changed is retried; persistent drift stays fail-closed.
+   if(cause instanceof TurnStateChanged){if(attempt+1<TURN_CONSISTENCY_ATTEMPTS)continue;throw malformed('orchestrator','session-evidence',cause);}
+   if(cause instanceof ProviderReadError)throw cause;
+   throw readFailure('orchestrator','session-evidence','unknown',undefined,cause);
+  }
+ }
+ throw malformed('orchestrator','session-evidence',new Error('Turn state changed during transcript pagination; refresh evidence'));
+}
+async function collectSessionEvidence(session:string,spawn:typeof Bun.spawn,freshnessMs:number){
+ const started=Date.now(),deadline=started+freshnessMs;let before:number|undefined,first:any;const entries:any[]=[];const turns=new Map<string,{value:any,hash:string}>();let sawTurns=false;
  for(let page=0;page<100;page++){
- const remaining=deadline-Date.now();if(remaining<1)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
+ const remaining=deadline-Date.now();if(remaining<1)throw readFailure('orchestrator','session-evidence','timeout');
  const p=spawn([AO,'session','get',session,'--transcript','100','--json','--cap','0',...(before===undefined?[]:['--before',String(before)])],{stdout:'pipe',stderr:'pipe',timeout:Math.min(30000,remaining)});
- const [text,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
- if(Date.now()>=deadline)throw Error('Transcript collection exceeded freshness deadline; receipt evidence incomplete');
- if(code!==0)throw Error('Orchestrator session inspection failed');
- const r=JSON.parse(text);
- if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw Error('Invalid session evidence');
+ const [text,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ if(Date.now()>=deadline)throw readFailure('orchestrator','session-evidence','timeout');
+ if(code!==0)throw readFailure('orchestrator','session-evidence',p.signalCode==='SIGTERM'?'timeout':err,code);
+ let r;try{r=JSON.parse(text);}catch(cause){throw malformed('orchestrator','session-evidence',cause);}
+ if(r.session?.id!==session||!Array.isArray(r.transcript?.entries))throw malformed('orchestrator','session-evidence');
  if(!first)first=r;
- if(JSON.stringify(r.transcript.turns)!==JSON.stringify(first.transcript.turns))throw Error('Turn state changed during transcript pagination; refresh evidence');
+ // Reconcile turns by identity: a page-local turn is additive, while the same
+ // turn carrying different evidence means the transcript moved under us.
+ if(Array.isArray(r.transcript.turns)){
+  sawTurns=true;
+  for(const t of r.transcript.turns){
+   const key=String(t?.id),hash=JSON.stringify(t),prior=turns.get(key);
+   if(prior&&prior.hash!==hash)throw new TurnStateChanged(`Turn ${key} changed during transcript pagination; refresh evidence`);
+   if(!prior)turns.set(key,{value:t,hash});
+  }
+ }
  const batch=r.transcript.entries;
- if(batch.some((x:any)=>!Number.isSafeInteger(x.sequence)||(before!==undefined&&x.sequence>=before))||new Set(batch.map((x:any)=>x.sequence)).size!==batch.length)throw Error('Invalid transcript pagination sequence');
+ if(batch.some((x:any)=>!Number.isSafeInteger(x.sequence)||(before!==undefined&&x.sequence>=before))||new Set(batch.map((x:any)=>x.sequence)).size!==batch.length)throw malformed('orchestrator','session-evidence',new Error('Invalid transcript pagination sequence'));
  entries.unshift(...batch);
- if(r.transcript.hasMoreBefore===false||r.transcript.hasMoreBefore===undefined&&batch.length<100){first.transcript.entries=entries;first.receiptObservation={observed:started,complete:true};return first;}
- if(!batch.length)throw Error('Transcript page has no pagination cursor');
+ if(r.transcript.hasMoreBefore===false||r.transcript.hasMoreBefore===undefined&&batch.length<100){first.transcript.entries=entries;if(sawTurns)first.transcript.turns=[...turns.values()].map(x=>x.value);first.receiptObservation={observed:started,complete:true};return first;}
+ if(!batch.length)throw malformed('orchestrator','session-evidence',new Error('Transcript page has no pagination cursor'));
  before=Math.min(...batch.map((x:any)=>x.sequence));
  }
- throw Error('Transcript pagination limit reached; receipt evidence incomplete');
+ throw malformed('orchestrator','session-evidence',new Error('Transcript pagination limit reached; receipt evidence incomplete'));
 }
 // Capturing an agent plan never approves it. The caller selects a concrete entry;
 // human approval remains bound to the specification+plan hash in Store.approve.

@@ -1,5 +1,44 @@
 # ADLC Bridge
 
+### Planning dependency observation
+
+Dependency bindings may opt into `stage: "planning"` (omitted stage retains
+the approved-worker continuation path). A planning binding uses the existing
+`dependencyRecovery.enabled`, `baseBranch`, `jobs[].issue`, `planHash`,
+`specHash`, and exact prerequisite repository/PR/capability SHA-256 fields.
+It additionally requires `project` equal to the configured Linear project,
+`contractReview: {"actor": "named reviewer", "compatibility": "why this exact
+captured plan remains valid against the pinned interfaces"}`, and a reviewed
+`headSha` for each prerequisite PR. Configuration is operator-controlled, never
+inferred from ticket comments. Do not put literal placeholder values into live
+configuration.
+
+Pin an in-development PR only after reviewing its interface contract and the
+existing plan. The observer waits for that exact head to merge into the exact
+base and checks the pinned capability contents there. Any head or capability
+change fails closed: review it and explicitly update configuration, or use the
+existing same-session replanning flow with fresh approval if the plan changes.
+Hashes are never learned or silently rewritten by polling. Host-runtime
+prerequisites remain unsupported without authoritative installation proof;
+source merge is not runtime activation.
+
+`dependency-preview JOB CONFIG` inspects planning evidence without requiring a
+run or implementation grant. `dependency-resume JOB CONFIG HASH` records only
+the verified planning resolution; normal workflow polling evaluates current
+approval policy and eligibility. `dependency-status` exposes `planningWaits`
+separately from implementation waits. Missing configuration reports a wait,
+not a promise of auto-resume. `plan-approval-required` still requires explicit
+current human approval. Original plan text, receipt, and reservation are kept.
+
+Observation never fetches, switches, merges, or updates the planning worktree.
+If implementation needs source synchronization that its real scoped grant
+does not allow, an operator must reconcile under separate authorization; no
+grant is fabricated to make progress. Changed plan/spec/config/base evidence
+between approval and delivery blocks delivery for reconciliation. Accepted or
+uncertain implementation delivery is owned by the existing dispatcher and is
+never resent by this observer. Runtime installation and PR merging remain
+separate human actions.
+
 ## Configuration-driven verification and setup (v1)
 
 Project JSON keeps repository/Linear mappings, approval and routing policies, and
@@ -214,8 +253,16 @@ Your repository's own workflows may independently deploy when a human merges.
 
 ```sh
 adlc start --all     # start managed Orchestrator, then all project intake services
-adlc stop --all      # pause intake, check workers, stop the managed backend
-adlc status --all    # show backend and all registered intake services
+adlc stop --all      # PREVIEW full shutdown; does not stop anything yet
+adlc status --all    # backend, intake, owned workers, shared sessions, child processes
+adlc services stop PROJECT              # pause this project's intake only
+adlc services stop --all --pause         # pause all intake; keep workers/backend
+adlc services stop --all --drain --timeout 120 --json
+# Review the returned confirm hash, then repeat the exact scope/mode/timeout:
+adlc services stop --all --drain --timeout 120 --apply --confirm HASH --json
+adlc services start PROJECT             # re-enable only this project's intake
+adlc services restart PROJECT --drain   # PREVIEW; apply with returned hash
+adlc services stop PROJECT --workers    # PREVIEW explicit worker interruption
 ```
 
 Full-stack controls require a registered, hash-pinned Orchestrator background
@@ -224,12 +271,47 @@ service on this Mac. They use the owner-only
 (`executable`, `sha256`, `serviceLabel`, `launcher`) and the matching installed
 LaunchAgent. They preserve unrelated Orchestrator installations and services.
 
-`stop --all` disables the managed services across subsequent logins;
-`start --all` re-enables them. Stop pauses **all registered project intake** first,
-then checks every live session's activity and conversation turns. Active, queued,
-unknown, or unreadable worker state refuses backend shutdown and leaves intake
-paused. Finish or stop those workers in Orchestrator, then retry. Do not submit
-new worker requests during shutdown. There is no force-stop flag.
+Grouped `services start|stop|restart|status` accepts `PROJECT`, `--project PROJECT`,
+or explicit `--all`. Flat `start`, `stop`, `restart`, and `status --all` are aliases;
+flat `status --project PROJECT` retains its existing **job-status** meaning.
+Use `services status --project PROJECT` for lifecycle status. `service-status`
+retains its legacy intake-only inspection (including all projects without an ID).
+Without a scope, lifecycle commands select only an unambiguous registered project.
+
+**Stop modes:** project stop defaults to intake-only pause. `--pause` explicitly
+keeps workers and backend running, including with `--all`, and works even when
+worker APIs are unavailable. `--drain` stops new coordination, waits for already
+queued/active native turns, then exits verified owned agents in place. Drain does
+not run further coordination stages, issue new turns, approve work, or wait for
+an entire multi-stage ticket to finish. `--workers` explicitly interrupts owned
+agents through AO's session-preserving `exit-agent` API. Never use session kill,
+worktree cleanup, process-name matching, or replacement sessions to restart work.
+Full `stop --all` without a mode refuses busy/queued/unknown workers and exits
+only verified idle owned agents before stopping the managed backend.
+
+Full shutdown, drain, explicit worker stop, and restart are **preview-only** until
+`--apply --confirm HASH`. A confirmation binds action, scope, mode, persistence,
+timeout and the observed session identities/ownership and native turn IDs. Existing
+turns may finish during drain; newly queued work requires a fresh preview. If these change, preview
+again. `--preview` is available for non-disruptive start/pause too. The default
+timeout is 30 seconds; `--timeout` accepts 1–3600. Timeout or partial failure reports
+remaining observed resources and exits nonzero, without escalating to force-kill.
+An uncertain exit acknowledgement requires inspection of the original session.
+
+All-stack stop defaults to persistent disable-at-login; `start --all` re-enables
+the requested managed stack. Project stop defaults to unloading this login only;
+`--disable-login` explicitly persists its launchd disable. `--temporary` suppresses
+launchd disable, so installed RunAtLoad/KeepAlive definitions may load next login.
+Durable intake pause markers still block bridge polls until explicit start; login
+or an app window is not authorization to dispatch. No plist is moved or deleted.
+The same project pause blocks explicit `ingest`, `dependency-resume`,
+`feature-start`/`feature-step`, `tick-review`, and new `spec-reconcile` replanning
+turns under the submission fence. Read-only inspection and receipt-only recovery
+remain available; a manual submission command does not implicitly restart intake.
+Starting one project checks backend readiness first (starting the registered
+managed dependency only when needed). After an all-stack stop it retains durable
+pause markers for every other project before releasing the global fence; it does
+not re-enable their services or resume their workers.
 
 Every bridge-owned session creation and turn delivery shares an inter-process
 barrier with shutdown. Planning, implementation and feature-agent reservations
@@ -237,8 +319,9 @@ stay inside that same barrier through submission; rejected acquisition leaves
 requests pending rather than falsely recording an uncertain delivery.
 Stop holds it from intake unload and the final inventory scan through
 backend shutdown and leaves submissions paused until a successful `start --all`.
-A delivery already holding it refuses shutdown before unloading any intake
-service, instead of interrupting the send. Retry once that delivery settles.
+A delivery already holding it refuses ordinary shutdown before unloading any
+intake service, instead of interrupting the send. Drain can wait within its timeout
+for that fence to settle, never breaking or deleting a held lock.
 Direct `stop PROJECT` and installer-driven intake stops use the same fence, so
 they cannot unload a poll process while it owns an in-flight submission.
 Each complete CLI poll tick also holds the fence through provider mutations and
@@ -260,11 +343,40 @@ This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle
 during shutdown as well.
 
-These commands control background services. The desktop window may remain open;
-run `start --all` before reopening it when the stack is off. Worktrees, durable
-queue, session history, and credentials are preserved. `status --all` is read-only.
-A backend startup failure does not start intake. The existing commands below
-retain their project and queue meanings:
+These commands control background services, not desktop windows. Closing a window
+does not stop agents/services or prove memory release; stopping intake alone
+releases only its poll process. Exiting agents can release their controller memory;
+backend shutdown can release daemon memory. UI memory, unrelated apps, detached
+processes and OS caches remain outside that guarantee. The window may stay open;
+run `start --all` before reopening it when the stack is off.
+
+Status is read-only and separates intake services, owned workers, shared/external
+sessions, and observed daemon descendants (PID plus process start time). It never
+claims that every process on the Mac is off. Missing/unreadable native inventory
+is **unknown**, not an empty worker list. A stopped/crashed daemon cannot attest
+current session/child state, so status may return incomplete evidence even when
+launchd reports unloaded. Backend shutdown refuses live unowned/shared sessions,
+including idle sessions. Project scope never stops the shared backend.
+
+Stop and status validate project/registry/controller/service identity without
+requiring valid execution-policy settings. Unsupported branch-update limits or
+newer runtime options cannot prevent safe pause/diagnosis; malformed JSON, changed
+identity and altered service definitions still fail closed. Start uses full
+configuration validation and verifies poll startup acknowledgements.
+
+Restart stops the selected scope then starts dependencies before intake; it is
+not a reset/retry operation. Worktrees (including uncommitted changes), durable
+queue, session history, approvals, delivery receipts and attempt history survive.
+Exited/interrupted workers are **not automatically resumed**: inspect the existing
+session and use the approved job recovery/resume workflow after current scope and
+receipt reconciliation. No lifecycle command resends a prompt or creates a worker.
+A partial start leaves global intake paused and reports the successful steps;
+fix the reported problem, inspect status, then explicitly retry start.
+
+Live macOS shutdown/start integration must be validated by a separately authorized
+operator using disposable managed sessions/services. Mocked launchd tests do not
+prove live compatibility and no existing live session may be interrupted by a
+coding worker. The existing commands below retain their project and queue meanings:
 
 ```sh
 adlc projects
@@ -285,11 +397,10 @@ It polls approximately every 60 seconds. `loaded: true, running: false` normally
 means it is enabled and waiting between polls. Start is idempotent; it does not
 force another tick when already loaded.
 
-**Stopping coordination does not stop existing Orchestrator workers**, close
-Orchestrator, or disable a repository's GitHub workflows. Stop individual workers
-through Orchestrator when needed. `stop` unloads the service for the current login;
-the installed LaunchAgent may load again at the next login. To keep it off across
-logins, stop it and move its plist out of `~/Library/LaunchAgents` until needed.
+**Project stop without a worker mode does not stop existing Orchestrator workers**,
+close Orchestrator, or disable a repository's GitHub workflows. Use the previewed
+`--drain` or explicit `--workers` workflow when worker exit is intended, and
+`--disable-login` rather than moving installed service definitions.
 
 The configured project uses a machine-local `config/<project>.json`. A
 `ready-queue` standing policy can authorize every eligible **Todo + agent-ready**
@@ -826,6 +937,9 @@ never activate.
 
 `update-apply` acquires the shared submission fence, records a durable intent,
 stops previously loaded intake, and re-checks authoritative worker activity.
+The control scope remains exclusive through activation, recovery and verification;
+concurrent stack starts cannot remove its pause. An existing operator pause is
+preserved and refuses apply/rollback until explicit operator reconciliation.
 Active turns, queued turns, uncertain delivery, pending mutations or unknown
 activity defer the update, restore the prior intake, and notify `waiting for
 idle`. Unknown activity is treated as busy. Backend or schema activation also
@@ -1168,21 +1282,43 @@ failures may be fixed by editing only a PR description, for example:
 The wizard can collect these names. They are added to the readiness gate as
 required checks, even for existing registered PRs.
 
-**Current production limitation:** GitHub check/job responses do not attest which
-PR description they evaluated, so production evidence has `descriptionHash: null`.
-Configured metadata checks therefore cannot authorize automatic findings or
-PR-description remediation, even when the check succeeds. Otherwise-clear checks
-wait up to five minutes for body-bound evidence and then block for inspection;
-unattested failures block for inspection without sending remediation. This remains
-fail-closed until a trustworthy body-bound attestation source is implemented.
+GitHub check/job responses alone do not attest which description they evaluated.
+The bridge accepts an `ADLC_METADATA_V1` JSON record only from logs fetched from
+a verified, completed `pull_request_target` job. It cross-checks repository, PR,
+head SHA, workflow path, run ID/attempt, check suite, job/check-run URL, check name
+and result against GitHub API records. The workflow source at the run's PR base
+SHA must exactly match the bundled producer template; customized or unverifiable
+workflows cannot authorize evidence. The record's SHA-256 description hash must
+match the exact current UTF-8 body, without whitespace or newline normalization.
+Missing, ambiguous, malformed, mismatched or unavailable evidence fails closed.
+Otherwise-clear checks wait up to five minutes for body-bound evidence and then
+block for inspection; unattested failures cannot send remediation.
+
+`patches/pr-body-attestation.yml` is an **operator-reviewed rollout template**, not
+an active bridge workflow. In a repository already using `scripts/pr-body.mjs`,
+replace its existing PR-body workflow with this template through normal review,
+on the default branch. Retain the existing validator and validation semantics.
+The template executes only the base snapshot (`github.sha`), uses read-only
+permissions, reads event metadata as JSON, emits the exact event-body hash after
+validation, and preserves validation failures. Never check out PR code, interpolate
+PR text into executable source, or add PR-controlled commands to this trusted job.
+Base-branch workflow maintainers are part of the evidence trust boundary. The
+consumer trusts GitHub's `pull_request_target` provenance, not arbitrary log URLs,
+check output or PR-provided attestations. Other validators require a separately
+reviewed producer adaptation retaining these invariants.
+
+Description-only edits trigger the template via `edited`. Authenticated results
+for different body hashes are excluded from current readiness evaluation; unknown
+results and same-body duplicate checks remain ambiguous and block. Legacy checks
+without attestations may therefore still require operator inspection during rollout.
+The bridge does not install workflows, modify rulesets or activate runtime snapshots.
 An empty `prMetadataChecks` policy skips this additional body-evidence gate; it
 does not bypass other required checks or CodeRabbit approval. Clearing the policy
 does not clear an outstanding remediation send: its delivery must be reconciled,
 and any observed description change still requires a fresh CodeRabbit evaluation.
 
-The remediation flow below requires that future attestation support. In addition
-to body evidence, the bridge verifies the failed job’s repository, check-run ID,
-and PR head before reading its failure logs. Only a body-bound failure can send
+In addition to body evidence, the bridge verifies the failed job’s repository,
+check-run ID and PR head before reading its failure logs. Only a body-bound failure can send
 the relevant errors to the existing worker under its current approval and
 `open-pr` grant. The worker must use the current repository template, preserve
 truthful verification evidence, and make description changes only. It may not
@@ -1205,8 +1341,9 @@ Log retrieval checks the installed GitHub CLI version and passes `gh api
 that flag. Escape sequences are stripped before selected failure lines reach
 the worker.
 
-When GitHub returns old and rerun check results for one commit, the bridge passes
-the raw check results through unchanged, without extra provenance REST reads.
+When GitHub returns old and rerun check results for one commit, the bridge keeps
+raw results unchanged except for the authenticated older-description exclusion
+described above. Configured metadata checks require additional provenance reads.
 The native patch verifies workflow/job provenance but cannot supersede production
 attempts: GitHub REST job IDs are attempt-specific
 and do not establish a stable logical-job identity across attempts. Distinct job
@@ -2032,8 +2169,10 @@ select a candidate or dispatch work. Legacy flat commands retain their existing
 JSON/text output and operational error behavior for scripts.
 
 Compatibility aliases: `projects list` → `projects`; `routing show/preview` →
-`routing`; `services start/stop/status/config` →
-`start/stop/service-status/service-config`; `diagnostics doctor/readiness/runtime-check/ao-status`
+`routing`; `services start/stop/restart` → `start/stop/restart`;
+`services status` is the richer lifecycle inspection, while flat `service-status`
+retains intake-only output; `services config` → `service-config`;
+`diagnostics doctor/readiness/runtime-check/ao-status`
 → the corresponding flat command. `jobs show-plan/approvals/recover/cleanup/resume/approve/dependency-status/review-status`
 map to `show-plan/approvals/recover/cleanup/resume-job/approve-job/dependency-status/review-status`.
 Their existing explicit authorization, confirmation and argument requirements
@@ -2075,9 +2214,9 @@ Config commands require explicit project selection. Registered Orchestrator IDs
 and unambiguous registered Linear IDs resolve to the same project. Job lookup
 also supports a stored Linear ID when no registry entry exists. Exact job IDs
 take precedence over issue/ticket matches. `services list` is an alias of
-`projects`; `jobs show` aliases operator job status. Unsupported `--project` on
-legacy grouped service aliases is rejected, never silently discarded: use
-`services status PROJECT` or the documented positional legacy service command.
+`projects`; `jobs show` aliases operator job status. Lifecycle commands accept
+`--project PROJECT` or a positional project, but never both. `services config`
+retains its positional project requirement. No selector is silently discarded.
 
 Writable settings and defaults:
 
@@ -2132,9 +2271,97 @@ package and unknown running backend; equal package versions do not prove the sam
 commit or active runtime. Completion prints bash/zsh/fish definitions only; shell
 files are never modified automatically.
 
-New scoped commands use schemaVersion 1 success/error envelopes. Existing flat
+New scoped commands use schemaVersion 1 success/error envelopes. Version 1
+job views use display states `awaiting_plan`, `approval_wait`, `dependency_wait`,
+`working`, `observation_wait`, `blocked`, and `complete`. The nullable
+`observation` object retains historical evidence even when a persisted blocker,
+approval/dependency wait, or completion takes precedence. Its fields are:
+`failures` (consecutive incomplete observations), `nextRetry` (epoch milliseconds,
+or null when no automatic probe is eligible), `error` (nullable secret-safe typed
+provider evidence: provider, operation, timestamp, classification, optional
+exitStatus/httpStatus/retryAt/requestId, and bounded detail), and `evidenceAgeMs`
+(elapsed milliseconds or null for legacy unknown evidence). `observation_wait`
+means an otherwise approved working job is waiting on read-only observation;
+it does not authorize dispatch, Git writes, or approval.
+
+Existing flat
 commands retain legacy text/JSON contracts. Display state `awaiting_plan` means
 no planning dispatch, not an active worker; activity/freshness remain unknown
 without authoritative evidence. Linked DEV-35/43/34/33/51/55 integrations remain
 planned, not success-shaped placeholders; existing guarded engine commands remain
 available as documented elsewhere.
+# Read-only observation recovery
+
+Review-loop GitHub branch/ancestry/readiness reads, conflict-recovery delivery
+facts (before and after reservation) and Orchestrator session evidence have
+durable observation recovery, separate from remediation and all
+mutation receipts. Evidence stores provider, safe operation, time, classification,
+exit/HTTP status and available retry/request identifiers. Raw stderr, credentials,
+URLs and response bodies are not retained; diagnostics are an allowlisted summary.
+Nested errors retain their cause in memory, not in persisted diagnostics.
+Transcript pagination reconciles page-local turns and retries a genuinely changed
+turn before failing closed.
+
+Timeout/network, 5xx and explicit primary/secondary throttling errors retry at
+1, 2, 4, 8 and 16 seconds (±25% jitter). From failure six onward the circuit uses
+one health probe per 30 minutes, or later when Retry-After/rate-reset requires it.
+Only a complete successful observation resets consecutive failures. Unknown,
+malformed, missing-resource and authentication/permission failures require
+inspection and an explicit read retry; unknown errors are never called quota
+failures. A successful read is not approval or permission to write.
+
+Failure history spans providers and survives branch-only ticks until readiness
+collection succeeds. Unknown mergeability uses a separate durable one-minute
+wait, not the provider-failure or remediation budget. After six unknown results,
+polling stops for inspection; `retry-observation JOB` rearms that wait after
+operator inspection. A known branch result clears the mergeability wait only.
+
+Capacity/cooldowns are shared by provider across projects/jobs in the same state
+database. A job's circuit delay is not shared: transient failures impose only a
+one-second provider coordination cooldown, extended by valid provider retry
+hints. GitHub throttling without a usable hint instead waits at least one minute
+across the job and shared provider cooldown. Provider hints are capped at 24 hours
+from observation time; existing longer stored cooldowns are also capped at startup.
+Untyped callback errors remain unknown; only typed provider-read evidence can
+authorize automatic transient recovery. Invalid timestamps outside the supported Date range are rejected; legacy
+invalid stored cooldowns are durably normalized to a 30-minute health-probe wait
+without clearing failure history or mutation receipts. Reserved conflict recovery
+uses this read backoff before any worktree mutation; later uncertain mutation
+stages still require their existing reconciliation and are never replayed.
+
+Capacity coordination uses the same state
+database. A provider lease permits one collection at a time (10-minute crash
+expiry); a job evaluation lease suppresses concurrent continuations (one-hour
+crash expiry). Run projects sharing provider capacity against the same state
+database, not independent databases. Restart preserves cooldowns and leases.
+There is no autonomous mutation replay or retry timer outside normal supervised
+polling; existing update/shutdown submission barriers remain authoritative.
+
+Inspect `adlc review-status` or `adlc jobs show JOB --json` for the observation
+class, evidence age, failure count and scheduled retry time. Old six-failure rows
+without typed evidence become eligible for a guarded probe at their stored due
+time; their historical cause remains unknown. For persistent failures, verify
+provider login, repository/session access and configuration locally. Never paste
+tokens or credential stores into tickets. When blocker synchronization is enabled,
+the existing receipt-backed Linear publisher posts a deduplicated notice without
+adding/removing labels or blindly repeating an uncertain comment delivery.
+
+After correcting a permanent problem, use `adlc retry-observation JOB`. This
+rearms reads only and does not bypass a shared provider cooldown. Inspect
+`adlc review-status` for the provider's `sharedNextRead` timestamp. To override
+an abnormal shared cooldown after inspecting provider health and retry guidance,
+use `adlc retry-observation JOB --override-shared-cooldown github TIMESTAMP`
+(or `orchestrator`). This compares the exact inspected timestamp, audits the
+override, and clears only that provider's shared cooldown; it does not change
+any job wait. Then use plain `retry-observation JOB` separately as needed. A
+changed timestamp requires inspection again. Neither action replays mutations.
+
+Inspect
+`adlc reconcile-publication` preview separately for uncertain publication; read
+recovery never replays PUTs, pushes, comments, model sends or other mutations.
+Other freshness, scope, approval, ownership, busy-worker and reconciliation gates
+remain in force. Recovering reads does not clear those blockers or reset attempts.
+
+Source changes do not activate the pinned live runtime. After human review and
+manual merge, an operator must follow the guarded runtime activation workflow;
+coding workers must not install, activate, restart or deploy the live bridge.

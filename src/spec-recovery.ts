@@ -8,6 +8,7 @@ import {PLAN_STATUS_INSTRUCTION,recordReadiness} from './readiness';
 import {withTurnSubmission} from './turn-submission';
 import {readBranchSnapshot} from './branch-updates';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
+import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
 
 /** Preview never changes reservations, routing or authorization. Confirmation
  * authorizes a planning-only turn, not implementation or a permission expansion. */
@@ -112,6 +113,9 @@ export class SpecRecovery{
     return {...row,action:absent?'replan_absence_reconciled':unmarked?'replan_unmarked_reconciled':'replan_failed_reconciled',nextAction:'Run spec-reconcile again for a fresh preview; a new planning turn requires its own confirmation.'};
    }
    if(!preview.proof||preview.confirmation!==confirmation)throw Error('Preview changed or delivery already reserved; refresh evidence, never replay');
+   // Receipt-only reconciliation above remains available while paused. A new
+   // replanning turn must honor the project pause before routing/reservation.
+   assertProjectReferenceIntakeEnabled(this.s.get(job).project,this.s);assertConfiguredProjectIntakeEnabled(c,this.s);
    const proof=preview.proof,priorRow=this.s.db.query('SELECT client_id FROM spec_replans WHERE revision=?').get(preview.revision) as any;
    // Attempts for one revision replace the row, so the job-wide count never grows.
    // Derive the next suffix from this revision's recorded client ID.

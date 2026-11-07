@@ -2,6 +2,7 @@ import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {ReceiptReconciliation,evaluateReceipt} from '../src/receipt-reconciliation';
 import {sessionEvidence} from '../src/session-evidence';
+import {ProviderReadError} from '../src/provider-read';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -65,18 +66,36 @@ test('late nonterminal and contradictory terminal receipts do not erase cancella
 test('accepted entry without a native turn is not execution',()=>{
  const {s,b,e}=fixture();try{delete e.transcript.entries[0].turnId;expect(evaluateReceipt(b,e).state).toBe('accepted');}finally{s.close();}
 });
+test('unexpected spawn and stream failures are unknown without interpreting their messages',async()=>{
+ for(const mode of ['spawn','stream']){
+ const cause=new Error('Invalid pagination timeout freshness deadline ETIMEDOUT');
+ const spawn=(()=>{if(mode==='spawn')throw cause;return {stdout:new ReadableStream({start(controller){controller.error(cause);}}),stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ try{await sessionEvidence('worker',spawn);throw Error('Expected failure');}
+ catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe('unknown');expect((error as Error).cause).toBe(cause);}
+ }
+});
 test('collector exhausts sequence pages before proving receipt completeness',async()=>{
  const calls:string[][]=[];
  const spawn=((args:string[])=>{calls.push(args);const page=calls.length===1?Array.from({length:100},(_,i)=>({sequence:i+2})): [{sequence:1,clientMessageId:'exact'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
  const e=await sessionEvidence('worker',spawn);expect(e.transcript.entries).toHaveLength(101);expect(calls[1]).toContain('--before');expect(calls[1].at(-1)).toBe('2');expect(e.receiptObservation.complete).toBe(true);
 });
+test('collector reconciles page-local turns before proving completeness',async()=>{
+ let calls=0;
+ const spawn=((_args:string[])=>{const first=calls++%2===0;const page=first?Array.from({length:100},(_,i)=>({sequence:i+2})):[{sequence:1}];const turns=first?[{id:'a',state:'completed'}]:[{id:'b',state:'running'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ const e=await sessionEvidence('worker',spawn);expect(e.transcript.turns).toEqual([{id:'a',state:'completed'},{id:'b',state:'running'}]);
+});
+test('collector retries a genuinely changed turn and then fails closed',async()=>{
+ let calls=0;
+ const spawn=((_args:string[])=>{const first=calls++%2===0;const page=first?Array.from({length:100},(_,i)=>({sequence:i+2})):[{sequence:1}];const turns=first?[{id:'a',state:'running'}]:[{id:'a',state:'completed'}];return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:page,turns}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};}) as typeof Bun.spawn;
+ await expect(sessionEvidence('worker',spawn)).rejects.toThrow('orchestrator session-evidence: malformed');expect(calls).toBe(6);
+});
 test('collector rejects repeated cursor evidence',async()=>{
  const spawn=(()=>({stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:Array.from({length:100},(_,i)=>({sequence:i+1})),turns:[]}})).body,stderr:new Response('').body,exited:Promise.resolve(0)})) as typeof Bun.spawn;
- await expect(sessionEvidence('worker',spawn)).rejects.toThrow('pagination');
+ await expect(sessionEvidence('worker',spawn)).rejects.toThrow('orchestrator session-evidence: malformed');
 });
 test('collector rejects a final page returned after the whole freshness deadline',async()=>{
  let options:any;const spawn=((_args:string[],opts:any)=>{options=opts;return {stdout:new Response(JSON.stringify({session:{id:'worker'},transcript:{entries:[{sequence:1}],turns:[]}})).body,stderr:new Response('').body,exited:Bun.sleep(20).then(()=>0)};}) as typeof Bun.spawn;
- await expect(sessionEvidence('worker',spawn,5)).rejects.toThrow('freshness deadline');expect(options.timeout).toBeLessThanOrEqual(5);
+ await expect(sessionEvidence('worker',spawn,5)).rejects.toThrow('orchestrator session-evidence: timeout');expect(options.timeout).toBeLessThanOrEqual(5);
 });
 test('restart and competing store observations retain exact attempt and terminal evidence',()=>{
  const dir=mkdtempSync(join(tmpdir(),'receipt-test-')),path=join(dir,'state.sqlite');

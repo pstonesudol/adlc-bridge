@@ -4,10 +4,68 @@ import {join,dirname} from 'node:path';
 import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
 import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,evaluateCheckRuns,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
-import {installBridge} from '../src/install';
+import {installBridge,installIO,snapshot,distributionVersion} from '../src/install';
+import {liveUpdateIO} from '../src/update';
 import {formatUpdateHistory,parseHistoryArgs,readUpdateHistory} from '../src/update-history';
 
 const repo='acme/adlc';
+test('real installer activation, rollback and failed-install recovery retain the exclusive update fence',async()=>{
+ for(const fail of [false,true]){
+  const f=fixture();try{
+   const source=join(f.root,'source'),stage=join(f.root,'stage');
+   for(const root of [source,stage])mkdirSync(join(root,'src'),{recursive:true});
+   writeFileSync(join(source,'src/cli.ts'),'prior bytes');writeFileSync(join(stage,'src/cli.ts'),'candidate bytes');
+   const prior=snapshot(source,join(f.state,'versions')),version=distributionVersion(stage);
+   const launcher=join(f.root,'adlc'),record=join(f.state,'installation.json');
+   writeFileSync(record,JSON.stringify({source,version:prior.version,cli:prior.cli,launcher}),{mode:0o600});
+   // Recovery must not substitute this now-drifted checkout for the prior snapshot.
+   writeFileSync(join(source,'src/cli.ts'),'unverified drift');
+   const projects=['one','two'].map(project=>({project,label:`local.adlc.${project}`,config:`/${project}.json`}));
+   const agents=join(f.root,'Library/LaunchAgents');mkdirSync(agents,{recursive:true});
+   for(const p of projects)writeFileSync(join(agents,p.label+'.plist'),'fixture definition');
+   let failHook=fail,hookCalls=0;
+   const installation={...installIO,state:()=>f.state,home:()=>f.root,registeredProjects:async()=>projects,
+    readDefinition:()=>({Label:'local.adlc.one',ProgramArguments:[process.execPath,prior.cli,'poll','/one.json']}),assertDefinition:()=>{},
+    serviceControl:async(action:string,project?:string)=>f.io.stack.project(action,project!),
+    localAO:async()=>({status:'ok',project:{config:{}}}),
+    installWorkflowHook:async()=>{hookCalls++;expect(f.manager.turns.isPaused()).toBe(true);await expect(turnBarrier(f.state).submit(async()=>{})).rejects.toThrow('in progress');if(failHook){failHook=false;throw Error('fixture installation failure');}}
+   } as typeof installIO;
+   const live=liveUpdateIO(f.state,{stack:f.io.stack,installation});
+   f.io.install=live.install;f.io.launcher=live.launcher;
+   f.io.stage=async(_p,c)=>({root:stage,commit:c.commit,version,files:['src/cli.ts']});
+   const backend=f.io.stack.backend;
+   f.io.stack.backend=async()=>{
+    expect(f.manager.turns.isPaused()).toBe(true);
+    // Independent control processes cannot resume intake during verification.
+    const child=Bun.spawnSync([process.execPath,'--eval',`import {turnBarrier} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};try{await turnBarrier(${JSON.stringify(f.state)}).run(async()=>{throw Error('control entered')});process.exit(2)}catch(e){if(!e.message.includes('in progress'))throw e}`]);
+    expect(child.exitCode).toBe(0);return backend();
+   };
+   if(fail){
+    await expect(f.manager.apply()).rejects.toThrow('fixture installation failure');
+    expect(JSON.parse(readFileSync(record,'utf8')).version).toBe(prior.version);
+    expect(readFileSync(JSON.parse(readFileSync(record,'utf8')).cli,'utf8')).toBe('prior bytes');
+   }else{
+    expect(await f.manager.apply()).toMatchObject({activated:true,version});
+    expect(JSON.parse(readFileSync(record,'utf8')).version).toBe(version);
+    expect(await f.manager.rollback()).toMatchObject({rolledBack:true,version:prior.version});
+    expect(JSON.parse(readFileSync(record,'utf8')).version).toBe(prior.version);
+   }
+   expect(hookCalls).toBeGreaterThan(1);expect(f.services).toEqual({one:true,two:false});expect(f.manager.turns.isPaused()).toBe(false);
+   // Ordinary installation must still reject loaded intake behind an operator pause.
+   f.manager.turns.pause();const before=readFileSync(record,'utf8');
+   await expect(installBridge(true,stage,launcher,installation)).rejects.toThrow('cannot restart loaded intake');
+   expect(readFileSync(record,'utf8')).toBe(before);expect(f.manager.turns.isPaused()).toBe(true);
+  }finally{f.close();}
+ }
+});
+test('updates and rollback preserve an existing operator pause without touching services',async()=>{
+ const f=fixture();try{
+  await f.manager.apply();const calls=f.calls.slice();f.manager.turns.pause();
+  await expect(f.manager.apply()).rejects.toThrow('already paused');
+  await expect(f.manager.rollback()).rejects.toThrow('already paused');
+  expect(f.calls).toEqual(calls);expect(f.manager.turns.isPaused()).toBe(true);expect(f.services.one).toBe(true);
+ }finally{f.close();}
+});
 test('history retains activation, rollback and repeated attempts in the existing intent',async()=>{
  const f=fixture({version:'b'.repeat(16)});try{
   await f.manager.apply();await f.manager.rollback();await f.manager.apply();

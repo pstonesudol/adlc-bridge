@@ -3,8 +3,46 @@ import {mkdtempSync,rmSync,existsSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../src/core';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('CLI shared cooldown override and job retry remain separate operator actions',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-cooldown-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}'),hash=s.propose(id,'plan');s.approve(id,hash,'human');
+ const o=new RecoveryObservation(s);o.failed(id,readFailure('github','branch-read','HTTP 429\nRetry-After: 999999999\n',1));const expected=o.status(id).sharedNextRead;s.close();
+ const run=(...args:string[])=>Bun.spawnSync([process.execPath,cli,'retry-observation',id,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:path}});
+ const stale=run('--override-shared-cooldown','github',String(expected-1));
+ expect(stale.exitCode).not.toBe(0);expect(stale.stderr.toString()).toContain('Shared cooldown changed; inspect before overriding');
+ const unchanged=new Store(path);expect(new RecoveryObservation(unchanged).status(id).sharedNextRead).toBe(expected);unchanged.close();
+ for(const args of [['--override-shared-cooldown','linear',String(expected)],['--override-shared-cooldown','github',`${expected}x`]]){
+  const invalid=run(...args);expect(invalid.exitCode).not.toBe(0);expect(invalid.stderr.toString()).toContain('Provider and inspected cooldown timestamp required');
+ }
+ const still=new Store(path);expect(new RecoveryObservation(still).status(id).sharedNextRead).toBe(expected);still.close();
+ const override=run('--override-shared-cooldown','github',String(expected));expect(override.exitCode).toBe(0);expect(JSON.parse(override.stdout.toString())).toMatchObject({readRetry:false,sharedCooldown:'cleared',mutationReplay:false});
+ const inspect=new Store(path);expect(new RecoveryObservation(inspect).status(id)).toMatchObject({failures:1,sharedNextRead:null});inspect.close();
+ expect(run().exitCode).toBe(0);const after=new Store(path);expect(new RecoveryObservation(after).status(id)).toBeNull();after.close();
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('persisted blocked and waiting guidance outranks historical transient observations',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-blocked-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');
+ new RecoveryObservation(s).failed(id,readFailure('github','review-read','HTTP 503'));
+ s.close();
+ for(const [persisted,state,action] of [['blocked','blocked',`adlc jobs recover ${id}`],['awaiting_approval','approval_wait',`adlc jobs show-plan ${id}`],['awaiting_plan','awaiting_plan','Inspect queue list for eligibility and planning capacity; no worker has been dispatched.']]){
+ const writer=new Store(path);writer.db.query('UPDATE jobs SET state=?,reason=? WHERE id=?').run(persisted,'Eligibility changed',id);writer.close();
+ expect(jobViews(path)[0]).toMatchObject({state,reason:'Eligibility changed',nextAction:action,observation:{failures:1,nextRetry:null,error:{classification:'server'}}});
+ }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('completed jobs retain observation evidence without suggesting an inactive probe',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-complete-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}');
+ new RecoveryObservation(s).failed(id,readFailure('github','review-read','HTTP 503'));
+ s.db.query("UPDATE jobs SET state='done',reason='Human merged PR' WHERE id=?").run(id);s.close();
+ expect(jobViews(path)[0]).toMatchObject({state:'complete',reason:'Human merged PR',nextAction:'No job action required; merging remains human-only.',observation:{failures:1,nextRetry:null,error:{classification:'server'}}});
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('ticket lookup requires project selection, never picks a candidate',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-'));try{
   const path=join(root,'state.sqlite'),s=new Store(path);

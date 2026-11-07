@@ -5,7 +5,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {readUpdateHistory,type RetainedIntent,type HistoryEvidence} from './update-history';
 import {appState,installationRecord} from './install-state';
 import {atomicFile} from './atomic-file';
-import {distributionFiles,distributionVersion,installBridge} from './install';
+import {distributionFiles,distributionVersion,installBridge,installIO} from './install';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {liveStackOps,type StackOps} from './stack-control';
 
@@ -213,9 +213,9 @@ export type UpdateIO={
  notify(event:string,key:string,detail?:Record<string,unknown>):void;
  now():number;
 };
-export function liveUpdateIO(state=appState()):UpdateIO{
+export function liveUpdateIO(state=appState(),adapters:{stack?:StackOps;installation?:typeof installIO}={}):UpdateIO{
  // Loaded lazily so read-only help never constructs live service state.
- let stack:StackOps|undefined;
+ let stack:StackOps|undefined=adapters.stack;
  return {
   state:()=>state,
   resolve:resolveCandidate,
@@ -224,7 +224,7 @@ export function liveUpdateIO(state=appState()):UpdateIO{
   tests:(policy,staged)=>runCandidateTests(policy,staged,state),
   compatibility:candidateCompatibility,
   get stack(){return stack??=liveStackOps(false);},
-  install:(apply,source,launcher)=>installBridge(apply,source,launcher),
+  install:(apply,source,launcher)=>installBridge(apply,source,launcher,adapters.installation??{...installIO,state:()=>state}),
   launcher:()=>installationRecord(state)?.launcher as string|undefined,
   dbHash,
   notify:(event,key,detail)=>notifyOnce(state,event,key,detail),
@@ -303,9 +303,13 @@ export class UpdateManager{
   this.notify('update-available',plan.candidate.commit,{ref:plan.candidate.ref,classification:plan.classification});
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and inspect it before updating');
   const release=acquireLock(state);
-  const wasPaused=this.turns.isPaused();
-  const startService=(project:string)=>wasPaused?this.io.stack.project('start',project):this.turns.run(()=>this.io.stack.project('start',project));
   try{
+   // Own the shared control scope through quiescence, installation, recovery,
+   // verification and resume. Concurrent stack starts must never lift our fence.
+   return await this.turns.run(async()=>{
+   const wasPaused=this.turns.isPaused();
+   if(wasPaused)throw Error('Intake is already paused; explicit operator recovery or start is required before updating');
+   const startService=(project:string)=>this.io.stack.project('start',project);
    if(installedVersion(state).record.version!==plan.installedVersion)throw Error('Installed version changed after preview; re-run the update');
    const existing=readIntent(state);if(existing&&activeStages.has(existing.stage))throw Error(`An interrupted update is recorded at ${existing.stage}; inspect services and update-intent.json, then use update-rollback or explicit operator recovery`);
    if(existing?.stage==='operator-action-required')throw Error('A prior update requires explicit operator recovery; inspect services and update-intent.json before retrying');
@@ -379,14 +383,18 @@ export class UpdateManager{
     const steps=recovery.length?`Intake remains paused. Inspect update-intent.json, ${join(state,'backups')} and service-status; recovery errors: ${recovery.map(item=>item.message).join('; ')}`:`Prior runtime restored; inspect update-intent.json and logs`;
     throw new Error(`Update failed (${error instanceof Error?error.message:String(error)}). ${steps}`,{cause:error});
    }
+   });
   }finally{release();}
  }
  async rollback(){
   const state=this.io.state();
   const launcher=this.io.launcher();if(!launcher)throw Error('Installed launcher identity is unavailable; preserve the installation and follow operator recovery steps');
-  const release=acquireLock(state),wasPaused=this.turns.isPaused();
-  const startService=(project:string)=>wasPaused?this.io.stack.project('start',project):this.turns.run(()=>this.io.stack.project('start',project));
+  const release=acquireLock(state);
   try{
+   return await this.turns.run(async()=>{
+   const wasPaused=this.turns.isPaused();
+   if(wasPaused)throw Error('Intake is already paused; explicit operator recovery or start is required before rollback');
+   const startService=(project:string)=>this.io.stack.project('start',project);
    const installed=readInstalledState(state);if(!installed)throw Error('No activated update is recorded; nothing to roll back');
    if(!installed.rollbackSafe)throw Error(`Rollback is unsafe: ${installed.classification} changes require explicit migration restore evidence; backups preserved at ${join(state,'backups')}`);
    if(installed.classification==='schema'&&(installed.dbHash===null||this.io.dbHash()!==installed.dbHash))throw Error('Database changed after activation; refusing to roll back against possibly incompatible work. Preserve evidence and follow operator recovery steps');
@@ -426,6 +434,7 @@ export class UpdateManager{
     if(!leavePaused&&!wasPaused)this.turns.resume();
     throw new Error(`Rollback failed (${error instanceof Error?error.message:String(error)}). Inspect update-intent.json and service-status`,{cause:error});
    }
+   });
   }finally{release();}
  }
 }

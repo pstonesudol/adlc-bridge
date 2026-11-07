@@ -1,8 +1,8 @@
 import {digest} from './core';
 // GitHub check/job REST responses do not attest which PR body was evaluated.
 // Do not infer it from the current body, timestamps, check output, or logs.
-// Until a trustworthy body-bound attestation source is supported, production
-// evidence deliberately carries null and metadata-remediation waits fail closed.
+// This metadata-only fallback deliberately carries null. Production uses the
+// separately verified workflow/job log collector in metadata-attestation.ts.
 export function metadataCheckEvidence(checks:any[],head:string,allowed:string[]){
  return checks.filter(c=>allowed.includes(c.name)&&c.app?.slug==='github-actions'&&c.head_sha===head).map(c=>({name:c.name,checkId:c.id,sha:c.head_sha,status:c.status,conclusion:c.conclusion,descriptionHash:null}));
 }

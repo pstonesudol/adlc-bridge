@@ -47,16 +47,17 @@ test('installer migrates projects without plists and rolls back gates, record, l
   expect(readdirSync(join(state,'versions'))).toHaveLength(1);expect(readFileSync(snapshot(source,join(state,'versions')).cli,'utf8')).toBe('original');
  }finally{rmSync(root,{recursive:true,force:true});}
 });
-test('snapshot reinstalls use only a verified installation source and preserve the root when no record exists',async()=>{
+test('explicit snapshot roots never redirect through the installation source',async()=>{
  const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-reinstall-'))),state=join(root,'ADLC Bridge'),installed=join(state,'versions/abc'),source=join(root,'source'),record=join(state,'installation.json');
  try{
   for(const dir of [join(installed,'src'),join(source,'src')])mkdirSync(dir,{recursive:true});writeFileSync(join(installed,'src/cli.ts'),'installed');writeFileSync(join(source,'src/cli.ts'),'source');
   let reads=0;const io:any={state:()=>state,home:()=>root,registeredProjects:async()=>{reads++;return [];}};
   expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);
-  const valid={source,cli:join(installed,'src/cli.ts')};writeFileSync(record,JSON.stringify(valid),{mode:0o600});expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(source);
-  reads=0;chmodSync(record,0o644);await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('owner-only');expect(reads).toBe(0);chmodSync(record,0o600);
-  writeFileSync(record,JSON.stringify({...valid,source:'relative'}));await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('Invalid installation source');expect(reads).toBe(0);
-  const other=join(root,'other-record');writeFileSync(other,JSON.stringify(valid),{mode:0o600});rmSync(record);symlinkSync(other,record);await expect(installBridge(false,installed,join(root,'adlc'),io)).rejects.toThrow('owner-only');expect(reads).toBe(0);
+   const valid={source,cli:join(installed,'src/cli.ts')};writeFileSync(record,JSON.stringify(valid),{mode:0o600});expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);
+   // An explicit immutable root does not consult even stale/unsafe source metadata.
+   chmodSync(record,0o644);expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);chmodSync(record,0o600);
+   writeFileSync(record,JSON.stringify({...valid,source:'relative'}));expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);
+   const other=join(root,'other-record');writeFileSync(other,JSON.stringify(valid),{mode:0o600});rmSync(record);symlinkSync(other,record);expect((await installBridge(false,installed,join(root,'adlc'),io)).source).toBe(installed);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('install uses read-only project discovery for preview and writable discovery for apply',async()=>{

@@ -11,7 +11,8 @@ import {homedir} from 'node:os';
 import {Store} from './core';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
-import {stackControl} from './stack-control';
+import {lifecycleCLI} from './lifecycle-cli';
+import {LifecycleFailure,type LifecycleAction} from './managed-lifecycle';
 import {initWizard} from './init';
 import {poll,validate,requiredCheckNames,metadataCheckNames} from './linear';
 import {setupPreview,writeSetupService,sanitizedSetup,validateRuntime,withVerificationContext} from './setup';
@@ -43,6 +44,7 @@ import {liveTransport,installWorkflowHook} from './workflow-transport';
 import {remediationPolicy} from './remediation';
 import {acknowledgePoll,runPollTick} from './poll-process';
 import {withTurnSubmission} from './turn-submission';
+import {assertConfiguredProjectIntakeEnabled,assertProjectReferenceIntakeEnabled} from './project-services';
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
@@ -58,6 +60,8 @@ import {projectEntries,selectProject} from './operator-discovery';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
+const lifecycleStatus=command==='status'&&(a.includes('--all')||!a.includes('--project')&&a.some(x=>!x.startsWith('-')));
+const lifecycleRequested=['start','stop','restart'].includes(command)||lifecycleStatus;
 let groupHelp='';
 let project:string|undefined;
 const out=(x:unknown)=>console.log(JSON.stringify(grouped&&json?{schemaVersion:1,command:requested,data:x}:x,null,2));
@@ -93,12 +97,14 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
  const initialIdentity=loadConfig?identity(startup):undefined;
  return async()=>runPollTick(async()=>{
   const c=loadConfig?loadConfig():startup;
+  assertConfiguredProjectIntakeEnabled(c,s);
   if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
   io.out(await io.poll(c,s,io.linearToken()));
   await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  if(blockers&&(workflow as Workflow).planningDependencies)io.out({planningDependencyNotices:await (workflow as Workflow).planningDependencies.notices(c,blockers as LinearBlockers)});
   if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)io.out({dependencyNotices:await dependencies.notices(c,blockers as LinearBlockers)});}
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
   const planApprovals=await linearApprovals.sync(c);if(planApprovals.length)io.out({planApprovals});
@@ -121,7 +127,17 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
  });
 }
 async function main(){
+  if(command==='update'){
+   if(a[0]!=='history')throw Error(`Use ${UPDATE_HISTORY_HELP}`);
+   if(a.length===2&&['--help','-h'].includes(a[1]))return console.log(UPDATE_HISTORY_HELP);
+   const options=parseHistoryArgs(a.slice(1)),history=readUpdateHistory(appState(),options.project);
+   return options.json?out(history):console.log(formatUpdateHistory(history));
+  }
    if(command==='help'||a.includes('--help')||a.includes('-h')){groupHelp=operatorHelp(command==='help'?a[0]:groups[command]?command:undefined);command='help';}
+   else if(lifecycleRequested||command==='services'&&['start','stop','restart','status'].includes(a[0])){
+    const verb=command==='services'?a.shift()!:command;
+    const result=await lifecycleCLI((verb==='service-status'?'status':verb) as LifecycleAction,a,db);out(result);if(result.complete===false)process.exitCode=1;return;
+   }
    else if(modern)return dispatchOperator(command,a,db);
    else if(grouped){
     const verbs=groups[command],verb=a.shift();
@@ -162,12 +178,6 @@ async function main(){
     return out(await installBridge(a.includes('--apply'),undefined,bin));
   }
   if(command==='install-runtime')return out(await installRuntime(req(a.includes('--binary')?a[a.indexOf('--binary')+1]:undefined,'--binary PATH'),a.includes('--apply')));
-  if(command==='update'){
-   if(a[0]!=='history')throw Error(`Use ${UPDATE_HISTORY_HELP}`);
-   if(a.length===2&&['--help','-h'].includes(a[1]))return console.log(UPDATE_HISTORY_HELP);
-   const options=parseHistoryArgs(a.slice(1)),history=readUpdateHistory(appState(),options.project);
-   return options.json?out(history):console.log(formatUpdateHistory(history));
-  }
   if(command==='update-config'){
    if(a.length!==1&&!(a.length===2&&a[1]==='--apply'))throw Error('Use update-config POLICY_JSON [--apply]');
    const policy=JSON.parse(readFileSync(req(a[0],'Policy file'),'utf8'));
@@ -184,7 +194,6 @@ async function main(){
    if(command==='update-rollback'&&a.length===0)return out(await manager.rollback());
    throw Error('Unsupported update command or option');
   }
-  if(['start','stop','status'].includes(command)&&a.includes('--all')){if(a.length!==1)throw Error('Use --all without a project ID or other options');return out(await stackControl(command as 'start'|'stop'|'status'));}
   if(command==='setup'){
     const c=JSON.parse(readFileSync(req(a[0],'Project config'),'utf8')),r=JSON.parse(readFileSync(req(a[1],'Runtime config'),'utf8'));
     if(a.includes('--export'))return out(sanitizedSetup(c,r));
@@ -225,8 +234,8 @@ async function main(){
   update-rollback                      restore the prior compatible verified snapshot
   update history [--project PROJECT] [--json]
                                        read-only, redacted shared-runtime timeline
-  start --all | stop --all | status --all
-                                       full background stack; stop requires idle workers
+  start --all | stop --all | status --all | restart --all
+                                       managed stack; disruptive actions preview first
   projects                             list registered project services
   bind-controller PROJECT CONTROLLER   preview verified missing-identity migration
     [--apply --confirm HASH]            bind only the currently inspected identity; no activation
@@ -280,6 +289,8 @@ spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning
   recovery-status                      read-only conflict stages, evidence and blockers
   recovery-preview JOB CONFIG          read-only conflict eligibility preview
   retry-observation JOB                rearm read-only provider checks; never replay mutation
+    [--override-shared-cooldown github|orchestrator EXPECTED_NEXT_READ]
+                                       clear inspected provider cooldown only; rearm JOB separately
   reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]
                                        inspect/confirm proven published Git intent only
   reconcile-conflict JOB CONFIG        read-only published-merge reconciliation preview
@@ -327,12 +338,15 @@ Registered approved review targets can request bounded in-scope fixes from their
       if(command==='feature-start'){
         const config=JSON.parse(readFileSync(req(a[0],'Config'),'utf8'));validate(config);
         const ti=a.indexOf('--title'),title=ti>=0?req(a[ti+1],'Title'):'Feature plan';
-        const created=await features.create(config,readFileSync(req(a[1],'Requirements file'),'utf8'),title,a.includes('--no-source'));out(created);return out(await features.tick(created.id,config.featurePlanning?.maxAgents));
+        return await withTurnSubmission(async()=>{
+         assertConfiguredProjectIntakeEnabled(config,s);assertProjectReferenceIntakeEnabled(config.linear.projectId,s);
+         const created=await features.create(config,readFileSync(req(a[1],'Requirements file'),'utf8'),title,a.includes('--no-source'));out(created);return out(await features.tick(created.id,config.featurePlanning?.maxAgents));
+        });
       }
       if(command==='feature-list')return out(features.list());
       const id=req(a[0],'Feature ID');
       if(command==='feature-show')return out(features.show(id));
-      if(command==='feature-step')return out(await features.tick(id));
+      if(command==='feature-step')return out(await withTurnSubmission(async()=>{assertProjectReferenceIntakeEnabled(features.get(id).project,s);return features.tick(id);}));
       if(command==='feature-edit')return out(features.setDraft(id,JSON.parse(readFileSync(req(a[1],'Draft file'),'utf8'))));
       if(command==='feature-approve')return out(features.approve(id,req(a[1],'Hash'),req(a[2],'Human'),a.includes('--acknowledge-questions')));
       if(command==='feature-publish')return out(await new FeaturePublish(s,features).publish(id));
@@ -355,9 +369,12 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,!applying);
     try{
      const workflow=new Workflow(store,liveTransport,undefined,!applying),dependencies=new DependencyRecovery(store,workflow);
-     if(command==='dependency-status')return out(dependencies.status());
+     if(command==='dependency-status')return out({...dependencies.status(),planningWaits:workflow.planningDependencies.rows()});
      const config=projectConfiguration(req(a[1],'Config'));validate(config);
-     return out(applying?await dependencies.tick(a[0],config,a[2]):await dependencies.preview(a[0],config));
+     return out(applying?await withTurnSubmission(async()=>{
+      assertProjectReferenceIntakeEnabled(store.get(a[0]).project,store);assertConfiguredProjectIntakeEnabled(config,store);
+      return dependencies.tick(a[0],config,a[2]);
+     }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
    if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
@@ -400,11 +417,15 @@ Registered approved review targets can request bounded in-scope fixes from their
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     const revision=revisionStatus(s,t.job),stale=revision?.blocking===true;
-    return {...t,reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
+    return {...t,observation:new RecoveryObservation(s).status(t.job),reviewState:t.state,...(blocked?{state:'blocked',displayStatus:reviewDisplay('blocked'),blockedReason:job.reason}:{}),...(stale?{state:'requirements_changed',displayStatus:'Requirements changed — fresh plan/approval required'}:{}),revision,jobState:job.state,remediation};
   });
    try{
     if(command==='retry-observation'){
-     if(a.length!==1)throw Error('Use retry-observation JOB');lifecycle.current(a[0]);new RecoveryObservation(s).clear(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');return out({job:a[0],readRetry:true,mutationReplay:false});
+     if(a.length!==1&&!(a.length===4&&a[1]==='--override-shared-cooldown'))throw Error('Use retry-observation JOB [--override-shared-cooldown github|orchestrator EXPECTED_NEXT_READ]');
+     lifecycle.current(a[0]);const observation=new RecoveryObservation(s);
+     if(a.length===4){observation.overrideCooldown(a[0],a[2],Number(a[3]));return out({job:a[0],readRetry:false,mutationReplay:false,sharedCooldown:'cleared',jobWait:'retained; retry-observation JOB separately'});}
+     s.db.transaction(()=>{observation.retry(a[0]);s.event(a[0],'operator_read_retry','Provider observations only; all mutation uncertainty retained');}).immediate();
+     return out({job:a[0],readRetry:true,mutationReplay:false,sharedCooldown:'retained'});
     }
     if(command==='authorize-base-merge'){
      return out(authorizeBaseMerge(lifecycle,a));
@@ -427,6 +448,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job');
       if(s.get(job).project!==c!.linear.projectId)throw Error('Job project does not match configured project');
       const result=await runPollTick(async()=>{
+       assertConfiguredProjectIntakeEnabled(c!,s);
        await poll(c!,s,linearToken());
        const stage=await workflow.resume(job,c!);
        let blockerLabel='retained';
@@ -450,6 +472,7 @@ Registered approved review targets can request bounded in-scope fixes from their
        const config=projectConfiguration(req(a[1],'Config'));validate(config);
        const job=req(a[0],'Job'),target=reviewLoop.get(job);
        if(s.get(job).project!==config.linear.projectId||target?.repo!==config.githubRepo)throw Error('Review target differs from configured project');
+       assertProjectReferenceIntakeEnabled(s.get(job).project,s);assertConfiguredProjectIntakeEnabled(config,s);
        new ApprovalPolicyStore(s).verify(job,config.linear.projectId,config.approval);
        reviewLoop.configureMetadataChecks(config.linear.projectId,config.prMetadataChecks??[]);
        reviewLoop.setVerification(job,config.verification,config.verificationContext);
@@ -475,7 +498,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const project=req(a[0],'Project'),issue=req(a[1],'Issue'),specification=readFileSync(req(a[2],'Specification file'),'utf8');
       // Intake shares the submission fence: a reconcile reservation must make
       // ingestion fail closed rather than add work mid-reservation.
-      return out({id:await withTurnSubmission(async()=>s.enqueue(project,issue,specification))});
+      return out({id:await withTurnSubmission(async()=>{assertProjectReferenceIntakeEnabled(project,s);return s.enqueue(project,issue,specification);})});
     }
     if(command==='plan'){
       const job=req(a[0],'Job'),revision=latestRevision(s,job);
@@ -504,4 +527,4 @@ Registered approved review targets can request bounded in-scope fixes from their
     }finally{try{finished();}catch{console.error('Poll completion receipt needs inspection; intake quiescence will remain unverified');}}
   }finally{s.close();}
 }
-if(import.meta.main)main().catch(e=>{const message=modern&&!(e instanceof OperatorError)?'Operation failed; inspect project configuration and supported service/auth diagnostics. Sensitive details withheld.':e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(grouped&&json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[]}}):`${message}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});
+if(import.meta.main)main().catch(e=>{const message=modern&&!(e instanceof OperatorError)?'Operation failed; inspect project configuration and supported service/auth diagnostics. Sensitive details withheld.':e instanceof Error?e.message:'ADLC failed',code=e instanceof OperatorError?e.code:1;console.error(grouped&&json?JSON.stringify({schemaVersion:1,command:requested,error:{code,message,candidates:e instanceof OperatorError?e.candidates:[],...(e instanceof LifecycleFailure?{result:e.result}:{})}}):`${message}${grouped&&e instanceof LifecycleFailure?'\n'+JSON.stringify(e.result,null,2):''}${e instanceof OperatorError&&e.candidates.length?'\n'+JSON.stringify(e.candidates,null,2):''}`);process.exitCode=process.exitCode||code;});

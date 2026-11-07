@@ -48,8 +48,8 @@ export async function controlStack(action:'start'|'stop'|'status',ops:StackOps){
  return {scope:'all',backend:stopped,projects:results,note:'Background stack stopped and disabled at login. Start --all re-enables it. The desktop window may remain open.'};
  });
 }
-export async function command(args:string[],spawn=Bun.spawn){
- const p=spawn(args,{stdout:'pipe',stderr:'pipe',timeout:30000});
+export async function command(args:string[],spawn=Bun.spawn,timeout=30000){
+ const p=spawn(args,{stdout:'pipe',stderr:'pipe',timeout});
  const [stdout,stderr,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {stdout,stderr,code};
 }
 const stateDir=()=>join(homedir(),'Library/Application Support/ADLC Bridge');
@@ -65,8 +65,8 @@ export function managedServiceDefinition(state=stateDir(),home=homedir(),trust=t
  owned(pin.launcher);
  return {...pin,plist,target:`gui/${process.getuid()}/${pin.serviceLabel}`,domain:`gui/${process.getuid()}`};
 }
-async function loaded(target:string){
- const r=await command(['/bin/launchctl','print',target]);
+async function loaded(target:string,run=command){
+ const r=await run(['/bin/launchctl','print',target]);
  if(r.code!==0&&!/Could not find service/.test(r.stdout+r.stderr))throw Error('Unable to inspect Orchestrator service');
  return r.code===0;
 }
@@ -109,8 +109,9 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
  return blocked;
 }
-export function liveStackOps(readOnly=false,turns=turnBarrier()):StackOps{
+export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,run=command,remaining=()=>30000):StackOps{
  const config=managedServiceDefinition();
+ const inspect=async()=>daemonStatus(await run([AO,'status','--json']));
  return {
   turns,
   projects:()=>registeredProjects(readOnly),
@@ -119,33 +120,35 @@ export function liveStackOps(readOnly=false,turns=turnBarrier()):StackOps{
    const entries=await registeredProjects(action==='service-status'),p=entries.find(x=>x.project===id);if(!p)throw Error('Unknown project');
    if(action==='start'){const r=await command(['/bin/launchctl','enable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Could not enable project service');}
    const result=await serviceControl(action,id,turns);
-   if(action==='stop'){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
+   if(action==='stop'&&persistent){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
    return result;
   },
-  backend:async()=>{const s=await probe();return {loaded:await loaded(config.target),ready:s.ready,managed:s.ready?s.executablePath===config.executable&&trustedDaemon(s.executablePath):true,...(s.ready?{pid:s.pid}:{})};},
+  backend:async()=>{const s=await inspect();return {loaded:await loaded(config.target,run),ready:s.ready,managed:s.ready?s.executablePath===config.executable&&trustedDaemon(s.executablePath):true,...(s.ready?{pid:s.pid}:{})};},
   backendStart:async()=>{
-   const s=await probe();if(s.ready&&s.executablePath!==config.executable)throw Error('Another Orchestrator backend is running; preserved');
-   const enabled=await command(['/bin/launchctl','enable',config.target]);if(enabled.code!==0)throw Error('Could not enable Orchestrator service');
-   if(!await loaded(config.target)){const r=await command(['/bin/launchctl','bootstrap',config.domain,config.plist]);if(r.code!==0)throw Error('Could not start Orchestrator service');}
-   for(let i=0;i<100;i++){try{const p=await probe();if(p.ready&&p.executablePath===config.executable)return;}catch{}await Bun.sleep(200);}
+   const s=await inspect();if(s.ready&&s.executablePath!==config.executable)throw Error('Another Orchestrator backend is running; preserved');
+   const enabled=await run(['/bin/launchctl','enable',config.target]);if(enabled.code!==0)throw Error('Could not enable Orchestrator service');
+   if(!await loaded(config.target,run)){const r=await run(['/bin/launchctl','bootstrap',config.domain,config.plist]);if(r.code!==0)throw Error('Could not start Orchestrator service');}
+   for(let i=0;i<100;i++){remaining();try{const p=await inspect();if(p.ready&&p.executablePath===config.executable)return;}catch{}await Bun.sleep(200);}
    throw Error('Orchestrator did not become ready; intake was not started');
   },
   backendStop:async()=>{
-   const r=await command(['/bin/launchctl','disable',config.target]);if(r.code!==0)throw Error('Unable to disable Orchestrator login startup');
-   if(await loaded(config.target)){const b=await command(['/bin/launchctl','bootout',config.target]);if(b.code!==0)throw Error('Could not stop managed Orchestrator');}
-   for(let i=0;i<100;i++){try{if(!(await probe()).ready&&!await loaded(config.target))return;}catch{}await Bun.sleep(200);}
+   if(persistent){const r=await run(['/bin/launchctl','disable',config.target]);if(r.code!==0)throw Error('Unable to disable Orchestrator login startup');}
+   if(await loaded(config.target,run)){const b=await run(['/bin/launchctl','bootout',config.target]);if(b.code!==0)throw Error('Could not stop managed Orchestrator');}
+   for(let i=0;i<100;i++){remaining();try{if(!(await inspect()).ready&&!await loaded(config.target,run))return;}catch{}await Bun.sleep(200);}
    throw Error('Orchestrator shutdown is still pending');
   },
   blockers:()=>workerBlockers(config.executable)
  };
 }
 const stackIO={state:stateDir,ops:liveStackOps};
+export async function withStackLock<T>(state:string,operation:()=>Promise<T>){
+ const lock=join(state,'stack-control.lock');mkdirSync(state,{recursive:true,mode:0o700});
+ try{mkdirSync(lock,{mode:0o700});}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
+ try{return await operation();}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
+}
 export async function stackControl(action:'start'|'stop'|'status',io=stackIO){
   if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');
   if(action==='status')return controlStack(action,io.ops(true,turnBarrier(io.state())));
-  const lock=join(io.state(),'stack-control.lock');
-  mkdirSync(io.state(),{recursive:true,mode:0o700});
- try{mkdirSync(lock);}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
   const turns=turnBarrier(io.state());
-  try{return await turns.run(()=>controlStack(action,io.ops(false,turns)));}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
+  return withStackLock(io.state(),()=>turns.run(()=>controlStack(action,io.ops(false,turns))));
 }

@@ -1,10 +1,24 @@
 import {mkdirSync,rmdirSync,lstatSync,unlinkSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {join} from 'node:path';import {appState} from './install-state';
 import {atomicFile} from './atomic-file';
 import {AsyncLocalStorage} from 'node:async_hooks';
 const submitting=new AsyncLocalStorage<{lock:string;active:boolean}>();
 const controlling=new AsyncLocalStorage<{lock:string;active:boolean}>();
 export class TurnSubmissionBlocked extends Error{}
+const projectPausePath=(project:string,state:string)=>join(state,'paused-projects',createHash('sha256').update(project).digest('hex'));
+export function projectIntakePaused(project:string,state=appState()){
+ try{lstatSync(projectPausePath(project,state));return true;}catch(e:any){if(e?.code==='ENOENT')return false;throw e;}
+}
+export function setProjectIntakePaused(project:string,paused:boolean,state=appState()){
+ if(!/^[\w-]{1,80}$/.test(project))throw Error('Registered project ID required');
+ const path=projectPausePath(project,state);
+ if(paused)atomicFile(path,'Intake paused; explicit project start required\n');
+ else if(projectIntakePaused(project,state))unlinkSync(path);
+}
+export function assertProjectIntakeEnabled(project?:string,state=appState()){
+ if(project&&projectIntakePaused(project,state))throw new TurnSubmissionBlocked('Project intake is intentionally paused; use services start PROJECT after inspection');
+}
 export type TurnBarrier={
   run<T>(operation:()=>Promise<T>,mode?:'control'|'start'):Promise<T>;
   submit<T>(operation:()=>Promise<T>):Promise<T>;

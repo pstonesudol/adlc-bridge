@@ -5,7 +5,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {turnBarrier,TurnSubmissionBlocked} from './turn-submission';
 import {definitionXML} from './project-services';
 import {join,resolve,dirname,isAbsolute} from 'node:path';import {homedir} from 'node:os';import {createHash} from 'node:crypto';
-import {appState,installedCLI,verifiedInstallationSource,installationRecord} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
+import {appState,installedCLI,verifiedInstallationSource} from './install-state';import {registeredProjects,serviceControl} from './service-control';import {readDefinition,assertDefinition} from './project-services';import {localAO,installWorkflowHook} from './workflow-transport';
 function assertMovableStatePaths(def:any){
  const controller=def.ProgramArguments?.[1];
  if(typeof controller!=='string'||def.WorkingDirectory!==dirname(controller))return;
@@ -55,7 +55,7 @@ function verifyRoutingImport(root:string,files:string[]){
  if(result.exitCode!==0)throw Error('Routing runtime dependency import verification failed with auto-install disabled; snapshot was not activated');
 }
 const quote=(v:string)=>"'"+v.replaceAll("'","'\\''")+"'";
-const installIO={registeredProjects,serviceControl,localAO,installWorkflowHook,readDefinition,assertDefinition,trustedDaemon,state:appState,home:homedir};
+export const installIO={registeredProjects,serviceControl,localAO,installWorkflowHook,readDefinition,assertDefinition,trustedDaemon,state:appState,home:homedir};
 function runtimeMigration(state:string,home:string,io:typeof installIO){
  const pinPath=join(state,'orchestrator-runtime.json');if(!existsSync(pinPath))return null;
  const owned=(path:string,privateFile=false)=>{const st=lstatSync(path);if(!st.isFile()||st.isSymbolicLink()||st.uid!==process.getuid?.()||(st.mode&(privateFile?0o077:0o022)))throw Error('Runtime migration requires trusted owner-controlled files');};
@@ -66,10 +66,12 @@ function runtimeMigration(state:string,home:string,io:typeof installIO){
  if(def.Label!==pin.serviceLabel||!Array.isArray(def.ProgramArguments)||def.ProgramArguments.length!==2||def.ProgramArguments[0]!=='/usr/bin/python3'||def.ProgramArguments[1]!==pin.launcher)throw Error('Runtime definition changed; preserved');
  return {pinPath,pinBytes,pin,plist,def,plistBytes:readFileSync(plist)};
 }
-export async function installBridge(apply=false,root=resolve(import.meta.dir,'..'),bin?:string,io=installIO){
+export async function installBridge(apply=false,root?:string,bin?:string,io=installIO){
+  const defaultRoot=root===undefined;
+  root??=resolve(import.meta.dir,'..');
   const turns=turnBarrier(io.state());
   const inspectAndInstall=async()=>{
-  if(root.includes('/ADLC Bridge/versions/')){const installed=installationRecord(io.state());if(installed?.cli&&resolve(root)===resolve(dirname(dirname(installed.cli))))root=verifiedInstallationSource(io.state())??root;}
+  if(defaultRoot&&root!.includes('/ADLC Bridge/versions/'))root=verifiedInstallationSource(io.state())??root;
  const projects=await io.registeredProjects(!apply);
  const launcher=bin??(existsSync('/opt/homebrew/bin/adlc')?'/opt/homebrew/bin/adlc':join(io.home(),'.local/bin/adlc'));
  if(existsSync(launcher)){const st=lstatSync(launcher);if(!st.isFile()||st.isSymbolicLink()||!readFileSync(launcher,'utf8').includes('src/cli.ts'))throw Error('Existing launcher is not recognizable; choose --bin PATH');}

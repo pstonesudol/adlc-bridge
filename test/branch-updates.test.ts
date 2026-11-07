@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {featureGit} from '../src/approval-policy';import {BranchUpdates,type BranchSnapshot} from '../src/branch-updates';
+import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Lifecycle} from '../src/lifecycle';import {featureGit} from '../src/approval-policy';import {BranchUpdates,type BranchSnapshot} from '../src/branch-updates';import {ObservationLeaseLost} from '../src/observation-fence';
 const policy={enabled:true,authorizedBy:'test human',maxUpdates:3};
 test('accepted-update observation requires both inputs and stable current head; uncertainty is independent',async()=>{
  const f=fixture();try{
@@ -28,6 +28,17 @@ test('conflicts and active workers block branch updates without mutation',async(
 test('lost API response cannot repeat mutation; fork/default targets are refused',async()=>{const f=fixture();try{f.lose();expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');expect(f.calls()).toBe(1);f.b.headRepo='fork/repo';await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('owned');f.b.headRepo='owner/repo';f.b.defaultBranch=f.b.branch;await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toThrow('owned');}finally{f.s.close();}});
 test('update cap and missing authorization prevent further writes',async()=>{const f=fixture();try{expect(await f.updater.ensure(f.id,'owner/repo',1,f.session,undefined)).toBeNull();expect(f.calls()).toBe(0);await f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:1});f.b.head='c'.repeat(40);f.b.base='d'.repeat(40);expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,{...policy,maxUpdates:1}))?.reason).toContain('limit');expect(f.calls()).toBe(1);}finally{f.s.close();}});
 
+test('pre-send fence rejection releases its claim; possible delivery keeps uncertainty',async()=>{
+ const f=fixture();try{
+  f.updater.transport.update=async()=>{throw new ObservationLeaseLost(false);};
+  await expect(f.updater.ensure(f.id,'owner/repo',1,f.session,policy)).rejects.toBeInstanceOf(ObservationLeaseLost);
+  expect(f.s.db.query('SELECT * FROM branch_updates').get()).toBeNull();
+  expect(f.s.get(f.id).attempts).toBe(0);
+  f.updater.transport.update=async()=>{throw new ObservationLeaseLost(true);};
+  expect((await f.updater.ensure(f.id,'owner/repo',1,f.session,policy))?.state).toBe('blocked');
+  expect((f.s.db.query('SELECT state FROM branch_updates').get() as any).state).toBe('delivery_uncertain');
+ }finally{f.s.close();}
+});
 test('comparison resolves current base ref instead of trusting stale PR base SHA',async()=>{
  const {readBranchSnapshot}=await import('../src/branch-updates');const current='b'.repeat(40),head='c'.repeat(40);let compared='';
  const read=async(args:string[])=>{const path=args[1];if(path.endsWith('/pulls/1'))return {head:{sha:head,ref:'adlc/test',repo:{full_name:'owner/repo'}},base:{sha:'a'.repeat(40),ref:'main',repo:{full_name:'owner/repo',default_branch:'main'}},state:'open',draft:false,mergeable:true};if(path.includes('/git/ref/heads/'))return {ref:'refs/heads/main',object:{type:'commit',sha:current}};compared=path;return {behind_by:7};};
