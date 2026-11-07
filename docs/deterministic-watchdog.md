@@ -202,7 +202,11 @@ build diagnostics with approved repository paths. Security findings, paths
 outside scope, credentials/permission failures and unknown evidence require
 human inspection. Infrastructure failures wait with the existing watchdog's
 bounded exponential cadence (up to 15 minutes), then escalate after 30 minutes
-on the same head. No additional timer, action budget or poller exists. All
+on the same head. Cadence derives from persisted current-head age: delays of
+1, 2, 4, 8 and 15 minutes at head ages 0, 1, 3, 7 and 15 minutes. A new head
+restarts this cadence, without resetting any budget. Provider failures during
+the post-diagnosis re-read retain the ordinary provider-read handling rather
+than consuming the evaluation-exception limit. No additional timer, action budget or poller exists. All
 non-repairable outcomes identify the check in the review target's reason.
 
 Only repairable evidence reaches `sendPilotRemediation`; the sender refreshes

@@ -3,6 +3,8 @@ import {classifyCIFailure,readCIFailure,remediationFingerprint} from '../src/ci-
 import {Lifecycle} from '../src/lifecycle';
 import {incident} from './incidents/harness';
 import {ActionWatchdog,WATCHDOG_LIMITS} from '../src/action-watchdog';
+import {readFailure,ReadValidationError} from '../src/provider-read';
+import {RecoveryObservation} from '../src/recovery-observation';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -147,8 +149,55 @@ test('watchdog observation schedules existing evaluator only; transient backoff 
   const wait=await f.loop.tick(f.id);expect(wait.state).toBe('waiting_for_ci');
   const b=w.scheduleReview(f.id,c);w.finishReview(b.id,wait);
   const evaluation:any=f.s.db.query('SELECT * FROM watchdog_evaluations WHERE job=?').get(f.id);
-  expect(evaluation.next_tick).toBeGreaterThanOrEqual(Date.now()+WATCHDOG_LIMITS.intervalMs);
-  expect(evaluation.next_tick).toBeLessThanOrEqual(Date.now()+WATCHDOG_LIMITS.idleMs);
+  expect(evaluation.next_tick).toBe(Date.now()+WATCHDOG_LIMITS.intervalMs);
+  // Lifetime history must not accelerate a new head's first transient wait.
+  f.s.db.query('UPDATE watchdog_actions SET attempts=100 WHERE id=?').run(b.id);
+  f.s.db.query('UPDATE watchdog_budgets SET attempts=100 WHERE job=?').run(f.id);
+  for(const [age,delay] of [[0,1],[1,2],[3,4],[7,8],[15,15]]){
+   setSystemTime(new Date(f.loop.get(f.id).head_since+age*60000));
+   const transient=await f.loop.tick(f.id);expect(transient.state).toBe('waiting_for_ci');
+   w.finishReview(b.id,transient);
+   const next:any=f.s.db.query('SELECT * FROM watchdog_evaluations WHERE job=?').get(f.id);
+   expect(next.next_tick).toBe(Date.now()+delay*60000);
+  }
+  f.evidence.head='d'.repeat(40);f.evidence.failedChecks=[check(f.evidence.head)];
+  const newWait=await f.loop.tick(f.id),newAction=w.scheduleReview(f.id,c);w.finishReview(newAction.id,newWait);
+  expect(newAction.id).not.toBe(b.id);expect(newAction.attempts).toBe(100);
+  expect((f.s.db.query('SELECT next_tick FROM watchdog_evaluations WHERE job=?').get(f.id) as any).next_tick).toBe(Date.now()+WATCHDOG_LIMITS.intervalMs);
+  f.evidence.failedChecks=[];f.evidence.pendingChecks=['CI'];
+  setSystemTime(new Date(Date.now()+15*60000));
+  const pending=await f.loop.tick(f.id);w.finishReview(newAction.id,pending);
+  expect(pending.state).toBe('waiting_for_ci');
+  expect((f.s.db.query('SELECT next_tick FROM watchdog_evaluations WHERE job=?').get(f.id) as any).next_tick).toBe(Date.now()+WATCHDOG_LIMITS.intervalMs);
   expect(w.due('incident')).toEqual([]);expect(f.calls.filter(x=>x.kind==='send')).toHaveLength(1);
+ }finally{f.s.close();rmSync(root,{recursive:true,force:true});}
+});
+
+for(const kind of ['server','authentication','capacity','validation'] as const)test(`post-diagnosis ${kind} read failure settles without charging evaluation failures`,async()=>{
+ setSystemTime(new Date('2026-01-01'));
+ const f=failed(),root=mkdtempSync(join(tmpdir(),'dev80-read-failure-'));
+ try{
+  const j=f.s.get(f.id);new Lifecycle(f.s).grantGit(f.id,j.plan_hash,['inspect','commit','push-feature','open-pr'],'fixture-human');
+  const c={linear:{projectId:'incident'},githubRepo:'fixture/repo',approval:{mode:'manual'}};
+  const w=new ActionWatchdog(f.s,Date.now,()=>0.5,root),a=w.scheduleReview(f.id,c);
+  let reads=0;
+  f.loop.io.readiness=async()=>{
+   if(++reads===1)return f.evidence;
+   if(kind==='validation')throw new ReadValidationError();
+   throw readFailure('github','readiness',kind==='server'?'HTTP 503':'HTTP 401');
+  };
+  f.loop.io.readCIFailure=async()=>{
+   if(kind==='capacity')f.s.db.query("INSERT INTO observation_capacity VALUES ('github',?)").run(Date.now()+60000);
+   if(kind==='validation')f.s.db.query('INSERT INTO recovery_observations VALUES (?,1,?,?)').run(f.id,Date.now(),JSON.stringify({provider:'github',classification:'server'}));
+   return log;
+  };
+  const result=await f.loop.tick(f.id);w.finishReview(a.id,result);
+  expect(result).toMatchObject({state:['server','capacity'].includes(kind)?'waiting_for_worker':'blocked',head:f.evidence.head,send:false});
+  expect(reads).toBe(kind==='capacity'?1:2);expect(f.calls).toEqual([]);expect(f.s.get(f.id).attempts).toBe(0);
+  expect((f.s.db.query('SELECT failures FROM watchdog_evaluations WHERE job=?').get(f.id) as any).failures).toBe(0);
+  expect(w.get(a.id).outcome).not.toBe('evaluation_failed');
+  const observation=new RecoveryObservation(f.s).status(f.id);
+  if(kind==='validation'||kind==='capacity')expect(observation).toBeNull();
+  else expect(observation.evidence.classification).toBe(kind);
  }finally{f.s.close();rmSync(root,{recursive:true,force:true});}
 });

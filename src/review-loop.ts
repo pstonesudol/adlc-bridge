@@ -473,7 +473,9 @@ export class ReviewLoop{
     }
     if(blockers.length)return record({state:blockers.every(b=>b.transient)&&Date.now()-since<30*60000?'waiting_for_ci':'blocked',send:false,head:e.head,reason:blockers.map(b=>b.reason).join('; ')});
     // A log read cannot authorize a stale run/head. Re-read logical identities.
-    const fresh=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));
+    let fresh;
+    try{fresh=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));}
+    catch(error){if(error instanceof ReadValidationError)observation.clear(job);return record({...readStop(error,'Readiness evidence unavailable'),head:e.head});}
     if(fresh.head!==e.head||failures.some((c:any)=>fresh.failedChecks.filter((x:any)=>sameFailedCheck(c,x)).length!==1||fresh.pendingChecks.includes(c.name)))return record({state:'blocked',send:false,head:e.head,reason:`Required CI ${failures.map((c:any)=>c.name).join(', ')}: unknown; failure identity changed during diagnosis`});
    }
   const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
