@@ -3,7 +3,8 @@ import {readFailure,ReadValidationError} from '../src/provider-read';
 import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
 import {ObservationLeaseLost} from '../src/observation-fence';
 import {decision,ReviewLoop} from '../src/review-loop';
-import {Store} from '../src/core';
+import {Store,reviewGate} from '../src/core';
+import {requiredCheckState} from '../src/github';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {sendPilotRemediation} from '../src/pilot';
@@ -70,6 +71,20 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+test('resolved passing CI duplicates reach human review without requests or remediation',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);
+  const check=(id:number,conclusion:string)=>({id,name:'CI',head_sha:f.head,app:{slug:'github-actions'},status:'completed',conclusion,started_at:'2026-11-07T14:45:00Z',completed_at:`2026-11-07T14:45:0${id}Z`});
+  const raw=[check(1,'cancelled'),check(2,'success'),check(3,'success'),{...check(4,'success'),name:'CodeRabbit',app:{slug:'coderabbitai'}}];
+  const gate=reviewGate({head:f.head,observedHead:f.head,required:['CI'],checks:raw.map(c=>({...c,sha:c.head_sha,app:c.app.slug})),review:{sha:f.head,author:'coderabbitai[bot]',state:'APPROVED'},unresolved:0,threadsComplete:true,checksComplete:true,reviewComplete:true});
+  Object.assign(f.e,gate,requiredCheckState(raw,f.head,['CI']),{findings:[]});
+  expect(gate.clear).toBe(true);
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'ready_for_human',send:false,mergeEnabled:false});
+  expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
+  expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
 // Inject an attested collector response for success-path tests. The production
 // GitHub collector currently cannot supply this and returns a null body hash.
 function bodyEvidence(e:any,names=['PR body structure']){return names.map((name,i)=>({name,checkId:i+2,sha:e.head,status:'completed',conclusion:'success',descriptionHash:e.descriptionHash}));}
