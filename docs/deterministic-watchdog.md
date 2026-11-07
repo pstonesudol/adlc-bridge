@@ -181,7 +181,7 @@ DEV-52 remains an optional future model-supervision layer. It could consume
 typed action evidence, but cannot supply grants or bypass these contracts.
 DEV-59 owns submission-lock contention/backoff and abandoned-barrier diagnosis;
 this feature neither retries whole fenced operations nor changes lock ownership.
-Worker liveness/replacement, new receipt recovery and additional
+Worker replacement, new receipt recovery and additional
 supported recovery adapters are follow-ups. Each new effectful adapter needs
 its own exact permission/precondition contract, durable mutation reservation,
 existing transport/fence and authoritative receipt reconciliation before it can
@@ -231,6 +231,37 @@ no provider IO, claims, migrations, cooldown repairs or cleanup, and label
 evidence persisted-only. Evidence contains hashes, identifiers and fixed
 classification/activity codes; no transcripts, prompts, credentials or raw
 provider diagnostics are stored by the watchdog.
+
+### Owned-worker liveness (DEV-83)
+
+The same read action and separate ordinary evaluator now persist a closed
+`alive | busy | idle_no_delivery | stuck | terminated | unknown` diagnosis in
+`worker_liveness`. This is an evidence table, not a budget or action queue.
+Read-only watchdog status includes the classification, original session/worktree/
+branch, last known turn, observation time and recovery attempt count. Progress
+fingerprints hash ephemeral transcript/turn evidence and current head; transcript
+content, prompts and provider error bodies are never stored by this feature.
+
+Busy turns become stuck after 30 minutes without observed progress. Busy and idle
+waits use the existing evaluation cadence (1, 2, 4, 8, 15 minutes), derived from
+persisted progress age. They consume the same cumulative watchdog budget; a new
+head or restart cannot refill it. Existing CI head-age backoff is unchanged.
+An idle recorded delivery without outcome retains its authoritative receipts and
+uses the existing reconciliation path, with no resend. Completed metadata delivery
+still uses the existing description-change reconciliation, not commit inference.
+
+Terminated owners escalate with session, reservation and last-turn evidence;
+there is no resurrection or replacement. Unknown evidence fails closed. Stuck
+owners escalate when native resume is unavailable: the current transport can send
+new messages but has no authoritative native-turn resume operation. Silence alone
+cannot exclude a genuinely in-flight queued/running turn. Consequently this adapter
+performs **zero nudges** (`recoveryAttempts: 0`), rather than calling a new send a
+resume. There is no new sender, recovery operation, poller, lock takeover or budget
+table. A future supported resume must reuse the turn-submission fence and receipts
+and prove no in-flight turn before being enabled. DEV-31 and DEV-59 stay separate.
+These escalations stop automatic evaluation for the binding; inspection and an
+explicit supervised review remain operator actions. Tests are offline evidence,
+not a live pilot or authorization to install or activate the source changes.
 
 Offline tests execute the production evaluator and review integration with
 injected provider reads and deterministic time. Coverage includes due/not-due,

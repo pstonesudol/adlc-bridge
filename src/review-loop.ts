@@ -35,7 +35,8 @@ function readStop(error:unknown,fallback:string){
 }
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
-import {ActionWatchdog} from './action-watchdog';
+import {ActionWatchdog,WATCHDOG_LIMITS} from './action-watchdog';
+import {observeLiveness,livenessStop} from './worker-liveness';
 
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
@@ -78,7 +79,7 @@ const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeed
 export class ReviewLoop{
  io:typeof reviewIO;
  requests:ReviewRequests;
- constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={}){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
+  constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={},public now=Date.now){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
   head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,
@@ -282,14 +283,22 @@ export class ReviewLoop{
     session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
     snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
   }catch(e){return record(readStop(e,'Provider evidence unavailable'));}
-  try{
-   if(session.session.isTerminated!==false||!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
-   const local=await io.worktreeIdentity(this.s,job);
-   assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
+   try{
+    if(session.session.isTerminated!==true&&!session.session.prs?.some((p:any)=>p.number===t.pr&&p.url===`https://github.com/${t.repo}/pull/${t.pr}`))throw Error('Target/session mismatch');
+    assertDeliveryTarget(this.s,job,session.session,t.repo,t.pr,snapshot);
+    if(session.session.isTerminated===true){
+     const terminated=observeLiveness(this.s,job,session,snapshot.head,WATCHDOG_LIMITS.livenessMs,this.now());
+     return record({...livenessStop(terminated,WATCHDOG_LIMITS.livenessMs,this.now()),head:snapshot.head});
+    }
+    const local=await io.worktreeIdentity(this.s,job);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
-   const collected=this.completed(job);if(collected)return collected;
-   const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return record(activeDelivery);
+    const collected=this.completed(job);if(collected)return collected;
+    const live=observeLiveness(this.s,job,session,snapshot.head,WATCHDOG_LIMITS.livenessMs,this.now());
+    const liveStop=livenessStop(live,WATCHDOG_LIMITS.livenessMs,this.now());
+    if(liveStop&&['terminated','stuck','unknown'].includes(live.classification))return record({...liveStop,head:snapshot.head});
+    if(live.classification==='idle_no_delivery'&&liveStop?.state==='needs_reconciliation')return record({...liveStop,head:snapshot.head});
+    const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return record(activeDelivery);
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;
@@ -488,9 +497,14 @@ export class ReviewLoop{
    return true;
   }).immediate();
   if(!stored)return this.get(job)?.pr!==t.pr?{state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}:{state:'completed',send:false,head:e.head,reason:'Review target completed during collection'};
-  if(d.send&&t.remediate){
-   const reconciliation=this.reconcileRemediation(job,e.head,session);
-   if(reconciliation)return record(reconciliation);
+   if(d.send&&t.remediate){
+    const reconciliation=this.reconcileRemediation(job,e.head,session);
+    if(reconciliation)return record(reconciliation);
+    // Receipt reconciliation above may have established a metadata edit's
+    // delivery. Re-evaluate that fact rather than caching a pre-reconciliation
+    // idle diagnosis as authority to block or send a different remediation.
+    const deliveryLive=observeLiveness(this.s,job,session,e.head,WATCHDOG_LIMITS.livenessMs,this.now());
+    if(deliveryLive.classification!=='alive')return record({...livenessStop(deliveryLive,WATCHDOG_LIMITS.livenessMs,this.now()),head:e.head});
    if(session.transcript.controller!=='ready')return {...d,send:false,reason:'Worker busy; wait',head:e.head};
    const grant=this.s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
    const metadataOnly=reviewView.findings.every((f:any)=>f.kind==='pr_description');

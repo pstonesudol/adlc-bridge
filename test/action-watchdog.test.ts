@@ -21,7 +21,7 @@ function fixture(disk=false){
  let now=1_000_000,reads=0;
  const job=s.enqueue('p','issue','spec'),p=new Planning(s),r=p.reserve(job,'ao');p.gate(job,'ao','session',r.branch,'/worktree');
  const hash=s.propose(job,'plan');s.approve(job,hash,'human');const l=new Lifecycle(s);l.grantGit(job,hash,['inspect','commit','push-feature','open-pr'],'human');l.adoptSupervised(job,{id:'session',correlation:r.correlation,worktree:'/worktree',controller:'running'});
- const loop=new ReviewLoop(s,async()=>{throw Error('No review requests expected');});loop.configureMetadataChecks('p',[]);loop.register(job,'owner/repo',1,['CI'],['src/**'],true);
+  const loop=new ReviewLoop(s,async()=>{throw Error('No review requests expected');},{},()=>now);loop.configureMetadataChecks('p',[]);loop.register(job,'owner/repo',1,['CI'],['src/**'],true);
  const c={linear:{projectId:'p'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'}},w=new ActionWatchdog(s,()=>now,()=>0.5,root);
  const session:any={receiptObservation:{complete:true,observed:now},session:{id:'session',projectId:'ao',isTerminated:false,branch:r.branch,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};
  const snapshot:any={head:'a'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,branch:r.branch,base:'b'.repeat(40),baseBranch:'main',defaultBranch:'main',mergeable:true,behind:0};
@@ -91,6 +91,18 @@ throws=1;await tick();const deferred=status();await tick();const immediate=ordin
 advance();await tick();console.log(JSON.stringify({deferred,immediate,current:status(),ordinary,actions,before,after:receipts.get('original-send'),errors}));`);
   expect(r.deferred).toMatchObject({state:'pending',nextAction:'defer',outcome:'evaluation_uncertain',evaluation:{failures:1}});expect(r.immediate).toBe(1);
   expect(r.current).toMatchObject({state:'pending',evaluation:{failures:0}});expect(r.ordinary).toBe(2);expect(r.actions).toBe(2);expect(r.after).toEqual(r.before);expect(r.errors).toEqual(['Injected ordinary evaluation failure']);
+ }finally{f.close();}
+});
+test('scheduling and settlement failures do not skip later poll items',()=>{
+ const f=fixture(true);try{
+  const r=productionScenario(f,`
+const list=loop.list.bind(loop);loop.list=(...args)=>[{job:'bad-target',state:'waiting_for_review'},...list(...args)];
+const verify=loop.setVerification.bind(loop);loop.setVerification=(id,...args)=>{if(id==='bad-target')throw Error('bad configuration');return verify(id,...args);};
+const due=ActionWatchdog.prototype.due,finish=ActionWatchdog.prototype.finishReview;
+ActionWatchdog.prototype.due=function(...args){return [{id:'bad-action',job:'bad-job',state:'pending'},...due.apply(this,args)];};
+ActionWatchdog.prototype.finishReview=function(id,...args){if(id==='bad-action')throw Error('settlement failed');return finish.call(this,id,...args);};
+await tick();console.log(JSON.stringify({ordinary,actions,errors,current:status()}));`);
+  expect(r.ordinary).toBe(1);expect(r.actions).toBe(2);expect(r.errors).toHaveLength(3);expect(r.current.state).toBe('pending');
  }finally{f.close();}
 });
 test('consecutive evaluation failures back off to the configured cap across successful reads and head changes',()=>{

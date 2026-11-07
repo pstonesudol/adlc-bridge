@@ -21,7 +21,7 @@ import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-lo
 import {sendPilotRemediation} from ${JSON.stringify(join(import.meta.dir,'../src/pilot.ts'))};
 const head=${JSON.stringify(head)},branch=${JSON.stringify(r.branch)};
 const finding={source:'github-review',kind:'review_thread',threadId:'T1',commentsHash:'d'.repeat(64),path:'src/fix.ts',body:'Fix the scoped defect',sha:head};
-const session={session:{id:'session',branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};
+const session={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',branch,isTerminated:false,prs:[{number:1,url:'https://github.com/owner/repo/pull/1'}]},transcript:{controller:'ready',entries:[],turns:[]}};
 let sends=0;
 const providers={readBranchSnapshot:async()=>({head,base:'b'.repeat(40),branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:true,behind:0}),worktreeIdentity:async()=>({tree:'/worktree',branch,head}),sessionEvidence:async()=>session,readiness:async()=>({head,clear:false,reasons:['Unresolved or unknown findings'],descriptionHash:'body',templateSignature:'sig',findings:[finding],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true}),spawn:()=>{
  console.log('send-ready:'+ ++sends);
@@ -50,7 +50,9 @@ ReviewLoop.prototype.tick=async function(...args){this.io={...this.io,...provide
   expect(rows()).toEqual(before);expect(existsSync(join(state,'turn-submission.lock'))).toBe(false);await turnBarrier(state).run(async()=>{});
   // A fresh process cannot resend the uncertain delivery after interruption.
   const retry=Bun.spawnSync([process.execPath,'--preload',preload,join(import.meta.dir,'../src/cli.ts'),'tick-review',job,config],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:home,ADLC_DB:db},stdout:'pipe',stderr:'pipe',timeout:5000});
-  expect(retry.exitCode).toBe(0);expect(retry.stderr.toString()).toBe('');expect(JSON.parse(retry.stdout.toString())).toMatchObject({state:'needs_reconciliation',send:false});expect(rows()).toEqual(before);
+  // Fresh complete evidence preserves host acceptance when confirmation is
+  // absent; neither accepted-wait nor unknown delivery authorizes replay.
+  expect(retry.exitCode).toBe(0);expect(retry.stderr.toString()).toBe('');expect(JSON.parse(retry.stdout.toString())).toMatchObject({state:fail?'needs_reconciliation':'waiting_for_worker',send:false});expect(rows()).toEqual(before);
  }finally{if(child&&child.exitCode===null){(child.stdin as any).end();await child.exited;}rmSync(home,{recursive:true,force:true});}
 },15000);
 
