@@ -6,9 +6,30 @@ import {turnBarrier} from '../src/turn-submission';
 import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,evaluateCheckRuns,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
 import {installBridge,installIO,snapshot,distributionVersion} from '../src/install';
 import {liveUpdateIO} from '../src/update';
+import {dbHash} from '../src/update';
+import {Database} from 'bun:sqlite';
 import {formatUpdateHistory,parseHistoryArgs,readUpdateHistory} from '../src/update-history';
 
 const repo='acme/adlc';
+test('database rollback fingerprints include committed WAL writes and WAL absence',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-wal-')),path=join(root,'state.sqlite');let db:Database|undefined;
+ try{
+  expect(dbHash(path)).toBeNull();db=new Database(path);db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence(value TEXT); PRAGMA wal_checkpoint(TRUNCATE)');
+  const baseline=dbHash(path),main=readFileSync(path);expect(baseline).not.toBeNull();
+  db.exec("INSERT INTO evidence VALUES ('work after activation')");expect(readFileSync(path)).toEqual(main);expect(dbHash(path)).not.toBe(baseline);
+  db.close();db=undefined;rmSync(`${path}-wal`,{force:true});const absent=dbHash(path);writeFileSync(`${path}-wal`,'');expect(dbHash(path)).not.toBe(absent);
+  rmSync(`${path}-wal`);mkdirSync(`${path}-wal`);expect(dbHash(path)).toBeNull();
+ }finally{db?.close();rmSync(root,{recursive:true,force:true});}
+});
+test('failed hot and backend apply recover independently of a prior unsafe schema activation',async()=>{
+ for(const files of [['src/cli.ts'],['src/cli.ts','src/serve-orchestrator.py']]){
+  const f=fixture({files});try{
+   writeFileSync(join(f.state,'update-state.json'),JSON.stringify({version:1,commit:'b'.repeat(40),contentVersion:'v1',classification:'schema',rollbackSafe:false}),{mode:0o600});
+   f.setFail(true);await expect(f.manager.apply()).rejects.toThrow('Update failed');
+   expect(f.installs).toEqual([join(f.root,'stage'),join(f.state,'versions','v1')]);expect(f.manager.history().entries.at(-1)?.outcome).toBe('rolled-back');expect(f.manager.turns.isPaused()).toBe(false);
+  }finally{f.close();}
+ }
+});
 test('real installer activation, rollback and failed-install recovery retain the exclusive update fence',async()=>{
  for(const fail of [false,true]){
   const f=fixture();try{
@@ -144,6 +165,9 @@ test('history options and CLI JSON/help are stable and missing state remains abs
   const missing=join(f.root,'missing');const run=(args:string[])=>Bun.spawnSync(['bun','src/cli.ts','update','history',...args],{env:{...process.env,HOME:missing}});
   const json=run(['--json']);expect(json.exitCode).toBe(0);expect(JSON.parse(json.stdout.toString())).toMatchObject({version:1,history:'unknown',entries:[]});
   expect(run(['--help']).stdout.toString().trim()).toBe('adlc update history [--project PROJECT] [--json]');
+  for(const args of [['--help'],['-h'],['history','--help'],['history','-h']]){
+   const help=Bun.spawnSync(['bun','src/cli.ts','update',...args],{env:{...process.env,HOME:missing}});expect(help.exitCode).toBe(0);expect(help.stdout.toString().trim()).toBe('adlc update history [--project PROJECT] [--json]');
+  }
   expect(run(['--apply']).exitCode).not.toBe(0);expect(existsSync(join(missing,'Library','Application Support','ADLC Bridge'))).toBe(false);
  }finally{f.close();}
 });
@@ -279,7 +303,7 @@ test('isolated staging pins the exact commit and refuses a modified checkout',as
   writeFileSync(join(staged.root,'src/cli.ts'),'modified');await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
   writeFileSync(join(staged.root,'src/cli.ts'),'candidate bytes');
   writeFileSync(join(staged.root,'.git/info/exclude'),'src/generated.ts\n');writeFileSync(join(staged.root,'src/generated.ts'),'ignored bytes');
-  await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
+  await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow(`inspect and remove ${staged.root}, then retry`);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('a deferral whose intake restoration fails remains paused for operator action',async()=>{

@@ -116,7 +116,7 @@ export async function stageCandidate(policy:UpdatePolicy,candidate:Candidate,sta
  const inspect=()=>{
   if(!existsSync(join(root,'.git')))throw Error('Staged update checkout is missing its pinned Git identity');
   const head=runGit(['rev-parse','HEAD'],root).trim();if(head!==candidate.commit)throw Error('Staged update checkout no longer matches the pinned candidate');
-  if(runGit(['status','--porcelain','--ignored'],root).trim())throw Error('Staged update checkout was modified; operator action required');
+  if(runGit(['status','--porcelain','--ignored'],root).trim())throw Error(`Staged update checkout was modified; inspect and remove ${root}, then retry`);
   const files=distributionFiles(root);return {root,commit:head,version:distributionVersion(root,files),files};
  };
  if(existsSync(root))return inspect();
@@ -186,8 +186,11 @@ function acquireLock(state:string){
  try{mkdirSync(lock,{mode:0o700});}catch(error:any){if(error?.code==='EEXIST')throw Error('Another update operation is in progress. If interrupted, inspect services and update-intent.json before removing update.lock');throw error;}
  return ()=>{try{rmSync(lock,{recursive:true});}catch{console.error('Update lock cleanup needs inspection:',lock);}};
 }
-function dbHash(path=process.env.ADLC_DB??join(appState(),'state.sqlite')){
- try{return existsSync(path)?digest(readFileSync(path)):null;}catch{return null;}
+export function dbHash(path=process.env.ADLC_DB??join(appState(),'state.sqlite')){
+ try{
+  const capture=()=>JSON.stringify({database:digest(readFileSync(path)),wal:existsSync(`${path}-wal`)?digest(readFileSync(`${path}-wal`)):null});
+  const baseline=capture();return capture()===baseline?digest(baseline):null;
+ }catch{return null;}
 }
 function previousServices(stack:StackOps){
  return (async()=>{
@@ -352,7 +355,7 @@ export class UpdateManager{
     const deferred=error instanceof UpdateDeferred;
     const recovery:Error[]=[];let rolledBack=false,runtimeStopped=false;
     if(!deferred){
-     const installedState=readInstalledState(state),safe=plan.migration?.rollbackSafe??installedState?.rollbackSafe??true;
+     const safe=plan.migration?.rollbackSafe??true;
      const runtimeRecovery=installAttempted&&plan.classification!=='hot';
      if(runtimeRecovery&&safe){
       // Never restore files or start a runtime underneath a candidate backend.

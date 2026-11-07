@@ -128,6 +128,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
 }
 async function main(){
   if(command==='update'){
+   if(a.length===1&&['--help','-h'].includes(a[0]))return console.log(UPDATE_HISTORY_HELP);
    if(a[0]!=='history')throw Error(`Use ${UPDATE_HISTORY_HELP}`);
    if(a.length===2&&['--help','-h'].includes(a[1]))return console.log(UPDATE_HISTORY_HELP);
    const options=parseHistoryArgs(a.slice(1)),history=readUpdateHistory(appState(),options.project);
