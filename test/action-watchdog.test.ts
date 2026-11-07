@@ -28,6 +28,110 @@ function fixture(disk=false){
  const io={sessionEvidence:async()=>{reads++;session.receiptObservation={complete:true,observed:now};return session;},readBranchSnapshot:async()=>{reads++;return snapshot;}};
  return {root,path,s,job,loop,c,w,session,snapshot,io,now:()=>now,advance:(ms=60000)=>now+=ms,reads:()=>reads,close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
 }
+// Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
+// controlled clock. A subprocess isolates the poll fence's HOME and Date.now.
+function productionScenario(f:ReturnType<typeof fixture>,scenario:string){
+ const script=`
+import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
+import {Store} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
+import {ActionWatchdog,actionStatus,WATCHDOG_LIMITS} from ${JSON.stringify(join(import.meta.dir,'../src/action-watchdog.ts'))};
+import {BranchUpdates} from ${JSON.stringify(join(import.meta.dir,'../src/branch-updates.ts'))};
+import {ReceiptReconciliation} from ${JSON.stringify(join(import.meta.dir,'../src/receipt-reconciliation.ts'))};
+import {digest} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {turnBarrier} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};
+import {existsSync} from 'node:fs';import {join} from 'node:path';import {appState} from ${JSON.stringify(join(import.meta.dir,'../src/install-state.ts'))};
+let now=Date.now();Date.now=()=>now;
+const s=new Store(${JSON.stringify(f.path)}),job=${JSON.stringify(f.job)},config=${JSON.stringify(f.c)},snapshot=${JSON.stringify(f.snapshot)},session=${JSON.stringify(f.session)};
+let ordinary=0,actions=0,failed=false,clear=false,throws=0,changeHeadOnThrow=false;const errors=[];
+console.error=(message)=>errors.push(message);
+const forbidden=async()=>{throw Error('Unexpected mutation');};
+const loop=new ReviewLoop(s,forbidden,{sessionEvidence:async()=>({...session,receiptObservation:{complete:true,observed:now}}),readBranchSnapshot:async()=>snapshot,worktreeIdentity:async()=>({tree:'/worktree',branch:snapshot.branch,head:snapshot.head}),readiness:async()=>({head:snapshot.head,clear,reasons:[],findings:[],failedChecks:failed?[{name:'CI'}]:[],pendingChecks:!failed&&!clear?['CI']:[],missingChecks:[]}),disableNativeFeedback:forbidden,sendPilotRemediation:forbidden});
+const ensure=BranchUpdates.prototype.ensure;BranchUpdates.prototype.ensure=async function(...args){const result=await ensure.apply(this,args);if(throws){throws--;if(changeHeadOnThrow){snapshot.head=ordinary.toString(16).padStart(40,'0');s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(snapshot.head,job);}throw Error('Injected ordinary evaluation failure');}return result;};
+const original=loop.tick.bind(loop);loop.tick=async(...args)=>{if(!existsSync(join(appState(),'turn-submission.lock')))throw Error('Poll fence missing');if(args[5])actions++;else ordinary++;return original(...args);};
+const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>[],linearToken:()=>'',out:()=>{}}});
+const status=()=>actionStatus(s,job,now),advance=(ms=WATCHDOG_LIMITS.intervalMs)=>now+=ms;
+s.db.query('UPDATE review_targets SET head=?,head_since=? WHERE job=?').run(snapshot.head,now,job);
+${scenario}
+s.close();`;
+ const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
+ expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');return JSON.parse(result.stdout.toString());
+}
+test('idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget',()=>{
+ const f=fixture(true);try{
+  const r=productionScenario(f,`
+clear=true;s.db.query("UPDATE review_targets SET state='ready_for_human' WHERE job=?").run(job);
+await tick();const first=ordinary;
+for(let i=0;i<300;i++){await tick();advance(WATCHDOG_LIMITS.idleMs);await tick();}
+const idleStatus=status(),idleTicks=ordinary;
+// New CI evidence still reaches ordinary evaluation and resumes charged work.
+clear=false;snapshot.head='c'.repeat(40);advance(WATCHDOG_LIMITS.idleMs);await tick();advance();await tick();
+console.log(JSON.stringify({first,idleTicks,idleStatus,current:status(),target:loop.get(job).state,ordinary,actions,errors}));`);
+  expect(r.first).toBe(1);expect(r.idleTicks).toBe(301);expect(r.idleStatus).toMatchObject({state:'pending',attempts:0,evaluation:{failures:0}});
+  expect(r.target).toBe('waiting_for_ci');expect(r.current).toMatchObject({state:'pending',attempts:1});expect(r.ordinary).toBe(303);expect(r.actions).toBe(303);expect(r.errors).toEqual([]);
+ }finally{f.close();}
+});
+test('human-required target sees a worker push through bounded ordinary polling and resumes observation',()=>{
+ const f=fixture(true);try{
+  const r=productionScenario(f,`
+failed=true;await tick();const blocked=status(),oldHead=loop.get(job).head;
+failed=false;snapshot.head='c'.repeat(40);await tick();const before=ordinary;
+advance(WATCHDOG_LIMITS.idleMs);await tick();const refreshed=loop.get(job),after=ordinary;
+advance(WATCHDOG_LIMITS.idleMs);await tick();console.log(JSON.stringify({blocked,oldHead,before,after,refreshed,current:status(),ordinary,actions,errors}));`);
+  expect(r.blocked).toMatchObject({state:'escalated',outcome:'human_required'});expect(r.before).toBe(1);expect(r.after).toBe(2);
+  expect(r.oldHead).toBe('a'.repeat(40));expect(r.refreshed).toMatchObject({head:'c'.repeat(40),state:'waiting_for_ci'});
+  expect(r.current).toMatchObject({state:'pending',binding:{head:'c'.repeat(40)}});expect(r.ordinary).toBe(3);expect(r.actions).toBe(2);expect(r.errors).toEqual([]);
+ }finally{f.close();}
+});
+test('one thrown ordinary evaluation backs off durably then succeeds without operator action or receipt replay',()=>{
+ const f=fixture(true);try{
+  const r=productionScenario(f,`
+const receipts=new ReceiptReconciliation(s),j=s.get(job);receipts.reserve({job,plan:j.plan_hash,spec:digest(j.spec),session:'session',client:'original-send',attempt:'implementation'});receipts.accepted('original-send');const before=receipts.get('original-send');
+throws=1;await tick();const deferred=status();await tick();const immediate=ordinary;
+advance();await tick();console.log(JSON.stringify({deferred,immediate,current:status(),ordinary,actions,before,after:receipts.get('original-send'),errors}));`);
+  expect(r.deferred).toMatchObject({state:'pending',nextAction:'defer',outcome:'evaluation_uncertain',evaluation:{failures:1}});expect(r.immediate).toBe(1);
+  expect(r.current).toMatchObject({state:'pending',evaluation:{failures:0}});expect(r.ordinary).toBe(2);expect(r.actions).toBe(2);expect(r.after).toEqual(r.before);expect(r.errors).toEqual(['Injected ordinary evaluation failure']);
+ }finally{f.close();}
+});
+test('consecutive evaluation failures back off to the configured cap across successful reads and head changes',()=>{
+ const f=fixture(true);try{
+  const r=productionScenario(f,`
+throws=WATCHDOG_LIMITS.maxEvaluationFailures;changeHeadOnThrow=true;const samples=[];
+for(let i=0;i<WATCHDOG_LIMITS.maxEvaluationFailures;i++){
+ await tick();samples.push({failures:status().evaluation.failures,delay:status().evaluation.next_tick-now,ordinary});
+ await tick();advance(samples.at(-1).delay);
+}
+advance(24*60*60000);await tick();snapshot.head='e'.repeat(40);s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(snapshot.head,job);await tick();
+console.log(JSON.stringify({samples,current:status(),ordinary,actions,errors}));`);
+  expect(r.samples.map((x:any)=>x.failures)).toEqual([1,2,3,4,5,6]);expect(r.samples.map((x:any)=>x.delay)).toEqual([60000,120000,240000,480000,900000,900000]);
+  expect(r.current).toMatchObject({state:'escalated',outcome:'evaluation_failed',evaluation:{failures:6}});expect(r.ordinary).toBe(6);expect(r.actions).toBe(6);expect(r.errors).toHaveLength(6);
+ }finally{f.close();}
+});
+test('bounded human-required polling still honors revoked authority, reservations, pause and completion',()=>{
+ for(const guard of ['grant','reservation','pause','completed']){const f=fixture(true);try{
+  const r=productionScenario(f,`
+failed=true;await tick();const blocked=status();advance(WATCHDOG_LIMITS.idleMs);
+if(${JSON.stringify(guard)}==='grant')s.db.query('DELETE FROM git_grants WHERE job=?').run(job);
+if(${JSON.stringify(guard)}==='reservation'){s.db.exec('CREATE TABLE conflict_recoveries(id TEXT,job TEXT,state TEXT,worktree TEXT)');s.db.query("INSERT INTO conflict_recoveries VALUES ('recovery',?,'delivery_uncertain','/worktree')").run(job);}
+if(${JSON.stringify(guard)}==='pause')turnBarrier().pause();
+if(${JSON.stringify(guard)}==='completed')s.db.query("UPDATE review_targets SET state='completed' WHERE job=?").run(job);
+try{await tick();}catch(error){errors.push(error.message);}
+console.log(JSON.stringify({blocked,current:status(),ordinary,actions,errors}));`);
+  expect(r.blocked.outcome).toBe('human_required');expect(r.ordinary).toBe(1);expect(r.actions).toBe(1);
+  if(guard==='completed')expect(r.current).toBeNull();
+  if(guard==='grant'||guard==='reservation')expect(r.current).toMatchObject({state:'escalated',outcome:'authority_unavailable'});
+ }finally{f.close();}}
+});
+test('ordinary evaluation cadence and failure count survive a connection restart',()=>{
+ const f=fixture(true);let second:Store|undefined;try{
+  const a=f.w.scheduleReview(f.job,f.c);expect(f.w.beginReview(a.id,f.c)).toBe(true);f.w.finishReview(a.id);
+  second=new Store(f.path);const w=new ActionWatchdog(second,f.now,()=>0.5,f.root);
+  expect(w.beginReview(a.id,f.c)).toBe(false);expect(w.due('p',4,true)).toEqual([]);
+  expect(actionStatus(second,f.job)?.evaluation.failures).toBe(1);
+  f.advance();expect(w.due('p',4,true)).toHaveLength(1);expect(w.beginReview(a.id,f.c)).toBe(true);
+  f.w.finishReview(a.id,{state:'waiting_for_review'});expect(actionStatus(second,f.job)?.evaluation.failures).toBe(0);
+ }finally{second?.close();f.close();}
+});
 test('closed contract distinguishes legitimate waits from human/unsupported recovery',()=>{
  for(const blocker of ['ci_wait','reviewer_wait','worker_wait','provider_wait','receipt_uncertain'] as const){expect(evaluateAction(blocker,10,10)).toEqual({kind:'observe',operation:'review-evidence'});expect(evaluateAction(blocker,11,10).kind).toBe('defer');}
  for(const blocker of ['human','dependency_wait','unsupported'] as const)expect(evaluateAction(blocker,0,10).kind).toBe('escalate');
@@ -121,11 +225,13 @@ test('provider cooldown defers another action without IO; job budget survives he
   const next=f.w.scheduleReview(f.job,f.c);expect(next.id).not.toBe(a.id);expect(next.outcome).toBe('budget_exhausted');expect(actionStatus(f.s,f.job)?.attempts).toBe(240);
  }finally{f.close();}
 });
-test('bounded candidates are project-scoped and oldest due first; unknown effectful tick outcome stops',()=>{
+test('bounded candidates are project-scoped and oldest due first; thrown evaluation defers',()=>{
  const f=fixture();try{
   const a=f.w.scheduleReview(f.job,f.c);
   for(let i=1;i<=6;i++){const job=f.s.enqueue(i===6?'other':'p',`i${i}`,'spec');f.s.db.query('INSERT INTO watchdog_actions SELECT ?,?,?,binding,next_action,blocker,state,?,attempts,max_attempts,failures,token,lease_until,outcome,reason,observed_at,evidence FROM watchdog_actions WHERE id=?').run(`a${i}`,job,i===6?'other':'p',f.now()-i,a.id);}
   expect(f.w.due('p').map(a=>a.id)).toEqual(['a5','a4','a3','a2']);expect(f.w.due('other')).toHaveLength(1);
+  f.s.db.query("UPDATE watchdog_actions SET state='escalated',outcome='human_required' WHERE id IN ('a5','a3')").run();
+  expect(f.w.due('p',4,true).map(a=>a.id)).toEqual(['a5','a4','a3','a2']);expect(f.w.due('p').map(a=>a.id)).toEqual(['a4','a2','a1',a.id]);
   f.w.finishReview(a.id);expect(actionStatus(f.s,f.job)?.outcome).toBe('evaluation_uncertain');expect(f.w.due('p').some(x=>x.id===a.id)).toBe(false);
  }finally{f.close();}
 });
@@ -254,9 +360,9 @@ test('provider rearm preserves budget, shared capacity and mutation uncertainty;
   f.w.finishReview(a.id);retryWatchdogObservation(f.s,f.job,f.now());expect(f.w.get(a.id).outcome).toBe('evaluation_uncertain');
  }finally{f.close();}
 });
-test('unchanged-binding escalation stays latched across polls, elapsed time and restart',()=>{
+test('exhausted evaluation failures stay latched across polls, elapsed time and restart',()=>{
  const f=fixture(true);let second:Store|undefined;try{
-  const a=f.w.scheduleReview(f.job,f.c);f.w.finishReview(a.id);
+  const a=f.w.scheduleReview(f.job,f.c);for(let i=0;i<WATCHDOG_LIMITS.maxEvaluationFailures;i++)f.w.finishReview(a.id);
   const stopped=f.w.get(a.id);f.advance(24*60*60*1000);
   second=new Store(f.path);const restarted=new ActionWatchdog(second,f.now,()=>0.5,f.root);
   expect(restarted.scheduleReview(f.job,f.c)).toEqual(stopped);
@@ -276,6 +382,7 @@ test('supervised review clears a same-head human blocker and bounded polling res
   expect(f.w.scheduleReview(f.job,f.c).state).toBe('escalated');
   failed=false;
   expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c)).state).toBe('waiting_for_ci');
+  f.advance(WATCHDOG_LIMITS.idleMs);
   const resumed=f.w.scheduleReview(f.job,f.c);
   expect(resumed).toMatchObject({id:a.id,binding:a.binding,state:'pending',next_action:'observe',outcome:'blocker_cleared',attempts:1});
   expect(f.w.due('p').map(r=>r.id)).toEqual([a.id]);
@@ -298,14 +405,16 @@ test('same-binding human_required rearm still requires eligibility, no reservati
   if(guard==='eligibility')f.advance(120001);
   if(guard==='reservation'){f.s.db.exec('CREATE TABLE conflict_recoveries(id TEXT,job TEXT,state TEXT,worktree TEXT)');f.s.db.query("INSERT INTO conflict_recoveries VALUES ('recovery',?,'delivery_uncertain','/worktree')").run(f.job);}
   if(guard==='budget')f.s.db.query('UPDATE watchdog_budgets SET attempts=max_attempts WHERE job=?').run(f.job);
-  expect(f.w.scheduleReview(f.job,f.c)).toEqual(stopped);expect(f.w.due('p')).toEqual([]);expect(f.reads()).toBe(0);
+  const current=f.w.scheduleReview(f.job,f.c);
+  if(guard==='eligibility'||guard==='reservation')expect(current).toMatchObject({state:'escalated',outcome:'authority_unavailable'});else expect(current).toEqual(stopped);
+  expect(f.w.due('p')).toEqual([]);expect(f.reads()).toBe(0);
  }finally{f.close();}}
 });
 test('clearing a blocker does not automatically revive any other escalation outcome',()=>{
  const f=fixture();try{
-  const a=f.w.scheduleReview(f.job,f.c);f.w.finishReview(a.id);
-  for(const outcome of ['evaluation_uncertain','unsupported','retry_exhausted','stale','recurrent_binding','authority_unavailable','budget_exhausted']){
-   f.s.db.query('UPDATE watchdog_actions SET outcome=? WHERE id=?').run(outcome,a.id);const stopped=f.w.get(a.id);
+  const a=f.w.scheduleReview(f.job,f.c);
+  for(const outcome of ['evaluation_failed','unsupported','retry_exhausted','stale','recurrent_binding','authority_unavailable','budget_exhausted']){
+   f.s.db.query("UPDATE watchdog_actions SET state='escalated',outcome=? WHERE id=?").run(outcome,a.id);const stopped=f.w.get(a.id);
    expect(f.w.scheduleReview(f.job,f.c)).toEqual(stopped);expect(f.w.due('p')).toEqual([]);
   }
   expect(f.reads()).toBe(0);

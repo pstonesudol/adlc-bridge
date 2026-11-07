@@ -9,7 +9,7 @@ executor, worker creation, sender, or automatic replacement/recovery worker.
 ## Production integration
 
 `createCLIPollTick` skips completed review targets, schedules the remaining
-registered targets and selects at most four due actions, oldest first, within the existing sequential
+registered targets and selects at most four due candidates, oldest first, within the existing sequential
 `runPollTick` / `withTurnSubmission` scope. Poll and serve use that same path;
 `serveLoop` remains cadence-only. With an action, `ReviewLoop.tick` only calls
 `ActionWatchdog.observeReview`, validates/persists the session/branch evidence
@@ -17,7 +17,7 @@ and returns `observed` before entering normal review evaluation. It does not
 reconcile mutation receipts, update review readiness, update branches, request
 reviews, send remediation or run conflict recovery.
 
-Only after that successful return does the same sequential poll invoke the
+For a pending action, only after that successful return does the same sequential poll invoke the
 existing `ReviewLoop.tick` **without an action** for that target. This separate
 effectful step collects its own fresh evidence, including new session/branch
 reads; it does not reuse the observation as mutation authority. A failed or
@@ -25,13 +25,23 @@ deferred observation skips the effectful step. Both calls remain inside the
 same poll/submission fence, and each uses the existing review-evaluation lease.
 There is no second sender, timer or background review loop.
 
+An escalated `human_required` target also receives an ordinary review check at
+most once per 15 minutes, without an action. It shares the **same four-candidate
+batch**, submission fence and review lease, and revalidates binding, eligibility,
+pause and worktree reservations before entry. This lets the existing evaluator
+discover a worker push or cleared CI/review blocker instead of requiring a manual
+tick just to refresh the persisted head. Other escalated outcomes do not use this
+path. It is ordinary review evaluation, not an automatic recovery operation.
+
 **The whole review tick is effectful and is not a retryable observation.** The
 watchdog reserves only its closed read adapter. The separate ordinary review
 step retains existing authorization, remediation/branch/review-request budgets,
 delivery reservations, fences and receipt reconciliation. The observation budget
-counts only read-action reservations; it grants no mutation budget or permission.
-An unsettled exception from the separate effectful step escalates rather than being
-classified as a transient read error. No readiness, GitHub approval, Changes
+counts non-idle read-action reservations; it grants no mutation budget or permission.
+An unsettled exception from the separate effectful step uses its own durable
+per-job failure counter and backoff, not provider-read retry classification.
+The next ordinary evaluation obtains fresh evidence and retains every existing
+mutation receipt; it does not replay a transport callback. No readiness, GitHub approval, Changes
 Requested, skipped/neutral review or human-only merge rule is changed.
 
 Workflow planning, clarification and dependency handling retain their existing
@@ -45,7 +55,8 @@ the existing supervised path, independent of automatic observation budgets.
 The supported recovery operation type is currently `never`: there are **zero
 new automatic recovery operations**. CI/reviewer/worker/provider waits and
 uncertain receipts can receive bounded observations. Human, dependency and
-unsupported blockers stop for their existing operator interfaces. A conflict
+unsupported blockers stop the read action for their existing operator interfaces;
+`human_required` retains the bounded ordinary check described above. A conflict
 worktree reservation is unsupported by this scheduler; it is not cleared or
 bypassed. Active/queued workers may be read, but observation supplies no
 permission to steer them.
@@ -71,17 +82,29 @@ of reviving its old claim.
 
 `watchdog_actions` records identity/binding, blocker, next action, due time,
 claim token/expiry, attempts, failures, outcome/reason and bounded evidence.
-`watchdog_budgets` holds cumulative per-job consumption. Module-owned additive
+`watchdog_budgets` holds cumulative per-job consumption. `watchdog_evaluations`
+holds per-job ordinary-review due time and consecutive evaluation failures.
+Its cadence is reserved before the ordinary call, and both fields survive new
+action bindings and process restarts. Module-owned additive
 tables follow the existing `Store` extension pattern; read-only status never
 creates them. Actions and budgets are not deleted on restart or head changes.
 
 Defaults are four candidates per poll, a 60-second minimum interval, a
 two-minute observation claim, six consecutive transient failures per action,
-and 240 lifetime automatic observation reservations per job. There is no
+and 240 lifetime **non-idle** automatic observation reservations per job. A
+`ready_for_human` target with blocker `none` uses a 15-minute cadence and does not
+charge `watchdog_budgets`; a newly discovered blocker restores charged observation.
+There is no
 automatic budget reset/extension; different heads/specs/plans do not reset the
-job budget. Reservation consumes budget even if the process exits before IO or
+job budget. A non-idle reservation consumes budget even if the process exits before IO or
 shared provider capacity subsequently defers it. No elapsed wait is evidence of
 worker failure or successful delivery.
+
+Ordinary evaluation exceptions defer with `evaluation_uncertain` after 1, 2, 4,
+8 and 15 minutes. The sixth consecutive exception stops automatic evaluation as
+`evaluation_failed`. A settled ordinary result resets that counter; a successful
+read action, a head/configuration change or a provider retry does not. There is
+no automatic reset after exhaustion. The limits are defined in `WATCHDOG_LIMITS`.
 
 Only read-only claims can be reclaimed on expiry. A stale owner cannot publish
 its result after another token claims the action. Existing provider and review
@@ -96,7 +119,7 @@ never enables retry. Due times retain provider retry floors. Exhaustion reports
 an explicit operator inspection step. Existing `retry-observation JOB` can
 rearm a provider-error escalation after inspection, retaining cumulative budget,
 shared cooldown, uncertain mutation receipts and all mutation-specific gates.
-Other escalations require their existing supervised inspection/recovery path;
+Other escalations (apart from the bounded `human_required` check) require their existing supervised inspection/recovery path;
 there is no generic watchdog reset command.
 
 ### Operator path for an unchanged-binding escalation
@@ -105,10 +128,11 @@ Most `escalated` outcomes intentionally remain stopped for the same binding.
 There is one scheduler exception: `human_required` can resume **read-only
 observation** after the recorded blocker ceases to be `human`, `dependency_wait`
 or `unsupported`, current eligibility passes, no worktree reservation exists,
-and cumulative budget remains. This accommodates a supervised review changing
-a blocked target back to a legitimate wait on the same head. Counters and
-mutation receipts are retained. Other outcomes, including `evaluation_uncertain`,
-do not revive merely because a target state, description or elapsed time changes.
+and cumulative budget remains. The ordinary 15-minute check or a supervised
+review can refresh a blocked target on the same head; a worker push can update
+the binding through the same ordinary evaluator. Counters and mutation receipts
+are retained. `evaluation_uncertain` is a bounded deferral, not a terminal
+escalation. `evaluation_failed` remains stopped, including across new bindings.
 
 1. Inspect `adlc jobs status JOB --json` for the exact action, binding, outcome
    and budget. For a recovery reservation, also inspect `adlc recovery-status`.
@@ -132,8 +156,9 @@ do not revive merely because a target state, description or elapsed time changes
    All other unchanged-binding escalations stay stopped unless the explicit
    provider-read retry applies; further evaluations remain supervised operations.
    A genuinely new binding can receive its own action on a later poll, subject
-   to the retained job budget; an A → B → A recurrence remains stopped. Do not
-   manufacture a head/spec/configuration change to reset the scheduler.
+   to the retained job budget and evaluation failure cap; an A → B → A recurrence
+   remains stopped. Do not manufacture a head/spec/configuration change to reset
+   the scheduler.
 
 For `budget_exhausted` there is no watchdog budget extension/reset command in
 this foundation. `extend-budget` concerns remediation, not this observation
@@ -166,7 +191,8 @@ point.
 ## Inspection and verification
 
 `adlc jobs status JOB --json` exposes persisted `watchdog` identity, next action,
-due time, attempts/budget, failure count, outcome, escalation reason and evidence
+due time, attempts/budget, provider failure count, persisted ordinary `evaluation`
+due time (`next_tick`) and consecutive failures, outcome, escalation reason and evidence
 age. Human-readable job status includes a concise watchdog line. Absence of the
 new tables returns `watchdog: null`. Completed jobs/review targets also return
 `watchdog: null`; retained historical actions are neither displayed as current
@@ -182,6 +208,9 @@ injected provider reads and deterministic time. Coverage includes due/not-due,
 cross-connection claims, restart, expired-read late completion, changed bindings
 and grants, pause before/during reads, active/queued work, provider capacity,
 retry/job budgets, uncertain receipts, and byte-unchanged read-only status.
+Production-poll regressions cover 301 idle evaluations over 75 simulated hours,
+worker pushes during human escalation, one-throw recovery, bounded consecutive
+failure exhaustion across head changes, and retained cadence across restart.
 Run `bun test`. These tests do not demonstrate a live unattended pilot, install
 or activate the feature, or authorize service operation. Activation remains an
 explicit reviewed operator action; merging remains human-only.

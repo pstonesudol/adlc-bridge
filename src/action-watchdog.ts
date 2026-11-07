@@ -18,7 +18,7 @@ export type ActionContract=
  |{kind:'escalate';blocker:BlockerClass};
 export type ActionBinding=Readonly<{job:string;project:string;spec:string;revision:string|null;plan:string|null;session:string|null;owner:string|null;repo:string|null;pr:number|null;head:string|null;authority:string;ownership:string;target:string;configuration:string}>;
 export type ActionRow={id:string;job:string;project:string;binding:string;next_action:'observe'|'defer'|'escalate';blocker:BlockerClass;state:'pending'|'claimed'|'escalated'|'superseded';due_at:number;attempts:number;max_attempts:number;failures:number;token:string|null;lease_until:number|null;outcome:string;reason:string;observed_at:number|null;evidence:string|null};
-export const WATCHDOG_LIMITS={perTick:4,maxAttempts:240,maxFailures:6,intervalMs:60000,leaseMs:120000} as const;
+export const WATCHDOG_LIMITS={perTick:4,maxAttempts:240,maxFailures:6,maxEvaluationFailures:6,intervalMs:60000,idleMs:15*60000,leaseMs:120000} as const;
 export function evaluateAction(blocker:BlockerClass,due:number,now:number):ActionContract{
  if(['human','dependency_wait','unsupported'].includes(blocker))return {kind:'escalate',blocker};
  return due>now?{kind:'defer',blocker}:{kind:'observe',operation:'review-evidence'};
@@ -26,6 +26,7 @@ export function evaluateAction(blocker:BlockerClass,due:number,now:number):Actio
 const has=(s:Store,table:string)=>!!s.db.query('SELECT 1 FROM sqlite_master WHERE type=\'table\' AND name=?').get(table);
 const row=(s:Store,table:string,job:string):any=>has(s,table)?s.db.query(`SELECT * FROM ${table} WHERE job=?`).get(job):null;
 const completed=(s:Store,job:string)=>s.get(job).state==='done'||row(s,'review_targets',job)?.state==='completed';
+const idle=(s:Store,job:string)=>row(s,'review_targets',job)?.state==='ready_for_human'&&classifyBlocker(s,job)==='none';
 const statusJSON=(text:string|null)=>{try{return text===null?null:JSON.parse(text);}catch{return null;}};
 
 // Local snapshots contain fingerprints, never spec text, prompts, error bodies or grants.
@@ -68,7 +69,7 @@ export function actionStatus(s:Store,job:string,now=Date.now()){
  const r=s.db.query("SELECT * FROM watchdog_actions WHERE job=? AND state!='superseded' ORDER BY rowid DESC LIMIT 1").get(job) as ActionRow|null;
  if(!r)return null;
  const b=row(s,'watchdog_budgets',job);
- return {id:r.id,operation:'review-evidence',nextAction:r.next_action,blocker:r.blocker,state:r.state,dueAt:r.state==='escalated'?null:r.due_at,attempts:b?.attempts??r.attempts,maxAttempts:b?.max_attempts??r.max_attempts,failures:r.failures,outcome:r.outcome,reason:r.reason,evidence:statusJSON(r.evidence),evidenceAgeMs:r.observed_at===null?null:Math.max(0,now-r.observed_at),binding:statusJSON(r.binding),freshness:'persisted-only',recoverySupported:false};
+ return {id:r.id,operation:'review-evidence',nextAction:r.next_action,blocker:r.blocker,state:r.state,dueAt:r.state==='escalated'?null:r.due_at,attempts:b?.attempts??r.attempts,maxAttempts:b?.max_attempts??r.max_attempts,failures:r.failures,evaluation:row(s,'watchdog_evaluations',job),outcome:r.outcome,reason:r.reason,evidence:statusJSON(r.evidence),evidenceAgeMs:r.observed_at===null?null:Math.max(0,now-r.observed_at),binding:statusJSON(r.binding),freshness:'persisted-only',recoverySupported:false};
 }
 // Existing explicit read retry may rearm provider observations, never uncertain
 // review effects, superseded actions, receipts or cumulative job budgets.
@@ -83,51 +84,76 @@ export class ActionWatchdog{
  constructor(public s:Store,public now=Date.now,public random=Math.random,private stateRoot?:string){
   if(s.readonly)throw Error('Watchdog evaluation requires a writable store; use actionStatus for inspection');
   s.db.exec(`CREATE TABLE IF NOT EXISTS watchdog_budgets(job TEXT PRIMARY KEY REFERENCES jobs(id),attempts INTEGER NOT NULL,max_attempts INTEGER NOT NULL);
+   CREATE TABLE IF NOT EXISTS watchdog_evaluations(job TEXT PRIMARY KEY REFERENCES jobs(id),next_tick INTEGER NOT NULL,failures INTEGER NOT NULL DEFAULT 0);
    CREATE TABLE IF NOT EXISTS watchdog_actions(id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),project TEXT NOT NULL,binding TEXT NOT NULL,next_action TEXT NOT NULL,blocker TEXT NOT NULL,state TEXT NOT NULL,due_at INTEGER NOT NULL,attempts INTEGER NOT NULL,max_attempts INTEGER NOT NULL,failures INTEGER NOT NULL DEFAULT 0,token TEXT,lease_until INTEGER,outcome TEXT NOT NULL,reason TEXT NOT NULL,observed_at INTEGER,evidence TEXT);
    CREATE INDEX IF NOT EXISTS watchdog_due ON watchdog_actions(project,state,due_at);`);
  }
  get(id:string){return this.s.db.query('SELECT * FROM watchdog_actions WHERE id=?').get(id) as ActionRow;}
- private stop(id:string,blocker:BlockerClass,outcome:string,reason:string){this.s.db.query("UPDATE watchdog_actions SET state='escalated',next_action='escalate',blocker=?,outcome=?,reason=?,token=NULL,lease_until=NULL WHERE id=?").run(blocker,outcome,reason,id);}
+ private stop(id:string,blocker:BlockerClass,outcome:string,reason:string){this.s.db.query("UPDATE watchdog_actions SET state='escalated',next_action='escalate',blocker=?,outcome=?,reason=?,token=NULL,lease_until=NULL,due_at=MAX(due_at,?) WHERE id=?").run(blocker,outcome,reason,outcome==='human_required'?this.now()+WATCHDOG_LIMITS.idleMs:0,id);}
  scheduleReview(job:string,c:any){
   return this.s.db.transaction(()=>{
    const binding=actionBinding(this.s,job,c),encoded=JSON.stringify(binding),id=digest(JSON.stringify(['review-evidence',binding]));
    this.s.db.query('INSERT OR IGNORE INTO watchdog_budgets VALUES (?,0,?)').run(job,WATCHDOG_LIMITS.maxAttempts);
+   this.s.db.query('INSERT OR IGNORE INTO watchdog_evaluations VALUES (?,0,0)').run(job);
    const budget=row(this.s,'watchdog_budgets',job),blocker=classifyBlocker(this.s,job,this.get(id)?.outcome==='operator_read_retry');
    this.s.db.query("UPDATE watchdog_actions SET state='superseded',token=NULL,lease_until=NULL,outcome='binding_changed',reason='Binding changed; stale evidence discarded' WHERE job=? AND id!=? AND state!='superseded'").run(job,id);
    this.s.db.query("INSERT OR IGNORE INTO watchdog_actions(id,job,project,binding,next_action,blocker,state,due_at,attempts,max_attempts,outcome,reason) VALUES (?,?,?,?,?,?,'pending',?,?,?,'scheduled','Read-only review evidence observation')").run(id,job,binding.project,encoded,'observe',blocker,this.now(),budget.attempts,budget.max_attempts);
    // A recurring hash must not revive a superseded claim (including A -> B -> A).
    const old=this.get(id);
    if(old.state==='superseded'){this.stop(id,'human','recurrent_binding','A superseded binding recurred; inspect history rather than reviving its old claim');return this.get(id);}
+   if(row(this.s,'watchdog_evaluations',job).failures>=WATCHDOG_LIMITS.maxEvaluationFailures){this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');return this.get(id);}
    if(old.state==='escalated'){
+    if(old.outcome!=='human_required')return old;
+    if(!eligibility(this.s,job,c,this.now())||worktreeReservation(this.s,job)){this.stop(id,'unsupported','authority_unavailable','Ordinary review suspended: current authority or worktree reservation prevents evaluation');return this.get(id);}
     // Only a cleared human blocker may resume observations on the same binding.
     // Uncertain effects and every other escalation remain terminal here.
-    if(old.outcome!=='human_required'||evaluateAction(blocker,0,this.now()).kind==='escalate'||!eligibility(this.s,job,c,this.now())||worktreeReservation(this.s,job)||budget.attempts>=budget.max_attempts)return old;
+    if(evaluateAction(blocker,0,this.now()).kind==='escalate'||budget.attempts>=budget.max_attempts)return old;
     this.s.db.query("UPDATE watchdog_actions SET state='pending',next_action='observe',blocker=?,due_at=?,outcome='blocker_cleared',reason='Recorded blocker cleared; authorized read-only observation resumed; budgets and receipts retained' WHERE id=? AND state='escalated' AND outcome='human_required'").run(blocker,this.now(),id);
     return this.get(id);
    }
    if(!eligibility(this.s,job,c,this.now()))this.stop(id,'human','authority_unavailable','Inspect current plan, ownership and inspect grant; no authority inferred');
    else if(worktreeReservation(this.s,job))this.stop(id,'unsupported','unsupported','Conflict recovery retains the worktree reservation; inspect recovery-status through the existing recovery interface');
-   else if(evaluateAction(blocker,old.due_at,this.now()).kind==='escalate')this.stop(id,blocker,'unsupported','Use the existing approval, clarification, dependency or recovery inspection; automatic recovery is unsupported');
-   else if(budget.attempts>=budget.max_attempts)this.stop(id,blocker,'budget_exhausted','Automatic observation budget exhausted; inspect jobs status and use an explicit supervised tick-review after resolving the blocker');
+   else if(evaluateAction(blocker,old.due_at,this.now()).kind==='escalate'&&!row(this.s,'watchdog_evaluations',job).failures)this.stop(id,blocker,blocker==='unsupported'?'unsupported':'human_required','Existing blocker requires attention; bounded ordinary review may observe changed evidence; automatic recovery is unsupported');
+   else if(!idle(this.s,job)&&budget.attempts>=budget.max_attempts)this.stop(id,blocker,'budget_exhausted','Automatic observation budget exhausted; inspect jobs status and use an explicit supervised tick-review after resolving the blocker');
    return this.get(id);
   }).immediate();
  }
- finishReview(id:string,result?:{state?:string}){
-  // The surrounding tick is effectful. Never retry a thrown/unknown evaluation
-  // as though it were a read failure; existing receipts remain authoritative.
-  const a=this.get(id);if(!a||a.state==='superseded'||a.state==='escalated'||completed(this.s,a.job))return;
-  if(!result?.state){this.stop(id,'unsupported','evaluation_uncertain','Review evaluation did not settle; inspect existing receipts and recovery status before an explicit supervised tick-review');return;}
+ finishReview(id:string,result?:{state?:string},evaluated=true){
+  const a=this.get(id);if(!a||a.state==='superseded'||a.state==='escalated'&&a.outcome!=='human_required'||completed(this.s,a.job))return;
   const blocker=classifyBlocker(this.s,a.job),read=row(this.s,'recovery_observations',a.job);
+  // Observation success must never reset consecutive effectful evaluation failures.
+  if(evaluated){
+   const failures=result?.state?0:row(this.s,'watchdog_evaluations',a.job).failures+1;
+   const slow=a.state==='escalated'||idle(this.s,a.job)||['human','dependency_wait','unsupported'].includes(blocker);
+   const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs;
+   this.s.db.query('UPDATE watchdog_evaluations SET failures=?,next_tick=? WHERE job=?').run(failures,this.now()+delay,a.job);
+   if(failures){
+    if(failures>=WATCHDOG_LIMITS.maxEvaluationFailures)this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');
+    else this.s.db.query("UPDATE watchdog_actions SET state='pending',next_action='defer',due_at=?,outcome='evaluation_uncertain',reason='Ordinary review deferred after an exception; fresh evaluation retains all mutation receipts',token=NULL,lease_until=NULL WHERE id=?").run(this.now()+delay,id);
+    return;
+   }
+  }
+  if(!result?.state)return;
   if(read&&['human','unsupported'].includes(blocker)){this.stop(id,'provider_wait','unsupported','Provider read failure requires inspection; use retry-observation JOB after correcting access; no mutation replay');return;}
   if(['human','dependency_wait','unsupported'].includes(blocker)){this.stop(id,blocker,'human_required','Existing review or worker blocker requires human inspection; automatic recovery is unsupported');return;}
-  this.s.db.query("UPDATE watchdog_actions SET due_at=MAX(due_at,?),blocker=? WHERE id=? AND state='pending'").run(Math.max(this.now()+WATCHDOG_LIMITS.intervalMs,read?.next_read??0),blocker,id);
+  this.s.db.query("UPDATE watchdog_actions SET due_at=MAX(due_at,?),blocker=? WHERE id=? AND state='pending'").run(Math.max(this.now()+(idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),read?.next_read??0),blocker,id);
  }
- due(project:string,limit:number=WATCHDOG_LIMITS.perTick):ActionRow[]{
+ // Reserve cadence before entering the separate ordinary evaluator. The outer
+ // poll fence and ReviewLoop's lease still serialize all mutation entrypoints.
+ beginReview(id:string,c:any){
+  return this.s.db.transaction(()=>{
+   const a=this.get(id);if(!a||completed(this.s,a.job)||a.state==='superseded'||a.state==='claimed'||a.state==='escalated'&&(a.outcome!=='human_required'||a.due_at>this.now()))return false;
+   this.assertCurrent(a,c);
+   return this.s.db.query('UPDATE watchdog_evaluations SET next_tick=? WHERE job=? AND next_tick<=? AND failures<?').run(this.now()+(a.state==='escalated'||idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),a.job,this.now(),WATCHDOG_LIMITS.maxEvaluationFailures).changes===1;
+  }).immediate();
+ }
+ due(project:string,limit:number=WATCHDOG_LIMITS.perTick,includeHuman=false):ActionRow[]{
   if(!Number.isSafeInteger(limit)||limit<1||limit>WATCHDOG_LIMITS.perTick)throw Error('Invalid bounded watchdog batch');
   // Retained actions are history once their job/target completes, even if they
   // were pending before completion. Neither polling nor status revives them.
   const reviewFilter=has(this.s,'review_targets')?"AND NOT EXISTS (SELECT 1 FROM review_targets t WHERE t.job=a.job AND t.state='completed')":'';
-  return this.s.db.query(`SELECT a.* FROM watchdog_actions a JOIN jobs j ON j.id=a.job WHERE a.project=? AND j.state!='done' ${reviewFilter} AND (a.state='pending' OR (a.state='claimed' AND a.lease_until<=?)) AND a.due_at<=? ORDER BY a.due_at,a.id LIMIT ?`).all(project,this.now(),this.now(),limit) as ActionRow[];
+  const humanFilter=includeHuman?"OR (a.state='escalated' AND a.outcome='human_required')":'';
+  return this.s.db.query(`SELECT a.* FROM watchdog_actions a JOIN jobs j ON j.id=a.job LEFT JOIN watchdog_evaluations e ON e.job=a.job WHERE a.project=? AND j.state!='done' ${reviewFilter} AND (a.state='pending' OR (a.state='claimed' AND a.lease_until<=?) ${humanFilter}) AND a.due_at<=? AND COALESCE(e.next_tick,0)<=? AND COALESCE(e.failures,0)<? ORDER BY MAX(a.due_at,COALESCE(e.next_tick,0)),a.id LIMIT ?`).all(project,this.now(),this.now(),this.now(),WATCHDOG_LIMITS.maxEvaluationFailures,limit) as ActionRow[];
  }
  assertReviewAction(id:string,job:string,c:any){
   const a=this.get(id);if(!a||a.job!==job||!['pending','claimed'].includes(a.state))throw new UnsupportedAction();
@@ -154,10 +180,11 @@ export class ActionWatchdog{
    this.assertCurrent(a,c);
     if(a.due_at>this.now()||a.state==='claimed'&&(a.lease_until??Infinity)>this.now())throw new ObservationDeferred(Math.max(a.due_at,a.lease_until??0));
    const budget=row(this.s,'watchdog_budgets',a.job);
-   if(budget.attempts>=budget.max_attempts){this.stop(id,a.blocker,'budget_exhausted','Observation budget exhausted; inspect jobs status; explicit supervised review remains available');return null;}
-   // Reservation consumes budget even if the process exits before the read.
-   this.s.db.query('UPDATE watchdog_budgets SET attempts=attempts+1 WHERE job=?').run(a.job);
-   this.s.db.query("UPDATE watchdog_actions SET state='claimed',next_action='observe',token=?,lease_until=?,attempts=?,outcome='read_reserved',reason='Only read-only provider observation reserved' WHERE id=?").run(token,this.now()+WATCHDOG_LIMITS.leaseMs,budget.attempts+1,id);
+   const charge=idle(this.s,a.job)?0:1;
+   if(charge&&budget.attempts>=budget.max_attempts){this.stop(id,a.blocker,'budget_exhausted','Observation budget exhausted; inspect jobs status; explicit supervised review remains available');return null;}
+   // Non-idle reservations consume budget even if the process exits before IO.
+   this.s.db.query('UPDATE watchdog_budgets SET attempts=attempts+? WHERE job=?').run(charge,a.job);
+   this.s.db.query("UPDATE watchdog_actions SET state='claimed',next_action='observe',token=?,lease_until=?,attempts=?,outcome='read_reserved',reason='Only read-only provider observation reserved' WHERE id=?").run(token,this.now()+WATCHDOG_LIMITS.leaseMs,budget.attempts+charge,id);
    return this.get(id);
   }).immediate();
   if(!a)throw new UnsupportedAction();
@@ -176,7 +203,7 @@ export class ActionWatchdog{
    if(session.receiptObservation?.complete!==true||!Number.isSafeInteger(observed)||observed>this.now()||this.now()-observed>RECEIPT_FRESHNESS_MS)throw new UnsupportedAction();
    assertDeliveryTarget(this.s,a.job,session.session,binding.repo!,binding.pr!,snapshot);
    const activity=session.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))?'active_or_queued':session.transcript.controller==='ready'?'idle':'unknown';
-   this.s.db.query("UPDATE watchdog_actions SET state='pending',next_action='defer',due_at=?,token=NULL,lease_until=NULL,failures=0,outcome='observed',reason='Fresh observation only; existing review and receipt gates still apply',observed_at=?,evidence=? WHERE id=? AND token=?").run(this.now()+WATCHDOG_LIMITS.intervalMs,this.now(),JSON.stringify({version:1,source:'session-and-branch',activity,head:snapshot.head,mutationAuthority:false}),id,token);
+   this.s.db.query("UPDATE watchdog_actions SET state='pending',next_action='defer',due_at=?,token=NULL,lease_until=NULL,failures=0,outcome='observed',reason='Fresh observation only; existing review and receipt gates still apply',observed_at=?,evidence=? WHERE id=? AND token=?").run(this.now()+(idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),this.now(),JSON.stringify({version:1,source:'session-and-branch',activity,head:snapshot.head,mutationAuthority:false}),id,token);
    return {session,snapshot};
   }catch(error){
    // Never persist raw provider errors, transcript content or untrusted prose.
