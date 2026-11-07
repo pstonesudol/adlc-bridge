@@ -41,11 +41,12 @@ they are not themselves a reason to request human scope expansion.
 
 ## Pending acceptance gates
 
-- DEV-77: duplicate/cancelled logical CI attempts. Skipped executable expectation
-  currently fails against the raw-check resolver.
-- DEV-65: skipped current-head review plus stale changes requested. Explicit todo
-  requires an injected collector replay once its fix/interface lands; merely
-  setting `clear=true` would not test stale-review classification.
+- DEV-77 is active: duplicate/cancelled logical CI attempts use deterministic
+  provider IDs and chronology and pass through `reviewGate` directly.
+- DEV-65 is active: classified skipped current-head review plus stale changes
+  requested waits for grace, requests once, and accepts fresh current-head
+  approval. Classification itself is covered in `test/coderabbit-scheduling.test.ts`;
+  this replay verifies ReviewLoop behavior given that classified evidence.
 - Later CI-remediation ticket, **not assigned in Linear at implementation time**:
   skipped executable worker-repair expectation.
 - Later worker-liveness ticket, **not assigned**: separate skipped terminated and
