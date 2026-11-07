@@ -431,6 +431,30 @@ test('rollback restores the prior verified snapshot and refuses after incompatib
   await changed.manager.apply();changed.io.dbHash=()=> 'db2';await expect(changed.manager.rollback()).rejects.toThrow('Database changed after activation');expect(changed.installs).toHaveLength(1);
  }finally{changed.close();}
 });
+test('rollback recovery distinguishes completed and unconfirmed backend restarts',async()=>{
+ for(const failure of ['service','health','backend']){
+  const f=fixture({files:['src/cli.ts','src/serve-orchestrator.py']});try{
+   await f.manager.apply();f.calls.length=0;
+   if(failure==='backend')f.io.stack.backendStart=async()=>{throw Error('restart receipt missing');};
+   if(failure==='service'){
+    const project=f.io.stack.project;let fail=true;
+    f.io.stack.project=async(action,id)=>{if(action==='start'&&fail){fail=false;f.calls.push(`start:${id}`);throw Error('service start failed');}return project(action,id);};
+   }
+   if(failure==='health'){
+    const backend=f.io.stack.backend;let reads=0;
+    f.io.stack.backend=async()=>{const status=await backend();return ++reads===2?{...status,ready:false}:status;};
+   }
+   const reason=failure==='backend'?'Backend restart is unconfirmed':'Backend restart completed before rollback failure';
+   await expect(f.manager.rollback()).rejects.toThrow(reason);
+   const intent=JSON.parse(readFileSync(join(f.state,'update-intent.json'),'utf8'));
+   expect(intent.stage).toBe('operator-action-required');expect(intent.error).toContain(reason);expect(intent.error).not.toContain('remains stopped');
+   expect(intent.backendStopped).toBe(failure==='backend');expect(f.manager.turns.isPaused()).toBe(true);
+   expect(f.calls.filter(call=>call==='start:one')).toHaveLength(failure==='backend'?0:2);
+   expect(f.services.two).toBe(false);
+   if(failure!=='backend')expect(intent.evidence.backendRestart).toBe('completed');
+  }finally{f.close();}
+ }
+});
 test('rollback acquires the update lock before reading or changing state',async()=>{
  const f=fixture();try{
   await f.manager.apply();const installations=f.installs.length;mkdirSync(join(f.state,'update.lock'));

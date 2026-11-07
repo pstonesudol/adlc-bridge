@@ -405,7 +405,7 @@ export class UpdateManager{
    const source=installed.previousSource;const rel=typeof source==='string'&&isAbsolute(source)?relative(join(state,'versions'),source):'..';if(typeof source!=='string'||!rel||rel.startsWith('..')||isAbsolute(rel)||rel.includes(sep)||!existsSync(join(source,'src','cli.ts')))throw Error('Previous verified snapshot is unavailable; preserve evidence and follow operator recovery steps');
    const intent=writeIntent(state,{version:1,stage:'staged',candidate:installed.previousCommit??installed.previousVersion,fromVersion:installed.contentVersion,classification:installed.classification,priorServices:[],backendStopped:false,installed:false,startedAt:new Date().toISOString(),updatedAt:new Date().toISOString(),evidence:{operation:'rollback',sourceCommit:installed.previousCommit,candidateSnapshot:installed.previousVersion,rollbackSafe:installed.rollbackSafe,migration:installed.classification==='schema'?'compatibility-verified':'not-required',backendRestart:installed.classification==='hot'?'not-required':undefined}});
    if(!wasPaused)this.turns.pause();
-   let prior:PriorService[]=[];let leavePaused=false,backendStopped=false;
+   let prior:PriorService[]=[];let leavePaused=false,backendStopped=false,backendRunning=false;
    try{
     prior=await previousServices(this.io.stack);advance(state,intent,'stopping',{priorServices:prior});
     for(const service of prior)if(service.loaded){await this.io.stack.project('stop',service.project);}
@@ -418,8 +418,8 @@ export class UpdateManager{
     advance(state,intent,'installing');
     await this.io.install(true,source,launcher);
     advance(state,intent,'starting',{installed:true,evidence:{installedSnapshot:installed.previousVersion}});
-    if(backendStopped)await this.io.stack.backendStart();
-    if(backendStopped)advance(state,intent,'starting',{evidence:{backendRestart:'completed'}});
+    if(backendStopped){await this.io.stack.backendStart();backendRunning=true;}
+    if(backendStopped)advance(state,intent,'starting',{backendStopped:false,evidence:{backendRestart:'completed'}});
     for(const service of prior)if(service.loaded)await startService(service.project);
     const backend=await this.io.stack.backend();if(!backend.ready||!backend.managed)throw Error('Restored runtime is not healthy');
     // A successful rollback is terminal for this record; never leave metadata
@@ -431,11 +431,12 @@ export class UpdateManager{
     return {rolledBack:true,version:installed.previousVersion,restoredServices:prior};
    }catch(error){
     const recovery:Error[]=[];
-    if(backendStopped)recovery.push(new Error('Backend remains stopped after rollback failure; operator action required'));
-    else for(const service of prior)if(service.loaded)try{await startService(service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
-    advance(state,intent,recovery.length?'operator-action-required':'failed',{error:error instanceof Error?error.message:String(error)});leavePaused=recovery.length>0;
+    if(backendStopped)recovery.push(new Error(backendRunning?'Backend restart completed before rollback failure; inspect health and coordination services; operator action required':'Backend restart is unconfirmed after rollback failure; operator action required'));
+    if(!backendStopped||backendRunning)for(const service of prior)if(service.loaded)try{await startService(service.project);}catch(restore){recovery.push(new Error(`Project ${service.project} did not restart`,{cause:restore}));}
+    const reason=[error instanceof Error?error.message:String(error),...recovery.map(item=>item.message)].join('; ');
+    advance(state,intent,recovery.length?'operator-action-required':'failed',{error:reason});leavePaused=recovery.length>0;
     if(!leavePaused&&!wasPaused)this.turns.resume();
-    throw new Error(`Rollback failed (${error instanceof Error?error.message:String(error)}). Inspect update-intent.json and service-status`,{cause:error});
+    throw new Error(`Rollback failed (${reason}). Inspect update-intent.json and service-status`,{cause:error});
    }
    });
   }finally{release();}
