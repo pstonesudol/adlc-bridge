@@ -1,4 +1,5 @@
 import {randomUUID} from 'node:crypto';
+import {RecoveryObservation,transient} from './recovery-observation';
 import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
@@ -7,7 +8,7 @@ import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} fr
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
-export type NoticeOptions={binding?:string;body?:string;applyLabel?:boolean;guard?:(issue:any)=>void};
+export type NoticeOptions={binding?:string;body?:string;heading?:string;applyLabel?:boolean;guard?:(issue:any)=>void};
 
 function blockerOutcome(outcome:string){return ['needs_input','blocked_dependency','failed','uncertain','needs_reconciliation'].includes(outcome);}
 
@@ -18,9 +19,10 @@ export class LinearBlockers{
   s.db.exec(`CREATE TABLE IF NOT EXISTS blocker_notices(
    job TEXT NOT NULL REFERENCES jobs(id),binding TEXT NOT NULL,comment_id TEXT NOT NULL UNIQUE,
    body TEXT NOT NULL,state TEXT NOT NULL,created TEXT,label_applied INTEGER NOT NULL DEFAULT 0,
-   applied_label_id TEXT,reason TEXT,PRIMARY KEY(job,binding));`);
+   applied_label_id TEXT,reason TEXT,checked TEXT,PRIMARY KEY(job,binding));`);
   const columns=s.db.query('PRAGMA table_info(blocker_notices)').all() as any[];
   if(!columns.some(column=>column.name==='applied_label_id'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN applied_label_id TEXT');
+  if(!columns.some(column=>column.name==='checked'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN checked TEXT');
  }
  binding(job:string,outcome:any,labelId?:string){
   return digest(JSON.stringify([outcome.plan_hash,outcome.outcome,outcome.reason,outcome.questions,outcome.dependencies,labelId??null]));
@@ -47,7 +49,7 @@ export class LinearBlockers{
   if(!row){
    const commentId=randomUUID();
    const body=options?.body??[
-      `## ADLC: ${outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped'} — ${issue.identifier}`,
+      `## ADLC: ${options?.heading??(outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped')} — ${issue.identifier}`,
      `Outcome: **${outcome.outcome.replaceAll('_',' ')}**`,
      `Plan version: \`${outcome.plan_hash}\``,
      outcome.reason?`Reason: ${outcome.reason}`:null,
@@ -160,6 +162,25 @@ export class LinearBlockers{
     if(prior>=0)rows.splice(prior,1);
     rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason:review.reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
    }
+  }
+  const observations=new RecoveryObservation(this.s);
+  for(const j of this.s.list().filter(j=>j.project===c.linear.projectId)){
+   const stop=observations.status(j.id),e=stop?.evidence;
+   if(!e||transient(e))continue;
+   try{new Lifecycle(this.s).current(j.id);}catch{continue;}
+   const binding=digest(JSON.stringify(['observation',j.plan_hash,e.provider,e.operation,e.classification]));
+   // Re-verify a posted notice for the same evidence only periodically instead of
+   // rereading the issue and comment inventory on every poll. A changed binding,
+   // missing or edited comment and uncertain delivery still read normally.
+   const posted=this.s.db.query("SELECT checked FROM blocker_notices WHERE job=? AND binding=? AND state='posted'").get(j.id,binding) as any;
+   if(posted&&Number.isFinite(Date.parse(posted.checked))&&Date.now()-Date.parse(posted.checked)<60*60*1000)continue;
+   const reason=`${e.provider} ${e.operation}: ${e.classification}. Inspect provider login status, repository/session visibility and configuration locally; do not paste credentials. After correction run retry-observation ${j.id}; mutation uncertainty remains unchanged.`;
+   try{
+    const result=await this.leave(j.id,{plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason,questions:'[]',dependencies:'[]'},c,{binding,applyLabel:false,heading:'provider observation recovery required'});
+    this.s.db.query("UPDATE blocker_notices SET checked=? WHERE job=? AND binding=?").run(new Date().toISOString(),j.id,binding);
+    results.push(result);
+   }
+   catch(error){results.push({job:j.id,state:'blocked',reason:'Observation blocker notice requires reconciliation; no blind resend'});}
   }
   for(const outcome of rows){
    handled.add(outcome.job);

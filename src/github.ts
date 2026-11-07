@@ -1,4 +1,5 @@
 import {latestWorkflowChecks} from './check-runs';
+import {githubRead,ReadValidationError} from './provider-read';
 import {templateLogReader} from './gh-logs';
 import {templateCIFindings,templateSignature,metadataBodyCovered} from './pr-template-ci';
 import {attestMetadataChecks,currentMetadataChecks} from './metadata-attestation';
@@ -7,10 +8,7 @@ import { reviewGate, digest, type ReviewEvidence } from './core';
 import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
 
 async function gh(args: string[]): Promise<any> {
-  const p=Bun.spawn(['gh',...args],{stdout:'pipe',stderr:'pipe',timeout:30000});
-  const [out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
-  if(code!==0) throw Error(`GitHub read failed (${code})`);
-  return JSON.parse(out);
+  return githubRead(args,'review-read');
 }
 async function pages(path: string, key?:string) {
   const data=await gh(['api','--paginate','--slurp',path]);
@@ -79,7 +77,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   required=[...new Set([...required,...metadataChecks])];
   const base=`repos/${repo}`;
   const first=await gh(['api',`${base}/pulls/${number}`]);
-  if(first.state!=='open')throw Error('PR is not open');
+  if(first.state!=='open')throw new ReadValidationError();
   const [rawChecks,reviews]=await Promise.all([pages(`${base}/commits/${first.head.sha}/check-runs?per_page=100`,'check_runs'),pages(`${base}/pulls/${number}/reviews?per_page=100`)]);
   let checks=latestWorkflowChecks(rawChecks);
   const [owner,name]=repo.split('/'); let after:string|null=null;const cursors=new Set();

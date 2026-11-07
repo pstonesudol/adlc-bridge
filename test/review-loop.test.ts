@@ -1,4 +1,7 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime,spyOn} from 'bun:test';
+import {readFailure,ReadValidationError} from '../src/provider-read';
+import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
+import {ObservationLeaseLost} from '../src/observation-fence';
 import {decision,ReviewLoop} from '../src/review-loop';
 import {Store} from '../src/core';
 import {Planning} from '../src/planning';
@@ -213,21 +216,98 @@ test('second branch read failure invalidates stale readiness and enters durable 
   await f.loop.tick(f.id,undefined,undefined,undefined,config);expect(reads).toBe(2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
-test('accepted ancestry provider errors back off outside conflict path without resetting consecutive failures',async()=>{
+test('closed PR readiness validation remains actionable without a read failure budget',async()=>{
+ const f=templateFixture();try{
+ f.loop.io.readiness=async()=>{throw new ReadValidationError();};
+ for(let n=0;n<2;n++){
+ expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'PR is not open; inspect PR state before further review.'});
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.sends()).toBe(0);
+ }
+ }finally{f.s.close();}
+});
+test('later read deferrals, including wrapped ancestry errors, remain waiting without failures',async()=>{
+ for(const stage of ['snapshot','ensure','readiness','accepted']){
+ const f=templateFixture();const original=RecoveryObservation.prototype.read;
+ // Identify the intended call site from the read callback itself; a provider-only
+ // or call-count signal cannot distinguish these GitHub reads.
+ const target:{[stage:string]:[string,number]}={snapshot:['readBranchSnapshot',2],ensure:['readBranchSnapshot',2],readiness:['readiness',1],accepted:['contains',1]};
+ const [kind,wanted]=target[stage],seen:Record<string,number>={};
+ const spy=spyOn(RecoveryObservation.prototype,'read').mockImplementation(async function(job,provider,read:any){
+ const source=String(read),at=source.includes('readiness')?'readiness':source.includes('contains')?'contains':source.includes('sessionEvidence')?'sessionEvidence':'readBranchSnapshot';
+ seen[at]=(seen[at]??0)+1;
+ if(at===kind&&seen[at]===wanted)throw new ObservationDeferred(Date.now()+1000);
+ return original.call(this,job,provider,read);
+ });
+ try{
+ if(stage==='accepted'){
+ const {BranchUpdates}=await import('../src/branch-updates');new BranchUpdates(f.s);
+ f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
+ const snapshot=f.loop.io.readBranchSnapshot;f.loop.io.readBranchSnapshot=async(...args)=>({...await snapshot(...args),behind:1,mergeable:false});
+ f.loop.io.contains=async()=>{throw Error('Unexpected ancestry provider read');};
+ }
+ const config=stage==='snapshot'||stage==='accepted'?{conflictRecovery:{enabled:true}}:undefined;
+ const result=await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ expect(seen[kind]).toBe(wanted);
+ // A deferral must stop the tick before any later provider read (notably readiness).
+ if(stage!=='readiness')expect(seen.readiness??0).toBe(0);
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.sends()).toBe(0);
+ }finally{spy.mockRestore();f.s.close();}
+ }
+});
+test('expired job lease fences a paused tick after a newer tick completes',async()=>{
+ const f=templateFixture();let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let reads=0;
+ try{
+ const old={...f.e,head:'c'.repeat(40),clear:true,failedChecks:[],findings:[]};
+ f.loop.io.readiness=async()=>{if(++reads===1){await gate;return old;}return {...f.e,clear:true,failedChecks:[],findings:[]};};
+ const first=f.loop.tick(f.id);while(reads===0)await Promise.resolve();
+ setSystemTime(new Date(Date.now()+60*60*1000+1));
+ await f.loop.tick(f.id);const newer={...f.loop.get(f.id)};release();
+ expect(await first).toMatchObject({state:'waiting_for_worker',send:false});expect(f.loop.get(f.id)).toEqual(newer);expect(newer.head).not.toBe(old.head);expect(f.sends()).toBe(0);
+ }finally{release?.();setSystemTime();f.s.close();}
+});
+test('branch updates bound unknown mergeability without conflict recovery',async()=>{
+ const f=templateFixture();try{
+ new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');
+ const original=f.loop.io.readBranchSnapshot;f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),behind:1,mergeable:null});
+ for(let n=1;n<=6;n++){
+ expect((await f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3})).state).toBe(n===6?'blocked':'updating_branch');setSystemTime(new Date(Date.now()+60001));
+ }
+ expect(new RecoveryObservation(f.s).status(f.id)).toBeNull();expect(f.s.get(f.id).attempts).toBe(0);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
+test('branch-only ticks preserve readiness failure history',async()=>{
+ const f=templateFixture();try{
+ let branchOnly=false;const original=f.loop.io.readBranchSnapshot;
+ f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),behind:branchOnly?1:0,mergeable:branchOnly?null:true});
+ f.loop.io.readiness=async()=>{throw readFailure('github','review-read','HTTP 503');};
+ const config={conflictRecovery:{enabled:true}};
+ await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ let row=f.s.db.query('SELECT failures,next_read FROM recovery_observations').get() as any;expect(row.failures).toBe(1);setSystemTime(new Date(row.next_read+1));
+ branchOnly=true;expect((await f.loop.tick(f.id,undefined,undefined,undefined,config)).state).toBe('updating_branch');
+ expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(1);
+ setSystemTime(new Date(Date.now()+60001));branchOnly=false;await f.loop.tick(f.id,undefined,undefined,undefined,config);
+ row=f.s.db.query('SELECT failures FROM recovery_observations').get() as any;expect(row.failures).toBe(2);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
+test('six accepted ancestry read failures recover automatically without manual database edits',async()=>{
  const f=templateFixture();try{
   const l=new Lifecycle(f.s);l.grantGit(f.id,f.s.get(f.id).plan_hash,['open-pr','fetch','push-feature'],'human');
   new (await import('../src/branch-updates')).BranchUpdates(f.s);
   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'b'.repeat(40),'accepted',1,null);
-  let reads=0;f.loop.io.contains=async()=>{reads++;throw Error('provider rate limited');};
+  let reads=0;f.loop.io.contains=async()=>{reads++;throw readFailure('github','ancestry','HTTP 503');};
   const c={conflictRecovery:{enabled:true}},p={enabled:true,authorizedBy:'human',maxUpdates:3};
   for(let n=1;n<=6;n++){
-   if(n>1)f.s.db.query('UPDATE recovery_observations SET next_read=0').run();
-   expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('blocked');
+   expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('waiting_for_worker');
    expect((f.s.db.query('SELECT failures FROM recovery_observations').get() as any).failures).toBe(n);
    await f.loop.tick(f.id,p,undefined,undefined,c);expect(reads).toBe(n);
+   const row=f.s.db.query('SELECT next_read FROM recovery_observations').get() as any;setSystemTime(new Date(row.next_read+1));
   }
+  f.loop.io.contains=async()=>true;f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];
+  expect((await f.loop.tick(f.id,p,undefined,undefined,c)).state).toBe('waiting_for_ci');
+  expect(f.s.db.query('SELECT * FROM recovery_observations').get()).toBeNull();
   expect(f.s.get(f.id).attempts).toBe(0);expect(f.sends()).toBe(0);
- }finally{f.s.close();}
+ }finally{setSystemTime();f.s.close();}
 });
 test('identity failures retain specific hints and do not consume provider read retries',async()=>{
  for(const kind of ['session','local','repository','authorization']){
@@ -433,8 +513,10 @@ test('concurrent ticks retain their explicitly supplied check policy despite sha
   f.e.clear=true;f.e.failedChecks=[];f.e.findings=[];let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve),seen:any[]=[];
   f.loop.io.sessionEvidence=async()=>{await gate;return f.session;};f.loop.io.readiness=async(_repo,_pr,required,metadata)=>{seen.push({required,metadata});return f.e;};
   const checks=['Strict metadata'],strict=f.loop.tick(f.id,undefined,undefined,{project:'project',checks}),empty=f.loop.tick(f.id,undefined,undefined,{project:'project',checks:[]});
-  checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await Promise.all([strict,empty]);
-  expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']},{required:['CI'],metadata:[]}]);expect(f.sends()).toBe(0);
+  const before={...f.loop.get(f.id)};
+  expect(await empty).toMatchObject({state:'waiting_for_worker',send:false});expect(seen).toEqual([]);expect(f.loop.get(f.id)).toEqual(before);expect(f.sends()).toBe(0);
+  checks.length=0;f.loop.configureMetadataChecks('project',[]);release();await strict;
+  expect(seen).toEqual([{required:['CI','Strict metadata'],metadata:['Strict metadata']}]);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 test('same-name failures require matching check-run identity and head for remediation or metadata waiting',async()=>{
@@ -721,6 +803,29 @@ test('metadata-only remediation does not require container runtime context',asyn
   f.loop.setVerification(f.id,{version:1,mode:'container',steps:[{cwd:'.',argv:['node','--test']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['src']}});
   expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
   expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a pre-send lease rejection releases the unsent remediation attempt for a later retry',async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings),before=f.s.get(f.id).attempts;
+  await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],{...f.io,spawn:()=>{throw new ObservationLeaseLost(false);}})).rejects.toBeInstanceOf(ObservationLeaseLost);
+  expect(f.s.get(f.id).attempts).toBe(before);
+  expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM review_feedback').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM delivery_receipts').all()).toEqual([]);
+  expect(f.s.db.query('SELECT consumed,no_progress,last_attempt FROM remediation_budget WHERE job=?').get(f.id)).toMatchObject({consumed:0,no_progress:0,last_attempt:null});
+  expect(f.s.db.query("SELECT kind FROM events WHERE kind='remediation_released_unsent'").get()).not.toBeNull();
+  const retried=await sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],f.io);
+  expect(retried).toMatchObject({state:'delivery_uncertain',attempt:1});expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+ }finally{f.s.close();}
+});
+test('a possible post-send lease loss keeps delivery uncertainty',async()=>{
+ const f=threadFixture();try{
+  const findings=JSON.stringify(f.e.findings);
+  await expect(sendPilotRemediation(f.s,f.id,f.head,findings,'owner/repo',1,['CI'],undefined,[],{...f.io,spawn:()=>{throw new ObservationLeaseLost(true);}})).rejects.toBeInstanceOf(ObservationLeaseLost);
+  expect(f.s.db.query('SELECT state FROM remediation').all()).toEqual([{state:'delivery_uncertain'}]);
+  expect(f.s.get(f.id).attempts).toBe(1);
+  expect(f.s.db.query('SELECT attempt FROM review_feedback').all()).toEqual([{attempt:1}]);
  }finally{f.s.close();}
 });
 test('a duplicate remediation reservation never spawns a second worker for the same feedback',async()=>{

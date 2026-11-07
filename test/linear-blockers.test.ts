@@ -1,10 +1,62 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
 import {ConflictRecovery} from '../src/conflict-recovery';
 import {ReviewLoop} from '../src/review-loop';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
+test('posted observation notice is rechecked hourly without duplicates',async()=>{
+ const f=fixture();try{
+ f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ const blockers=f.blockers();await blockers.sync(f.config);expect(f.creates).toBe(1);
+ const checked=Date.parse((f.s.db.query('SELECT checked FROM blocker_notices WHERE job=?').get(f.id) as any).checked);
+ expect(Number.isFinite(checked)).toBe(true);
+ const before=f.calls;
+ await blockers.sync(f.config);expect(f.calls).toBe(before);expect(f.creates).toBe(1);
+ setSystemTime(new Date(checked+60*60*1000+1));await blockers.sync(f.config);
+ expect(f.calls).toBeGreaterThan(before);expect(f.creates).toBe(1);
+ const rechecked=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(rechecked);expect(f.creates).toBe(1);
+ // A legacy row without a checked timestamp is rechecked once, then throttled.
+ f.s.db.query('UPDATE blocker_notices SET checked=NULL WHERE job=?').run(f.id);
+ const legacy=f.calls;await blockers.sync(f.config);expect(f.calls).toBeGreaterThan(legacy);expect(f.creates).toBe(1);
+ const settled=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(settled);
+ }finally{setSystemTime();f.s.close();}
+});
+test('transient or unapproved observations publish no notice',async()=>{
+ const f=fixture();try{
+ f.running();const observations=new RecoveryObservation(f.s);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 503',1));
+ await f.blockers().sync(f.config);
+ expect(f.comments.some(c=>c.body.includes('provider observation recovery required'))).toBe(false);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ f.s.db.query("UPDATE jobs SET state='awaiting_plan' WHERE id=?").run(f.id);
+ await f.blockers().sync(f.config);
+ expect(f.comments.some(c=>c.body.includes('provider observation recovery required'))).toBe(false);
+ }finally{f.s.close();}
+});
+test('observation notice does not retain an old-plan owned blocker label',async()=>{
+ const f=fixture();try{
+ const blockers=f.blockers();await blockers.sync(f.config);expect(f.labels).toContain(labelId);
+ const j=f.s.get(f.id),plan='new approved plan',hash=digest(JSON.stringify([j.spec,plan]));
+ f.s.db.query("UPDATE jobs SET state='approved',plan=?,plan_hash=?,approved_hash=? WHERE id=?").run(plan,hash,hash,f.id);
+ new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
+ await blockers.sync(f.config);expect(f.creates).toBe(2);expect(f.labels).not.toContain(labelId);expect(f.labels).toContain('ready');
+ expect(f.comments[1].body).toContain('## ADLC: provider observation recovery required');
+ }finally{f.s.close();}
+});
+
+test('permanent read failures publish one secret-safe operator notice without labels',async()=>{
+ const f=fixture();try{
+ f.running();const observations=new RecoveryObservation(f.s);
+ observations.failed(f.id,readFailure('github','branch-read','HTTP 401 Authorization: Bearer PRIVATE',1));
+ const blockers=f.blockers();await blockers.sync(f.config);await blockers.sync(f.config);
+ expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.comments[0].body).toContain('retry-observation');expect(f.comments[0].body).not.toContain('PRIVATE');
+ expect(f.comments[0].body).toContain('## ADLC: provider observation recovery required');expect(f.comments[0].body).not.toContain('implementation stopped');expect(f.comments[0].body).toContain('This synchronization records an outcome only.');expect(f.comments[0].body).toContain('Human PR merges remain required.');
+ const before=f.calls;await blockers.sync(f.config);expect(f.calls).toBe(before);
+ }finally{f.s.close();}
+});
 
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};

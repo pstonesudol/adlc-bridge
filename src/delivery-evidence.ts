@@ -1,4 +1,5 @@
 import {realpathSync} from 'node:fs';
+import {readFailure} from './provider-read';
 import {Store} from './core';
 import {AO} from './orchestrator';
 import {sessionEvidence} from './session-evidence';
@@ -7,8 +8,15 @@ import type {RecoveryTransport,DeliveryFacts} from './delivery-recovery';
 export type ProcessRunner=(args:string[],cwd?:string)=>Promise<string>;
 export const command:ProcessRunner=async(args,cwd)=>{
  const p=Bun.spawn(args,{cwd,stdout:'pipe',stderr:'pipe',timeout:30000});
- const [out,,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
- if(code!==0)throw Error(`Required evidence unavailable: ${args[0]} ${args[1]}`);return out.trim();
+ const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+ // GitHub and Orchestrator reads carry typed, secret-safe evidence so a
+ // transient failure can be retried instead of becoming a permanent reason.
+ if(code!==0){
+ if(args[0]==='gh')throw readFailure('github','recovery-facts',p.signalCode==='SIGTERM'?'timeout':err,code);
+ if(args[0]===AO)throw readFailure('orchestrator','recovery-facts',p.signalCode==='SIGTERM'?'timeout':err,code);
+ throw Error(`Required evidence unavailable: ${args[0]} ${args[1]}`);
+ }
+ return out.trim();
 }
 const json=async(run:ProcessRunner,args:string[])=>JSON.parse(await run(args));
 const git=(run:ProcessRunner,cwd:string,...args:string[])=>run(['git','--no-optional-locks',...args],cwd);

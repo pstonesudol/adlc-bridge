@@ -2038,9 +2038,97 @@ package and unknown running backend; equal package versions do not prove the sam
 commit or active runtime. Completion prints bash/zsh/fish definitions only; shell
 files are never modified automatically.
 
-New scoped commands use schemaVersion 1 success/error envelopes. Existing flat
+New scoped commands use schemaVersion 1 success/error envelopes. Version 1
+job views use display states `awaiting_plan`, `approval_wait`, `dependency_wait`,
+`working`, `observation_wait`, `blocked`, and `complete`. The nullable
+`observation` object retains historical evidence even when a persisted blocker,
+approval/dependency wait, or completion takes precedence. Its fields are:
+`failures` (consecutive incomplete observations), `nextRetry` (epoch milliseconds,
+or null when no automatic probe is eligible), `error` (nullable secret-safe typed
+provider evidence: provider, operation, timestamp, classification, optional
+exitStatus/httpStatus/retryAt/requestId, and bounded detail), and `evidenceAgeMs`
+(elapsed milliseconds or null for legacy unknown evidence). `observation_wait`
+means an otherwise approved working job is waiting on read-only observation;
+it does not authorize dispatch, Git writes, or approval.
+
+Existing flat
 commands retain legacy text/JSON contracts. Display state `awaiting_plan` means
 no planning dispatch, not an active worker; activity/freshness remain unknown
 without authoritative evidence. Linked DEV-35/43/34/33/51/55 integrations remain
 planned, not success-shaped placeholders; existing guarded engine commands remain
 available as documented elsewhere.
+# Read-only observation recovery
+
+Review-loop GitHub branch/ancestry/readiness reads, conflict-recovery delivery
+facts (before and after reservation) and Orchestrator session evidence have
+durable observation recovery, separate from remediation and all
+mutation receipts. Evidence stores provider, safe operation, time, classification,
+exit/HTTP status and available retry/request identifiers. Raw stderr, credentials,
+URLs and response bodies are not retained; diagnostics are an allowlisted summary.
+Nested errors retain their cause in memory, not in persisted diagnostics.
+Transcript pagination reconciles page-local turns and retries a genuinely changed
+turn before failing closed.
+
+Timeout/network, 5xx and explicit primary/secondary throttling errors retry at
+1, 2, 4, 8 and 16 seconds (±25% jitter). From failure six onward the circuit uses
+one health probe per 30 minutes, or later when Retry-After/rate-reset requires it.
+Only a complete successful observation resets consecutive failures. Unknown,
+malformed, missing-resource and authentication/permission failures require
+inspection and an explicit read retry; unknown errors are never called quota
+failures. A successful read is not approval or permission to write.
+
+Failure history spans providers and survives branch-only ticks until readiness
+collection succeeds. Unknown mergeability uses a separate durable one-minute
+wait, not the provider-failure or remediation budget. After six unknown results,
+polling stops for inspection; `retry-observation JOB` rearms that wait after
+operator inspection. A known branch result clears the mergeability wait only.
+
+Capacity/cooldowns are shared by provider across projects/jobs in the same state
+database. A job's circuit delay is not shared: transient failures impose only a
+one-second provider coordination cooldown, extended by valid provider retry
+hints. GitHub throttling without a usable hint instead waits at least one minute
+across the job and shared provider cooldown. Provider hints are capped at 24 hours
+from observation time; existing longer stored cooldowns are also capped at startup.
+Untyped callback errors remain unknown; only typed provider-read evidence can
+authorize automatic transient recovery. Invalid timestamps outside the supported Date range are rejected; legacy
+invalid stored cooldowns are durably normalized to a 30-minute health-probe wait
+without clearing failure history or mutation receipts. Reserved conflict recovery
+uses this read backoff before any worktree mutation; later uncertain mutation
+stages still require their existing reconciliation and are never replayed.
+
+Capacity coordination uses the same state
+database. A provider lease permits one collection at a time (10-minute crash
+expiry); a job evaluation lease suppresses concurrent continuations (one-hour
+crash expiry). Run projects sharing provider capacity against the same state
+database, not independent databases. Restart preserves cooldowns and leases.
+There is no autonomous mutation replay or retry timer outside normal supervised
+polling; existing update/shutdown submission barriers remain authoritative.
+
+Inspect `adlc review-status` or `adlc jobs show JOB --json` for the observation
+class, evidence age, failure count and scheduled retry time. Old six-failure rows
+without typed evidence become eligible for a guarded probe at their stored due
+time; their historical cause remains unknown. For persistent failures, verify
+provider login, repository/session access and configuration locally. Never paste
+tokens or credential stores into tickets. When blocker synchronization is enabled,
+the existing receipt-backed Linear publisher posts a deduplicated notice without
+adding/removing labels or blindly repeating an uncertain comment delivery.
+
+After correcting a permanent problem, use `adlc retry-observation JOB`. This
+rearms reads only and does not bypass a shared provider cooldown. Inspect
+`adlc review-status` for the provider's `sharedNextRead` timestamp. To override
+an abnormal shared cooldown after inspecting provider health and retry guidance,
+use `adlc retry-observation JOB --override-shared-cooldown github TIMESTAMP`
+(or `orchestrator`). This compares the exact inspected timestamp, audits the
+override, and clears only that provider's shared cooldown; it does not change
+any job wait. Then use plain `retry-observation JOB` separately as needed. A
+changed timestamp requires inspection again. Neither action replays mutations.
+
+Inspect
+`adlc reconcile-publication` preview separately for uncertain publication; read
+recovery never replays PUTs, pushes, comments, model sends or other mutations.
+Other freshness, scope, approval, ownership, busy-worker and reconciliation gates
+remain in force. Recovering reads does not clear those blockers or reset attempts.
+
+Source changes do not activate the pinned live runtime. After human review and
+manual merge, an operator must follow the guarded runtime activation workflow;
+coding workers must not install, activate, restart or deploy the live bridge.

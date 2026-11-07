@@ -1,4 +1,6 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
+import {RecoveryObservation} from '../src/recovery-observation';
+import {readFailure} from '../src/provider-read';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -42,6 +44,139 @@ async function fixture(filename='app.txt'){
  const recovery=new ConflictRecovery(s,io as any);
  return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
 }
+test('reserved conflict recovery retries six read failures before any mutation',async()=>{
+ const f=await fixture();let fail=true,reads=0;
+ const snapshot=async()=>{if(++reads>=3&&fail)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ try{
+ for(let n=1;n<=6;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});expect(f.sends()).toBe(0);
+ expect(f.commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref'].includes(a[1]))).toHaveLength(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);setSystemTime(new Date(status.next_read+1));
+ }
+ fail=false;expect((await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ // A complete guarded observation resets only the job's read failure history.
+ expect(new RecoveryObservation(f.s).status(f.job)).toBeNull();
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery retries transient facts read failures after GitHub recovers',async()=>{
+ const f=await fixture();let calls=0,remaining=2;
+ // The reservation preview and inspection read facts before the row exists;
+ // only reads under the reserved stage may be tracked and retried.
+ const facts=async()=>{if(++calls>2&&remaining-->0)throw readFailure('github','recovery-facts','HTTP 503',1);return f.io.facts(f.job,f.config);};
+ try{
+ for(let n=1;n<=2;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.sends()).toBe(0);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ expect(f.commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref'].includes(a[1]))).toHaveLength(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);expect(status.evidence).toMatchObject({provider:'github',classification:'server'});setSystemTime(new Date(status.next_read+1));
+ }
+ expect((await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery retries transient orchestrator facts failures after AO recovers',async()=>{
+ const f=await fixture();let calls=0,remaining=2;
+ const facts=async()=>{if(++calls>2&&remaining-->0)throw readFailure('orchestrator','recovery-facts','AO daemon is not running — start it with `ao start`',1);return f.io.facts(f.job,f.config);};
+ try{
+ for(let n=1;n<=2;n++){
+ const result=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('waiting_for_worker');expect(f.sends()).toBe(0);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status.failures).toBe(n);expect(status.evidence).toMatchObject({provider:'orchestrator',classification:'network'});setSystemTime(new Date(status.next_read+1));
+ }
+ expect((await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('transient reservation reads back off before a conflict recovery row exists',async()=>{
+ const f=await fixture();let fail=true;
+ const facts=async()=>{if(fail)throw readFailure('github','recovery-facts','HTTP 503',1);return f.io.facts(f.job,f.config);};
+ try{
+ const first=await new ConflictRecovery(f.s,{...f.io,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(first).toMatchObject({state:'waiting_for_worker',send:false,reason:expect.stringContaining('backoff')});expect(f.recovery.row(f.job)).toBeUndefined();expect(f.sends()).toBe(0);
+ const status=new RecoveryObservation(f.s).status(f.job);expect(status).toMatchObject({failures:1,evidence:{provider:'github',classification:'server'}});
+ let reads=0;const counted=async()=>{reads++;return f.io.facts(f.job,f.config);};
+ expect((await new ConflictRecovery(f.s,{...f.io,facts:counted} as any).tick(f.job,f.config,'owner/repo',1)).state).toBe('waiting_for_worker');
+ expect(reads).toBe(0);expect(f.recovery.row(f.job)).toBeUndefined();
+ fail=false;setSystemTime(new Date(status.next_read+1));
+ expect((await new ConflictRecovery(f.s,{...f.io,facts:counted} as any).tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');
+ expect(f.sends()).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('shared provider cooldown defers an unreserved conflict tick without provider reads',async()=>{
+ const f=await fixture();let reads=0;
+ const unavailable=async()=>{reads++;throw Error('Provider read attempted during shared cooldown');};
+ const gated={...f.io,facts:unavailable,snapshot:unavailable,evidence:unavailable};
+ try{
+ new RecoveryObservation(f.s).failed('other-job',readFailure('github','branch-read','HTTP 429\nRetry-After: 60\n',1));
+ const result=await new ConflictRecovery(f.s,gated as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ expect(reads).toBe(0);expect(f.recovery.row(f.job)).toBeUndefined();expect(f.sends()).toBe(0);
+ }finally{f.close();}
+},60000);
+async function reservedWithReadFailure(f:any){
+ let reads=0;const snapshot=async()=>{if(++reads===3)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ return snapshot;
+}
+const mutating=(commands:string[][])=>commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref','commit','push'].includes(a[1]));
+test('reserved conflict recovery blocks a permanent provider failure without Git mutations',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ const mark=f.commands.length,before=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(before.next_read+1));
+ const facts=async()=>{throw readFailure('github','recovery-facts','HTTP 401',1);};
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('blocked');expect(result?.reason).toContain('authentication');
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(before.failures+1);expect(after.evidence.classification).toBe('authentication');
+ expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery keeps an untyped facts failure terminal without an observation',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);
+ const mark=f.commands.length,before=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(before.next_read+1));
+ const facts=async()=>{throw Error('Untyped facts failure');};
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot,facts} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result?.state).toBe('blocked');expect(result?.reason).toContain('Untyped facts failure');
+ expect(f.recovery.row(f.job).reason).toContain('Untyped facts failure');
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(before.failures);expect(after.evidence).toEqual(before.evidence);
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved conflict recovery defers a shared cooldown without recording a failure',async()=>{
+ const f=await fixture();try{
+ const snapshot=await reservedWithReadFailure(f);
+ const status=new RecoveryObservation(f.s).status(f.job);setSystemTime(new Date(status.next_read+1));
+ new RecoveryObservation(f.s).failed('other-job',readFailure('github','branch-read','HTTP 429\nRetry-After: 600\n',1));
+ const mark=f.commands.length;
+ const result=await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ expect(result).toMatchObject({state:'waiting_for_worker',send:false});expect(result.reason).toContain('deferred until');
+ const after=new RecoveryObservation(f.s).status(f.job);expect(after.failures).toBe(status.failures);expect(after.evidence).toEqual(status.evidence);
+ expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
+ expect(f.sends()).toBe(0);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+ }finally{setSystemTime();f.close();}
+},60000);
+test('reserved manual preview is read-only and guards retain observation history',async()=>{
+ const f=await fixture();let reads=0;let reader:Store|undefined;
+ try{
+ const snapshot=async()=>{if(++reads===3)throw readFailure('github','branch-read','HTTP 503',1);return f.io.snapshot();};
+ await new ConflictRecovery(f.s,{...f.io,snapshot} as any).tick(f.job,f.config,'owner/repo',1);
+ const row=f.recovery.row(f.job);expect(row.state).toBe('reserved');
+ const before=f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job);
+ const events=f.s.db.query('SELECT count(*) AS n FROM events').get();
+ reader=Store.readonly(join(f.dir,'state.sqlite'));
+ const preview=new ConflictRecovery(reader,f.io as any);
+ await expect(preview.manualPreview(f.job,f.config)).rejects.toThrow('recorded conflict index required');
+ expect(f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job)).toEqual(before);
+ expect(f.s.db.query('SELECT count(*) AS n FROM events').get()).toEqual(events);
+ setSystemTime(new Date((before as any).next_read+1));
+ await f.recovery.guard(row,f.config);
+ expect(f.s.db.query('SELECT * FROM recovery_observations WHERE job=?').get(f.job)).toEqual(before);
+ expect(f.recovery.row(f.job)).toEqual(row);expect(f.sends()).toBe(0);
+ }finally{setSystemTime();reader?.close();f.close();}
+},60000);
 test('DEV-15/16 conflict preserves feature and base safeguards, normal pushes and invalidates old clearance',async()=>{
  const f=await fixture();try{
   expect((await f.recovery.tick(f.job,f.config,'owner/repo',1))?.stage).toBe('resolving');expect(f.sends()).toBe(1);

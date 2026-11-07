@@ -1,4 +1,7 @@
 import {existsSync} from 'node:fs';
+import {fencedIO,assertObservationFence,ObservationLeaseLost} from './observation-fence';
+import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
+import {ProviderReadError} from './provider-read';
 import {resolve} from 'node:path';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
@@ -36,7 +39,7 @@ const sha=(v:string)=>/^[a-f0-9]{40,64}$/.test(v);
 export class ConflictRecovery{
  io:ConflictIO;
  constructor(public s:Store,overrides:Partial<ConflictIO>={}){
-   this.io={facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides};
+   this.io=fencedIO({facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides});
  }
  install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS conflict_recoveries(
  id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),plan TEXT NOT NULL,worktree TEXT NOT NULL,
@@ -47,6 +50,7 @@ export class ConflictRecovery{
  row(job:string){return recoveryRows(this.s).filter(r=>r.job===job).at(-1);}
  async git(tree:string,...args:string[]){const r=await this.io.command(['git',...args],tree);if(r.code!==0)throw Error(`Git ${args[0]} failed (${r.code}); preserve work and inspect: ${r.err.slice(0,2000)}`);return r.out.trim();}
  auth(job:string,c:any){
+  assertObservationFence();
   validateConflictPolicy(c.conflictRecovery);if(c.conflictRecovery?.enabled!==true)throw Error('Conflict recovery is not explicitly enabled');
   const a=new DeliveryRecovery(this.s,{} as any).authorization(job,c);
   if(!['inspect','fetch','branch','commit','push-feature','merge-base-feature'].every(op=>JSON.parse(a.grant).includes(op)))throw Error('Explicit current merge-base-feature and feature Git grants required; no retroactive grant migration');
@@ -68,8 +72,10 @@ export class ConflictRecovery{
   const d=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
   if(d?.state!=='pr_handoff')throw Error('Completed implementation PR handoff required');
  }
- async inspect(job:string,c:any,repo:string,pr:number){
-  const auth=this.auth(job,c),facts=await this.io.facts(job,c),b=await this.io.snapshot(repo,pr),e=await this.io.evidence(auth.session);
+ async inspect(job:string,c:any,repo:string,pr:number,observations?:RecoveryObservation){
+  const auth=this.auth(job,c),facts=await (observations?observations.read(job,'github',()=>this.io.facts(job,c),false):this.io.facts(job,c));
+  const b=await (observations?observations.read(job,'github',()=>this.io.snapshot(repo,pr)):this.io.snapshot(repo,pr));
+  const e=await (observations?observations.read(job,'orchestrator',()=>this.io.evidence(auth.session)):this.io.evidence(auth.session));
   assertDeliveryTarget(this.s,job,e.session,repo,pr,b);
   if(e.session?.id!==auth.session||e.session.isTerminated!==false||e.session.activity?.state!=='idle'||!e.session.prs?.some((p:any)=>p.number===pr&&p.url===`https://github.com/${repo}/pull/${pr}`&&p.state==='open'))throw Error('Native session activity or PR attachment changed');
   if(repo!==c.githubRepo||b.baseBranch!==c.conflictRecovery.baseBranch||facts.session!==auth.session||facts.worktree!==canonicalWorktree(auth.worktree)||facts.project!==auth.project||!facts.isolated||!facts.lineage||!facts.completed||facts.owners.length!==1||facts.owners[0]!==auth.session||facts.branch!==b.branch||facts.candidates.length!==1||facts.candidates[0].pr!==pr||facts.candidates[0].repo!==repo)throw Error('Owned isolated delivery repository/base/worktree evidence mismatch');
@@ -108,8 +114,8 @@ export class ConflictRecovery{
    }catch(e){this.set(r,'manual_verifying',d,e instanceof Error?e.message:'Verification uncertain');throw e;}
   });
  }
- async preview(job:string,c:any,repo:string,pr:number){
-  const x=await this.inspect(job,c,repo,pr);assertWorktreeAvailable(this.s,job);this.pending(job);
+ async preview(job:string,c:any,repo:string,pr:number,observations?:RecoveryObservation){
+  const x=await this.inspect(job,c,repo,pr,observations);assertWorktreeAvailable(this.s,job);this.pending(job);
   if(!x.facts.clean||x.facts.head!==x.b.head)throw Error('Dirty or divergent worktree; preserve edits/history for operator reconciliation');
   await this.noOperation(x.facts.worktree);
   if(x.b.mergeable!==false||x.b.behind<1)throw Error('Confirmed base conflict required');
@@ -195,6 +201,7 @@ export class ConflictRecovery{
   });
  }
  set(r:any,state:string,detail:any=JSON.parse(r.detail),reason:string|null=null){
+  assertObservationFence();
   if(r.state===state&&r.detail===JSON.stringify(detail)&&r.reason===reason)return;
   const changed=this.s.db.query('UPDATE conflict_recoveries SET state=?,detail=?,reason=? WHERE id=? AND state=? AND detail=? AND reason IS ?').run(state,JSON.stringify(detail),reason,r.id,r.state,r.detail,r.reason);
   if(!changed.changes)throw Error('Recovery stage changed concurrently; inspect current reservation');
@@ -204,31 +211,55 @@ export class ConflictRecovery{
  result(r:any){return {state:r.reason?'blocked':'updating_branch',send:false,head:r.head,reason:r.reason??`Conflict recovery ${r.id}: ${r.state}; prior CI/review clearance is not reusable`,recovery:r.id,stage:r.state};}
  async tick(job:string,c:any,repo:string,pr:number,budget:RemediationPolicy=DEFAULT_REMEDIATION_POLICY){
   return this.io.submit(async()=>{
+   assertObservationFence();
    let r=this.row(job);
    if(r?.state==='completed')r=undefined;
    if(!r){
-    const p=await this.preview(job,c,repo,pr);
-    const x=await this.inspect(job,c,repo,pr);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
-    this.install();
-    r=this.s.db.transaction(()=>{
-     assertWorktreeAvailable(this.s,job);this.pending(job);const a=this.auth(job,c);
-     if(a.plan!==p.plan)throw Error('Approval changed before reservation');
-     if(recoveryRows(this.s).filter(r=>r.job===job).length>=c.conflictRecovery.maxRecoveries)throw Error('Conflict recovery limit reached; operator inspection required');
-     const id=digest(JSON.stringify([job,p.plan,repo,pr,p.head,p.base]));
-     const attempt=new Lifecycle(this.s).reserveRemediation(job,p.head,`base-conflict:${id}`,budget) as any;
-     if(attempt.blocked||attempt.reused)throw Error(attempt.reason??'Recovery already reserved; never replay');
-     this.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,job,p.plan,p.worktree,a.session,repo,pr,x.b.branch,x.b.baseBranch,p.head,p.base,JSON.stringify(c.conflictRecovery),'reserved',`adlc-conflict-${id}`,attempt.attempt,JSON.stringify({paths:JSON.parse(a.paths)}),null,Date.now());
-     return this.row(job);
-    }).immediate();
+    // An earlier transient read failure holds this job before any reservation;
+    // never retry every poll or consume the mutation budget for a read.
+    const backoff=new RecoveryObservation(this.s).readWait(job);if(backoff)return backoff;
+    // Pre-reservation reads share the provider lease and cooldown with the
+    // reserved stage; a shared cooldown defers them before any provider call.
+    const observations=new RecoveryObservation(this.s);
+    try{
+     const p=await this.preview(job,c,repo,pr,observations);
+     const x=await this.inspect(job,c,repo,pr,observations);if(x.b.head!==p.head||x.b.base!==p.base||!x.facts.clean||x.facts.head!==p.head)throw Error('Head/base/worktree changed before reservation');
+     this.install();
+     r=this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);this.pending(job);const a=this.auth(job,c);
+      if(a.plan!==p.plan)throw Error('Approval changed before reservation');
+      if(recoveryRows(this.s).filter(r=>r.job===job).length>=c.conflictRecovery.maxRecoveries)throw Error('Conflict recovery limit reached; operator inspection required');
+      const id=digest(JSON.stringify([job,p.plan,repo,pr,p.head,p.base]));
+      const attempt=new Lifecycle(this.s).reserveRemediation(job,p.head,`base-conflict:${id}`,budget) as any;
+      if(attempt.blocked||attempt.reused)throw Error(attempt.reason??'Recovery already reserved; never replay');
+      this.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,job,p.plan,p.worktree,a.session,repo,pr,x.b.branch,x.b.baseBranch,p.head,p.base,JSON.stringify(c.conflictRecovery),'reserved',`adlc-conflict-${id}`,attempt.attempt,JSON.stringify({paths:JSON.parse(a.paths)}),null,Date.now());
+      return this.row(job);
+     }).immediate();
+    }catch(error){
+     // The observation-backed reads already recorded one failure per attempt;
+     // never record it twice here. Validation and uncertainty keep their path.
+     if(error instanceof ObservationLeaseLost)throw error;
+     if(error instanceof ProviderReadError||error instanceof ObservationDeferred)return {...(observations.readWait(job)??{state:'waiting_for_worker',send:false,reason:error.message})};
+     throw error;
+    }
    }
    if(r.repo!==repo||r.pr!==pr)throw Error('Recovery target mismatch');
+   if(r.state==='reserved'){const wait=new RecoveryObservation(this.s).wait(job);if(wait)return {...wait,recovery:r.id,stage:r.state};}
    if(r.reason&&!['resolving','pushing'].includes(r.state))return this.result(r);
    if(r.state==='resolving'){
     const e=await this.io.evidence(r.session),entry=e.transcript?.entries?.find((e:any)=>e.clientMessageId===r.client_id);
     const active=e.transcript?.turns?.filter((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state));
     if(active?.length===1&&entry&&active[0].id===entry.turnId)return {state:'waiting_for_worker',send:false,head:r.head,stage:r.state,reason:'Waiting for existing conflict resolution turn; no new attempt'};
    }
+   const previousReadFailures=r.state==='reserved'?new RecoveryObservation(this.s).status(job)?.failures??0:0;
    try{return await this.advance(r,c);}catch(error){
+    // A lost lease is not a recovery failure; the owner of the lease decides.
+    if(error instanceof ObservationLeaseLost)throw error;
+    if(r.state==='reserved'&&(error instanceof ProviderReadError||error instanceof ObservationDeferred)){
+     assertObservationFence();const observations=new RecoveryObservation(this.s);
+     if(error instanceof ProviderReadError&&(observations.status(job)?.failures??0)===previousReadFailures)observations.failed(job,error);
+     return {...(observations.wait(job)??{state:'waiting_for_worker',send:false,reason:error.message}),recovery:r.id,stage:r.state};
+    }
     const latest=this.row(job);if(latest.state!==r.state||latest.detail!==r.detail||latest.reason!==r.reason)return this.result(latest);
     const reason=(error instanceof Error?error.message:'Recovery evidence unavailable')+`; recovery ${r.id} retains its reservation and evidence. Inspect recovery-status; no automatic replay, reset or force-push.`;
     this.set(r,r.state,JSON.parse(r.detail),reason);return this.result(r);
@@ -236,7 +267,8 @@ export class ConflictRecovery{
   });
  }
  async guard(r:any,c:any,expectedRemote=r.head){
-  const x=await this.inspect(r.job,c,r.repo,r.pr);
+  const observations=r.state==='reserved'&&!this.s.readonly?new RecoveryObservation(this.s):undefined;
+  const x=await this.inspect(r.job,c,r.repo,r.pr,observations);
   if(x.auth.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy||JSON.stringify(JSON.parse(x.auth.paths))!==JSON.stringify(JSON.parse(r.detail).paths)||x.b.head!==expectedRemote||x.b.base!==r.base||x.b.branch!==r.branch||x.b.baseBranch!==r.base_branch)throw Error('Approval, policy, scope, remote head/base or ownership changed; preserve recovery evidence');
   await this.noOperation(r.worktree,true);return x;
  }
@@ -275,6 +307,9 @@ export class ConflictRecovery{
   const x=await this.guard(r,c);
   if(r.state==='reserved'){
    if(!x.facts.clean||x.facts.head!==r.head)throw Error('Dirty or divergent worktree before merge');
+   // The complete guarded observation succeeded, so only this job's read
+   // backoff resets. The shared provider cooldown and receipts are unchanged.
+   new RecoveryObservation(this.s).clear(r.job);
    await this.noOperation(r.worktree);
    this.set(r,'fetching',d);
    await this.git(r.worktree,'fetch','--no-tags','origin',`refs/heads/${r.branch}`,`refs/heads/${r.base_branch}`);

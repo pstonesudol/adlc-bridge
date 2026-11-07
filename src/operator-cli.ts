@@ -39,14 +39,16 @@ export function jobViews(path:string,project?:string,reference?:string){
  try{
   const table=(name:string,job:string)=>s.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name)?s.db.query(`SELECT * FROM ${name} WHERE job=?`).get(job) as any:null;
   return rows(path).filter(j=>(!project||j.project===project)&&(!id||j.id===id)).map(j=>{
-   const planning=table('planning_dispatch',j.id),implementation=table('implementation_dispatch',j.id),outcome=table('worker_outcomes',j.id),wait=table('dependency_waits',j.id);
+    const planning=table('planning_dispatch',j.id),implementation=table('implementation_dispatch',j.id),outcome=table('worker_outcomes',j.id),wait=table('dependency_waits',j.id),observation=table('recovery_observations',j.id);
    const currentOutcome=outcome?.plan_hash===j.plan_hash&&!(wait?.plan===j.plan_hash&&wait.state==='resumed')?outcome:null;
    const dependency=wait?.plan===j.plan_hash&&wait.state==='waiting_for_dependencies'?wait:null;
    const state=j.state==='done'?'complete':j.state==='blocked'?'blocked':dependency||currentOutcome?.outcome==='blocked_dependency'?'dependency_wait':currentOutcome&&['needs_input','failed','uncertain','needs_reconciliation'].includes(currentOutcome.outcome)?'blocked':j.state==='awaiting_approval'?'approval_wait':j.state==='awaiting_plan'&&!planning?'awaiting_plan':'working';
    let ticket=null;try{ticket=JSON.parse(j.spec).identifier??null;}catch{}
-   return {job:j.id,project:j.project,issue:j.issue,ticket,state,orchestrationState:j.state,
-    reason:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
-    nextAction:state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
+    let readError=null;try{readError=JSON.parse(observation?.reason??'null');}catch{}
+    const automatic=!readError||['throttled','timeout','network','server'].includes(readError.classification),activeObservation=observation&&state==='working'&&j.state==='approved'&&j.approved_hash===j.plan_hash;
+    return {job:j.id,project:j.project,issue:j.issue,ticket,state:activeObservation?(automatic?'observation_wait':'blocked'):state,orchestrationState:j.state,observation:observation?{failures:observation.failures,nextRetry:activeObservation&&automatic?observation.next_read:null,error:readError,evidenceAgeMs:readError?.timestamp?Math.max(0,Date.now()-readError.timestamp):null}:null,
+     reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
+     nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
     worker:{activity:'unknown',session:implementation?.session_id??planning?.session_id??null,dispatchState:implementation?.state??planning?.state??null,outcome:currentOutcome?.outcome??null},
     evidence:{freshness:'unknown',persistedUpdatedAt:j.updated,note:'Persisted state only; no live worker or provider refresh performed.'}};
   });
