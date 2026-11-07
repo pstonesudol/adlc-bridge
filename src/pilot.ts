@@ -18,6 +18,7 @@ import {assertWorktreeAvailable} from './worktree-reservation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
 import {scopeAllows} from './file-scope';
+import {readCIFailure,classifyCIFailure,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 export function codeRemediationInstructions(verification?:Verification,context?:VerificationContext,worktree?:string){return `Fix only actionable findings within the approved ticket scope. ${verificationInstructions(verification,context,worktree)} Commit and push the existing feature branch, then STOP for host review.`;}
 
 export async function adoptPilot(s:Store,job:string,session:string){
@@ -26,7 +27,7 @@ export async function adoptPilot(s:Store,job:string,session:string){
  return new Lifecycle(s).adoptSupervised(job,{id:session,correlation:r.correlation,worktree:r.worktree,controller:'running'});
 }
 // A host-driven tick observes only. No quiet/absent review becomes approval.
-const pilotIO={sessionEvidence,readiness,spawn:Bun.spawn,submit:withTurnSubmission,readBranchSnapshot,worktreeIdentity};
+const pilotIO={sessionEvidence,readiness,spawn:Bun.spawn,submit:withTurnSubmission,readBranchSnapshot,worktreeIdentity,readCIFailure};
 export async function observePilot(s:Store,job:string,repo:string,pr:number,required:string[],metadataChecks:string[]=[],io=pilotIO){
  io=fencedIO(io);
  new Lifecycle(s).current(job);
@@ -49,14 +50,21 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
  const j=l.current(job),operations=metadataOnly?['open-pr']:['commit','push-feature',...(parsed.some((f:any)=>f.kind==='pr_description')?['open-pr']:[])];
  if(!grant||grant.plan_hash!==j.plan_hash||!operations.every(op=>JSON.parse(grant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
  const e=await io.sessionEvidence(r.session_id);if(e.transcript.controller!=='ready'||!Array.isArray(e.transcript.turns)||e.transcript.turns.some((t:any)=>['running','queued'].includes(t.state)))throw Error('Worker must be idle with no queued work');
- const validateReview=(review:any)=>{
- if(review.head!==head||review.clear||!Array.isArray(review.reasons)||review.reasons.includes('Head changed'))throw Error('Current uncleared PR head required');
+  const validateReview=(review:any)=>{
+  if(review.head!==head||review.clear||!Array.isArray(review.reasons)||review.reasons.includes('Head changed')){
+   const ci=parsed.find((f:any)=>f.source==='required-ci');
+   if(ci)throw new CIFailureBlocked(`Required CI ${ci.check} (#${ci.checkId}): unknown; current uncleared head changed before delivery`);
+   throw Error('Current uncleared PR head required');
+  }
  // Carried-forward threads are authorized by identity: the same observed head
  // must still carry the exact thread and reviewer-comment set. A changed head,
  // edited comment set or resolved thread invalidates this delivery.
   if(parsed.some((f:any)=>f.source==='github-review'&&(f.sha!==review.head||typeof f.body!=='string'||review.findings.filter((x:any)=>x.source==='github-review'&&x.threadId===f.threadId&&x.commentsHash===f.commentsHash&&x.path===f.path&&x.body===f.body).length!==1)))throw Error('Review feedback changed; recheck before delivery');
   if(parsed.some((f:any)=>f.source==='github-ci'&&(!metadataChecks.includes(f.check)||!metadataFailureBodyCovered(review,f)||!review.findings.some((x:any)=>x.source==='github-ci'&&x.check===f.check&&x.checkId===f.checkId&&x.sha===f.sha&&x.descriptionHash===f.descriptionHash))))throw Error('Template failure changed or body-bound evidence unavailable; recheck before delivery');
   if(parsed.some((f:any)=>f.source==='coderabbit-custom'&&(f.sha!==head||f.descriptionHash!==review.descriptionHash||!review.findings.some((x:any)=>x.source==='coderabbit-custom'&&x.evidenceHash===f.evidenceHash&&JSON.stringify(x)===JSON.stringify(f)))))throw Error('Custom-check evidence or description changed; recheck before delivery');
+  for(const f of parsed.filter((f:any)=>f.source==='required-ci')){
+   if(f.sha!==head||review.pendingChecks?.includes(f.check)||review.failedChecks.filter((c:any)=>sameFailedCheck(c,{id:f.checkId,sha:f.sha,name:f.check,conclusion:f.conclusion,url:f.url})).length!==1||review.failedChecks.some((c:any)=>!parsed.some((x:any)=>x.check===c.name&&x.checkId===c.id&&x.sha===c.sha)))throw new CIFailureBlocked(`Required CI ${f.check} (#${f.checkId}): unknown; failed check set changed before delivery`);
+  }
  };
  validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));
   return io.submit(async()=>{
@@ -71,7 +79,15 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
   // Routing/submission may await external work. Refresh evidence inside the
  // submission fence, then reserve synchronously without an intervening await.
  const review=await observePilot(s,job,repo,pr,required,metadataChecks,io);
- validateReview(review);
+  validateReview(review);
+  for(const f of parsed.filter((f:any)=>f.source==='required-ci')){
+   const target=s.db.query('SELECT allowed_paths,repo,pr,remediate FROM review_targets WHERE job=?').get(job) as any;
+   if(!target?.remediate||target.repo!==repo||target.pr!==pr)throw Error('Required CI remediation target changed');
+   const diagnosis=classifyCIFailure(await io.readCIFailure(repo,{id:f.checkId,sha:f.sha,name:f.check,conclusion:f.conclusion,url:f.url}),JSON.parse(target.allowed_paths));
+   if(diagnosis.classification!=='repairable'||diagnosis.signature!==f.signature||JSON.stringify(diagnosis.paths)!==JSON.stringify(f.paths))throw new CIFailureBlocked(`Required CI ${f.check} (#${f.checkId}): ${diagnosis.classification==='repairable'?'unknown':diagnosis.classification}; diagnosis changed or unavailable before delivery; human inspection required`);
+  }
+  // Log collection awaited provider IO: refresh identity once more before reserve.
+  if(parsed.some((f:any)=>f.source==='required-ci'))validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));
   const current=l.current(job),currentGrant=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
   if(current.plan_hash!==j.plan_hash||!currentGrant||currentGrant.plan_hash!==current.plan_hash||!operations.every(op=>JSON.parse(currentGrant.operations).includes(op)))throw Error('Current scoped GitHub authorization required');
   // Validate/build instructions under the submission fence before spending an
@@ -80,7 +96,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
    const verification=metadataOnly&&!parsed.some((f:any)=>f.source==='coderabbit-custom')?undefined:remediationVerification(s,job),context=verification?remediationRuntime(s,job):undefined;
    if(verification?.mode==='container'&&!context&&!parsed.some((f:any)=>f.source==='coderabbit-custom'))return {blocked:true,reason:'Container remediation requires validated runtime context; supply it before retrying'};
    const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT allowed_paths FROM review_targets WHERE job=?').get(job) as any:null;
-   if(parsed.some((f:any)=>f.kind!=='pr_description'&&(!target||!scopeAllows(f.path,JSON.parse(target.allowed_paths)))))throw Error('Review findings exceed approved file scope');
+   if(parsed.some((f:any)=>f.kind!=='pr_description'&&(!target||!scopeAllows(f.path,JSON.parse(target.allowed_paths))||f.source==='required-ci'&&f.paths.some((p:string)=>!scopeAllows(p,JSON.parse(target.allowed_paths))))))throw Error('Review findings exceed approved file scope');
    const evidenceInstructions=`First inspect existing session transcript/artifacts and current-head CI. Verify that any reused result tested exactly ${head}; label older checks historical, not current verification. Before and after running checks, verify the clean reserved worktree HEAD and remote PR head equal ${head}; stop for divergence or unavailable prerequisites, never switch branches or discard work. Use only configured or already-approved verification, never install dependencies or expand scope to satisfy review prose. ${verificationInstructions(verification,context,r.worktree)} Record actual argv/commands, working directory, runtime, tested SHA, exit codes and observed results, including browser surface, mocks and limitations where required. Preserve accurate evidence and valid requirements; never fabricate results, attestation or approval and never remove a requirement simply to pass. If access, runtime, browser prerequisites or a scope decision is missing, report the exact blocker using the worker outcome and discovery receipts below so the host can use the Linear clarification flow. Do not change Linear directly.`;
    const action=metadataOnly?
     `This is PR-description evidence remediation only for https://github.com/${repo}/pull/${pr}. ${evidenceInstructions} Read the current repository PR template and PR-body validator. Update the PR description truthfully; N/A/not-run must include a reason and does not satisfy an outstanding verification requirement. Do not modify application files, commit, push, deploy, or bypass checks. After updating the description, STOP so the host coordinator can re-request CodeRabbit once.`:

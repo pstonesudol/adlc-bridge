@@ -181,12 +181,41 @@ DEV-52 remains an optional future model-supervision layer. It could consume
 typed action evidence, but cannot supply grants or bypass these contracts.
 DEV-59 owns submission-lock contention/backoff and abandoned-barrier diagnosis;
 this feature neither retries whole fenced operations nor changes lock ownership.
-CI repair, worker liveness/replacement, new receipt recovery and additional
+Worker liveness/replacement, new receipt recovery and additional
 supported recovery adapters are follow-ups. Each new effectful adapter needs
 its own exact permission/precondition contract, durable mutation reservation,
 existing transport/fence and authoritative receipt reconciliation before it can
 inhabit `invoke_supported_recovery`. A generic callback is not an extension
 point.
+
+### Required CI diagnosis (DEV-80)
+
+The separate ordinary review evaluation now diagnoses up to eight failed
+required checks, after the existing logical-check resolver selects current-head
+identities. The observation action itself remains read-only and cannot send.
+Job/run/check IDs, SHA, name, conclusion and GitHub job URL must match before
+reading logs through the bounded `gh-logs` adapter (30 seconds, 128 KiB per stream).
+Ambiguous, stale, cancelled or unavailable evidence cannot authorize repair.
+
+`src/ci-failures.ts` conservatively classifies deterministic test/typecheck/lint/
+build diagnostics with approved repository paths. Security findings, paths
+outside scope, credentials/permission failures and unknown evidence require
+human inspection. Infrastructure failures wait with the existing watchdog's
+bounded exponential cadence (up to 15 minutes), then escalate after 30 minutes
+on the same head. Cadence derives from persisted current-head age: delays of
+1, 2, 4, 8 and 15 minutes at head ages 0, 1, 3, 7 and 15 minutes. A new head
+restarts this cadence, without resetting any budget. Provider failures during
+the post-diagnosis re-read retain the ordinary provider-read handling rather
+than consuming the evaluation-exception limit. No additional timer, action budget or poller exists. All
+non-repairable outcomes identify the check in the review target's reason.
+
+Only repairable evidence reaches `sendPilotRemediation`; the sender refreshes
+the failure set and reclassifies logs under the existing submission fence before
+reserving an attempt. It keeps the owned session/worktree, Git grants, receipts
+and job remediation budget. Stable CI fingerprints exclude SHA and run IDs so
+new heads/reruns cannot manufacture progress. Raw logs stay ephemeral; findings
+contain identities, approved paths and fixed diagnostic codes, not excerpts or
+provider error bodies. Unit and incident tests do not prove live provider behavior.
 
 ## Inspection and verification
 

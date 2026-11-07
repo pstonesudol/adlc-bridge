@@ -1,9 +1,9 @@
 /** DEV-78 incident acceptance matrix. Runner: bun test test/incidents
- * Status: 9 active, 3 skip, 1 todo (13 tests).
+ * Status: 10 active, 2 skip, 1 todo (13 tests).
  * 1 duplicate/cancelled CI (#150): active DEV-77
  * 2 skipped current-head review + stale CHANGES_REQUESTED (#30): active DEV-65
  * 3 missing body-bound attestation: active DEV-70 (wait for provider evidence)
- * 4 repairable required CI: skip DEV-78 follow-up, CI-remediation ticket unassigned
+ * 4 repairable required CI: active DEV-80
  * 5 transient provider read/backoff: active DEV-56
  * 6 terminated/stuck worker: 2 skips, DEV-78 follow-up, liveness ticket unassigned
  * 7 uncertain worker receipt: todo DEV-78 follow-up, receipt ticket unassigned;
@@ -83,10 +83,13 @@ test('3 missing body-bound attestation waits, then accepts fresh attestation wit
  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');f.assertSafe();
 }));
 
-test.skip('4 later CI-remediation ticket (unassigned): repair required CI using existing worker',()=>replay(async f=>{
- Object.assign(f.evidence,{clear:false,reasons:['Required CI failed'],failedChecks:[{name:'CI',sha:f.evidence.head,id:1}]});
+test('4 DEV-80: repair required CI using existing worker exactly once',()=>replay(async f=>{
+ Object.assign(f.evidence,{clear:false,reasons:['Required CI failed'],failedChecks:[{name:'CI',sha:f.evidence.head,id:1,conclusion:'failure',url:'https://github.com/fixture/repo/actions/runs/1/job/1'}]});
  expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');
  expect(f.calls.filter(c=>c.kind==='send')).toHaveLength(1);
+ for(let i=0;i<3;i++)expect((await f.loop.tick(f.id)).send).toBe(false);
+ expect(f.calls.filter(c=>c.kind==='send')).toHaveLength(1);
+ expect(f.s.get(f.id).attempts).toBe(1);
  f.complete();expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');f.assertSafe();
 }));
 
