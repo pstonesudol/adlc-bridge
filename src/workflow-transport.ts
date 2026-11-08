@@ -52,7 +52,13 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
    if(d.session?.id===s.id&&d.session.projectId===project&&d.session.branch===branch&&(includeTerminated||!d.session.isTerminated))matches.push(d.session);
   }return matches;
  },
- evidence:sessionEvidence,
+  evidence:sessionEvidence,
+  async restorePlan(session,project){
+   let p:ReturnType<typeof spawn>;
+   try{p=spawn([AO,'session','restore',session,'--project',project],{stdout:'pipe',stderr:'pipe',timeout:120000});}catch{throw new PreSendFailure('Native restore not launched');}
+   const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+   if(code!==0)throw Error('Planning restore outcome uncertain; inspect spec-restore, never replay');
+  },
  preflightRoute,
  configureRoute:configureSessionRoute,
    async sendImplementation(session,prompt,clientId,mode){

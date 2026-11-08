@@ -1,6 +1,8 @@
 import {Store} from './core';
 import {tryVerifiedCoordinator} from './coordinator-gate';
 import {Planning} from './planning';
+import {consumePlanningRestore,restoreRepository} from './planning-restore';
+import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
 
@@ -31,6 +33,16 @@ async function gate(){
     const s=new Store(join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite'));
     try{
       new Planning(s);
+      if(s.db.query("SELECT name FROM sqlite_master WHERE name='planning_restores'").get()){
+       const restore=s.db.query("SELECT p.job,p.session_id FROM planning_runs p JOIN planning_restores r ON r.job=p.job WHERE p.project=? AND p.branch=? AND r.state='reserved'").all(project,branch.trim()) as any[];
+       if(restore.length){
+        if(restore.length!==1)throw Error('Ambiguous planning restore authorization');
+        const repository=await restoreRepository(s,restore[0].job,c);
+        await assertCurrentPlanningRequirements(s,restore[0].job,c);
+        consumePlanningRestore(s,restore[0].job,c,restore[0].session_id,project,branch.trim(),cwd,repository);
+        console.log('ADLC: exact one-use planning-only restore admitted; revised planning and configured approval remain required');return;
+       }
+      }
       const r=s.db.query("SELECT p.job FROM planning_runs p JOIN planning_dispatch d ON p.job=d.job JOIN jobs j ON j.id=p.job WHERE p.project=? AND p.branch=? AND j.project=? AND d.state='dispatch_uncertain'").get(project,branch.trim(),c.linear.projectId) as any;
       if(!r)throw Error('No durable planning dispatch authorizes this branch');
       new Planning(s).gate(r.job,project,null,branch.trim(),cwd);

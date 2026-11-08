@@ -2177,6 +2177,24 @@ Do not create another worker/PR. A reserved send is never replayed; normal polli
 captures its exact completed reply, or retains its uncertainty. Repeated edits
 coalesce to the latest revision while preserving earlier delivery records.
 
+For an archived/terminated planning owner after a requirement revision (DEV-91),
+first run `adlc spec-restore JOB CONFIG` for a read-only preview, then repeat with
+`--confirm HASH`. Confirmation durably reserves **one planning-only native restore**
+before calling AO. Admission requires the exact native session/project/workspace,
+linked repository/branch/HEAD, current eligible Linear requirements, retained
+completed receipts, and unambiguous existing PR ownership. Local work and history
+are preserved; `planning_finished` alone never permits setup.
+
+Repeat `spec-restore JOB CONFIG --confirm HASH` with the returned binding to
+reconcile the outcome **without invoking restore again**. A lost reply or restart
+does not authorize replay or a replacement worker. Missing receipts, unknown
+activity, identity/requirements changes, or an unconsumed/failed setup remain
+blocked for operator inspection. Only a known failure before native launch permits
+a fresh preview and separately confirmed attempt. Once restore is verified,
+preview and confirm `spec-reconcile` separately to request revised planning in the
+same session. Neither restore nor reconciliation grants implementation authority;
+the configured approval policy, human-only merging and no-deploy policy remain.
+
 After capture, `plan-approval-required` tickets use the exact fenced command in
 the new Linear plan notice, from a configured human. Previous replies are stale.
 Standing-policy tickets pass through current eligibility/readiness/scope policy;

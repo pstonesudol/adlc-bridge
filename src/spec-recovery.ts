@@ -10,6 +10,11 @@ import {readBranchSnapshot} from './branch-updates';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
 
+export async function assertCurrentPlanningRequirements(s:Store,job:string,c:WorkflowConfig,read=readLinearIssue){
+ const j=s.get(job),issue=await read(j.issue),lc=c as any;
+ if(issue?.id!==j.issue||issue.project?.id!==j.project||issue.team?.id!==lc.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((l:any)=>l.id===lc.linear.readyLabelId)||![lc.linear.readyStateId,...lc.statusSync?.enabled?[lc.statusSync.inProgress,lc.statusSync.inReview]:[]].includes(issue.state?.id)||j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Fresh eligible unchanged Linear requirements required');
+}
+
 /** Preview never changes reservations, routing or authorization. Confirmation
  * authorizes a planning-only turn, not implementation or a permission expansion. */
 export class SpecRecovery{
@@ -41,20 +46,21 @@ export class SpecRecovery{
   const unmarked={turn:owned[0].id,state:'completed',inventory:digest(JSON.stringify({entries,turns})),observed};
   return {action:'reconcile_unmarked_replan',revision:delivery.revision,delivery,unmarked,confirmation:digest(JSON.stringify([latestRevision(this.s,job)?.id,delivery,unmarked.turn,unmarked.state,unmarked.inventory])),status:revisionStatus(this.s,job),nextAction:'Confirm only this exact completed unmarked turn to retire it without replay. A new planning turn requires a separate fresh preview and confirmation.'};
  }
- async preview(job:string,c:WorkflowConfig){
+  async preview(job:string,c:WorkflowConfig,archived=false,restoreBinding?:string){
   const j=this.s.get(job),r=latestRevision(this.s,job),p=this.s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
   if(!r||r.new_hash!==digest(j.spec)||j.project!==c.linear.projectId)throw Error('Current requirement revision required');
   // A terminal failure from an earlier revision still holds a durable
   // reservation. Surface its exact receipt before the latest revision so the
   // operator can retire it without replaying a send or editing live state.
-  if(j.state==='awaiting_plan')for(const prior of this.s.db.query("SELECT * FROM spec_replans WHERE job=? AND revision!=? AND state IN ('accepted','delivery_uncertain') ORDER BY rowid").all(job,r.id) as any[]){
+   if(!archived&&j.state==='awaiting_plan')for(const prior of this.s.db.query("SELECT * FROM spec_replans WHERE job=? AND revision!=? AND state IN ('accepted','delivery_uncertain') ORDER BY rowid").all(job,r.id) as any[]){
    const owner=await this.w.t.evidence(prior.session),sent=owner.transcript?.entries?.find((x:any)=>x.clientMessageId===prior.client_id),turn=sent&&owner.transcript.turns?.find((t:any)=>t.id===sent.turnId);
    const absent=this.absentPreview(job,prior,owner);if(absent)return absent;
    const unmarked=this.unmarkedPreview(job,prior,owner);if(unmarked)return unmarked;
    if(turn&&['failed','cancelled','interrupted'].includes(turn.state))return {action:'reconcile_failed_replan',revision:prior.revision,delivery:prior,confirmation:digest(JSON.stringify([prior.revision,prior.client_id,prior.session,turn.id,turn.state])),status:revisionStatus(this.s,job),nextAction:'Confirm this exact earlier terminal failure first; the failed send is never replayed. Then preview again for the current revision.'};
   }
   const delivery=this.s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(r.id) as any;
-   if(delivery&&!['failed','superseded_completed'].includes(delivery.state)){
+    if(delivery&&!['failed','superseded_completed'].includes(delivery.state)){
+     if(archived)throw Error('Replan delivery requires reconciliation before restore');
     const owner=await this.w.t.evidence(delivery.session),sent=owner.transcript?.entries?.find((x:any)=>x.clientMessageId===delivery.client_id),turn=sent&&owner.transcript.turns?.find((t:any)=>t.id===sent.turnId);
     const absent=this.absentPreview(job,delivery,owner);if(absent)return absent;
     const unmarked=this.unmarkedPreview(job,delivery,owner);if(unmarked)return unmarked;
@@ -62,12 +68,11 @@ export class SpecRecovery{
     return {action:j.state==='awaiting_approval'?'await_approval':r.state==='authorized'?'continue_under_current_grants':'refresh_evidence',revision:r.id,delivery,status:revisionStatus(this.s,job)};
    }
   if(j.state!=='awaiting_plan'||!c.automation?.planningEnabled||!p?.session_id||p.project!==c.automation.orchestratorProject)throw Error('Existing authorized planning owner required');
-  assertWorktreeAvailable(this.s,job);
-  const issue=await this.issue(j.issue),lc=c as any;
-  if(issue?.id!==j.issue||issue.project?.id!==j.project||issue.team?.id!==lc.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((l:any)=>l.id===lc.linear.readyLabelId)||![lc.linear.readyStateId,...lc.statusSync?.enabled?[lc.statusSync.inProgress,lc.statusSync.inReview]:[]].includes(issue.state?.id)||j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Fresh eligible unchanged Linear requirements required');
+   assertWorktreeAvailable(this.s,job,undefined,restoreBinding);
+   await assertCurrentPlanningRequirements(this.s,job,c,this.issue);const lc=c as any;
   const e=await this.w.t.evidence(p.session_id),session=e.session,turns=e.transcript?.turns;
-  if(session?.id!==p.session_id||session.projectId!==p.project||session.branch!==p.branch||session.isTerminated!==false)throw Error('Existing owner identity changed; no replacement session');
-  if(e.transcript?.controller!=='ready'||!Array.isArray(turns)||!turns.length||turns.some((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state)))throw Error('Existing worker is busy or quiescence is unknown; wait without injecting or killing work');
+   if(session?.id!==p.session_id||session.projectId!==p.project||session.branch!==p.branch||session.isTerminated!==archived)throw Error(`Existing owner identity changed; no replacement session. For an archived terminated owner, preview spec-restore ${job} CONFIG; never bypass setup gates`);
+   if(e.transcript?.controller!==(archived?'stopped':'ready')||!Array.isArray(turns)||!turns.length||turns.some((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state)))throw Error('Existing worker is busy or quiescence is unknown; wait without injecting or killing work');
   const run=this.s.db.query('SELECT * FROM runs WHERE job=?').get(job) as any;
   if(run&&(run.owner!=='orchestrator'||run.session_id!==p.session_id||run.worktree!==p.worktree))throw Error('Execution ownership needs reconciliation');
   // Retain and resolve ALL prior deliveries, including a superseded revision.

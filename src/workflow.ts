@@ -17,13 +17,14 @@ import {ensureReadinessStore,activeReadinessResolution,applicableResolution,asse
 import {effectiveSettings} from './project-settings';
 import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
+import {ensurePlanningRestores} from './planning-restore';
 import {PlanningDependencies} from './planning-dependencies';
 import {assertRequiredIntegrations} from './integration-capabilities';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
 // Completed planning dispatches release their slot even if manually proposed.
-const activePlanning="(d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
+export const activePlanning="(EXISTS (SELECT 1 FROM planning_restores restore WHERE restore.job=d.job AND restore.state IN ('reserved','setup_consumed')) OR d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
@@ -35,6 +36,7 @@ export interface WorkflowTransport{
   configureRoute?(session:string,route:Route):Promise<unknown>;
   worktree?(job:string):Promise<{branch:string;head:string;tree?:string;worktree?:string}>;
   branchSnapshot?(repo:string,pr:number):Promise<any>;
+  restorePlan?(session:string,project:string):Promise<void>;
 }
 export class Workflow{
  planningDependencies:PlanningDependencies;
@@ -42,6 +44,7 @@ export class Workflow{
  constructor(public s:Store,public t:WorkflowTransport,router?:TaskRouting,readonly=false){
   this.planningDependencies=new PlanningDependencies(s,this);
   if(readonly){this.router=router??({} as TaskRouting);return;}
+  ensurePlanningRestores(s);
   this.router=router??new TaskRouting(s);
   new Planning(s);new Lifecycle(s);new ApprovalPolicyStore(s);ensureReadinessStore(s);
   s.db.exec('CREATE TABLE IF NOT EXISTS project_execution_policy(project TEXT PRIMARY KEY,runtime TEXT NOT NULL)');

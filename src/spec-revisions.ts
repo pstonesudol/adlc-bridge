@@ -163,5 +163,5 @@ export function revisionStatus(s:Store,job:string){
  const p=s.db.query('SELECT state,reason FROM spec_replans WHERE revision=?').get(r.id) as any;
  const j=s.get(job),settled=r.state==='authorized'||r.state==='preplanning';
  return {revision:r.id,oldHash:r.old_hash,newHash:r.new_hash,summary:r.summary,state:r.state,delivery:p??null,blocking:!settled,
-  nextAction:r.state==='authorized'?'Continue only under the fresh current grant':r.state==='preplanning'?'No recovery needed: the first captured plan binds these requirements.':j.state==='awaiting_approval'?'Await current-plan approval':`Preview spec-reconcile ${job} CONFIG; confirm only after the existing owner is idle. No replacement worker or PR.`};
+  nextAction:r.state==='authorized'?'Continue only under the fresh current grant':r.state==='preplanning'?'No recovery needed: the first captured plan binds these requirements.':j.state==='awaiting_approval'?'Await current-plan approval':`Preview spec-reconcile ${job} CONFIG; confirm only after the existing owner is idle. For an archived terminated owner, preview spec-restore ${job} CONFIG first; confirm only the exact planning-only restore. No replacement worker or PR.`};
 }
