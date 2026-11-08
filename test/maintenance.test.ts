@@ -49,7 +49,7 @@ test('uncertain recovery changes only proven rows after exact confirmation and p
  const f=fixture();try{
   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'old','base','delivery_uncertain',1,'lost');f.s.db.query('UPDATE jobs SET attempts=4 WHERE id=?').run(f.id);
   const preview=await maintenance(f.s,'recover',f.id,false,undefined,f.io);expect(preview.provenBranchUpdates).toEqual([{head:'old',base:'base'}]);expect(f.writes).toEqual([]);
-  await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(f.writes).toEqual(['poll','policy','tick']);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'observed'});expect(f.s.get(f.id).attempts).toBe(4);
+  await maintenance(f.s,'recover',f.id,true,preview.confirmation,f.io);expect(f.writes).toEqual(['poll','policy','tick']);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'remote_observed'});expect(f.s.get(f.id).attempts).toBe(4);
  }finally{f.close();}
  for(const side of ['base','old']){const g=fixture();try{g.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(g.id,'old','base','delivery_uncertain',1,'lost');g.unproven(side);await expect(maintenance(g.s,'recover',g.id,true,'any',g.io)).rejects.toThrow('cannot be proven');expect(g.writes).toEqual([]);expect(g.s.db.query('SELECT state FROM branch_updates').get()).toEqual({state:'delivery_uncertain'});}finally{g.close();}}
 });

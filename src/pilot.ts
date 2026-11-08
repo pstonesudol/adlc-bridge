@@ -37,6 +37,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
  const snapshot=await io.readBranchSnapshot(repo,pr),local=await io.worktreeIdentity(s,job);
  assertDeliveryTarget(s,job,e.session,repo,pr,snapshot);
  if(local.branch!==snapshot.branch)throw Error('Blocked — branch mismatch: worktree differs from verified delivery branch');
+ if(local.head!==snapshot.head)throw Error('Worktree and remote PR HEAD differ; wait for owned branch synchronization before remediation');
  const result=await io.readiness(repo,pr,required,metadataChecks);
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
