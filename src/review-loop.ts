@@ -164,18 +164,19 @@ export class ReviewLoop{
     if(!pending)return;
     if((this.s.db.query("SELECT count(*) AS n FROM remediation WHERE job=? AND state IN ('reserved','delivery_uncertain')").get(job) as any).n!==1)return {state:'needs_reconciliation',send:false,head,reason:'active_competing_attempt: multiple remediation reservations; inspect original attempts'};
    const recovery=this.s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get()?this.s.db.query('SELECT id,detail,client_id FROM conflict_recoveries WHERE job=? AND attempt=?').get(job,pending.attempt) as any:null;
-   const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
+    const handle=recovery?.client_id??`adlc-fix-${job.slice(0,12)}-${pending.attempt}`;
+    const hint=recovery?`inspect adlc recovery-preview ${job} CONFIG (conflict recovery interface)`:`preview adlc receipt-reconcile ${job} CONFIG ${pending.attempt}`;
     const run=new Lifecycle(this.s).run(job),j=this.s.get(job);
      const ledger=new ReceiptReconciliation(this.s),binding={job,plan:run.plan_hash,spec:digest(j.spec),session:run.session_id,client:handle,attempt:`remediation:${pending.attempt}`};
      let receipt=ledger.inspect(binding,session,false);
-     if(receipt.state==='unknown')return {state:'needs_reconciliation',send:false,head,reason:`${receipt.code}: ${receipt.reason}; preview adlc receipt-reconcile ${job} CONFIG ${pending.attempt}`,delivery:receipt};
+      if(receipt.state==='unknown')return {state:'needs_reconciliation',send:false,head,reason:`${receipt.code}: ${receipt.reason}; ${hint}`,delivery:receipt};
      for(const [table,states] of [['continuations',['reserved','delivery_uncertain','delivery_accepted']],['spec_replans',['accepted','delivery_uncertain']]] as const){
       if(this.s.db.query("SELECT name FROM sqlite_master WHERE name=?").get(table)&&(this.s.db.query(`SELECT state FROM ${table} WHERE job=?`).all(job) as any[]).some(x=>(states as readonly string[]).includes(x.state)))return {state:'needs_reconciliation',send:false,head,reason:'active_competing_attempt: another continuation or replan is reserved'};
      }
      if(ledger.list(job).some(x=>x.client!==handle&&!['completed','failed','cancelled'].includes(x.state)&&ledger.inspectOriginal(x,session).state!=='completed'))return {state:'needs_reconciliation',send:false,head,reason:'active_competing_attempt: another reserved delivery remains unresolved'};
      if(session.transcript?.turns?.some((t:any)=>t.id!==receipt.turn&&!['completed','failed','cancelled','interrupted'].includes(t.state)))return {state:'needs_reconciliation',send:false,head,reason:'active_competing_attempt: another native turn is active'};
      receipt=ledger.inspect(binding,session);
-     if(receipt.state!=='completed')return {state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:`${receipt.code}: ${receipt.reason}; preview adlc receipt-reconcile ${job} CONFIG ${pending.attempt}`,delivery:receipt};
+      if(receipt.state!=='completed')return {state:['queued','running','accepted'].includes(receipt.state)?'waiting_for_worker':'needs_reconciliation',send:false,head,reason:`${receipt.code}: ${receipt.reason}; ${hint}`,delivery:receipt};
     if(activeOnly)return;
    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(job,pending.attempt);
    if(recovery){const detail=JSON.parse(recovery.detail);if(detail.message==='uncertain')this.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=? AND detail=?').run(JSON.stringify({...detail,message:'completed'}),recovery.id,recovery.detail);}
