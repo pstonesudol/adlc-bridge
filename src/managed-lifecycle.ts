@@ -1,5 +1,5 @@
 import {existsSync} from 'node:fs';
-import {Database} from 'bun:sqlite';
+import {Database,constants} from 'bun:sqlite';
 import {Store,digest} from './core';
 import {AO} from './orchestrator';
 import {appState} from './install-state';
@@ -155,6 +155,16 @@ export function descendants(rows:ProcessIdentity[],root:number){
 }
 async function processInventory(run=command){const r=await run(['/bin/ps','-axo','pid=,ppid=,lstart=']);if(r.code!==0)throw Error('Cannot inspect process inventory');return parseProcesses(r.stdout);}
 type LifecycleIO={run?:typeof command;evidence?:typeof sessionEvidence;trust?:typeof trustedDaemon;list?:(port:number,timeout:number)=>Promise<any>};
+export function checkpointDatabase(path:string){
+ if(!existsSync(path))return;
+ // Explicit read/write without CREATE: never recreate a file lost after the check.
+ const db=new Database(path,constants.SQLITE_OPEN_READWRITE);
+ try{
+  const r=db.query('PRAGMA wal_checkpoint(FULL)').get() as {busy:number;log:number;checkpointed:number};
+  if(r?.busy)throw Error('Durable checkpoint busy; backend preserved');
+  return r;
+ }finally{db.close();}
+}
 export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=appState(),deadline=Date.now()+o.timeout*1000,io:LifecycleIO={}):LifecycleOps{
  const turns=turnBarrier(state);
  const remaining=()=>{const ms=deadline-Date.now();if(ms<1)throw Error('Lifecycle timeout; no force escalation was attempted');return ms;};
@@ -218,7 +228,7 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
    const r=await run([AO,'session','exit-agent',worker.session,...(current.session.projectId?['--project',worker.project]:[]),'--json']);if(r.code!==0)throw Error(`Worker ${worker.session} exit failed or uncertain; inspect the original session, never retry by replacement`);
    const receipt=JSON.parse(r.stdout);if(receipt.ok!==true||receipt.sessionId!==worker.session)throw Error('Worker exit acknowledgement invalid; inspect original session');
   },
-  checkpoint:async()=>{remaining();if(!existsSync(path))return;const db=new Database(path,{create:false});try{const r=db.query('PRAGMA wal_checkpoint(FULL)').get() as any;if(r?.busy)throw Error('Durable checkpoint busy; backend preserved');}finally{db.close();}},
+  checkpoint:async()=>{remaining();checkpointDatabase(path);},
   processesRemain:async previous=>{const rows=await processInventory(run);return previous.filter(p=>rows.some(r=>r.pid===p.pid&&r.started===p.started));},
   now:Date.now,sleep:ms=>Bun.sleep(ms)
  };

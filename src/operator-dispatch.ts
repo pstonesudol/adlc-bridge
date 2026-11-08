@@ -3,24 +3,32 @@ import {projectEntries,selectProject,projectConfig,authStatus,queueView,versionV
 import {configView,configDefaults,editConfig,configPolling} from './operator-config';
 import {serviceControl} from './service-control';
 import {validate} from './linear';
+import {autonomyMetrics,humanMetrics} from './autonomy-metrics';
 
 export function modernCommand(command:string,args:string[]){
- return ['config','queue','auth','version','completion'].includes(command)||command==='projects'&&args[0]==='show'||['status','doctor'].includes(command)&&args.includes('--project')||command==='jobs'&&['show','list','status','lookup'].includes(args[0]);
+ return ['config','queue','auth','version','completion'].includes(command)||command==='projects'&&args[0]==='show'||['status','doctor'].includes(command)&&args.includes('--project')||command==='jobs'&&['metrics','show','list','status','lookup'].includes(args[0]);
 }
 export async function dispatchOperator(command:string,args:string[],db:string){
  const json=args.includes('--json');const options:Record<string,string|boolean>={},position:string[]=[];
  for(let i=0;i<args.length;i++){
   const arg=args[i];if(!arg.startsWith('-')){position.push(arg);continue;}
-  if(!['--project','--state','--json','--apply'].includes(arg)||Object.hasOwn(options,arg))throw new OperatorError('Unknown or repeated option. Use --help.');
-  if(['--project','--state'].includes(arg)){if(!args[i+1]||args[i+1].startsWith('-'))throw new OperatorError(`${arg} requires a value`);options[arg]=args[++i];}else options[arg]=true;
+   if(!['--project','--state','--json','--apply','--since','--until'].includes(arg)||Object.hasOwn(options,arg))throw new OperatorError('Unknown or repeated option. Use --help.');
+   if(['--project','--state','--since','--until'].includes(arg)){if(!args[i+1]||args[i+1].startsWith('-'))throw new OperatorError(`${arg} requires a value`);options[arg]=args[++i];}else options[arg]=true;
  }
  const requireCount=(n:number)=>{if(position.length!==n)throw new OperatorError('Unexpected or missing arguments. Use --help.');};
  if(options['--apply']&&!(command==='config'&&['set','reset'].includes(position[0])))throw new OperatorError('--apply is supported only by config set/reset');
- if(options['--state']&&!(command==='jobs'&&position[0]==='list'))throw new OperatorError('--state is supported only by jobs list');
+  if(options['--state']&&!(command==='jobs'&&position[0]==='list'))throw new OperatorError('--state is supported only by jobs list');
+  if((options['--since']||options['--until'])&&!(command==='jobs'&&position[0]==='metrics'))throw new OperatorError('--since/--until are supported only by jobs metrics');
  const emit=(data:unknown,human?:string)=>console.log(json?JSON.stringify({schemaVersion:1,command,data},null,2):human??JSON.stringify(data,null,2));
  if(command==='version'){requireCount(0);if(options['--project'])throw new OperatorError('version does not accept --project');emit(versionView());return;}
  if(command==='completion'){requireCount(1);if(Object.keys(options).length)throw new OperatorError('completion accepts only SHELL');console.log(completion(position[0],Object.keys(groups).concat('status','doctor','version','completion')));return;}
- const entries=projectEntries(db),requested=options['--project'] as string|undefined;
+  const entries=projectEntries(db),requested=options['--project'] as string|undefined;
+  if(command==='jobs'&&position[0]==='metrics'){
+   requireCount(1);
+   const project=requested&&entries.length?selectProject(entries,requested).linear_project:requested;
+   const report=autonomyMetrics(db,{project,since:options['--since'] as string|undefined,until:options['--until'] as string|undefined});
+   emit(report,humanMetrics(report));return;
+  }
  if(command==='projects'&&requested)throw new OperatorError('Use projects show PROJECT, without --project');
  if(command==='jobs'){
   const verb=position.shift()!;if(position.length>1||['show','lookup'].includes(verb)&&position.length!==1||verb==='list'&&position.length)throw new OperatorError('Use jobs list [--state STATE] or jobs show/status/lookup [JOB/TICKET]');
