@@ -31,7 +31,8 @@ test('log reader binds job, run, SHA, check identity and conclusion before readi
  for(const change of [{},{id:4},{run_id:9},{head_sha:'b'.repeat(40)},{name:'other'},{conclusion:'cancelled'},{check_run_url:'wrong'}]){
   const reads:string[]=[];
   const result=await readCIFailure('fixture/repo',c,async path=>{reads.push(path);return path.endsWith('/logs')?log:JSON.stringify({...job,...change});});
-  expect(result).toBe(Object.keys(change).length?null:log);expect(reads.length).toBe(Object.keys(change).length?1:2);
+  if(Object.keys(change).length)expect(classifyCIFailure(result,scope)).toMatchObject({classification:'unknown',reason:expect.stringContaining('provenance mismatch')});else expect(result).toBe(log);
+  expect(reads.length).toBe(Object.keys(change).length?1:2);
  }
  expect(await readCIFailure('fixture/repo',{...c,url:'https://evil.test/fixture/repo/actions/runs/2/job/3'},async()=>{throw Error('must not read');})).toBeNull();
 });

@@ -2,6 +2,7 @@ import {existsSync} from 'node:fs';
 import {Store} from './core';
 import {actionStatus} from './action-watchdog';
 import {receiptStatus} from './remediation-receipts';
+import {maintenanceStatus} from './branch-maintenance';
 export class OperatorError extends Error {
  constructor(message:string,public code=2,public candidates:unknown[]=[]){super(message);}
 }
@@ -9,13 +10,16 @@ export const groups:Record<string,Record<string,string>>={
  projects:{list:'projects',show:'@project',setup:'setup',init:'init','bind-controller':'bind-controller'},
  config:{show:'@config',get:'@config',set:'@config',validate:'@config',diff:'@config',reset:'@config'},
  queue:{list:'@queue'},auth:{status:'@auth'},
- jobs:{list:'@list',show:'@status',status:'@status',lookup:'@lookup','show-plan':'show-plan',approvals:'approvals',approve:'approve-job',recover:'recover',cleanup:'cleanup',resume:'resume-job','dependency-status':'dependency-status','review-status':'review-status'},
+ jobs:{metrics:'@metrics',list:'@list',show:'@status',status:'@status',lookup:'@lookup','show-plan':'show-plan',approvals:'approvals',approve:'approve-job',recover:'recover',cleanup:'cleanup',resume:'resume-job','dependency-status':'dependency-status','review-status':'review-status'},
  routing:{show:'routing',preview:'routing'},
  services:{list:'projects',status:'service-status',start:'start',stop:'stop',restart:'restart',config:'service-config'},
  diagnostics:{doctor:'doctor',readiness:'readiness','runtime-check':'runtime-check','ao-status':'ao-status'},
 };
-export function operatorHelp(group?:string){
+function baseOperatorHelp(group?:string){
  return `ADLC operator CLI\n${Object.entries(groups).filter(([name])=>!group||name===group).map(([name,verbs])=>`  ${name} ${Object.keys(verbs).join(' | ')}`).join('\n')}\n  status --project PROJECT [--json]\n  doctor --project PROJECT [--json]\n  version [--json] | completion bash|zsh|fish\n  config set KEY VALUE | reset KEY --project PROJECT [--apply]\n  jobs list [--state STATE] [--project PROJECT]\n  help [GROUP] | COMMAND --help\nJobs accept JOB or TICKET, with --project PROJECT for ambiguity.\nProject selection uses registered Orchestrator project IDs; jobs also accept stored Linear project IDs.\nGrouped commands support --json; legacy flat commands retain their output.\nInspection never dispatches workers or activates configuration.\nmaxPlanning controls concurrent planning only, not implementation/review workers.\nInstallation: install / install-runtime (preview unless --apply).\nLifecycle: services start|stop|restart|status [PROJECT|--project PROJECT|--all] [--json]\n  stop [--pause|--drain|--workers] [--timeout SECONDS] [--temporary|--disable-login]\n  restart [--drain|--workers] [--timeout SECONDS]\n  stop --all, stop --drain/--workers, and restart preview unless --apply --confirm HASH.\n  --preview never changes services. Project stop pauses intake only by default.\n  All-stack stop disables login startup by default; --temporary unloads this login only.\n  Start/restart never automatically resumes exited workers or replays uncertain deliveries.\nPlanned, unavailable integrations: DEV-35 detailed jobs; DEV-34/33 independent routing; DEV-51 update/rollback; DEV-55 dependency reevaluation.\nSource updates: operator-managed; no implicit fetch/update/install.\nExit codes: 0 success, 1 operational failure/incomplete evidence, 2 usage, 3 not found, 4 ambiguous.\nLegacy command reference follows:\n`;
+}
+export function operatorHelp(group?:string){
+ return baseOperatorHelp(group)+(!group||group==='jobs'?'Metrics: jobs metrics [--project PROJECT] [--since UTC_ISO] [--until UTC_ISO] [--json]\nDefaults to last 30 days; maximum 366 days, 1000 jobs, 50000 events. Persisted-only evidence, never dispatch.\n':'');
 }
 function rows(path:string){
  if(!existsSync(path))return [];
@@ -53,7 +57,8 @@ export function jobViews(path:string,project?:string,reference?:string){
      reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
      nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
       watchdog:actionStatus(s,j.id),
-      receipts,
+       receipts,
+       maintenance:maintenanceStatus(s,j.id),review:table('review_targets',j.id),
      worker:{activity:'unknown',session:implementation?.session_id??planning?.session_id??null,dispatchState:implementation?.state??planning?.state??null,outcome:currentOutcome?.outcome??null},
     evidence:{freshness:'unknown',persistedUpdatedAt:j.updated,note:'Persisted state only; no live worker or provider refresh performed.'}};
   });

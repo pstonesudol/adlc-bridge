@@ -37,6 +37,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
  const snapshot=await io.readBranchSnapshot(repo,pr),local=await io.worktreeIdentity(s,job);
  assertDeliveryTarget(s,job,e.session,repo,pr,snapshot);
  if(local.branch!==snapshot.branch)throw Error('Blocked — branch mismatch: worktree differs from verified delivery branch');
+ if(local.head!==snapshot.head)throw Error('Worktree and remote PR HEAD differ; wait for owned branch synchronization before remediation');
  const result=await io.readiness(repo,pr,required,metadataChecks);
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
@@ -84,7 +85,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
    const target=s.db.query('SELECT allowed_paths,repo,pr,remediate FROM review_targets WHERE job=?').get(job) as any;
    if(!target?.remediate||target.repo!==repo||target.pr!==pr)throw Error('Required CI remediation target changed');
    const diagnosis=classifyCIFailure(await io.readCIFailure(repo,{id:f.checkId,sha:f.sha,name:f.check,conclusion:f.conclusion,url:f.url}),JSON.parse(target.allowed_paths));
-   if(diagnosis.classification!=='repairable'||diagnosis.signature!==f.signature||JSON.stringify(diagnosis.paths)!==JSON.stringify(f.paths))throw new CIFailureBlocked(`Required CI ${f.check} (#${f.checkId}): ${diagnosis.classification==='repairable'?'unknown':diagnosis.classification}; diagnosis changed or unavailable before delivery; human inspection required`);
+   if(diagnosis.classification!=='repairable'||diagnosis.signature!==f.signature||JSON.stringify(diagnosis.paths)!==JSON.stringify(f.paths)||JSON.stringify(diagnosis.evidence?.provenance)!==JSON.stringify(f.evidence?.provenance))throw new CIFailureBlocked(`Required CI ${f.check} (#${f.checkId}): ${diagnosis.classification==='repairable'?'unknown':diagnosis.classification}; diagnosis changed or unavailable before delivery; human inspection required`);
   }
   // Log collection awaited provider IO: refresh identity once more before reserve.
   if(parsed.some((f:any)=>f.source==='required-ci'))validateReview(await observePilot(s,job,repo,pr,required,metadataChecks,io));

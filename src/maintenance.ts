@@ -65,7 +65,7 @@ export async function maintenance(s:Store,action:'recover'|'cleanup',job:string,
  if(latestPR?.state!=='open'||latestPR.head?.sha!==pr.head.sha||latestPR.head?.ref!==pr.head.ref||latestPR.head?.repo?.full_name!==target.repo||latestPR.base?.sha!==pr.base?.sha)throw Error('PR changed during recovery; uncertain ledger preserved');
  s.db.transaction(()=>{
   assertRecovery(fresh);
-  for(const row of proven)s.db.query("UPDATE branch_updates SET state='observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
+  for(const row of proven)s.db.query("UPDATE branch_updates SET state='remote_observed',reason=NULL WHERE job=? AND head=? AND base=? AND state='delivery_uncertain'").run(job,row.head,row.base);
   s.event(job,'review_recovery_requested',JSON.stringify({...report,proven}));
  }).immediate();
   await io.poll(c,s,io.linearToken());const loop=io.review(s);loop.configureMetadataChecks(c.linear.projectId,metadataChecks);return {...report,result:await loop.tick(job,c.branchUpdate,budget,{project:c.linear.projectId,checks:metadataChecks},c)};

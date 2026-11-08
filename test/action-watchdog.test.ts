@@ -28,6 +28,18 @@ function fixture(disk=false){
  const io={sessionEvidence:async()=>{reads++;session.receiptObservation={complete:true,observed:now};return session;},readBranchSnapshot:async()=>{reads++;return snapshot;}};
  return {root,path,s,job,loop,c,w,session,snapshot,io,now:()=>now,advance:(ms=60000)=>now+=ms,reads:()=>reads,close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
 }
+test('DEV-95: a review blocker does not strand the existing branch synchronization reservation',()=>{
+ const f=fixture();try{
+  f.s.db.exec('CREATE TABLE branch_syncs(job TEXT PRIMARY KEY,worktree TEXT,state TEXT,proof TEXT,reason TEXT)');
+  f.s.db.query("INSERT INTO branch_syncs VALUES (?,?,'reserved','{}',NULL)").run(f.job,'/worktree');
+  f.loop.record(f.job,{state:'blocked',send:false,reason:'CodeRabbit custom-check failure: incomplete summary'});
+  const action=f.w.scheduleReview(f.job,f.c);
+  expect(action.outcome).toBe('human_required');
+  f.advance(WATCHDOG_LIMITS.idleMs);
+  expect(f.w.beginReview(action.id,f.c)).toBe(true);
+  expect(f.loop.get(f.job).state).toBe('blocked');
+ }finally{f.close();}
+});
 // Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
 // controlled clock. A subprocess isolates the poll fence's HOME and Date.now.
 function productionScenario(f:ReturnType<typeof fixture>,scenario:string){

@@ -1346,6 +1346,26 @@ checked by the human and GitHub at merge time. No protection, review, or check i
 bypassed. Workers must fetch and fast-forward their local feature branch before
 further code remediation and stop if it is dirty or divergent.
 
+## Bounded required-CI failure evidence
+
+Required-CI diagnosis streams job logs instead of rejecting every log over
+128 KiB. It retains failure summaries and nearby context (including Bun test
+file headers), rather than a tail-only sample or incidental `Error` text from
+passing fixtures. The collector limits log stdout to 4 MiB, excerpts to 64 KiB,
+lines to 8,192 characters, and failure contexts to 64. Version/metadata reads
+and stderr each retain the existing 128 KiB cap. One diagnosis has a shared
+30-second deadline; timed-out or over-budget subprocesses are killed and reaped.
+
+Repository/run/job/check/head, run attempt and failed-step numbers are bound
+before diagnosis and revalidated before dispatch. Raw excerpts and test/error
+prose stay ephemeral: persisted findings contain validated paths, provenance and
+omission/byte metadata, plus the job link for inspecting exact test/error context.
+Invalid UTF-8, binary/archive or unsupported control data, giant lines, truncated
+failure summaries, unavailable logs and exhausted budgets fail closed with an
+inspection reason. This is not a generic archive decoder or unlimited log viewer.
+Only sufficient in-scope evidence enters the existing authorized same-worker
+remediation path; collecting evidence does not reserve a remediation attempt.
+
 ## Automatic PR-template CI remediation
 
 Configure exact GitHub Actions job names in `prMetadataChecks` for checks whose
@@ -2170,6 +2190,24 @@ It does not grant implementation, verification, commit/push or PR metadata edits
 Do not create another worker/PR. A reserved send is never replayed; normal polling
 captures its exact completed reply, or retains its uncertainty. Repeated edits
 coalesce to the latest revision while preserving earlier delivery records.
+
+For an archived/terminated planning owner after a requirement revision (DEV-91),
+first run `adlc spec-restore JOB CONFIG` for a read-only preview, then repeat with
+`--confirm HASH`. Confirmation durably reserves **one planning-only native restore**
+before calling AO. Admission requires the exact native session/project/workspace,
+linked repository/branch/HEAD, current eligible Linear requirements, retained
+completed receipts, and unambiguous existing PR ownership. Local work and history
+are preserved; `planning_finished` alone never permits setup.
+
+Repeat `spec-restore JOB CONFIG --confirm HASH` with the returned binding to
+reconcile the outcome **without invoking restore again**. A lost reply or restart
+does not authorize replay or a replacement worker. Missing receipts, unknown
+activity, identity/requirements changes, or an unconsumed/failed setup remain
+blocked for operator inspection. Only a known failure before native launch permits
+a fresh preview and separately confirmed attempt. Once restore is verified,
+preview and confirm `spec-reconcile` separately to request revised planning in the
+same session. Neither restore nor reconciliation grants implementation authority;
+the configured approval policy, human-only merging and no-deploy policy remain.
 
 After capture, `plan-approval-required` tickets use the exact fenced command in
 the new Linear plan notice, from a configured human. Previous replies are stale.

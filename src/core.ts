@@ -1,9 +1,11 @@
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {installRevisions,recordRevision,observeLegacyRevision,latestRevision} from './spec-revisions';
 import {latestWorkflowChecks} from './check-runs';
+// Copied-source diagnostics may have no package manifest. Never invent a release.
+const runtimeVersion=(()=>{try{const v=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8')).version;return typeof v==='string'?v:'unknown';}catch{return 'unknown';}})();
 
 export const digest = (text: string) => createHash('sha256').update(text).digest('hex');
 export type State = 'awaiting_plan' | 'awaiting_approval' | 'approved' | 'blocked' | 'done';
@@ -76,10 +78,19 @@ export class Store {
       }
     }).immediate();
     installRevisions(this);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS event_provenance (
+      seq INTEGER PRIMARY KEY REFERENCES events(seq), event_ms INTEGER NOT NULL,
+      runtime_version TEXT NOT NULL, attempt INTEGER NOT NULL, plan_hash TEXT,
+      detail_hash TEXT NOT NULL);`);
     } catch (error) { this.db.close(); throw error; }
   }
   event(id: string, kind: string, detail: string) {
-    this.db.query('INSERT INTO events(job,kind,detail) VALUES (?,?,?)').run(id, kind, detail);
+    this.db.transaction(()=>{
+      const job=this.get(id);
+      const now=Date.now();
+      const event=this.db.query('INSERT INTO events(job,kind,detail,at) VALUES (?,?,?,?)').run(id, kind, detail,new Date(now).toISOString());
+      this.db.query('INSERT INTO event_provenance VALUES (?,?,?,?,?,?)').run(event.lastInsertRowid,now,runtimeVersion,job.attempts,job.plan_hash,digest(detail));
+    }).immediate();
   }
   enqueue(project: string, issue: string, spec: string) {
     if (!project || !issue || !spec.trim()) throw Error('Project, issue and specification required');

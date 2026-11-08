@@ -9,6 +9,7 @@ import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {Store} from './core';
+import {PlanningRestore} from './planning-restore';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {lifecycleCLI} from './lifecycle-cli';
@@ -48,7 +49,7 @@ import {assertConfiguredProjectIntakeEnabled,assertProjectReferenceIntakeEnabled
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
-import {recoveryRows} from './worktree-reservation';
+import {recoveryRows,branchSyncRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
@@ -194,7 +195,7 @@ async function main(){
      if(!existsSync(db))return out([]);
      const store=Store.readonly(db);try{
       if(command==='approvals')return out(store.db.query("SELECT id AS job,project,plan_hash AS hash,reason FROM jobs WHERE state='awaiting_approval' AND (? IS NULL OR project=?)").all(project??null,project??null));
-      return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null):[]);
+       return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?(store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null) as any[]).map(t=>({...t,maintenance:store.db.query("SELECT name FROM sqlite_master WHERE name='branch_maintenance'").get()?store.db.query('SELECT * FROM branch_maintenance WHERE job=?').get(t.job):null})):[]);
      }finally{store.close();}
     }
    }
@@ -310,6 +311,7 @@ async function main(){
                                        preview/confirm completed same-spec plan replacement; no approval
 reconcile-preview CONFIG              read-only blocker/outcome preview for existing workers
 spec-reconcile JOB CONFIG [--confirm HASH] preview/authorize same-owner planning only after a spec edit
+spec-restore JOB CONFIG [--confirm HASH] preview/restore exact archived planning owner; never replay uncertain restore
 receipt-reconcile JOB CONFIG ATTEMPT [--confirm HASH] settle an original completed remediation receipt only; never resend or approve
   dependency-preview JOB CONFIG        read-only dependency/base/capability evidence
   dependency-resume JOB CONFIG HASH    confirm unchanged evidence using existing continuation
@@ -411,6 +413,13 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,a.length===3);
     try{return out(await new RemediationReceipts(store,new Workflow(store,liveTransport,undefined,true)).reconcile(a[0],attempt,config,a[4]));}finally{store.close();}
    }
+   if(command==='spec-restore'){
+    if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-restore JOB CONFIG [--confirm HASH]');
+    const config=projectConfiguration(a[1]);validate(config);
+    if(!existsSync(db))throw Error('Existing database required');
+    const store=new Store(db,a.length===2);
+    try{return out(await new PlanningRestore(store,new Workflow(store,liveTransport,undefined,a.length===2)).reconcile(a[0],config,a[3]));}finally{store.close();}
+   }
    if(command==='spec-reconcile'){
     if(a.length!==2&&!(a.length===4&&a[2]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[3])))throw Error('Use spec-reconcile JOB CONFIG [--confirm HASH]');
     const config=projectConfiguration(a[1]);validate(config);
@@ -449,7 +458,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='recovery-status'||command==='recovery-preview'){
      const store=new Store(db,true);
      try{
-      if(command==='recovery-status')return out(recoveryRows(store));
+      if(command==='recovery-status')return out([...recoveryRows(store),...branchSyncRows(store)]);
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       const job=req(a[0],'Job'),target=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
       if(!target)throw Error('Existing review target required');

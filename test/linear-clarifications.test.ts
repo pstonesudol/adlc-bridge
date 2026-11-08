@@ -10,6 +10,7 @@ import {LinearApprovals} from '../src/linear-approvals';
 import {ApprovalPolicyStore} from '../src/approval-policy';
 import {ReviewLoop} from '../src/review-loop';
 import {Lifecycle} from '../src/lifecycle';
+import {projectMetrics} from '../src/autonomy-metrics';
 const human='11111111-1111-1111-1111-111111111111',label='22222222-2222-2222-2222-222222222222';
 const config:any={repo:'/repo',requiredChecks:['CI'],linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},blockerSync:{enabled:true,labelId:label},clarifications:{enabled:true,humanIds:[human]}};
 const discovery='<!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Inspected ticket, linked copy ticket and src/a.ts; approved display wording is unchanged","necessity":"The exact listing identifier is absent and required to address the correct listing"} -->';
@@ -94,7 +95,11 @@ test('normal human answer plus explicit scope confirmation resumes exactly once 
   expect(f.labels).toEqual(['ready','human-label']);expect(f.s.get(f.id).actor).toBe('Patrick');expect(f.s.get(f.id).approved_hash).toBe(f.s.get(f.id).plan_hash);
   const resolution=f.s.db.query('SELECT * FROM plan_resolutions').get() as any;
   await f.adapter().sync(config);expect(f.sends).toHaveLength(2);expect((f.s.db.query('SELECT * FROM plan_resolutions').get() as any).at).toBe(resolution.at);
-  expect(f.comments.some(x=>x.body.includes('work resumed in the existing session'))).toBe(true);
+   expect(f.comments.some(x=>x.body.includes('work resumed in the existing session'))).toBe(true);
+   const report=projectMetrics(f.s,{},Date.now()+1000),row=report.jobs.find(j=>j.job===f.id)!;
+   expect(row.interventions).toBe(0);expect(row.humanActions).toBeGreaterThanOrEqual(2);
+   expect(row.provenance.some(p=>p.category==='expected_human_action')).toBe(true);
+   expect(row.handoff).toBeNull(); // A clarification reply is not reviewed-PR completion.
  }finally{f.s.close();}
 });
 test('unauthorized, bot, quoted, edited and stale replies cannot resolve',async()=>{
