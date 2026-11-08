@@ -1,5 +1,6 @@
 import {BranchUpdates,BranchObservationFailure,branchTransport,type BranchPolicy} from './branch-updates';
 import {BranchSync} from './branch-sync';
+import {maintenanceStatus} from './branch-maintenance';
 import {scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
@@ -108,7 +109,8 @@ export class ReviewLoop{
      SELECT l.job,COALESCE((SELECT t.pr FROM review_targets t WHERE t.job=l.job),0),l.head,l.body_hash,l.state,l.requested FROM full_review_requests_legacy l;
    DROP TABLE full_review_requests_legacy;`);
   }).immediate();
-  this.requests=new ReviewRequests(s);
+   this.requests=new ReviewRequests(s);
+   s.db.exec(`CREATE TABLE IF NOT EXISTS branch_maintenance(job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT,state TEXT NOT NULL,reason TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
  }
  configureMetadataChecks(project:string,names:string[]){
   if(!Array.isArray(names)||names.some(n=>typeof n!=='string'||!n.trim())||names.length>10)throw Error('Explicit PR metadata check names required');
@@ -162,7 +164,7 @@ export class ReviewLoop{
     const mode=this.requests.get(this.get(job).repo,pr,head)?.mode??'full';
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:`${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
    }
- list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
+  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,maintenance:maintenanceStatus(this.s,t.job),displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
   private reconcileRemediation(job:string,head:string,session:any,activeOnly=false){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
     if(!pending)return;
@@ -280,11 +282,42 @@ export class ReviewLoop{
    }
   const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
   const observation=new RecoveryObservation(this.s);
-  const observedTransport={...branchTransport,
+   const observedTransport={...branchTransport,
    update:(repo:string,pr:number,head:string)=>fencedIO(branchTransport).update(repo,pr,head),
    read:(repo:string,pr:number)=>observation.read(job,'github',()=>io.readBranchSnapshot(repo,pr)),
-   contains:(repo:string,ancestor:string,head:string)=>observation.read(job,'github',()=>io.contains(repo,ancestor,head))};
-  const wait=observation?.wait(job);if(wait)return record(wait);
+    contains:(repo:string,ancestor:string,head:string)=>observation.read(job,'github',()=>io.contains(repo,ancestor,head))};
+   const persistMaintenance=(result:any)=>{
+    assertObservationFence();l.current(job);
+    const current=this.get(job);if(current.pr!==t.pr||current.state==='completed')return;
+    this.s.db.query('INSERT INTO branch_maintenance(job,repo,pr,head,state,reason) VALUES (?,?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET repo=excluded.repo,pr=excluded.pr,head=excluded.head,state=excluded.state,reason=excluded.reason,updated=CURRENT_TIMESTAMP').run(job,t.repo,t.pr,result.head??null,result.maintenanceComplete?'completed':result.state,result.reason);
+   };
+   // Maintenance may return before the effectful review evaluator, but must not
+   // erase its blocker or starve read-only CI/review observation. No request,
+   // remediation, verification clearance or ready decision is made here.
+   const maintenance=async(result:any)=>{
+    persistMaintenance(result);
+    let review=this.get(job);
+    if(review.pr!==t.pr||review.state==='completed')return record(result);
+    // Invalidate old clearance before IO, including a lost/throttled read.
+    if(review.state==='ready_for_human')record({state:'waiting_for_review',send:false,head:result.head,reason:'Branch maintenance pending; fresh current-head verification and review required'});
+    try{
+     const e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,[...new Set([...JSON.parse(t.required_checks),...metadataChecks])],metadataChecks));
+     l.current(job);
+     if(this.get(job).pr===t.pr&&this.get(job).state!=='completed'){
+      if(e.head===result.head){
+       this.s.db.query("UPDATE review_targets SET head=?,head_since=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,t.head===e.head?t.head_since:Date.now(),job,t.pr);
+       if(e.customCheckBlocker)record({state:'blocked',send:false,head:e.head,reason:e.customCheckBlocker});
+      }
+     }
+    }catch(error){
+     if(error instanceof ObservationLeaseLost)throw error;
+     if(error instanceof ReadValidationError)observation.clear(job,false);
+     if(this.get(job).state!=='blocked')record(readStop(error,'Review evidence incomplete; maintenance status retained'));
+    }
+    review=this.get(job);
+    return {...result,maintenance:maintenanceStatus(this.s,job),review:{state:review.state,head:review.head,reason:review.reason}};
+   };
+   const wait=observation?.wait(job);if(wait)return t.state==='blocked'?{...wait,maintenance:maintenanceStatus(this.s,job),review:{state:t.state,head:t.head,reason:t.reason}}:record(wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
    if(recovery&&!recovery.branchSync){
@@ -316,7 +349,7 @@ export class ReviewLoop{
      if(live.classification==='idle_no_delivery'&&liveStop?.state==='needs_reconciliation'&&!this.s.db.query("SELECT 1 FROM remediation WHERE job=? AND state='delivery_uncertain'").get(job))return record({...liveStop,head:snapshot.head});
    if(config&&(local.head!==snapshot.head||recovery?.branchSync)){
     const synchronized=await new BranchSync(this.s,observedTransport).ensure(job,config,t.repo,t.pr);
-    if(synchronized)return record(synchronized);
+     if(synchronized)return maintenance(synchronized);
    }
    if(!config&&recovery?.branchSync)return record({state:'blocked',send:false,reason:'Pending branch synchronization requires the registered project configuration; no review dispatch'});
    let branch;
@@ -334,10 +367,16 @@ export class ReviewLoop{
     }
    }
    try{branch=await new BranchUpdates(this.s,observedTransport).ensure(job,t.repo,t.pr,session,branchPolicy);}
-   catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){return record(readStop(error,'Branch observation unavailable'));}throw error;}
-   if(branch?.mergeabilityUnknown)return record({...observation.mergeabilityUnknown(job),head:branch.head});
+    catch(error){const terminal=this.completed(job);if(terminal)return terminal;if(error instanceof BranchObservationFailure){
+     const stopped=readStop(error,'Branch observation unavailable');persistMaintenance(stopped);
+     // A provider deferral stops all later reads, not just branch reads.
+     const review=this.get(job);
+     return review.state==='blocked'?{...stopped,maintenance:maintenanceStatus(this.s,job),review:{state:review.state,head:review.head,reason:review.reason}}:record(stopped);
+    }throw error;}
+    if(branch?.mergeabilityUnknown)return maintenance({...observation.mergeabilityUnknown(job),head:branch.head});
    observation.mergeabilityKnown(job);
-   if(branch)return record(branch);
+    if(branch)return maintenance(branch);
+    if(snapshot.behind===0&&local.head===snapshot.head&&maintenanceStatus(this.s,job))persistMaintenance({state:'completed',head:snapshot.head,reason:'Branch maintenance reconciled; review and verification remain independent'});
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;

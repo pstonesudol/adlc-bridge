@@ -88,7 +88,7 @@ export class BranchSync{
     this.s.db.query("UPDATE branch_syncs SET state='completed',reason=NULL WHERE job=?").run(job);
     this.s.event(job,'feature_worktree_synchronized',JSON.stringify({head:proof.target,predecessor:proof.predecessor,verification:'historical evidence remains SHA-bound; fresh verification required'}));
    }).immediate();
-   return {state:'updating_branch',send:false,head:proof.target,reason:'Owned worktree synchronized; collect fresh current-head CI/review/verification next poll'};
+    return {state:'updating_branch',send:false,head:proof.target,maintenanceComplete:true,reason:'Owned worktree synchronized; collect fresh current-head CI/review/verification next poll'};
   }catch(error){
    const reason=error instanceof Error?error.message:'Branch synchronization evidence unavailable';
    assertObservationFence();this.s.db.query('UPDATE branch_syncs SET reason=? WHERE job=? AND state!=\'completed\'').run(reason,job);

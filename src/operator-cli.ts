@@ -2,6 +2,7 @@ import {existsSync} from 'node:fs';
 import {Store} from './core';
 import {actionStatus} from './action-watchdog';
 import {receiptStatus} from './remediation-receipts';
+import {maintenanceStatus} from './branch-maintenance';
 export class OperatorError extends Error {
  constructor(message:string,public code=2,public candidates:unknown[]=[]){super(message);}
 }
@@ -56,7 +57,8 @@ export function jobViews(path:string,project?:string,reference?:string){
      reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
      nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
       watchdog:actionStatus(s,j.id),
-      receipts,
+       receipts,
+       maintenance:maintenanceStatus(s,j.id),review:table('review_targets',j.id),
      worker:{activity:'unknown',session:implementation?.session_id??planning?.session_id??null,dispatchState:implementation?.state??planning?.state??null,outcome:currentOutcome?.outcome??null},
     evidence:{freshness:'unknown',persistedUpdatedAt:j.updated,note:'Persisted state only; no live worker or provider refresh performed.'}};
   });
