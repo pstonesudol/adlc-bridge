@@ -1,0 +1,1249 @@
+--- a/backend/internal/adapters/chatdriver/acp/client.go
++++ b/backend/internal/adapters/chatdriver/acp/client.go
+@@ -741,6 +741,8 @@
+ 				emit(event)
+ 			}
+ 		}
++	case update.CurrentModeUpdate != nil:
++		c.confirmProviderMode(string(update.CurrentModeUpdate.CurrentModeId))
+ 	case update.ConfigOptionUpdate != nil:
+ 		// The update is a complete replacement, not a delta. Model changes can
+ 		// rebuild effort and fast-mode choices, including removing an option.
+--- a/backend/internal/adapters/chatdriver/acp/conversation.go
++++ b/backend/internal/adapters/chatdriver/acp/conversation.go
+@@ -116,6 +116,9 @@
+ 	turnDiffTurnID    string
+ 	providerFailure   *ports.ChatEvent
+ 	configOptions     []ports.ChatConfigOption
++	configSetMu       sync.Mutex
++	modeConfirmation  uint64
++	confirmedMode     string
+ 	skills            []ports.ChatSkill
+ 	skillsKnown       bool
+ 	closed            bool
+--- a/backend/internal/adapters/chatdriver/acp/config_options.go
++++ b/backend/internal/adapters/chatdriver/acp/config_options.go
+@@ -6,6 +6,7 @@
+ 	"fmt"
+ 	"slices"
+ 	"strings"
++	"time"
+ 
+ 	acpsdk "github.com/coder/acp-go-sdk"
+ 
+@@ -25,6 +26,22 @@
+ 		return nil, errConversationClosed
+ 	}
+ 	return cloneConfigOptions(c.configOptions), nil
++}
++
++// A pre-patch host or uncertain selection has no confirmation provenance. Never
++// trust its original setup snapshot as proof of the current live mode.
++func (c *conversation) ProviderModeSnapshotConfirmed() bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.liveState == nil || !c.liveState.ModeKnown {
++		return false
++	}
++	for _, option := range c.configOptions {
++		if option.ID == "mode" && option.Current.Select == c.liveState.CurrentMode && choiceOffered(option.Choices, option.Current.Select) {
++			return true
++		}
++	}
++	return false
+ }
+ 
+ // SetConfigOption applies exactly the type the provider advertised and replaces
+@@ -36,6 +53,10 @@
+ 	id string,
+ 	value ports.ChatConfigOptionValue,
+ ) ([]ports.ChatConfigOption, error) {
++	// A selection and its confirmation form one operation. Never let a second
++	// selection borrow the first request's notification as its confirmation.
++	c.configSetMu.Lock()
++	defer c.configSetMu.Unlock()
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, err
+ 	}
+@@ -46,6 +67,7 @@
+ 	// new model's settings, such as Cursor's thinking and fast mode.
+ 	legacyModel := c.legacyModel && !c.modelConfigOption
+ 	legacyMode := c.legacyMode
++	modeGeneration := c.modeConfirmation
+ 	var option *ports.ChatConfigOption
+ 	for i := range c.configOptions {
+ 		if c.configOptions[i].ID == id {
+@@ -82,6 +104,12 @@
+ 		if _, err := c.conn.SetSessionMode(ctx, acpsdk.SetSessionModeRequest{
+ 			SessionId: acpsdk.SessionId(sessionID), ModeId: acpsdk.SessionModeId(value.Select),
+ 		}); err != nil {
++			if isACPInvalidParams(err) {
++				return nil, fmt.Errorf("%w: provider rejected mode", ports.ErrChatConfigOptionInvalid)
++			}
++			if isACPMethodNotFound(err) {
++				return nil, fmt.Errorf("%w: provider mode setter unavailable", ports.ErrChatUnsupported)
++			}
+ 			return nil, fmt.Errorf("set ACP legacy session mode %q: %w", value.Select, err)
+ 		}
+ 		c.applyAcceptedConfigOption(id, value)
+@@ -117,6 +145,12 @@
+ 
+ 	resp, err := c.conn.SetSessionConfigOption(ctx, request)
+ 	if err != nil {
++		if isACPMethodNotFound(err) {
++			return nil, fmt.Errorf("%w: provider option setter unavailable", ports.ErrChatUnsupported)
++		}
++		if isACPInvalidParams(err) {
++			return nil, fmt.Errorf("%w: provider rejected option %q", ports.ErrChatConfigOptionInvalid, id)
++		}
+ 		return nil, fmt.Errorf("set ACP session config option %q: %w", id, err)
+ 	}
+ 	// ACP marks the response's configOptions required and defines it as the full
+@@ -130,6 +164,12 @@
+ 	// specifically require an authoritative provider-reported post-change catalog
+ 	// (such as safety guards during handoff) receive nil so they can fail closed.
+ 	if len(resp.ConfigOptions) == 0 {
++		if id == "mode" {
++			// Some ACP peers confirm mode selection with current_mode_update,
++			// not a rebuilt response catalog. Only a fresh advertised provider
++			// notification counts; never turn an acknowledgement into evidence.
++			return c.awaitModeConfirmation(ctx, value.Select, modeGeneration)
++		}
+ 		c.applyAcceptedConfigOption(id, value)
+ 		return nil, nil
+ 	}
+@@ -146,8 +186,66 @@
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	c.configOptions = normalized
++	c.modeConfirmation++
++	c.confirmedMode = ""
++	for _, option := range normalized {
++		if option.ID == "mode" && choiceOffered(option.Choices, option.Current.Select) {
++			c.confirmedMode = option.Current.Select
++		}
++	}
+ 	if len(normalized) > 0 {
+ 		c.capabilities[ports.ChatCapabilityConfigOptions] = true
++	}
++}
++
++// A mode update is provider evidence, not permission or implementation authority.
++// Unadvertised values invalidate earlier evidence; no aliases are guessed.
++func (c *conversation) confirmProviderMode(mode string) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for i := range c.configOptions {
++		option := &c.configOptions[i]
++		if option.ID == "mode" && option.Type == ports.ChatConfigOptionSelect {
++			option.Current = ports.ChatConfigOptionValue{Select: mode}
++			c.confirmedMode = ""
++			if choiceOffered(option.Choices, mode) {
++				c.confirmedMode = mode
++			}
++			c.modeConfirmation++
++			return
++		}
++	}
++}
++
++// Read-only bounded observation, never a setter retry. A timeout leaves the
++// selection unconfirmed, so startup cannot publish a usable controller.
++func (c *conversation) awaitModeConfirmation(ctx context.Context, mode string, since uint64) ([]ports.ChatConfigOption, error) {
++	deadline := time.NewTimer(250 * time.Millisecond)
++	defer deadline.Stop()
++	ticker := time.NewTicker(5 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		c.mu.Lock()
++		closed := c.closed
++		confirmed := c.modeConfirmation > since && c.confirmedMode == mode
++		options := cloneConfigOptions(c.configOptions)
++		c.mu.Unlock()
++		if closed {
++			return nil, errConversationClosed
++		}
++		if confirmed {
++			return options, nil
++		}
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case <-deadline.C:
++			return nil, fmt.Errorf("%w: provider did not confirm selected mode", ports.ErrChatRecoveryInconclusive)
++		case <-ticker.C:
++		}
+ 	}
+ }
+ 
+--- a/backend/internal/adapters/chatdriver/acp/driver.go
++++ b/backend/internal/adapters/chatdriver/acp/driver.go
+@@ -506,6 +506,9 @@
+ 			setup.Models, setup.Modes,
+ 		)
+ 		conv.setReportedProviderConversationID(reportedProviderConversationID)
++		if live.ModeKnown {
++			conv.confirmProviderMode(live.CurrentMode)
++		}
+ 		conv.initialPermission = ports.PermissionMode(live.InitialPermissions)
+ 		conv.setSessionPreamble(d.sessionPreamble(launchCfg))
+ 		return conv, nil
+--- a/backend/internal/adapters/chatdriver/acp/driver_test.go
++++ b/backend/internal/adapters/chatdriver/acp/driver_test.go
+@@ -823,6 +823,7 @@
+ 	newConfig           []acpsdk.SessionConfigOption
+ 	setConfig           []acpsdk.SessionConfigOption
+ 	setCalls            int
++	modeUpdateOnSet     string
+ 	steering            bool
+ 	steerText           string
+ 	steerPrompt         []acpsdk.ContentBlock
+@@ -1123,7 +1124,7 @@
+ 	}
+ 	return acpsdk.LoadSessionResponse{}, nil
+ }
+-func (a *fakeAgent) SetSessionConfigOption(_ context.Context, params acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
++func (a *fakeAgent) SetSessionConfigOption(ctx context.Context, params acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
+ 	a.mu.Lock()
+ 	a.setCalls++
+ 	if a.configErr != nil {
+@@ -1148,7 +1149,18 @@
+ 		a.options[string(params.Boolean.ConfigId)] = fmt.Sprintf("%t", params.Boolean.Value)
+ 	}
+ 	response := append([]acpsdk.SessionConfigOption(nil), a.setConfig...)
++	modeUpdate := a.modeUpdateOnSet
+ 	a.mu.Unlock()
++	if modeUpdate != "" {
++		var update acpsdk.SessionUpdate
++		raw, _ := json.Marshal(map[string]string{"sessionUpdate": "current_mode_update", "currentModeId": modeUpdate})
++		if err := json.Unmarshal(raw, &update); err != nil {
++			return acpsdk.SetSessionConfigOptionResponse{}, err
++		}
++		if err := a.conn.SessionUpdate(ctx, acpsdk.SessionNotification{SessionId: params.ValueId.SessionId, Update: update}); err != nil {
++			return acpsdk.SetSessionConfigOptionResponse{}, err
++		}
++	}
+ 	return acpsdk.SetSessionConfigOptionResponse{ConfigOptions: response}, nil
+ }
+ func (a *fakeAgent) SetSessionMode(_ context.Context, params acpsdk.SetSessionModeRequest) (acpsdk.SetSessionModeResponse, error) {
+--- /dev/null
++++ b/backend/internal/adapters/chatdriver/acp/mode_confirmation_test.go
+@@ -0,0 +1,141 @@
++package acp
++
++import (
++	"context"
++	"errors"
++	"io"
++	"log/slog"
++	"testing"
++	"time"
++
++	acpsdk "github.com/coder/acp-go-sdk"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++// Reproduces the native restore boundary: an ACP peer advertises a modern
++// mode picker but confirms selection through current_mode_update rather than
++// the optional-in-practice response catalog. No provider or model is launched.
++func TestModeConfirmationRequiresProviderEvidence(t *testing.T) {
++	for _, ids := range [][2]string{{"build", "plan"}, {"edit", "inspect"}} {
++		for _, update := range []string{"", ids[0], "unadvertised", ids[1]} {
++			t.Run(ids[1]+"/"+update, func(t *testing.T) {
++				agent := &fakeAgent{newConfig: []acpsdk.SessionConfigOption{selectOption("mode", "Mode", ids[0], ids[0], ids[1])}, modeUpdateOnSet: update}
++				driver := New(Config{Harness: domain.HarnessFake, Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true}, Probe: func(context.Context) error { return nil }, Launch: func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil }}, slog.New(slog.NewTextHandler(io.Discard, nil)))
++				driver.useTestProcess(fakeSpawn(agent))
++				conv, err := driver.Start(context.Background(), ports.ChatStartConfig{SessionID: "mode-test", WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeDefault})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer conv.Close()
++				c := conv.(*conversation)
++				before := c.permissionMode
++				options, err := c.SetConfigOption(context.Background(), "mode", ports.ChatConfigOptionValue{Select: ids[1]})
++				if update == ids[1] {
++					if err != nil {
++						t.Fatal(err)
++					}
++				} else if !errors.Is(err, ports.ErrChatRecoveryInconclusive) {
++					t.Fatalf("want unconfirmed mode error, got %v", err)
++				}
++				confirmed := false
++				for _, option := range options {
++					if option.ID == "mode" && option.Current.Select == ids[1] {
++						confirmed = true
++					}
++				}
++				if confirmed != (update == ids[1]) {
++					t.Fatalf("confirmation=%v, update=%q options=%+v", confirmed, update, options)
++				}
++				c.mu.Lock()
++				after := c.permissionMode
++				c.mu.Unlock()
++				if before != after {
++					t.Fatal("mode selection changed permission policy")
++				}
++				agent.mu.Lock()
++				calls := agent.setCalls
++				agent.mu.Unlock()
++				if calls != 1 {
++					t.Fatalf("mode setter called %d times; never retry uncertain selection", calls)
++				}
++			})
++		}
++	}
++}
++
++func TestModeSetterTimeoutCannotUseCachedCatalog(t *testing.T) {
++	for _, legacy := range []bool{false, true} {
++		t.Run(map[bool]string{false: "modern-unconfirmed", true: "legacy-confirmed"}[legacy], func(t *testing.T) {
++			agent := &fakeAgent{newConfig: []acpsdk.SessionConfigOption{selectOption("mode", "Mode", "plan", "build", "plan")}}
++			driver := New(Config{Harness: domain.HarnessFake, Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true}, Probe: func(context.Context) error { return nil }, Launch: func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil }}, slog.New(slog.NewTextHandler(io.Discard, nil)))
++			driver.useTestProcess(fakeSpawn(agent))
++			conv, err := driver.Start(context.Background(), ports.ChatStartConfig{SessionID: "cached-mode", WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeDefault})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer conv.Close()
++			c := conv.(*conversation)
++			c.legacyMode = legacy
++			options, err := c.SetConfigOption(context.Background(), "mode", ports.ChatConfigOptionValue{Select: "plan"})
++			if legacy {
++				if err != nil || len(options) != 1 || options[0].Current.Select != "plan" {
++					t.Fatalf("legacy selection lost confirmation: %+v %v", options, err)
++				}
++			} else {
++				if !errors.Is(err, ports.ErrChatRecoveryInconclusive) || len(options) != 0 {
++					t.Fatalf("unconfirmed setter can fall back to cached Plan: %+v %v", options, err)
++				}
++				cached, readErr := c.ListConfigOptions(context.Background())
++				if readErr != nil || len(cached) != 1 || cached[0].Current.Select != "plan" {
++					t.Fatal("fixture must retain the pre-existing cached Plan")
++				}
++			}
++			if c.permissionMode != ports.PermissionModeDefault {
++				t.Fatal("selection changed permissions")
++			}
++		})
++	}
++}
++
++func TestModeConfirmationNeverBorrowsCachedOrStaleEvidence(t *testing.T) {
++	c := &conversation{capabilities: make(ports.ChatCapabilities)}
++	c.replaceConfigOptions([]acpsdk.SessionConfigOption{selectOption("mode", "Mode", "build", "build", "plan")})
++	c.applyAcceptedConfigOption("mode", ports.ChatConfigOptionValue{Select: "plan"})
++	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
++	defer cancel()
++	if options, err := c.awaitModeConfirmation(ctx, "plan", c.modeConfirmation); err == nil || len(options) != 0 {
++		t.Fatal("optimistic cache counted as confirmation")
++	}
++	c.confirmProviderMode("plan")
++	generation := c.modeConfirmation
++	c.confirmProviderMode("unknown")
++	if c.confirmedMode != "" || c.modeConfirmation <= generation {
++		t.Fatal("unadvertised mode retained stale confirmation")
++	}
++	// Cancellation observes only; it cannot replay a selection or send a turn.
++	ctx2, cancel2 := context.WithCancel(context.Background())
++	cancel2()
++	if options, err := c.awaitModeConfirmation(ctx2, "plan", generation); err == nil || len(options) != 0 {
++		t.Fatal("cancelled/unconfirmed observation accepted")
++	}
++}
++
++func TestModeReconnectRequiresPersistentHostProvenance(t *testing.T) {
++	c := &conversation{capabilities: make(ports.ChatCapabilities), liveState: &persistenthost.ACPState{}}
++	c.replaceConfigOptions([]acpsdk.SessionConfigOption{selectOption("mode", "Mode", "plan", "build", "plan")})
++	if c.ProviderModeSnapshotConfirmed() {
++		t.Fatal("pre-patch/uncertain host trusted old setup snapshot")
++	}
++	c.liveState.ModeKnown = true
++	c.liveState.CurrentMode = "plan"
++	if !c.ProviderModeSnapshotConfirmed() {
++		t.Fatal("owned host evidence was lost")
++	}
++	c.liveState.CurrentMode = "build"
++	if c.ProviderModeSnapshotConfirmed() {
++		t.Fatal("mismatching host evidence was accepted")
++	}
++}
+--- a/backend/internal/adapters/chatdriver/opencodev2acp/driver.go
++++ b/backend/internal/adapters/chatdriver/opencodev2acp/driver.go
+@@ -52,11 +52,11 @@
+ 	return []string{"acp"}, env, nil
+ }
+ 
+-// OpenCode 2's ACP bridge advertises the built-in modes before custom agents
+-// have necessarily loaded. Keep the provider mode stable and implement AO's
+-// approval postures through permissionPolicy.
++// Workflow mode is provider/user intent, not an approval posture. Re-selecting
++// Build here on every turn silently undoes a restored Plan choice. The provider
++// advertises its default at startup; permissions remain in permissionPolicy.
+ func sessionMode(ports.PermissionMode) string {
+-	return "build"
++	return ""
+ }
+ 
+ func sessionOptions(settings ports.ChatTurnSettings) []acpdriver.SessionOption {
+--- a/backend/internal/adapters/chatdriver/opencodev2acp/driver_test.go
++++ b/backend/internal/adapters/chatdriver/opencodev2acp/driver_test.go
+@@ -63,6 +63,8 @@
+ 			Params struct {
+ 				ModeID    string `json:"modeId"`
+ 				SessionID string `json:"sessionId"`
++				ConfigID  string `json:"configId"`
++				Value     string `json:"value"`
+ 			} `json:"params"`
+ 		}
+ 		if json.Unmarshal(scanner.Bytes(), &request) != nil || len(request.ID) == 0 {
+@@ -85,6 +87,11 @@
+ 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}},"authMethods":[],"agentInfo":{"name":"OpenCode","version":"2.0.0"}}}`+"\n", request.ID)
+ 		case "session/new":
+ 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"opencode-v2-provider","configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"provider/default","options":[{"value":"provider/default","name":"Default"}]},{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"}]},{"id":"mode","name":"Session Mode","category":"mode","type":"select","currentValue":"build","options":[{"value":"build","name":"Build"},{"value":"plan","name":"Plan"}]}]}}`+"\n", request.ID)
++		case "session/set_config_option":
++			if request.Params.ConfigID == "mode" {
++				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"opencode-v2-provider","update":{"sessionUpdate":"current_mode_update","currentModeId":%q}}}`+"\n", request.Params.Value)
++			}
++			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", request.ID)
+ 		case "session/set_mode":
+ 			if request.Params.ModeID != "build" && request.Params.ModeID != "plan" {
+ 				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Invalid params: mode not found: %s"}}`+"\n", request.ID, request.Params.ModeID)
+@@ -119,6 +126,8 @@
+ 		t.Fatal(err)
+ 	}
+ 	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin:/bin")
++	t.Setenv("HOME", t.TempDir())
++	t.Setenv("XDG_DATA_HOME", t.TempDir())
+ 	t.Setenv("AO_TEST_OPENCODE_VERSION", version)
+ 	t.Setenv("AO_TEST_OPENCODE_V2_ACP_BINARY", os.Args[0])
+ 	t.Setenv("AO_TEST_OPENCODE_V2_ACP_PROVIDER", "1")
+@@ -151,8 +160,23 @@
+ 	if !strings.Contains(string(data), `"agents"`) || !strings.Contains(string(data), `"default_agent":"build"`) {
+ 		t.Fatalf("v2 launch config missing the configured build agent:\n%s", data)
+ 	}
+-	if !strings.Contains(string(data), "session/set_mode:build\n") {
+-		t.Fatalf("v2 approval mode was not applied through ACP:\n%s", data)
++	if strings.Contains(string(data), "session/set_mode:") {
++		t.Fatalf("approval posture selected a workflow mode:\n%s", data)
++	}
++	options, err := conversation.(ports.ChatConfigOptionController).SetConfigOption(context.Background(), "mode", ports.ChatConfigOptionValue{Select: "plan"})
++	if err != nil || len(options) == 0 {
++		t.Fatalf("Plan was not confirmed: %v %+v", err, options)
++	}
++	// Prepare only; no model prompt is sent. Permission application must not undo Plan.
++	if _, err := conversation.SendTurn(context.Background(), ports.ChatUserMessage{Text: "planning fixture", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeAuto}}); err != nil {
++		t.Fatal(err)
++	}
++	data, err = os.ReadFile(calls)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(data), "session/set_mode:build") || strings.Contains(string(data), "session/prompt:") {
++		t.Fatalf("Plan changed or a prompt was sent: %s", data)
+ 	}
+ }
+ 
+@@ -225,15 +249,15 @@
+ 	}
+ }
+ 
+-func TestApprovalModesSelectV2AgentsAndPermissionReplies(t *testing.T) {
++func TestApprovalModesPreserveWorkflowModeAndPermissionReplies(t *testing.T) {
+ 	for _, test := range []struct {
+ 		mode ports.PermissionMode
+ 		want string
+ 	}{
+-		{ports.PermissionModeDefault, "build"},
+-		{ports.PermissionModeAcceptEdits, "build"},
+-		{ports.PermissionModeAuto, "build"},
+-		{ports.PermissionModeBypassPermissions, "build"},
++		{ports.PermissionModeDefault, ""},
++		{ports.PermissionModeAcceptEdits, ""},
++		{ports.PermissionModeAuto, ""},
++		{ports.PermissionModeBypassPermissions, ""},
+ 	} {
+ 		if got := sessionMode(test.mode); got != test.want {
+ 			t.Errorf("sessionMode(%q) = %q, want %q", test.mode, got, test.want)
+--- a/backend/internal/adapters/chatdriver/persistenthost/host.go
++++ b/backend/internal/adapters/chatdriver/persistenthost/host.go
+@@ -123,6 +123,10 @@
+ // ACPState is the connection-scoped state needed to reconstruct an ACP client
+ // without initializing or resuming the same live provider a second time.
+ type ACPState struct {
++	// Unknown mode evidence survives daemon detach/restart with the live host.
++	ModeKnown            bool            `json:"modeKnown"`
++	CurrentMode          string          `json:"currentMode,omitempty"`
++	ModeRequest          uint64          `json:"modeRequest,omitempty"`
+ 	InitialPermissions   string          `json:"initialPermissions,omitempty"`
+ 	InitializeResult     json.RawMessage `json:"initializeResult,omitempty"`
+ 	SessionResult        json.RawMessage `json:"sessionResult,omitempty"`
+--- a/backend/internal/adapters/chatdriver/persistenthost/acp_relay.go
++++ b/backend/internal/adapters/chatdriver/persistenthost/acp_relay.go
+@@ -30,10 +30,11 @@
+ )
+ 
+ type acpClientRequest struct {
+-	clientID   json.RawMessage
+-	method     string
+-	params     json.RawMessage
+-	generation uint64
++	modeRequest uint64
++	clientID    json.RawMessage
++	method      string
++	params      json.RawMessage
++	generation  uint64
+ }
+ 
+ type acpServerRequest struct {
+@@ -244,8 +245,16 @@
+ 	}
+ 	r.nextRequestID++
+ 	providerID, _ := json.Marshal(r.nextRequestID)
++	// Models/options can reset workflow mode. Invalidate before forwarding;
++	// neither an empty acknowledgement nor a late older response restores trust.
++	if method == "session/set_mode" || method == "session/set_model" || method == "session/set_config_option" {
++		r.state.ModeKnown = false
++		r.state.CurrentMode = ""
++		r.state.ModeRequest = uint64(r.nextRequestID)
++	}
+ 	r.pending[string(providerID)] = acpClientRequest{
+-		clientID: append(json.RawMessage(nil), id...), method: method,
++		modeRequest: r.state.ModeRequest,
++		clientID:    append(json.RawMessage(nil), id...), method: method,
+ 		params: append(json.RawMessage(nil), envelope["params"]...), generation: generation,
+ 	}
+ 	envelope["id"] = providerID
+@@ -349,6 +358,9 @@
+ 	id := envelope["id"]
+ 
+ 	if method != "" {
++		if method == "session/update" {
++			r.captureModeUpdate(envelope["params"])
++		}
+ 		if len(id) > 0 && string(id) != "null" {
+ 			rewritten, key, created := r.providerRequest(envelope, frame)
+ 			if created && r.state.ActivePrompt {
+@@ -531,6 +543,22 @@
+ 		return
+ 	}
+ 	result := envelope["result"]
++	if request.modeRequest == r.state.ModeRequest {
++		if request.method == "session/set_config_option" {
++			r.captureModeCatalog(result, false)
++		}
++		if request.method == "session/set_mode" {
++			// Legacy ACP defines successful completion as selection. Modern
++			// empty config-option acknowledgements are not mode evidence.
++			var params struct {
++				Mode string `json:"modeId"`
++			}
++			if json.Unmarshal(request.params, &params) == nil && params.Mode != "" {
++				r.state.ModeKnown = true
++				r.state.CurrentMode = params.Mode
++			}
++		}
++	}
+ 	switch request.method {
+ 	case "initialize":
+ 		var params struct {
+@@ -554,6 +582,7 @@
+ 			}
+ 		}
+ 		r.state.SessionResult = append(json.RawMessage(nil), result...)
++		r.captureModeCatalog(result, true)
+ 		if response.SessionID != "" {
+ 			r.state.SessionID = response.SessionID
+ 		} else if request.method != "session/fork" {
+@@ -565,6 +594,77 @@
+ 				r.state.SessionID = params.SessionID
+ 			}
+ 		}
++	}
++}
++
++// Capture protocol-owned evidence only; workflow intent and permission semantics
++// remain in adapters. The adapter validates identifiers against advertised modes.
++func (r *acpRelay) captureModeCatalog(raw json.RawMessage, setup bool) {
++	var value struct {
++		Options []struct {
++			ID      string          `json:"id"`
++			Current json.RawMessage `json:"currentValue"`
++		} `json:"configOptions"`
++		Modes *struct {
++			Current string `json:"currentModeId"`
++		} `json:"modes"`
++	}
++	if json.Unmarshal(raw, &value) != nil {
++		return
++	}
++	if !setup && len(value.Options) == 0 {
++		return
++	}
++	// Retain the latest provider-owned catalog, not the original setup picker.
++	// A reconnect must still reject removed, duplicate or unadvertised modes.
++	var incoming, snapshot map[string]json.RawMessage
++	if json.Unmarshal(raw, &incoming) == nil && incoming["configOptions"] != nil && json.Unmarshal(r.state.SessionResult, &snapshot) == nil && snapshot != nil {
++		snapshot["configOptions"] = append(json.RawMessage(nil), incoming["configOptions"]...)
++		r.state.SessionResult, _ = json.Marshal(snapshot)
++	}
++	r.state.ModeKnown = false
++	r.state.CurrentMode = ""
++	count := 0
++	current := ""
++	for _, option := range value.Options {
++		if option.ID == "mode" {
++			count++
++			_ = json.Unmarshal(option.Current, &current)
++		}
++	}
++	if count > 0 {
++		r.state.ModeKnown = count == 1 && current != ""
++		r.state.CurrentMode = current
++		return
++	}
++	if setup && value.Modes != nil && value.Modes.Current != "" {
++		r.state.ModeKnown = true
++		r.state.CurrentMode = value.Modes.Current
++	}
++}
++
++func (r *acpRelay) captureModeUpdate(raw json.RawMessage) {
++	var params struct {
++		Session string `json:"sessionId"`
++		Update  struct {
++			Kind    string          `json:"sessionUpdate"`
++			Current string          `json:"currentModeId"`
++			Options json.RawMessage `json:"configOptions"`
++		} `json:"update"`
++	}
++	if json.Unmarshal(raw, &params) != nil || params.Session != r.state.SessionID {
++		return
++	}
++	switch params.Update.Kind {
++	case "current_mode_update":
++		r.state.ModeKnown = params.Update.Current != ""
++		r.state.CurrentMode = params.Update.Current
++	case "config_option_update":
++		// Empty notification means removal, unlike an empty setter ack.
++		r.state.ModeKnown = false
++		r.state.CurrentMode = ""
++		catalog, _ := json.Marshal(map[string]json.RawMessage{"configOptions": params.Update.Options})
++		r.captureModeCatalog(catalog, true)
+ 	}
+ }
+ 
+--- /dev/null
++++ b/backend/internal/adapters/chatdriver/persistenthost/mode_state_test.go
+@@ -0,0 +1,122 @@
++package persistenthost
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func seedModeRelay(t *testing.T) *acpRelay {
++	r := newTestACPRelay(t)
++	request := relayClientFrame(t, r, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`), 1)
++	relayProviderFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, request)+`,"result":{"sessionId":"owned","configOptions":[{"id":"mode","currentValue":"build"}]}}`), 1, true)
++	return r
++}
++func modeRequest(t *testing.T, r *acpRelay, id, value string) []byte {
++	return relayClientFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+id+`,"method":"session/set_config_option","params":{"sessionId":"owned","configId":"mode","value":"`+value+`"}}`), 1)
++}
++func TestModeUncertaintySurvivesDaemonAttachmentWithoutReplay(t *testing.T) {
++	r := seedModeRelay(t)
++	if !r.snapshot().ModeKnown {
++		t.Fatal("setup mode not observed")
++	}
++	request := modeRequest(t, r, "2", "plan")
++	// Snapshot serialization is the host/daemon attachment boundary. The host
++	// remains the same owner while a replacement daemon must retain uncertainty.
++	raw, err := json.Marshal(r.snapshot())
++	if err != nil {
++		t.Fatal(err)
++	}
++	var restarted ACPState
++	if err = json.Unmarshal(raw, &restarted); err != nil {
++		t.Fatal(err)
++	}
++	if restarted.ModeKnown || restarted.CurrentMode != "" {
++		t.Fatal("uncertain mode became confirmed on attachment")
++	}
++	if len(relayReplayFrames(t, r)) != 0 {
++		t.Fatal("mode request was replayed")
++	}
++	// A late empty reply from the old attachment is not evidence or a new send.
++	relayProviderFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, request)+`,"result":{}}`), 2, false)
++	if r.snapshot().ModeKnown || r.snapshot().ActivePrompt {
++		t.Fatal("empty acknowledgement confirmed mode or created a turn")
++	}
++	relayProviderFrame(t, r, []byte(`{"method":"session/update","params":{"sessionId":"other","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`), 2, false)
++	if r.snapshot().ModeKnown {
++		t.Fatal("foreign session supplied confirmation")
++	}
++	relayProviderFrame(t, r, []byte(`{"method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`), 2, false)
++	if !r.snapshot().ModeKnown || r.snapshot().CurrentMode != "plan" {
++		t.Fatal("fresh owned provider evidence lost")
++	}
++	if len(relayReplayFrames(t, r)) != 0 {
++		t.Fatal("mode recovery duplicated a turn")
++	}
++}
++func TestLateModeResponseCannotConfirmNewerSelection(t *testing.T) {
++	r := seedModeRelay(t)
++	old := modeRequest(t, r, "2", "plan")
++	latest := modeRequest(t, r, "3", "build")
++	relayProviderFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, old)+`,"result":{"configOptions":[{"id":"mode","currentValue":"plan"}]}}`), 2, true)
++	if r.snapshot().ModeKnown {
++		t.Fatal("older request confirmed a newer uncertain selection")
++	}
++	relayProviderFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, latest)+`,"error":{"code":-32602,"message":"private provider error"}}`), 2, true)
++	if r.snapshot().ModeKnown {
++		t.Fatal("rejected selection erased uncertainty")
++	}
++	if len(relayReplayFrames(t, r)) != 0 || r.snapshot().ActivePrompt {
++		t.Fatal("concurrent settings created/replayed a turn")
++	}
++}
++func TestModeCatalogRemovalInvalidatesReconnectEvidence(t *testing.T) {
++	r := seedModeRelay(t)
++	relayProviderFrame(t, r, []byte(`{"method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"config_option_update","configOptions":[]}}}`), 1, true)
++	if r.snapshot().ModeKnown {
++		t.Fatal("removed mode remained confirmed")
++	}
++}
++
++func TestModeCatalogSnapshotPreservesMixedTypesAndAmbiguity(t *testing.T) {
++	r := seedModeRelay(t)
++	r.captureModeCatalog([]byte(`{"configOptions":[{"id":"fast","currentValue":false},{"id":"mode","currentValue":"plan"}]}`), false)
++	if !r.snapshot().ModeKnown || r.snapshot().CurrentMode != "plan" {
++		t.Fatal("unrelated boolean option lost mode evidence")
++	}
++	r.captureModeCatalog([]byte(`{"configOptions":[{"id":"mode","currentValue":"plan"},{"id":"mode","currentValue":"build"}]}`), false)
++	if r.snapshot().ModeKnown {
++		t.Fatal("ambiguous mode became confirmed")
++	}
++	var snapshot struct {
++		Options []json.RawMessage `json:"configOptions"`
++	}
++	if err := json.Unmarshal(r.snapshot().SessionResult, &snapshot); err != nil || len(snapshot.Options) != 2 {
++		t.Fatal("reconnect substituted the original catalog")
++	}
++}
++
++// Models and variants may rebuild provider mode catalogs. Do not retain stale
++// Plan evidence merely because a non-mode setter returned an empty response.
++func TestModeModelAndEffortChangesRequireFreshEvidence(t *testing.T) {
++	for _, method := range []string{"session/set_model", "session/set_config_option"} {
++		t.Run(method, func(t *testing.T) {
++			r := seedModeRelay(t)
++			frame, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": method, "params": map[string]string{"sessionId": "owned", "configId": "effort", "value": "high", "modelId": "provider/model"}})
++			request := relayClientFrame(t, r, frame, 1)
++			if r.snapshot().ModeKnown {
++				t.Fatal("model/effort change kept stale mode evidence")
++			}
++			relayProviderFrame(t, r, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, request)+`,"result":{}}`), 2, false)
++			if r.snapshot().ModeKnown {
++				t.Fatal("empty non-mode acknowledgement confirmed workflow mode")
++			}
++			relayProviderFrame(t, r, []byte(`{"method":"session/update","params":{"sessionId":"owned","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}`), 2, false)
++			if !r.snapshot().ModeKnown || r.snapshot().CurrentMode != "plan" {
++				t.Fatal("fresh evidence did not release conservative fence")
++			}
++			if len(relayReplayFrames(t, r)) != 0 || r.snapshot().ActivePrompt {
++				t.Fatal("observation replayed a request or created a turn")
++			}
++		})
++	}
++}
+--- /dev/null
++++ b/backend/internal/service/chat/provider_mode.go
+@@ -0,0 +1,140 @@
++package chat
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++// ProviderModeRestoreError is intentionally free of provider error bodies.
++// The original cause remains available to errors.Is/As, not operator output.
++type ProviderModeRestoreError struct {
++	Kind, Requested, Observed string
++	cause                     error
++}
++
++func (e *ProviderModeRestoreError) Error() string {
++	return fmt.Sprintf("provider mode restore %s: requested=%q observed=%q; preserve the original session and permission boundary; inspect advertised modes and native compatibility, then explicitly recover; no automatic retry", e.Kind, safeModeID(e.Requested), safeModeID(e.Observed))
++}
++func (e *ProviderModeRestoreError) Unwrap() error { return e.cause }
++func (e *ProviderModeRestoreError) ProviderModeRestoreDetails() (kind, requested, observed string) {
++	kind = e.Kind
++	switch kind {
++	case "unsupported", "rejected", "unconfirmed", "transient", "uncertain":
++	default:
++		kind = "uncertain"
++	}
++	return kind, safeModeID(e.Requested), safeModeID(e.Observed)
++}
++func safeModeID(id string) string {
++	if len(id) == 0 || len(id) > 80 {
++		return "unknown"
++	}
++	for _, c := range id {
++		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
++			return "unknown"
++		}
++	}
++	return id
++}
++
++// Restore one exact saved provider identifier. Semantic intent and authority
++// remain with ADLC/the caller; there is no mode-name inference or fallback.
++// Called under the existing startup ownership gate, before controller publication.
++func restoreProviderMode(ctx context.Context, conv ports.ChatConversation, mode string, permission domain.PermissionMode, verifyOnly bool) error {
++	observed := ""
++	fail := func(kind string, cause error) error {
++		return &ProviderModeRestoreError{Kind: kind, Requested: mode, Observed: observed, cause: cause}
++	}
++	configurer, ok := conv.(ports.ChatConfigOptionController)
++	if !ok {
++		return fail("unsupported", ErrConfigOptionsUnsupported)
++	}
++	if err := ctx.Err(); err != nil {
++		return fail("transient", err)
++	}
++	options, err := configurer.ListConfigOptions(ctx)
++	if err != nil {
++		if errors.Is(err, ErrConfigOptionsUnsupported) {
++			return fail("unsupported", err)
++		}
++		return fail("transient", err)
++	} // No selection was attempted.
++	offered := false
++	count := 0
++	for _, option := range options {
++		if option.ID != "mode" {
++			continue
++		}
++		count++
++		observed = option.Current.Select
++		for _, choice := range option.Choices {
++			if choice.Value != mode {
++				continue
++			}
++			if choice.PermissionMode != "" && ports.NormalizePermissionMode(choice.PermissionMode) != ports.NormalizePermissionMode(permission) {
++				return fail("rejected", ports.ErrChatConfigOptionInvalid)
++			}
++			if offered {
++				return fail("unsupported", ports.ErrChatConfigOptionInvalid)
++			}
++			offered = true
++		}
++	}
++	if count != 1 || !offered {
++		return fail("unsupported", ports.ErrChatConfigOptionInvalid)
++	}
++	// A reconnected host may own an in-flight turn. Inspect its published state
++	// only; never use reconnect as authority to mutate a mode or bypass a failed
++	// restore. The saved requested mode is retained by existing durable settings.
++	if verifyOnly {
++		provenance, ok := conv.(interface{ ProviderModeSnapshotConfirmed() bool })
++		if observed != mode || !ok || !provenance.ProviderModeSnapshotConfirmed() {
++			return fail("unconfirmed", ports.ErrChatRecoveryInconclusive)
++		}
++		return nil
++	}
++	// Exactly one mutation. A transport failure may have applied the mode; neither
++	// this helper nor startup retries it or sends a turn to test the outcome.
++	options, err = configurer.SetConfigOption(ctx, "mode", ports.ChatConfigOptionValue{Select: mode})
++	if err != nil {
++		if errors.Is(err, ports.ErrChatRecoveryInconclusive) {
++			return fail("unconfirmed", err)
++		}
++		if errors.Is(err, ports.ErrChatUnsupported) {
++			return fail("unsupported", err)
++		}
++		if errors.Is(err, ports.ErrChatConfigOptionInvalid) {
++			return fail("rejected", err)
++		}
++		return fail("uncertain", err)
++	}
++	count = 0
++	confirmed := false
++	matches := 0
++	for _, option := range options {
++		if option.ID != "mode" {
++			continue
++		}
++		count++
++		observed = option.Current.Select
++		for _, choice := range option.Choices {
++			if choice.Value == mode {
++				matches++
++			}
++			if choice.Value == mode && choice.PermissionMode != "" && ports.NormalizePermissionMode(choice.PermissionMode) != ports.NormalizePermissionMode(permission) {
++				return fail("rejected", ports.ErrChatConfigOptionInvalid)
++			}
++			if choice.Value == mode && option.Current.Select == mode {
++				confirmed = true
++			}
++		}
++	}
++	if count != 1 || !confirmed || matches != 1 {
++		return fail("unconfirmed", ports.ErrChatRecoveryInconclusive)
++	}
++	return nil
++}
+--- /dev/null
++++ b/backend/internal/service/chat/provider_mode_test.go
+@@ -0,0 +1,113 @@
++package chat
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
++)
++
++type restoreModeFixture struct {
++	ports.ChatConversation
++	catalog         []ports.ChatConfigOption
++	response        []ports.ChatConfigOption
++	readErr, setErr error
++	calls           int
++	known           bool
++}
++
++func (f *restoreModeFixture) ProviderModeSnapshotConfirmed() bool { return f.known }
++
++func (f *restoreModeFixture) ListConfigOptions(context.Context) ([]ports.ChatConfigOption, error) {
++	return f.catalog, f.readErr
++}
++func (f *restoreModeFixture) SetConfigOption(context.Context, string, ports.ChatConfigOptionValue) ([]ports.ChatConfigOption, error) {
++	f.calls++
++	return f.response, f.setErr
++}
++func restoreCatalog(current, plan, execute string) []ports.ChatConfigOption {
++	return []ports.ChatConfigOption{{ID: "mode", Current: ports.ChatConfigOptionValue{Select: current}, Choices: []ports.ChatConfigOptionChoice{{Value: plan}, {Value: execute}}}}
++}
++
++func TestProviderModeRestoreContract(t *testing.T) {
++	for _, ids := range [][2]string{{"plan", "build"}, {"inspect", "edit"}} {
++		for _, kind := range []string{"confirmed", "unsupported", "unsupported-setter", "rejected", "unconfirmed", "unconfirmed-setter", "transient", "uncertain", "permission", "duplicate"} {
++			t.Run(ids[0]+"/"+kind, func(t *testing.T) {
++				f := &restoreModeFixture{catalog: restoreCatalog(ids[1], ids[0], ids[1]), response: restoreCatalog(ids[0], ids[0], ids[1])}
++				expectedCalls := 1
++				expectedKind := kind
++				switch kind {
++				case "unconfirmed-setter":
++					f.setErr = ports.ErrChatRecoveryInconclusive
++					expectedKind = "unconfirmed"
++				case "unsupported-setter":
++					f.setErr = ports.ErrChatUnsupported
++					expectedKind = "unsupported"
++				case "duplicate":
++					f.response[0].Choices = append(f.response[0].Choices, f.response[0].Choices[0])
++					expectedKind = "unconfirmed"
++				case "unsupported":
++					f.catalog = nil
++					expectedCalls = 0
++				case "rejected":
++					f.setErr = ports.ErrChatConfigOptionInvalid
++				case "unconfirmed":
++					f.response = nil
++				case "transient":
++					f.readErr = context.DeadlineExceeded
++					expectedCalls = 0
++				case "uncertain":
++					f.setErr = errors.New("Bearer credentials must not be printed")
++				case "permission":
++					f.catalog[0].Choices[0].PermissionMode = ports.PermissionModeBypassPermissions
++					expectedCalls = 0
++					expectedKind = "rejected"
++				}
++				err := restoreProviderMode(context.Background(), f, ids[0], ports.PermissionModeDefault, false)
++				if kind == "confirmed" {
++					if err != nil {
++						t.Fatal(err)
++					}
++				} else {
++					var failure *ProviderModeRestoreError
++					if !errors.As(err, &failure) || failure.Kind != expectedKind {
++						t.Fatalf("error=%v, want %s", err, expectedKind)
++					}
++					if strings.Contains(err.Error(), "credentials") {
++						t.Fatal("provider error body leaked")
++					}
++				}
++				if f.calls != expectedCalls {
++					t.Fatalf("setter calls=%d want %d", f.calls, expectedCalls)
++				}
++			})
++		}
++	}
++}
++
++func TestProviderModeRestoreRestartNeverBypassesUnconfirmedOrMutatesLiveHost(t *testing.T) {
++	// Persisted settings still request Plan after failure. A reconnect observes
++	// Build and must fail each time without selecting a mode or injecting a turn.
++	f := &restoreModeFixture{catalog: restoreCatalog("build", "plan", "build")}
++	for i := 0; i < 3; i++ {
++		if err := restoreProviderMode(context.Background(), f, "plan", ports.PermissionModeDefault, true); err == nil {
++			t.Fatal("unconfirmed live mode admitted")
++		}
++	}
++	if f.calls != 0 {
++		t.Fatal("reconnect changed an in-flight host")
++	}
++	f.catalog = restoreCatalog("plan", "plan", "build")
++	if err := restoreProviderMode(context.Background(), f, "plan", ports.PermissionModeDefault, true); err == nil {
++		t.Fatal("old setup snapshot counted as mode evidence")
++	}
++	f.known = true
++	if err := restoreProviderMode(context.Background(), f, "plan", ports.PermissionModeDefault, true); err != nil {
++		t.Fatal(err)
++	}
++	if f.calls != 0 {
++		t.Fatal("already confirmed mode was mutated")
++	}
++}
+--- a/backend/internal/service/chat/service.go
++++ b/backend/internal/service/chat/service.go
+@@ -913,8 +913,8 @@
+ 		// No native history exists to import; continue as a fresh start.
+ 		cfg.ProviderConversationID = ""
+ 	}
+-	if !liveReconnect && isOpenCodeHarness(cfg.Harness) && conversation.Settings.OpenCodeMode != "" {
+-		if err := restoreOpenCodeMode(ctx, conv, conversation.Settings.OpenCodeMode); err != nil {
++	if isOpenCodeHarness(cfg.Harness) && conversation.Settings.OpenCodeMode != "" {
++		if err := restoreProviderMode(ctx, conv, conversation.Settings.OpenCodeMode, conversation.Settings.ApprovalMode, liveReconnect); err != nil {
+ 			_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
+ 			return nil, err
+ 		}
+@@ -2545,7 +2545,16 @@
+ 	previous := controller.Settings()
+ 	options, err := configurer.SetConfigOption(ctx, configID, value)
+ 	if err != nil {
++		if configID == "mode" && errors.Is(err, ports.ErrChatRecoveryInconclusive) {
++			return nil, &ProviderModeRestoreError{Kind: "unconfirmed", Requested: value.Select, cause: err}
++		}
+ 		return nil, err
++	}
++	// A mode selection needs authoritative confirmation. Never turn an empty
++	// modern acknowledgement/timeout into success by re-reading an optimistic
++	// catalog, even if it already happens to display the requested mode.
++	if configID == "mode" && len(options) == 0 {
++		return nil, &ProviderModeRestoreError{Kind: "unconfirmed", Requested: value.Select, cause: ports.ErrChatRecoveryInconclusive}
+ 	}
+ 	if len(options) == 0 {
+ 		if listed, listErr := configurer.ListConfigOptions(ctx); listErr == nil {
+@@ -2584,25 +2593,6 @@
+ 
+ func isOpenCodeHarness(harness domain.AgentHarness) bool {
+ 	return harness == domain.HarnessOpenCode || harness == domain.HarnessOpenCodeV2
+-}
+-
+-// Restore the provider-owned choice before publishing a controller. A rejected
+-// Plan restore must not silently leave a usable controller in Build mode.
+-func restoreOpenCodeMode(ctx context.Context, conv ports.ChatConversation, mode string) error {
+-	configurer, ok := conv.(ports.ChatConfigOptionController)
+-	if !ok {
+-		return fmt.Errorf("restore OpenCode mode %q: %w", mode, ErrConfigOptionsUnsupported)
+-	}
+-	options, err := configurer.SetConfigOption(ctx, "mode", ports.ChatConfigOptionValue{Select: mode})
+-	if err != nil {
+-		return fmt.Errorf("restore OpenCode mode %q: %w", mode, err)
+-	}
+-	for _, option := range options {
+-		if option.ID == "mode" && option.Current.Select == mode {
+-			return nil
+-		}
+-	}
+-	return fmt.Errorf("restore OpenCode mode %q: provider did not confirm selected mode", mode)
+ }
+ 
+ func settingsFromConfigOptions(
+--- a/backend/internal/service/chat/opencode_mode_test.go
++++ b/backend/internal/service/chat/opencode_mode_test.go
+@@ -19,13 +19,17 @@
+ 	mode   string
+ 	setErr error
+ 	ignore bool
++	empty  bool
++	lists  int
+ }
+ 
+ func (c *modeConversation) ListConfigOptions(context.Context) ([]ports.ChatConfigOption, error) {
++	c.lists++
+ 	return []ports.ChatConfigOption{{
+ 		ID: "mode", Current: ports.ChatConfigOptionValue{Select: c.mode},
+ 		Choices: []ports.ChatConfigOptionChoice{
+ 			{Value: "build"}, {Value: "plan"},
++			{Value: "ao-plan-project-1"},
+ 			{Value: "ao-default"}, {Value: "ao-accept-edits"},
+ 			{Value: "ao-auto"}, {Value: "ao-bypass"},
+ 		},
+@@ -39,7 +43,41 @@
+ 	if !c.ignore {
+ 		c.mode = value.Select
+ 	}
++	if c.empty {
++		return nil, nil
++	}
+ 	return c.ListConfigOptions(ctx)
++}
++
++func TestProviderModeSetterFailureCannotUseCachedCatalog(t *testing.T) {
++	ctx := context.Background()
++	st := openStore(t)
++	conv := &modeConversation{fakeConversation: newFakeConversation(), mode: "plan"}
++	svc := chatsvc.New(chatsvc.Options{Store: st, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: conv}}, Log: slog.New(slog.DiscardHandler), NewID: uuid.NewString})
++	if _, err := svc.Start(ctx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessOpenCodeV2, WorkspacePath: t.TempDir()}); err != nil {
++		t.Fatal(err)
++	}
++	defer svc.Stop(ctx, testSession)
++	before, err := st.ConversationForSession(ctx, testSession)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, setterError := range []error{nil, ports.ErrChatRecoveryInconclusive} {
++		conv.empty = true
++		conv.setErr = setterError
++		conv.lists = 0
++		options, err := svc.SetConfigOption(ctx, testSession, "mode", ports.ChatConfigOptionValue{Select: "plan"})
++		if !errors.Is(err, ports.ErrChatRecoveryInconclusive) || len(options) != 0 {
++			t.Fatalf("cached Plan became successful PATCH evidence: %+v %v", options, err)
++		}
++		if conv.lists != 0 {
++			t.Fatal("unconfirmed mode re-read the optimistic catalog")
++		}
++		after, readErr := st.ConversationForSession(ctx, testSession)
++		if readErr != nil || after.Settings != before.Settings {
++			t.Fatal("unconfirmed mode changed persisted settings or permissions")
++		}
++	}
+ }
+ 
+ func TestOpenCodeModeSurvivesControllerRestart(t *testing.T) {
+--- a/backend/internal/service/session/service.go
++++ b/backend/internal/service/session/service.go
+@@ -1577,6 +1577,17 @@
+ // toAPIError maps the session engine's sentinel errors to their REST API
+ // equivalents; an unrecognized error passes through and surfaces as a 500.
+ func toAPIError(err error) error {
++	// Mode restoration carries a narrow sanitized diagnostic contract. Check it
++	// before generic timeout/relaunch mappings, which would lose its evidence.
++	var modeFailure interface {
++		ProviderModeRestoreDetails() (kind, requested, observed string)
++	}
++	if errors.As(err, &modeFailure) {
++		kind, requested, observed := modeFailure.ProviderModeRestoreDetails()
++		return apierr.Conflict("PROVIDER_MODE_RESTORE_FAILED",
++			fmt.Sprintf("Provider mode restore %s: requested=%q observed=%q. Preserve the original session and permissions; inspect native/provider compatibility before explicit recovery. No automatic retry.", kind, requested, observed),
++			map[string]any{"failureKind": kind, "requestedMode": requested, "observedMode": observed, "retrySafe": false})
++	}
+ 	original := ownership.Own(err, ownership.OwnerHTTP)
+ 	return ownership.Preserve(original, mapSessionError(original))
+ }
+--- /dev/null
++++ b/backend/internal/service/session/provider_mode_test.go
+@@ -0,0 +1,32 @@
++package session
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
++	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
++)
++
++func TestProviderModeFailureAPIContractIsSanitized(t *testing.T) {
++	for _, kind := range []string{"unsupported", "rejected", "unconfirmed", "transient", "uncertain"} {
++		cause := &chatsvc.ProviderModeRestoreError{Kind: kind, Requested: "plan", Observed: "build"}
++		mapped := toAPIError(fmt.Errorf("private provider token must not appear: %w", cause))
++		var api *apierr.Error
++		if !errors.As(mapped, &api) || api.Code != "PROVIDER_MODE_RESTORE_FAILED" {
++			t.Fatalf("mapped=%v", mapped)
++		}
++		if api.Details["failureKind"] != kind || api.Details["requestedMode"] != "plan" || api.Details["observedMode"] != "build" || api.Details["retrySafe"] != false {
++			t.Fatalf("details=%+v", api.Details)
++		}
++		if strings.Contains(api.Message, "private") {
++			t.Fatal("raw provider error leaked")
++		}
++	}
++	mapped := toAPIError(&chatsvc.ProviderModeRestoreError{Kind: "private/secret", Requested: "Bearer credentials", Observed: "build"}).(*apierr.Error)
++	if mapped.Details["failureKind"] != "uncertain" || mapped.Details["requestedMode"] != "unknown" || strings.Contains(mapped.Message, "credentials") {
++		t.Fatalf("untrusted identifiers leaked: %+v", mapped)
++	}
++}
+--- a/backend/internal/httpd/controllers/conversations.go
++++ b/backend/internal/httpd/controllers/conversations.go
+@@ -1178,6 +1178,14 @@
+ // writeConversationError maps the Chat service's typed failures onto stable
+ // codes, so a client can tell a permanent answer from a retryable one.
+ func writeConversationError(w http.ResponseWriter, r *http.Request, err error) {
++	var modeFailure *chatsvc.ProviderModeRestoreError
++	if errors.As(err, &modeFailure) {
++		kind, requested, observed := modeFailure.ProviderModeRestoreDetails()
++		envelope.WriteAPIError(w, r, http.StatusConflict, "conflict", "PROVIDER_MODE_RESTORE_FAILED",
++			"Provider mode "+kind+": requested="+requested+" observed="+observed+". Preserve the session and permissions; inspect native compatibility before explicit recovery. No automatic retry.",
++			map[string]any{"failureKind": kind, "requestedMode": requested, "observedMode": observed, "retrySafe": false})
++		return
++	}
+ 	switch {
+ 	case errors.Is(err, chatsvc.ErrFileReferenceInvalid):
+ 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation", "CHAT_FILE_REFERENCE_INVALID", err.Error(), nil)
+--- /dev/null
++++ b/backend/internal/httpd/controllers/provider_mode_test.go
+@@ -0,0 +1,32 @@
++package controllers
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/envelope"
++	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
++)
++
++func TestProviderModeSetterUnconfirmedHTTPEnvelope(t *testing.T) {
++	w := httptest.NewRecorder()
++	failure := &chatsvc.ProviderModeRestoreError{Kind: "unconfirmed", Requested: "plan", Observed: "plan"}
++	writeConversationError(w, httptest.NewRequest("PATCH", "/conversation/config-options/mode", nil), fmt.Errorf("private provider output: %w", failure))
++	if w.Code != http.StatusConflict {
++		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
++	}
++	var body envelope.APIError
++	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
++		t.Fatal(err)
++	}
++	if body.Code != "PROVIDER_MODE_RESTORE_FAILED" || body.Details["failureKind"] != "unconfirmed" || body.Details["retrySafe"] != false || body.Details["requestedMode"] != "plan" {
++		t.Fatalf("lost mode classification: %+v", body)
++	}
++	if strings.Contains(w.Body.String(), "private provider") {
++		t.Fatal("raw provider error leaked")
++	}
++}
