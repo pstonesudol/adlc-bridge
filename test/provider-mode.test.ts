@@ -42,14 +42,22 @@ test('diagnostic errors do not echo arbitrary provider output',()=>{
  catch(e:any){expect(e.message).toContain('observed=unknown');expect(e.message).not.toContain('secret');}
 });
 test('only typed native mode failures cross the HTTP redaction boundary',async()=>{
- for(const kind of ['unsupported','rejected','unconfirmed','transient','uncertain']){
-  const body={error:{code:'PROVIDER_MODE_RESTORE_FAILED',message:'Bearer private provider output',details:{failureKind:kind,requestedMode:'plan',observedMode:'build',retrySafe:false}}};
+ for(const nested of [false,true])for(const kind of ['unsupported','rejected','unconfirmed','transient','uncertain']){
+  const error={error:'conflict',code:'PROVIDER_MODE_RESTORE_FAILED',message:'Bearer private provider output',details:{failureKind:kind,requestedMode:'plan',observedMode:'build',retrySafe:false}};
+  const body=nested?{error}:error;
   const api=createLocalAO(async()=>({state:'ready',executablePath:'/verified/ao',port:3001}),async()=>new Response(JSON.stringify(body),{status:409}),()=>true);
   await expect(api('sessions/owned/restore','POST',{})).rejects.toThrow(`Native provider mode ${kind}: requested=plan; observed=build`);
   expect(nativeModeFailure(body)?.message).not.toContain('Bearer');
  }
  for(const body of [null,{error:{code:'OTHER',message:'private'}},{error:{code:'PROVIDER_MODE_RESTORE_FAILED',details:{failureKind:'uncertain',retrySafe:true}}}])expect(nativeModeFailure(body)).toBeNull();
  expect(nativeModeFailure({error:{code:'PROVIDER_MODE_RESTORE_FAILED',details:{failureKind:'uncertain',requestedMode:'Bearer secret',observedMode:'build',retrySafe:false}}})?.message).not.toContain('secret');
+});
+test('native envelope support does not weaken error schema validation',()=>{
+ for(const details of [null,[],{}, {failureKind:'unknown',retrySafe:false},{failureKind:'uncertain',retrySafe:true}]){
+  const error={code:'PROVIDER_MODE_RESTORE_FAILED',details};
+  expect(nativeModeFailure(error)).toBeNull();expect(nativeModeFailure({error})).toBeNull();
+ }
+ for(const body of [null,[],"private",{error:null},{code:'OTHER',error:{code:'PROVIDER_MODE_RESTORE_FAILED',details:{failureKind:'uncertain',retrySafe:false}}}])expect(nativeModeFailure(body)).toBeNull();
 });
 for(const failure of ['unsupported','unconfirmed','rejected','transient','uncertain'] as const){
  test(`routing ${failure} remains a precise intent blocker with no retry or send`,async()=>{

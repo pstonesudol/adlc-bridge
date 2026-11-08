@@ -28,6 +28,7 @@ await run([go,'test','-race','./internal/adapters/chatdriver/acp','./internal/ad
 await run([go,'test','-race','./internal/adapters/chatdriver/opencodev2acp','-run','TestLaunchesOpenCodeACPWithTheBuiltInModeAdvertisedAtStartup|TestApprovalModesPreserveWorkflowModeAndPermissionReplies'],join(source,'backend'),nativeEnv);
 await run([go,'test','-race','./internal/service/chat','-run','TestOpenCodeMode|TestProviderMode|TestHistoricalProjectProviderRestore'],join(source,'backend'),nativeEnv);
 await run([go,'test','-race','./internal/service/session','-run','TestProviderModeFailure|TestResumeAgentMapsRelaunchFailureToConflict'],join(source,'backend'),nativeEnv);
+await run([go,'test','-race','./internal/httpd/controllers','-run','TestProviderModeSetterUnconfirmedHTTPEnvelope'],join(source,'backend'),nativeEnv);
 await run([go,'test','-race','./internal/session_manager','-run','TestRestoreTerminatedChat|TestResumeChat|TestResumeExitedChat|TestRestoreChat|TestRestoreResumesChat'],join(source,'backend'),nativeEnv);
 await run([go,'build','-buildvcs=false','-o',join(out,'ao'), './cmd/ao'],join(source,'backend'),nativeEnv);
 }catch(e){try{rmSync(out,{recursive:true,force:true});}catch{console.error('Build directory cleanup needs inspection:',out);}throw e;}

@@ -20,8 +20,9 @@ export class NativeModeFailure extends Error{
  }
 }
 export function nativeModeFailure(body:unknown):NativeModeFailure|null{
- const error=(body as any)?.error,d=error?.details;
- if(error?.code!=='PROVIDER_MODE_RESTORE_FAILED'||!d||d.retrySafe!==false||!['unsupported','rejected','unconfirmed','transient','uncertain'].includes(d.failureKind))return null;
+ if(!body||typeof body!=='object'||Array.isArray(body))return null;
+ const b=body as any,error=b.code!==undefined?b:b.error,d=error?.details;
+ if(error?.code!=='PROVIDER_MODE_RESTORE_FAILED'||!d||typeof d!=='object'||Array.isArray(d)||d.retrySafe!==false||!['unsupported','rejected','unconfirmed','transient','uncertain'].includes(d.failureKind))return null;
  return new NativeModeFailure(d.failureKind,label(d.requestedMode),label(d.observedMode));
 }
 function modeOption(catalog:unknown,id:string){
