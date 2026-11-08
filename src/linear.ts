@@ -1,4 +1,5 @@
-import {ApprovalPolicyStore} from './approval-policy';
+import {ApprovalPolicyStore,type ApprovalPolicy} from './approval-policy';
+import {randomUUID} from 'node:crypto';
 import {validScopes} from './file-scope';
 import { Store,digest } from './core';
 import {remediationPolicy,type RemediationConfig} from './remediation';
@@ -12,6 +13,7 @@ import {validateIntegrationPolicy,type IntegrationPolicy} from './integration-ca
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
   requiredChecks:string[];
+  approval?:ApprovalPolicy;
   verification?:Verification;
   pollingIntervalSeconds?:number;
   automation?:{planningEnabled?:boolean;orchestratorProject?:string;maxPlanning?:number};
@@ -63,6 +65,8 @@ export function validate(c: any): asserts c is ProjectConfig {
 export async function poll(c: ProjectConfig, store: Store, token: string) {
   validate(c);
   if (!token) throw Error('ADLC_LINEAR_TOKEN required; existing application credentials are never copied');
+  const policyStore=new ApprovalPolicyStore(store),pollToken=randomUUID(),observed=Date.now();
+  store.db.query('INSERT INTO queue_poll_heads VALUES (?,?) ON CONFLICT(project) DO UPDATE SET token=excluded.token').run(c.linear.projectId,pollToken);
   let after: string | null = null;
   let count = 0;
   const seen = new Set<string>();
@@ -127,6 +131,7 @@ export async function poll(c: ProjectConfig, store: Store, token: string) {
   // Only a fully successful snapshot can revoke eligibility. Never dispatch from
   // cached approval when the issue has left the Todo + agent-ready scope.
   store.db.transaction(() => {
+    if((store.db.query('SELECT token FROM queue_poll_heads WHERE project=?').get(c.linear.projectId) as any)?.token!==pollToken)throw Error('Linear snapshot superseded by a newer poll; no eligibility changes applied');
     for(const issue of candidates){
       const held=store.db.query("SELECT name FROM sqlite_master WHERE name='feature_issue_holds'").get()&&store.db.query('SELECT issue FROM feature_issue_holds WHERE issue=?').get(issue.id);
       if(held||dependencyBlocked.has(issue.id))continue;
@@ -134,7 +139,14 @@ export async function poll(c: ProjectConfig, store: Store, token: string) {
       store.enqueue(c.linear.projectId,issue.id,JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}));eligible.add(issue.id);
     }
     if(store.db.query("SELECT name FROM sqlite_master WHERE name='feature_intake_blocks'").get()){for(const issue of candidates){store.db.query('DELETE FROM feature_intake_blocks WHERE issue=?').run(issue.id);if(dependencyBlocked.has(issue.id))store.db.query('INSERT INTO feature_intake_blocks VALUES (?,?)').run(issue.id,dependencyBlocked.get(issue.id)!);}}
-    new ApprovalPolicyStore(store).snapshot(c.linear.projectId,eligible,Date.now(),manual);
+    policyStore.snapshot(c.linear.projectId,eligible,observed,manual);
+    store.db.query('DELETE FROM queue_observations WHERE job IN (SELECT id FROM jobs WHERE project=?)').run(c.linear.projectId);
+    for(const issue of candidates){
+      if(!eligible.has(issue.id))continue;
+      const job=store.db.query('SELECT id,spec FROM jobs WHERE project=? AND issue=?').get(c.linear.projectId,issue.id) as any;
+      const evidence={issue:issue.id,project:issue.project.id,team:issue.team.id,state:issue.state.id,labels:issue.labels.nodes,labelsComplete:true,policy:c.approval??{mode:'manual'}};
+      store.db.query('INSERT INTO queue_observations VALUES (?,?,?,?)').run(job.id,digest(job.spec),observed,JSON.stringify(evidence));
+    }
     const jobs=store.db.query('SELECT id,issue,state FROM jobs WHERE project=?').all(c.linear.projectId) as any[];
     for(const job of jobs) {
       if(!eligible.has(job.issue) && !['blocked','done'].includes(job.state)) {

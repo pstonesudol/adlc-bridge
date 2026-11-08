@@ -57,7 +57,7 @@ export class LinearApprovals{
   let n=this.s.db.query('SELECT * FROM plan_approval_notices WHERE job=? AND binding=?').get(job,binding) as any;
   if(!n){
    const token=randomUUID(),commentId=randomUUID();
-   const body=[`## ADLC: awaiting your plan approval — ${issue.identifier}`,`Plan version: \`${j.plan_hash}\``,j.plan,
+   const body=[`## ADLC: awaiting your plan approval — ${issue.identifier}`,new ApprovalPolicyStore(this.s).promptContext(job,c.approval),`Plan version: \`${j.plan_hash}\``,j.plan,
     `### Approve this exact plan`,`Review the plan above. To authorize implementation, verification, feature-branch commit/push, and PR creation within \`${c.planApproval!.scope.join(', ')}\`, post a **new comment** containing only:`,
      ['```text',`Approve ADLC plan ${token}`,'```'].join('\n'),`Copy only the command above into a new comment on this issue or a reply in this notice's thread. Plain text, one inline-code wrapper, or one fenced block (no tag or text) are accepted. Outer spaces, tabs, newlines and non-breaking spaces are ignored; internal command spaces and token must remain exact. CRLF newlines are supported. Do not add prose, quotes or edit an existing comment; submit a new reply instead.`, `Only configured human approvers can release this gate. The reply applies only to this plan version. PR merges and deployment are not authorized. Requirements or plan changes invalidate it. Do not send the approval to the coding worker; reply on this Linear ticket.`].join('\n\n');
    this.s.db.query('INSERT OR IGNORE INTO plan_approval_notices(job,binding,plan_hash,comment_id,token,body,state) VALUES (?,?,?,?,?,?,?)').run(job,binding,j.plan_hash,commentId,token,body,'reserved');

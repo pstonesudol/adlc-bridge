@@ -60,6 +60,7 @@ test('per-ticket label overrides automatic policy; explicit human approval proce
  w.approve(id,hash,'test human',['**'],'supervised-host',featureGit);
  await w.tick(config);expect(messages.length).toBe(1);expect(policyStore.requiresManual(id)).toBe(true);
  expect(messages[0].prompt).toContain('Human test human approved');expect(policyStore.get(id)).toBeNull();
+ expect(policyStore.context(id).authorization.gate).toContain('Recorded human approval covers the current plan');
  await w.tick(config);expect(messages.length).toBe(1);
  }finally{s.close();}
 });
