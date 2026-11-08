@@ -1,0 +1,71 @@
+name: Native mode compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-mode-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  native-mode:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          # Attribute native evidence to the exact PR head, not a merge ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.27.1
+          cache: false
+      - name: Verify native restore contracts and build
+        shell: bash
+        env:
+          BUILD_DIR: ${{ runner.temp }}/dev92-native
+          EVIDENCE: ${{ runner.temp }}/dev92-native-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          trap 'status=$?; printf "verification_exit=%s\n" "$status" >> "$EVIDENCE/evidence.txt"; exit "$status"' EXIT
+          export ADLC_GO="$(command -v go)"
+          export PATH="$(dirname "$ADLC_GO"):$PATH"
+          export GOCACHE="$BUILD_DIR/go-cache"
+          export GOMODCACHE="$BUILD_DIR/go-mod"
+          {
+            printf 'source_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            date -u '+started_utc=%Y-%m-%dT%H:%M:%SZ'
+            "$ADLC_GO" version
+            bun --version
+            shasum -a 256 patches/orchestrator-provider-mode.patch scripts/build-orchestrator.ts
+          } | tee "$EVIDENCE/evidence.txt"
+          bun scripts/build-orchestrator.ts "$BUILD_DIR" 2>&1 | tee "$EVIDENCE/native-build.log"
+          (
+            cd "$BUILD_DIR/agent-orchestrator-403a8c8385ed43bbf9e9289e3f3bbaa6517dc437/backend"
+            env -i PATH="$PATH" HOME="$BUILD_DIR/test-home" AO_DATA_DIR="$BUILD_DIR/test-ao" \
+              GOTOOLCHAIN=local GOCACHE="$BUILD_DIR/go-cache" GOMODCACHE="$BUILD_DIR/go-mod" \
+              "$ADLC_GO" test -race -v -count=1 \
+              ./internal/adapters/chatdriver/acp ./internal/adapters/chatdriver/persistenthost \
+              ./internal/service/chat ./internal/httpd/controllers \
+              -run 'TestModeConfirmationRequiresProviderEvidence|TestModeSetterTimeoutCannotUseCachedCatalog|TestProviderModeSetterFailureCannotUseCachedCatalog|TestProviderModeRestoreContract|TestProviderModeSetterUnconfirmedHTTPEnvelope|TestModeModelAndEffortChangesRequireFreshEvidence'
+          ) 2>&1 | tee "$EVIDENCE/native-fixtures.log"
+          shasum -a 256 "$BUILD_DIR/ao" | tee -a "$EVIDENCE/evidence.txt"
+      - name: Upload attributable native verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-mode-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/dev92-native-evidence/
+          if-no-files-found: error
+          retention-days: 30

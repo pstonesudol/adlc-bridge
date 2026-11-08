@@ -7,6 +7,7 @@ import {disableNativeFeedback} from './ao-policy';
 import type {WorkflowTransport} from './workflow';
 import {withTurnSubmission} from './turn-submission';
 import {PreSendFailure} from './pre-send';
+import {nativeModeFailure} from './provider-mode';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {resolve,isAbsolute,basename,dirname} from 'node:path';
@@ -27,7 +28,7 @@ export function createLocalAO(status=jsonCommand,send=fetch,trust=trustedDaemon)
  }catch{throw new PreSendFailure('Orchestrator request not sent: readiness or request preparation failed');}
  try{
  const r=await send(url,options);
- const b:any=await r.json();if(!r.ok)throw Error(`Orchestrator HTTP ${r.status}`);return b;
+ const b:any=await r.json();if(!r.ok)throw nativeModeFailure(b)??Error(`Orchestrator HTTP ${r.status}`);return b;
  }catch(e){if(e instanceof PreSendFailure)throw Error('Orchestrator delivery outcome uncertain',{cause:e});throw e;}
 };}
 export const localAO=createLocalAO();
