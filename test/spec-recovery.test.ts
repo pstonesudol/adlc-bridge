@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,rmSync,writeFileSync,mkdirSync,symlinkSync,unlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,writeFileSync,readFileSync,mkdirSync,symlinkSync,unlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
@@ -12,9 +12,113 @@ import {createWorkflowTransport} from '../src/workflow-transport';
 import {ReviewLoop} from '../src/review-loop';
 import {worktreeReservation} from '../src/worktree-reservation';
 import {turnBarrier} from '../src/turn-submission';
+import {RemediationReceipts,receiptStatus} from '../src/remediation-receipts';
+import {ReceiptReconciliation} from '../src/receipt-reconciliation';
+import {Lifecycle} from '../src/lifecycle';
+import {jobViews,humanJobs} from '../src/operator-cli';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
+async function receiptFixture(legacy=false,changed=true,database=':memory:'){
+ const f=await fixture(database),l=new Lifecycle(f.s),ledger=new ReceiptReconciliation(f.s);
+ const attempt=l.reserveRemediation(f.job,'a'.repeat(40),'[]') as any;
+ f.s.db.query("UPDATE remediation SET state='delivery_uncertain' WHERE job=?").run(f.job);
+ const b={job:f.job,plan:f.hash,spec:digest(f.s.get(f.job).spec),session:'owner',client:`adlc-fix-${f.job.slice(0,12)}-${attempt.attempt}`,attempt:`remediation:${attempt.attempt}`};
+ // Historical implementation has actually completed; its accepted ledger row
+ // may not yet have been refreshed by a workflow poll.
+ if(!legacy)ledger.reserve(b);
+ f.e.transcript.entries.push({clientMessageId:b.client,turnId:'fix-turn',sequence:3,text:'not persisted: secret transcript'});
+ f.e.transcript.turns.push({id:'fix-turn',state:'completed'});
+ if(changed)f.edit('Revised requirements');
+ const receipts=new RemediationReceipts(f.s,f.w,async operation=>operation());
+ return {...f,b,ledger,receipts};
+}
+for(const legacy of [false,true])test(`DEV-69 ${legacy?'legacy':'reserved'} completed receipt reconciles changed requirements, preserves history and requires revised approval`,async()=>{
+ const f=await receiptFixture(legacy);try{
+  await expect(f.recovery.preview(f.job,config)).rejects.toThrow('Remediation delivery requires reconciliation');
+  const before={job:f.s.get(f.job),run:f.s.db.query('SELECT * FROM runs').get(),dispatch:f.w.implementation(f.job),budget:f.s.db.query('SELECT * FROM remediation_budget').get(),events:f.s.db.query('SELECT * FROM events').all()};
+  const preview=await f.receipts.preview(f.job,1,config);
+  expect(preview).toMatchObject({action:'reconcile_completed_remediation',receipt:{state:'completed',turn:'fix-turn'},source:{historical:true}});
+  expect(f.ledger.get(f.b.client)?.state??null).toBe(legacy?null:'reserved');
+  await expect(f.receipts.reconcile(f.job,1,config,'0'.repeat(64))).rejects.toThrow('Preview changed');
+  // A fresh inventory can confirm without persisting its transcript.
+  expect(await f.receipts.reconcile(f.job,1,config,preview.confirmation!)).toMatchObject({state:'completed',binding:f.b});
+  expect(f.sends).toHaveLength(1);expect(f.s.get(f.job)).toEqual(before.job);
+  expect(f.s.db.query('SELECT * FROM runs').get()).toEqual(before.run);expect(f.w.implementation(f.job)).toEqual(before.dispatch);
+  expect(f.s.db.query('SELECT * FROM remediation_budget').get()).toEqual(before.budget);
+  expect(f.s.db.query('SELECT * FROM events ORDER BY seq LIMIT ?').all(before.events.length)).toEqual(before.events);
+  const audit=f.s.db.query("SELECT detail FROM events WHERE kind='remediation_receipt_confirmed'").get() as any;
+  expect(audit.detail).not.toContain('secret transcript');expect(JSON.parse(audit.detail)).toMatchObject({legacy,historical:true,binding:f.b});
+  expect(f.ledger.get(f.b.client)).toMatchObject({...f.b,state:'completed',turn:'fix-turn'});
+  await expect(f.receipts.reconcile(f.job,1,config,preview.confirmation!)).rejects.toThrow('exact uncertain remediation');
+  expect(f.s.get(f.job).approved_hash).toBeNull();
+  const revised=await f.recovery.preview(f.job,config);expect(revised.action).toBe('request_replanning');
+  await f.recovery.reconcile(f.job,config,revised.confirmation);f.complete();await f.recovery.capture(f.job,config);
+  expect(f.s.get(f.job)).toMatchObject({state:'awaiting_approval',approved_hash:null});
+  expect(()=>f.w.approve(f.job,f.hash,'human',['src/**'],'supervised-host',featureGit)).toThrow();
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  expect(f.w.implementation(f.job).session_id).toBe('owner');expect(f.sends).toHaveLength(2);
+ }finally{f.s.close();}
+});
+for(const invalid of ['missing','stale','incomplete','future','duplicate','session','project','branch','terminated','client','plan','spec','attempt','out-of-order','terminal','turn','active-turn','competing-attempt','competing-delivery','revision','history'])test(`DEV-84 receipt confirmation refuses ${invalid} with no reconciliation mutation`,async()=>{
+ const f=await receiptFixture();try{
+  const preview=await f.receipts.preview(f.job,1,config);
+  if(invalid==='missing')f.e.transcript.entries.pop();
+  if(invalid==='stale')f.e.receiptObservation.observed=Date.now()-120001;
+  if(invalid==='incomplete')f.e.receiptObservation.complete=false;
+  if(invalid==='future')f.e.receiptObservation.observed=Date.now()+10000;
+  if(invalid==='duplicate')f.e.transcript.entries.push({...f.e.transcript.entries.at(-1)});
+  if(invalid==='session')f.e.session.id='other';
+  if(invalid==='project')f.e.session.projectId='other';
+  if(invalid==='branch')f.e.session.branch='other';
+  if(invalid==='terminated')f.e.session.isTerminated=true;
+  if(['client','plan','spec','attempt'].includes(invalid))f.s.db.query(`UPDATE delivery_receipts SET ${invalid}='other' WHERE client=?`).run(f.b.client);
+  if(invalid==='out-of-order')f.s.db.query('UPDATE delivery_receipts SET observed=? WHERE client=?').run(Date.now()+1,f.b.client);
+  if(invalid==='terminal')f.s.db.query("UPDATE delivery_receipts SET state='failed' WHERE client=?").run(f.b.client);
+  if(invalid==='turn')f.s.db.query("UPDATE delivery_receipts SET turn='different' WHERE client=?").run(f.b.client);
+  if(invalid==='active-turn')f.e.transcript.turns.push({id:'competing',state:'queued'});
+  if(invalid==='competing-attempt')f.s.db.query("INSERT INTO remediation VALUES (?, 'other', 'other', 2, 'reserved')").run(f.job);
+  if(invalid==='competing-delivery')f.ledger.reserve({...f.b,client:'competing',attempt:'continuation:2'});
+  if(invalid==='revision')f.edit('Changed after preview');
+  if(invalid==='history')f.s.db.query("UPDATE spec_revisions SET old_hash='unproved' WHERE job=?").run(f.job);
+  const snapshot=()=>({job:f.s.get(f.job),receipts:f.s.db.query('SELECT * FROM delivery_receipts').all(),remediation:f.s.db.query('SELECT * FROM remediation').all(),events:f.s.db.query('SELECT * FROM events').all()});
+  const before=snapshot();await expect(f.receipts.reconcile(f.job,1,config,preview.confirmation!)).rejects.toThrow();expect(snapshot()).toEqual(before);expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+test('DEV-84 legacy binding without recorded invalidation fails closed; persisted status never creates a ledger',async()=>{
+ const f=await receiptFixture(true);try{
+  expect(receiptStatus(f.s,f.job)).toEqual(expect.arrayContaining([expect.objectContaining({client:f.b.client,legacy:true,code:'legacy_binding_required',ageMs:null,nextAction:`adlc receipt-reconcile ${f.job} CONFIG 1`})]));
+  f.s.db.query('DELETE FROM spec_revision_evidence WHERE job=?').run(f.job);
+  await expect(f.receipts.preview(f.job,1,config)).rejects.toThrow('historical dispatch provenance missing');
+  expect(f.ledger.get(f.b.client)).toBeNull();
+ }finally{f.s.close();}
+});
+for(const state of ['accepted','queued','running','failed','cancelled'])test(`DEV-84 operator ${state} receipt has no completion confirmation`,async()=>{
+ const f=await receiptFixture(false,false);try{
+  if(state==='accepted'){delete f.e.transcript.entries.at(-1).turnId;f.e.transcript.turns.pop();}
+  else f.e.transcript.turns.at(-1).state=state;
+  const preview=await f.receipts.preview(f.job,1,config);expect(preview.confirmation).toBeNull();expect(preview.receipt.state).toBe(state);
+  await expect(f.receipts.reconcile(f.job,1,config,'0'.repeat(64))).rejects.toThrow('Preview changed');expect(f.ledger.get(f.b.client).state).toBe('reserved');expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+test('DEV-84 reopened read-only preview/status are byte-unchanged and concurrent confirmations settle once',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-receipt-preview-')),path=join(dir,'state.db'),f=await receiptFixture(true,true,path);
+ try{
+  f.s.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  const before=readFileSync(path),reader=Store.readonly(path);
+  let preview;
+  try{
+   const recovery=new RemediationReceipts(reader,new Workflow(reader,f.w.t,undefined,true),async op=>op());
+   preview=await recovery.preview(f.job,1,config);
+   const jobs=jobViews(path);expect(jobs[0].receipts).toEqual(expect.arrayContaining([expect.objectContaining({legacy:true,persistedOnly:true})]));
+   expect(humanJobs(jobs)).toContain(`adlc receipt-reconcile ${f.job} CONFIG 1`);expect(humanJobs(jobs)).toContain('age unknown');
+  }finally{reader.close();}
+  expect(readFileSync(path)).toEqual(before);expect(f.ledger.get(f.b.client)).toBeNull();
+  const results=await Promise.allSettled([f.receipts.reconcile(f.job,1,config,preview!.confirmation!),f.receipts.reconcile(f.job,1,config,preview!.confirmation!)]);
+  expect(results.filter(r=>r.status==='fulfilled')).toHaveLength(1);
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='remediation_receipt_confirmed'").get()).toEqual({n:1});expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
 async function fixture(database=':memory:'){
  const s=new Store(database),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
  let e:any,sends:any[]=[];

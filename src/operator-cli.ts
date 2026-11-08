@@ -1,6 +1,7 @@
 import {existsSync} from 'node:fs';
 import {Store} from './core';
 import {actionStatus} from './action-watchdog';
+import {receiptStatus} from './remediation-receipts';
 export class OperatorError extends Error {
  constructor(message:string,public code=2,public candidates:unknown[]=[]){super(message);}
 }
@@ -46,14 +47,16 @@ export function jobViews(path:string,project?:string,reference?:string){
    const state=j.state==='done'?'complete':j.state==='blocked'?'blocked':dependency||currentOutcome?.outcome==='blocked_dependency'?'dependency_wait':currentOutcome&&['needs_input','failed','uncertain','needs_reconciliation'].includes(currentOutcome.outcome)?'blocked':j.state==='awaiting_approval'?'approval_wait':j.state==='awaiting_plan'&&!planning?'awaiting_plan':'working';
    let ticket=null;try{ticket=JSON.parse(j.spec).identifier??null;}catch{}
     let readError=null;try{readError=JSON.parse(observation?.reason??'null');}catch{}
-    const automatic=!readError||['throttled','timeout','network','server'].includes(readError.classification),activeObservation=observation&&state==='working'&&j.state==='approved'&&j.approved_hash===j.plan_hash;
+     const automatic=!readError||['throttled','timeout','network','server'].includes(readError.classification),activeObservation=observation&&state==='working'&&j.state==='approved'&&j.approved_hash===j.plan_hash;
+     const receipts=receiptStatus(s,j.id);
     return {job:j.id,project:j.project,issue:j.issue,ticket,state:activeObservation?(automatic?'observation_wait':'blocked'):state,orchestrationState:j.state,observation:observation?{failures:observation.failures,nextRetry:activeObservation&&automatic?observation.next_read:null,error:readError,evidenceAgeMs:readError?.timestamp?Math.max(0,Date.now()-readError.timestamp):null}:null,
      reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
      nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
-     watchdog:actionStatus(s,j.id),
+      watchdog:actionStatus(s,j.id),
+      receipts,
      worker:{activity:'unknown',session:implementation?.session_id??planning?.session_id??null,dispatchState:implementation?.state??planning?.state??null,outcome:currentOutcome?.outcome??null},
     evidence:{freshness:'unknown',persistedUpdatedAt:j.updated,note:'Persisted state only; no live worker or provider refresh performed.'}};
   });
  }finally{s.close();}
 }
-export function humanJobs(jobs:any[]){return jobs.length?jobs.map(j=>`${j.ticket??j.issue} [${j.project}] ${j.job}\n  ${j.state} (orchestration: ${j.orchestrationState}; worker: ${j.worker.activity})\n  Reason: ${j.reason}\n  Evidence: ${j.evidence.freshness}; persisted ${j.evidence.persistedUpdatedAt}\n  Next: ${j.nextAction}${j.watchdog?`\n  Watchdog: ${j.watchdog.nextAction}; due ${j.watchdog.dueAt===null?'none':new Date(j.watchdog.dueAt).toISOString()}; observations ${j.watchdog.attempts}/${j.watchdog.maxAttempts}; ${j.watchdog.reason}${j.watchdog.liveness?`\n  Worker liveness: ${j.watchdog.liveness.classification}; recovery attempts ${j.watchdog.liveness.recoveryAttempts}; persisted-only`:''}`:''}`).join('\n'):'No jobs found.';}
+export function humanJobs(jobs:any[]){return jobs.length?jobs.map(j=>`${j.ticket??j.issue} [${j.project}] ${j.job}\n  ${j.state} (orchestration: ${j.orchestrationState}; worker: ${j.worker.activity})\n  Reason: ${j.reason}\n  Evidence: ${j.evidence.freshness}; persisted ${j.evidence.persistedUpdatedAt}\n  Next: ${j.nextAction}${(j.receipts??[]).filter((r:any)=>!['completed','failed','cancelled'].includes(r.state)).map((r:any)=>`\n  Receipt: ${r.attempt}; ${r.code}; age ${r.ageMs===null?'unknown':`${r.ageMs}ms`}; persisted-only\n  Next: ${r.nextAction}`).join('')}${j.watchdog?`\n  Watchdog: ${j.watchdog.nextAction}; due ${j.watchdog.dueAt===null?'none':new Date(j.watchdog.dueAt).toISOString()}; observations ${j.watchdog.attempts}/${j.watchdog.maxAttempts}; ${j.watchdog.reason}${j.watchdog.liveness?`\n  Worker liveness: ${j.watchdog.liveness.classification}; recovery attempts ${j.watchdog.liveness.recoveryAttempts}; persisted-only`:''}`:''}`).join('\n'):'No jobs found.';}

@@ -332,7 +332,7 @@ export class Workflow{
   const clientId=cont?cont.client_id:d.client_id;
   const ledger=new ReceiptReconciliation(this.s),binding=ledger.get(clientId);
   if(binding){
-   const delivery=ledger.inspect(binding,e,persist);
+    const delivery=ledger.inspect({job,plan:d.plan_hash,spec:digest(observedJob.spec),session:d.session_id,client:clientId,attempt:cont?`continuation:${cont.id}`:'implementation:1'},e,persist);
    if(delivery.state!=='completed'&&!['failed','cancelled'].includes(delivery.state))return {state:['accepted','queued','running'].includes(delivery.state)?'implementation_running':'needs_reconciliation',outcome:delivery.state==='unknown'?'uncertain':'running',reason:delivery.reason,delivery,session:d.session_id,questions:[],dependencies:[],source:'receipt',confidence:'high'};
   }
   let entry=e.transcript?.entries?.find((x:any)=>x.clientMessageId===clientId);

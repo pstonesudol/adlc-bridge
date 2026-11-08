@@ -3,7 +3,9 @@ import {readFailure,ReadValidationError} from '../src/provider-read';
 import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
 import {ObservationLeaseLost} from '../src/observation-fence';
 import {decision,ReviewLoop} from '../src/review-loop';
-import {Store,reviewGate} from '../src/core';
+import {Store,reviewGate,digest} from '../src/core';
+import {ReceiptReconciliation} from '../src/receipt-reconciliation';
+import {ConflictRecovery} from '../src/conflict-recovery';
 import {requiredCheckState} from '../src/github';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
@@ -83,6 +85,29 @@ test('resolved passing CI duplicates reach human review without requests or reme
   expect(f.reviews()).toBe(0);expect(f.sends()).toBe(0);
   expect(f.s.db.query('SELECT * FROM full_review_requests').all()).toEqual([]);
   expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+for(const conflict of [false,true])for(const state of ['unknown','running'])test(`${conflict?'conflict recovery':'ordinary remediation'} ${state} receipt points to its supported operator interface`,async()=>{
+ const f=templateFixture();try{
+  const j=f.s.get(f.id),client=conflict?'conflict-message':`adlc-fix-${f.id.slice(0,12)}-1`;
+  f.s.db.query("INSERT INTO remediation VALUES (?,?,?,1,'delivery_uncertain')").run(f.id,f.head,'finding');
+  if(conflict){
+   new ConflictRecovery(f.s).install();
+   // A settled recovery may still retain a delivery requiring reconciliation.
+   f.s.db.query('INSERT INTO conflict_recoveries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run('recovery',f.id,j.plan_hash,'/worktree','session','owner/repo',1,f.session.session.branch,'main',f.head,'b'.repeat(40),'{}','completed',client,1,'{}',null,Date.now());
+  }
+  const ledger=new ReceiptReconciliation(f.s);
+  ledger.reserve({job:f.id,plan:j.plan_hash,spec:digest(j.spec),session:'session',client,attempt:'remediation:1'});
+  if(state==='running'){
+   f.session.transcript.entries=[{clientMessageId:client,turnId:'turn'}];
+   f.session.transcript.turns=[{id:'turn',state:'running'}];
+  }
+  const result=await f.loop.tick(f.id);
+  expect(result).toMatchObject({state:state==='unknown'?'needs_reconciliation':'waiting_for_worker',send:false,delivery:{state,code:state==='unknown'?'receipt_absent':'turn_running'}});
+  expect(result.reason).toContain(conflict?`adlc recovery-preview ${f.id} CONFIG`:`adlc receipt-reconcile ${f.id} CONFIG 1`);
+  expect(result.reason).not.toContain(conflict?'receipt-reconcile':'recovery-preview');
+  expect(f.s.db.query('SELECT state FROM remediation WHERE job=?').get(f.id)).toEqual({state:'delivery_uncertain'});
+  expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
  }finally{f.s.close();}
 });
 // Inject an attested collector response for success-path tests. The production

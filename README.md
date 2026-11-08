@@ -2078,6 +2078,15 @@ cancelled. Missing/failed/uncertain receipts require controlled reconciliation,
 not a resend or database repair. Existing PR/session/worktree identity, attempts,
 reservations and historical evidence remain intact.
 
+For a `delivery_uncertain` remediation whose original turn actually completed
+(DEV-69), preview `adlc receipt-reconcile JOB CONFIG ATTEMPT`, then repeat with
+`--confirm HASH`. This receipt-only operation requires fresh complete original
+worker evidence and exact historical plan/spec/attempt/client identity. Legacy
+rows require corroborating retained history; mismatches or competing attempts
+remain blocked. It never resends or restores stale approval. Afterwards use the
+normal `spec-reconcile` path below. See [receipt reconciliation](docs/deterministic-watchdog.md#original-remediation-receipts-dev-84--dev-69)
+for refusals, audit guarantees and persisted-only receipt status.
+
 Use `adlc spec-reconcile JOB CONFIG` for a read-only preview. It refreshes Linear,
 owner, worktree and attached PR evidence. `--confirm HASH` authorizes **only a
 planning turn in the existing owner** when that exact evidence remains valid.
