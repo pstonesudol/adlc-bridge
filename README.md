@@ -1072,13 +1072,39 @@ for CI, Waiting for CodeRabbit, Addressing feedback, Blocked, or Ready for your
 review. These are bridge statuses; the installed Orchestrator board still uses
 its built-in labels.
 
-The bridge requests `@coderabbitai full review` for description-only fixes and
-stale review clearance after required CI is clear. An incremental `review` may
-be declined for an already-reviewed commit. Full review requests are durably
-limited to one per job, commit, and description hash, including uncertain delivery
-outcomes. No empty commits, approval commands, check overrides, or merges are used.
-A full review still has to return actual current-commit clearance; requesting it
-is not approval. If it fails or never responds, coordination blocks for inspection.
+The bridge requests `@coderabbitai review` (regular/incremental review) after a
+completed remediation batch and clear required CI, not after each individual fix.
+Normal scheduling retains the five-minute stable-head grace period. With automatic
+incremental review enabled it waits for the provider instead of posting a command.
+`reviews.auto_review.auto_incremental_review: false` disables triggering on every
+push, not explicit regular-review commands. Repository exclusions, opt-outs and
+intentional pauses remain respected; the bridge does not resume reviews itself.
+
+CodeRabbit's [command guide](https://docs.coderabbit.ai/guides/commands) and
+[configuration reference](https://docs.coderabbit.ai/reference/configuration)
+(verified 2026-11-07) distinguish incremental `review` (changes since the last
+review) from `full review` (all PR changes from scratch). Whole-PR reassessment is
+reserved for an explicit operator comment `@coderabbitai full review`; there is
+no automatic full-review fallback, including for description-only remediation.
+A regular review may skip an already-reviewed SHA or description-only edit. If
+it produces no fresh body/custom-check evidence, coordination waits then blocks
+for inspection rather than weakening freshness requirements or escalating silently.
+
+Requests share a durable repository/PR/head budget across jobs, modes, restarts
+and concurrent polls. Accepted or uncertain legacy full requests still consume
+that budget; changing commands does not replay them. Only confirmed throttling
+allows bounded retries after cooldown (at most three attempts). Mode is recorded
+per request/attempt, not added to its deduplication key. The historical
+`full_review_requests` table remains a compatibility/body-obligation ledger, not
+a selector of full-review mode. Old shared receipts migrate as `full`; new sends
+are `regular`. Markers remain stable and uncertain replies reconcile only against
+the exact recorded command, marker and send time, never trigger a resend.
+
+`adlc review-status`/`status` expose `reviewRequest.mode`; review-state reasons
+carried into CLI/Linear notices name the requested mode and limitations. Neither
+a successful command nor a green check is approval: current-head approval and
+fresh body/custom-check clearance remain required. No empty commits, approval
+commands, check overrides, or merges are used.
 
 #### Carried-forward CodeRabbit threads
 
