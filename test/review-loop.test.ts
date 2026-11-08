@@ -29,6 +29,17 @@ test('missing reviewer approvals stay in CI/review/rate-limit waits; hard obliga
  expect(decision(e,['src/**'],30*60*1000).state).toBe('blocked');
  for(const reason of ['Reviewer human: changes requested (42)','Reviewer human: fresh identity/membership evidence required before clearance'])expect(decision({...e,reviewerEvidence:{blockers:[missing,reason],pending:[]}},['src/**'],0)).toMatchObject({state:'blocked',reason});
 });
+for(const scenario of ['matching-stale','current','mismatched-id','mismatched-head','missing-status','multiple-changes'])test(`pending CI only waits for an authenticated matching stale CodeRabbit change request: ${scenario}`,()=>{
+ const head='a'.repeat(40),old='b'.repeat(40),blocker='Reviewer coderabbit: changes requested (42)';
+ const e:any={...pending(),head,reasons:[blocker],pendingChecks:['CI'],reviewSchedule:{evidence:{review:{id:42,state:'CHANGES_REQUESTED',commit:old,stale:true}}},reviewerEvidence:{blockers:[blocker],pending:[],approvals:[{reviewer:'coderabbit',changesRequested:[{id:42,head:old}]}]}};
+ if(scenario==='current'){e.reviewSchedule.evidence.review.stale=false;e.reviewSchedule.evidence.review.commit=head;e.reviewerEvidence.approvals[0].changesRequested[0].head=head;}
+ if(scenario==='mismatched-id')e.reviewerEvidence.approvals[0].changesRequested[0].id=43;
+ if(scenario==='mismatched-head')e.reviewerEvidence.approvals[0].changesRequested[0].head='c'.repeat(40);
+ if(scenario==='missing-status')e.reviewerEvidence.approvals=[];
+ if(scenario==='multiple-changes')e.reviewerEvidence.approvals[0].changesRequested.push({id:43,head:old});
+ expect(decision(e,['src/**'],0)).toMatchObject({state:scenario==='matching-stale'?'waiting_for_ci':'blocked',send:false});
+ expect(decision(e,['src/**'],30*60*1000).state).toBe('blocked');
+});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
  expect(decision(pending(),['a'],30*60*1000)).toMatchObject({state:'blocked',send:false});
@@ -238,12 +249,22 @@ for(const current of [false,true])test(`CodeRabbit ${current?'current':'stale'} 
  const f=pr30LoopFixture();try{
   const blockers=['Reviewer coderabbit: explicit current-head approval required','Reviewer coderabbit: changes requested (5810360982)'];
   f.e.reasons.push(...blockers);
-  f.e.reviewerEvidence={blockers,pending:[]};
-  if(current){f.e.reviewSchedule.evidence.review.stale=false;f.e.reviewSchedule.evidence.review.commit=f.head;f.e.reviewSchedule.evidence.recoverable=false;}
+  f.e.reviewerEvidence={blockers,pending:[],approvals:[{reviewer:'coderabbit',changesRequested:[{id:5810360982,head:f.e.reviewSchedule.evidence.review.commit}]}]};
+  if(current){f.e.reviewSchedule.evidence.review.stale=false;f.e.reviewSchedule.evidence.review.commit=f.head;f.e.reviewSchedule.evidence.recoverable=false;f.e.reviewerEvidence.approvals[0].changesRequested[0].head=f.head;}
   const result=await f.loop.tick(f.id);
   if(current){expect(result).toMatchObject({state:'blocked',send:false});expect(f.loop.get(f.id).state).toBe('blocked');}
   else expect(result).toMatchObject({state:'waiting_for_coderabbit',send:false});
   expect(f.reviews()).toBe(current?0:1);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+test('an unrepresentable provider reset keeps the request reserved for operator inspection without automatic retry',async()=>{
+ const f=pr30LoopFixture();try{
+  let publications=0;const spawn:any=()=>{publications++;return {stdout:new Response('HTTP/2 429\r\nRetry-After: 9000000000000\r\n\r\n{"message":"rate limit exceeded"}').body,stderr:new Response('').body,exited:Promise.resolve(1)};};
+  f.loop.postReview=async(repo,pr,marker)=>postCodeRabbitReview(repo,pr,marker,spawn);
+  await expect(f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).rejects.toThrow('operator inspection required');
+  expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
+  expect(f.loop.requests.get('owner/repo',1,f.head)).toMatchObject({state:'delivery_uncertain',attempts:1});
+  expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).toBe(false);expect(publications).toBe(1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 for(const failure of [false,true])test(`full review mode is accurate in request audit and ${failure?'uncertain':'accepted'} reasons`,async()=>{

@@ -175,6 +175,7 @@ export class ReviewRequests{
 }
 
 export class ReviewRateLimit extends Error{constructor(public retryAt?:number){super('CodeRabbit review request rejected by rate limit');}}
+export class ReviewResetUnrepresentable extends Error{constructor(){super('CodeRabbit provider reset cannot be safely represented; operator inspection required before retry');}}
 export const CONFIG_QUERY='query($owner:String!,$name:String!,$hy:String!,$hm:String!,$by:String!,$bm:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} hy:object(expression:$hy){... on Blob{oid text}} hm:object(expression:$hm){... on Blob{oid text}} by:object(expression:$by){... on Blob{oid text}} bm:object(expression:$bm){... on Blob{oid text}}}}';
 
 export async function collectReviewSchedule(repo:string,pr:any,base:string,comments:any[],reviews:any[],checks:any[],read:(args:string[])=>Promise<any>):Promise<ReviewSchedule>{

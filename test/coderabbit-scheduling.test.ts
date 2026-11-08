@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
 import {ReviewLoop,postFullReview,postCodeRabbitReview} from '../src/review-loop';
-import {deriveReviewSchedule,parseReviewConfig,ReviewRequests,collectReviewSchedule,ReviewRateLimit,reviewEscalationReason} from '../src/coderabbit-scheduling';
+import {deriveReviewSchedule,parseReviewConfig,ReviewRequests,collectReviewSchedule,ReviewRateLimit,ReviewResetUnrepresentable,reviewEscalationReason} from '../src/coderabbit-scheduling';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -23,6 +23,24 @@ test('only protocol-confirmed throttling permits a new request attempt',async()=
   expect(failure instanceof ReviewRateLimit).toBe(status!==500);
   if(status===500)expect(failure.message).toContain('uncertain');
  }
+});
+for(const header of ['retry-after','quota-reset'])test(`publication-to-ledger preserves a 48-hour ${header} embargo`,async()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);let now=Date.now();const job=s.enqueue('p','i','spec'),schedule={head:'head',signature:'config',blocker:null,incremental:false},requests=new ReviewRequests(s,()=>now);
+ const reset=Math.ceil((now+48*60*60*1000)/1000)*1000,headers=header==='retry-after'?'Retry-After: 172800':`x-ratelimit-remaining: 0\r\nx-ratelimit-reset: ${reset/1000}`;
+ const spawn:any=()=>({stdout:new Response(`HTTP/2 429\r\n${headers}\r\n\r\n{"message":"rate limit exceeded"}`).body,stderr:new Response('').body,exited:Promise.resolve(1)});
+ try{
+  expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
+  let error:any;try{await postCodeRabbitReview('o/r',1,'marker',spawn);}catch(e){error=e;}
+  expect(error).toBeInstanceOf(ReviewRateLimit);expect(error.retryAt).toBeGreaterThanOrEqual(now+48*60*60*1000);
+  requests.settle('o/r',1,'head','rate_limited','verified HTTP 429',error.retryAt);
+  now+=24*60*60*1000+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'new-head'})).toBe(false);
+  expect(requests.get('o/r',1,'head').attempts).toBe(1);
+  now=error.retryAt+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
+ }finally{s.close();}
+});
+test('publication rejects unrepresentable rate-limit hints instead of supplying a sendable retry',async()=>{
+ const spawn:any=()=>({stdout:new Response('HTTP/2 429\r\nRetry-After: 9000000000000\r\n\r\n{"message":"rate limit exceeded"}').body,stderr:new Response('').body,exited:Promise.resolve(1)});
+ await expect(postCodeRabbitReview('o/r',1,'marker',spawn)).rejects.toBeInstanceOf(ReviewResetUnrepresentable);
 });
 const HEAD='371f36b47194ee754aaa354bd64e1942625ac6f8',STALE='82855a5877ac91d9b7b87f95d3228112f562099e';
 const configured=(pause:number,incremental:boolean,drafts=false)=>`reviews:\n  auto_review:\n    enabled: true\n    auto_incremental_review: ${incremental}\n    auto_pause_after_reviewed_commits: ${pause}\n    drafts: ${drafts}\n  path_filters: ['!dist/**']\n`;

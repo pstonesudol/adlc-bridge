@@ -11,7 +11,7 @@ import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
 import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
-import {ReviewRequests,ReviewRateLimit,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,reviewRequestBody,reviewRequestMarker,type ReviewSchedule,type ReviewMode} from './coderabbit-scheduling';
+import {ReviewRequests,ReviewRateLimit,ReviewResetUnrepresentable,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,reviewRequestBody,reviewRequestMarker,type ReviewSchedule,type ReviewMode} from './coderabbit-scheduling';
 import {readFailure} from './provider-read';
 import {classifyCIFailure,readCIFailure,ciFinding,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 
@@ -41,6 +41,11 @@ import {ActionWatchdog,WATCHDOG_LIMITS} from './action-watchdog';
 import {observeLiveness,livenessStop} from './worker-liveness';
 import {bindReviewerPolicy,boundReviewerPolicy,ensureReviewerStore,reviewerInput} from './reviewer-policy';
 
+function staleCodeRabbitChangeRequestReason(e:any):string|null{
+ const review=e.reviewSchedule?.evidence?.review,approval=e.reviewerEvidence?.approvals?.find((a:any)=>a.reviewer==='coderabbit');
+ if(typeof e.head!=='string'||!e.head||review?.stale!==true||review.state!=='CHANGES_REQUESTED'||typeof review.commit!=='string'||!review.commit||review.commit===e.head||!Number.isSafeInteger(review.id)||review.id<1||approval?.changesRequested?.length!==1)return null;
+ const change=approval.changesRequested[0];return change.id===review.id&&change.head===review.commit?`Reviewer coderabbit: changes requested (${review.id})`:null;
+}
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
   if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
@@ -63,7 +68,8 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
   const paths=[...new Set(remaining.map((x:any)=>x.path).filter((p:any)=>typeof p==='string'&&p))].slice(0,10);
   return {state:'blocked',send:false,reason:`Unresolved review threads require human decision (${parts.join(', ')}): ${paths.join(', ')||'path unavailable'}`};
  }
-  const hardBlockers=(e.reviewerEvidence?.blockers??[]).filter((b:string)=>!/^Reviewer [a-z][a-z0-9-]{0,63}: explicit current-head approval required$/.test(b));
+  const staleReason=staleCodeRabbitChangeRequestReason(e);
+  const hardBlockers=(e.reviewerEvidence?.blockers??[]).filter((b:string)=>!/^Reviewer [a-z][a-z0-9-]{0,63}: explicit current-head approval required$/.test(b)&&b!==staleReason);
   if(hardBlockers.length||e.reviewerEvidence?.pending?.length)return {state:'blocked',send:false,reason:[...hardBlockers,...(e.reviewerEvidence.pending??[]).map((p:any)=>`Reviewer ${p.reviewer}: ${p.reason} (${p.id})`)].join('; ')};
   if(e.coderabbitRateLimited)return {state:waitingMs>=30*60*1000?'blocked':'waiting_for_coderabbit',send:false,reason:'CodeRabbit rate limited; wait for the provider limit to reset'};
  if(waitingMs>=30*60*1000)return {state:'blocked',send:false,reason:e.reasons.join('; ')};
@@ -73,8 +79,8 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
 export async function postCodeRabbitReview(repo:string,pr:number,marker='',spawn=Bun.spawn,mode:ReviewMode='regular'){
  const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=${reviewRequestBody(mode,marker)}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
- if(code!==0){const failure=readFailure('github','review-request',_err,code,undefined,Date.now(),_out).evidence;
-  if(failure.classification==='throttled'&&[403,429].includes(failure.httpStatus??0))throw new ReviewRateLimit(failure.retryAt);
+ if(code!==0){const failure=readFailure('github','review-request',_err,code,undefined,Date.now(),_out,'preserve').evidence;
+  if(failure.classification==='throttled'&&[403,429].includes(failure.httpStatus??0)){if(failure.retryAtUnrepresentable)throw new ReviewResetUnrepresentable();throw new ReviewRateLimit(failure.retryAt);}
  }
  if(code!==0)throw Error(`${mode} review request delivery uncertain; inspect before retry`);
 }
@@ -485,8 +491,8 @@ export class ReviewLoop{
   // Only an established obligation gate supplies a current-head/body baseline;
   // the zero fallback is not evidence that an existing review covers an edit.
   const blockerAlreadyFresh=!!(customObligation&&waiting&&waitStart>0&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
-  const staleChangeRequest=schedule?.evidence?.review?.stale===true&&schedule.evidence.review.state==='CHANGES_REQUESTED'&&schedule.evidence.review.commit!==e.head;
-  if(!schedule?.incremental&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA')||r==='Reviewer coderabbit: explicit current-head approval required'||staleChangeRequest&&/^Reviewer coderabbit: changes requested \([0-9, ]+\)$/.test(r))){
+  const staleReason=staleCodeRabbitChangeRequestReason(e);
+  if(!schedule?.incremental&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA')||r==='Reviewer coderabbit: explicit current-head approval required'||r===staleReason)){
    const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey,e);
    const stopped=this.get(job);if(stopped?.state==='blocked'&&stopped.reason?.startsWith('CodeRabbit review unavailable:'))return record({state:'blocked',send:false,head:e.head,reason:stopped.reason});
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
