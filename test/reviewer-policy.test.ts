@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {reviewerPolicy,reviewerInput,reviewerTrust,authenticatedReviewer,feedbackEligibility,collectTrustedFeedback,reviewerApprovals,bindReviewerPolicy,boundReviewerPolicy,reviewFindingTrustFresh,invalidateExpiredReviewerFindings,BOT_IDENTITIES,type NormalizedFeedback} from '../src/reviewer-policy';
+import {reviewerPolicy,reviewerInput,reviewerTrust,authenticatedReviewer,feedbackEligibility,collectTrustedFeedback,reviewerApprovals,bindReviewerPolicy,boundReviewerPolicy,reviewFindingTrustFresh,invalidateExpiredReviewerFindings,BOT_IDENTITIES,workerFindingsPayload,assertRemediationPromptSize,MAX_REVIEW_BODY_BYTES,MAX_WORKER_FINDINGS_BYTES,MAX_REMEDIATION_PROMPT_BYTES,type NormalizedFeedback} from '../src/reviewer-policy';
+import {digest} from '../src/core';
 import {configuredReviewEvidence} from '../src/github-reviewers';
 import {normalizeReviewThread} from '../src/github';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
@@ -13,6 +14,18 @@ const policy=()=>reviewerPolicy(undefined);
 const trusts=()=>policy().map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
 const context={repo:'o/r',pr:1,head:'a'.repeat(40),selfIds:[9]};
 const finding=(over:any={}):NormalizedFeedback=>({id:'C1',threadId:'T1',body:'Missing ownership guard',userId:BOT_IDENTITIES.codex.userId,type:'Bot',login:'chatgpt-codex-connector[bot]',path:'src/a.ts',line:4,originalCommit:'older',outdated:false,resolved:false,original:{id:'C1',body:'Missing ownership guard'},...over});
+test('worker transport bounds UTF-8 bodies and batches without truncating originals',()=>{
+ const original={body:'Fix guard',extra:'RAW_ORIGINAL_ONLY'.repeat(100000)};
+ const full=[{source:'github-review',threadId:'T1',body:'Fix guard',provenance:[{reviewer:'codex',commentId:'C1',userId:199175422,original}]}];
+ const compact=JSON.parse(workerFindingsPayload(full));
+ expect(compact[0].body).toBe('Fix guard');expect(compact[0].provenance).toEqual([{reviewer:'codex',commentId:'C1',userId:199175422,originalHash:digest(JSON.stringify(original))}]);
+ expect(full[0].provenance[0].original).toEqual(original);
+ expect(()=>workerFindingsPayload([{source:'github-review',body:'a'.repeat(MAX_REVIEW_BODY_BYTES)}])).not.toThrow();
+ expect(()=>workerFindingsPayload([{source:'github-review',body:'😀'.repeat(MAX_REVIEW_BODY_BYTES/4+1)}])).toThrow('grouped review body');
+ expect(()=>workerFindingsPayload([{source:'required-ci',body:'a'.repeat(MAX_WORKER_FINDINGS_BYTES)}])).toThrow('worker findings batch');
+ expect(()=>assertRemediationPromptSize('a'.repeat(MAX_REMEDIATION_PROMPT_BYTES))).not.toThrow();
+ expect(()=>assertRemediationPromptSize('a'.repeat(MAX_REMEDIATION_PROMPT_BYTES+1))).toThrow('complete worker prompt');
+});
 for(const raw of ['HTTP 429','HTTP 503','ETIMEDOUT','ECONNRESET'])test(`reviewer lookup propagates transient provider evidence: ${raw}`,async()=>{
  const failure=readFailure('github','reviewer-read',raw,1,undefined,now),wrapped=new Error('Reviewer lookup failed',{cause:failure});
  await expect(reviewerTrust(policy(),'o/r',async()=>{throw wrapped;},()=>now)).rejects.toBe(wrapped);

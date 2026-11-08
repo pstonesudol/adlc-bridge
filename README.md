@@ -2705,6 +2705,12 @@ still match the current head. Membership-selected required reviewers need at lea
 one current approval and no remaining member change request. Durable legacy
 thread receipts prevent replay on upgrade; legacy feedback needing edit validation
 requires human inspection instead of an unbounded automatic resend.
+Worker transport is bounded in UTF-8 bytes: 32 KiB per grouped review body,
+64 KiB per compact findings batch, and 96 KiB per complete remediation prompt.
+Oversized feedback blocks before durable delivery reservation without truncating
+findings or consuming an attempt. Validation, observation records and reservation
+hashes retain provider originals; only provenance IDs and original-content hashes
+are sent in the worker's compact transport copy.
 Human issue comments have no GitHub resolve operation. A subsequent explicit
 current-head approval by the same freshly authenticated human acknowledges their
 preceding issue-comment versions; observations retain comment/review originals.

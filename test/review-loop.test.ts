@@ -18,7 +18,7 @@ import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
-import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES} from '../src/reviewer-policy';
+import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES,MAX_REVIEW_BODY_BYTES,MAX_REMEDIATION_PROMPT_BYTES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing reviewer approvals stay in CI/review/rate-limit waits; hard obligations still block',()=>{
  const missing='Reviewer coderabbit: explicit current-head approval required';
@@ -1073,6 +1073,31 @@ function threadFixture(){
  loop.configureMetadataChecks('project',[]);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,candidate,sends:()=>sends,reviews:()=>reviews};
 }
+for(const oversized of ['body','batch','prompt'])test(`oversized reviewer ${oversized} is blocked before reservation, receipts or sends`,async()=>{
+ const f=threadFixture();try{
+  if(oversized==='body')f.e.findings[0].body='😀'.repeat(MAX_REVIEW_BODY_BYTES/4+1);
+  if(oversized==='batch')f.e.findings=Array.from({length:4},(_,i)=>({...f.e.findings[0],threadId:`T${i}`,body:'a'.repeat(20000)}));
+  if(oversized==='prompt')f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['echo','a'.repeat(MAX_REMEDIATION_PROMPT_BYTES)]}]});
+  const result=await sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],DEFAULT_REMEDIATION_POLICY,[],f.io);
+  expect(result).toMatchObject({blocked:true});expect(result.reason).toContain('No findings were truncated');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);expect(f.s.db.query('SELECT * FROM review_feedback').all()).toEqual([]);
+  const receipts=new ReceiptReconciliation(f.s);expect(receipts.list(f.id)).toEqual([]);
+ }finally{f.s.close();}
+});
+test('worker receives compact provenance while observed evidence and reservation identity retain originals',async()=>{
+ const f=threadFixture();try{
+  const original={body:f.e.findings[0].body,extra:'RAW_ORIGINAL_ONLY'.repeat(100000)};
+  f.e.findings[0].provenance=[{reviewer:'codex',commentId:'C1',userId:199175422,original}];
+  f.e.reviewerEvidence={trust:[{reviewer:'codex',observed:Date.now(),ids:[199175422],blocker:null}]};
+  let message='';const spawn=f.io.spawn;f.io.spawn=(args:string[])=>{message=args[args.indexOf('--message')+1];return spawn(args);};
+  const raw=JSON.stringify(f.e.findings),result=await sendPilotRemediation(f.s,f.id,f.head,raw,'owner/repo',1,['CI'],DEFAULT_REMEDIATION_POLICY,[],f.io);
+  expect(result.state).toBe('delivery_uncertain');expect(f.sends()).toBe(1);expect(Buffer.byteLength(message)).toBeLessThanOrEqual(MAX_REMEDIATION_PROMPT_BYTES);expect(message).not.toContain('RAW_ORIGINAL_ONLY');
+  const payload=JSON.parse(message.split('\nFindings:\n')[1]);expect(payload[0].provenance).toEqual([{reviewer:'codex',commentId:'C1',userId:199175422,originalHash:digest(JSON.stringify(original))}]);
+  const observed=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='pilot_review_observed' LIMIT 1").get(f.id) as any;
+  expect(JSON.parse(observed.detail).findings[0].provenance[0].original).toEqual(original);
+  expect((f.s.db.query('SELECT findings_hash FROM remediation WHERE job=?').get(f.id) as any).findings_hash).toBe(digest(raw));
+ }finally{f.s.close();}
+});
 for(const stage of ['initial','final'])test(`expired reviewer membership at ${stage} delivery refresh cannot reserve or send remediation`,async()=>{
  const f=threadFixture();try{
   f.e.findings[0].provenance=[{reviewer:'codex',userId:199175422,original:{body:f.e.findings[0].body}}];

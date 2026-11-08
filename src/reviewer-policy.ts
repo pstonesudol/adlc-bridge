@@ -12,6 +12,18 @@ export type ReviewerConfig={id:string;adapter:'github-review'|'coderabbit';ident
 export type Reviewer=ReviewerConfig&{enabled:boolean;remediate:boolean;approvalRequired:boolean;requestReview:boolean;reviewMode:'regular'|'full';cooldown:number;retryLimit:number};
 export const BOT_IDENTITIES={coderabbit:{userId:136622811,type:'Bot' as const,login:'coderabbitai[bot]'},codex:{userId:199175422,type:'Bot' as const,login:'chatgpt-codex-connector[bot]'}};
 const levels:Severity[]=['info','low','medium','high','critical'];
+export const MAX_REVIEW_BODY_BYTES=32*1024,MAX_WORKER_FINDINGS_BYTES=64*1024,MAX_REMEDIATION_PROMPT_BYTES=96*1024;
+export class ReviewerPayloadTooLarge extends Error{constructor(part:string){super(`Reviewer feedback exceeds ${part} size limit; operator inspection required. No findings were truncated.`);}}
+export function assertRemediationPromptSize(prompt:string){if(Buffer.byteLength(prompt,'utf8')>MAX_REMEDIATION_PROMPT_BYTES)throw new ReviewerPayloadTooLarge('complete worker prompt');}
+/** Only the transport copy is compacted; validation/receipts retain originals. */
+export function workerFindingsPayload(findings:any[]):string{
+ const compact=findings.map(f=>{
+  if(f.source!=='github-review')return f;
+  if(typeof f.body==='string'&&Buffer.byteLength(f.body,'utf8')>MAX_REVIEW_BODY_BYTES)throw new ReviewerPayloadTooLarge('grouped review body');
+  return {...f,...(Array.isArray(f.provenance)?{provenance:f.provenance.map((p:any)=>({reviewer:p.reviewer,commentId:p.commentId,userId:p.userId,originalHash:digest(JSON.stringify(p.original??null))}))}:{})};
+ });
+ const payload=JSON.stringify(compact);if(Buffer.byteLength(payload,'utf8')>MAX_WORKER_FINDINGS_BYTES)throw new ReviewerPayloadTooLarge('worker findings batch');return payload;
+}
 const defaults:ReviewerConfig[]=[{id:'coderabbit',adapter:'coderabbit',identity:BOT_IDENTITIES.coderabbit,approvalRequired:true,requestReview:true},{id:'codex',adapter:'github-review',identity:BOT_IDENTITIES.codex}];
 const object=(v:any)=>v&&typeof v==='object'&&!Array.isArray(v);
 const fail=(id:string,message:string):never=>{throw Error(`reviewers ${id}: ${message}`);};
