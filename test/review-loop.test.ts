@@ -178,7 +178,7 @@ test('missing current-head review gets one request after grace, retries only con
   f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   let calls=0;f.loop.postReview=async()=>{if(++calls===1)throw new ReviewRateLimit(Date.now()+60000);};
   await f.loop.tick(f.id);await f.loop.tick(f.id);expect(calls).toBe(1);
-  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0').run();await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
+  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0,requested=?').run(Date.now()-60001);await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
   await f.loop.tick(f.id);expect(calls).toBe(2);
   f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
   const escalated=await f.loop.tick(f.id);

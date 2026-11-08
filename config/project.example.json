@@ -32,6 +32,17 @@
   "requiredChecks": [
     "REPLACE_WITH_EXACT_REQUIRED_CHECK_NAME"
   ],
+  "reviewers": [
+    {
+      "id": "codex",
+      "adapter": "github-review",
+      "identity": {"userId": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"},
+      "enabled": true,
+      "remediate": true,
+      "approvalRequired": false,
+      "requestReview": false
+    }
+  ],
   "reviewAllowedPaths": [
     "src/**"
   ],

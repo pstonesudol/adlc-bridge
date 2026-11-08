@@ -1,0 +1,95 @@
+import {test,expect} from 'bun:test';
+import {Store} from '../src/core';
+import {reviewerPolicy,reviewerInput,reviewerTrust,authenticatedReviewer,feedbackEligibility,collectTrustedFeedback,reviewerApprovals,bindReviewerPolicy,boundReviewerPolicy,BOT_IDENTITIES,type NormalizedFeedback} from '../src/reviewer-policy';
+import {configuredReviewEvidence} from '../src/github-reviewers';
+import {normalizeReviewThread} from '../src/github';
+import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
+import {ReviewLoop} from '../src/review-loop';
+import {ReviewRequests} from '../src/coderabbit-scheduling';
+const now=Date.now();
+const policy=()=>reviewerPolicy(undefined);
+const trusts=()=>policy().map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
+const context={repo:'o/r',pr:1,head:'a'.repeat(40),selfIds:[9]};
+const finding=(over:any={}):NormalizedFeedback=>({id:'C1',threadId:'T1',body:'Missing ownership guard',userId:BOT_IDENTITIES.codex.userId,type:'Bot',login:'chatgpt-codex-connector[bot]',path:'src/a.ts',line:4,originalCommit:'older',outdated:false,resolved:false,original:{id:'C1',body:'Missing ownership guard'},...over});
+test('defaults keep CodeRabbit required and Codex advisory with no request adapter',()=>{
+ expect(policy()).toMatchObject([{id:'coderabbit',approvalRequired:true,requestReview:true},{id:'codex',approvalRequired:false,requestReview:false}]);
+ expect(reviewerPolicy(reviewerInput(policy()))).toEqual(policy());
+ for(const over of [{adapter:'claude'},{requestReview:true},{reviewMode:'full'},{cooldown:60000},{retryLimit:2},{enabled:false,approvalRequired:true},{minimumSeverity:'urgent'},{includePaths:['../secret']},{excludePaths:['/absolute']},{identity:{login:'fake',type:'Bot'}},{unknown:true}])expect(()=>reviewerPolicy([{id:'codex',...over}])).toThrow();
+ expect(()=>reviewerPolicy([{id:'coderabbit',approvalRequired:false}])).toThrow('cannot be weakened');
+});
+test('authenticated Codex feedback retains originals, source and head; spoofed, stale, self and control content excluded',()=>{
+ const result=collectTrustedFeedback(policy(),trusts(),[finding()],context,now);
+ expect(result.findings).toHaveLength(1);expect(result.findings[0]).toMatchObject({source:'github-review',repo:'o/r',pr:1,sha:context.head,originalCommit:'older',provenance:[{reviewer:'codex',userId:199175422,original:finding().original}]});
+ for(const over of [{userId:1},{type:'User'},{resolved:true},{userId:9},{body:'<!-- adlc-control:x -->'},{body:''}])expect(collectTrustedFeedback(policy(),trusts(),[finding(over)],context,now).findings).toEqual([]);
+ expect(collectTrustedFeedback(policy(),trusts(),[finding()],context,now+RECEIPT_FRESHNESS_MS+1).findings).toEqual([]);
+ expect(collectTrustedFeedback(policy(),trusts(),[finding({outdated:true})],context,now).pending[0].category).toBe('stale');
+});
+test('unknown severity, pathless, rename exclusion and deleted paths do not silently clear findings',()=>{
+ const r=policy()[1];expect(feedbackEligibility(r,finding({path:null}))).toBe('eligible');
+ expect(feedbackEligibility({...r,minimumSeverity:'high'},finding())).toBe('unclassified');
+ expect(feedbackEligibility({...r,minimumSeverity:'high'},finding({severity:'low'}))).toBe('excluded');
+ expect(feedbackEligibility({...r,includePaths:['src/**']},finding({path:null}))).toBe('unclassified');
+ expect(feedbackEligibility({...r,includePaths:['src/**'],excludePaths:['old/**']},finding({previousPath:'old/a.ts'}))).toBe('excluded');
+ expect(feedbackEligibility(r,finding({path:'deleted/file.ts'}))).toBe('eligible');
+});
+test('edited bodies change durable identity, exact duplicates retain provenance and distinct findings survive',()=>{
+ const collect=(fs:NormalizedFeedback[])=>collectTrustedFeedback(policy(),trusts(),fs,context,now).findings;
+ const first=collect([finding()])[0];
+ expect(collect([finding({body:'Different fix',original:{body:'Different fix'}})])[0].commentsHash).not.toBe(first.commentsHash);
+ const duplicate=collect([finding(),finding({id:'C2',original:{id:'C2',body:finding().body}})]);
+ expect(duplicate).toHaveLength(1);expect(duplicate[0].provenance).toHaveLength(2);expect(duplicate[0].body).toBe(finding().body);
+ expect(collect([finding(),finding({threadId:'T2',body:'Distinct fix'})])).toHaveLength(2);
+});
+test('approval is per reviewer/member/current head; comments and dismissal never approve',()=>{
+ const p=reviewerPolicy([{id:'human',adapter:'github-review',membership:{kind:'collaborators'},approvalRequired:true}]);
+ const trust=[...trusts(),{reviewer:'human',observed:now,ids:[3,4],blocker:null}];
+ const review=(over:any={})=>({id:1,user:{id:3,type:'User'},state:'APPROVED',commit_id:context.head,submitted_at:'2026-11-07T00:00:00Z',...over});
+ expect(reviewerApprovals(p,trust,[review()],context.head,[],now).status.find(s=>s.reviewer==='human').approved).toBe(true);
+ for(const over of [{state:'COMMENTED'},{state:'DISMISSED'},{commit_id:'old'},{user:{id:99,type:'User'}}])expect(reviewerApprovals(p,trust,[review(over)],context.head,[],now).status.find(s=>s.reviewer==='human').approved).toBe(false);
+ expect(reviewerApprovals(p,trust,[review(),review({id:2,user:{id:4,type:'User'},state:'CHANGES_REQUESTED',commit_id:'old'})],context.head,[],now).blockers.some(b=>b.includes('changes requested'))).toBe(true);
+ expect(reviewerApprovals(policy(),trusts(),[],context.head,[],now).blockers.some(b=>b.includes('codex'))).toBe(false);
+});
+test('fresh bounded membership excludes bots, revoked members and incomplete/renamed identity evidence',async()=>{
+ const p=reviewerPolicy([{id:'humans',adapter:'github-review',membership:{kind:'collaborators'}}]);
+ let revoked=false;const read=async(args:string[])=>{
+  const path=args[1];if(path.startsWith('user/')){const id=Number(path.split('/')[1]);return {id,type:'Bot',login:id===136622811?'coderabbitai[bot]':'chatgpt-codex-connector[bot]'};}
+  if(path.endsWith('page=1'))return Array.from({length:100},(_,i)=>({id:i+1,login:`human${i}`,type:'User',permissions:{pull:true}}));
+  return revoked?[]:[{id:999,login:'last',type:'User',permissions:{pull:true}},{id:1000,login:'bot',type:'Bot',permissions:{pull:true}}];
+ };
+ const t=await reviewerTrust(p,'o/r',read,()=>now);expect(t.at(-1)!.ids).toContain(999);expect(t.at(-1)!.ids).not.toContain(1000);
+ revoked=true;expect((await reviewerTrust(p,'o/r',read,()=>now)).at(-1)!.ids).not.toContain(999);
+ const renamed=await reviewerTrust(policy(),'o/r',async args=>({id:Number(args[1].split('/')[1]),type:'Bot',login:'spoofed'}),()=>now);
+ expect(renamed.every(t=>t.blocker&&t.ids.length===0)).toBe(true);
+ const missing=await reviewerTrust(p,'o/r',async()=>{throw Error('403');},()=>now);expect(missing.at(-1)!.ids).toEqual([]);
+});
+test('policy drift fails closed across restarts until a new reviewed plan binding',()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','spec');const h=s.propose(job,'plan');s.approve(job,h,'human');
+ bindReviewerPolicy(s,job,undefined);expect(boundReviewerPolicy(s,job)).toEqual(policy());
+ expect(()=>bindReviewerPolicy(s,job,[{id:'codex',remediate:false}])).toThrow('fresh reviewed plan');
+ const next=s.propose(job,'new plan');s.approve(job,next,'human');bindReviewerPolicy(s,job,[{id:'codex',remediate:false}]);expect(boundReviewerPolicy(s,job)[1].remediate).toBe(false);s.close();
+});
+test('generic adapter ingests authenticated Codex thread without treating bot summary as approval',async()=>{
+ const p=policy(),bot=BOT_IDENTITIES.codex;
+ const t=normalizeReviewThread({id:'T1',isResolved:false,isOutdated:false,path:'src/a.ts',line:1,comments:{nodes:[{id:'C1',body:'Fix guard',author:{login:bot.login,__typename:'Bot',databaseId:bot.userId},originalCommit:{oid:'old'}}],pageInfo:{hasNextPage:false}}});
+ const result=await configuredReviewEvidence(p,'o/r',{number:1,user:{id:8},head:{sha:context.head},changed_files:1},[t],[{id:4,user:{id:bot.userId,type:'Bot'},state:'COMMENTED',body:'Looks good',commit_id:context.head}],[],async args=>{
+  if(args[1]==='user')return {id:9};if(args.includes('--paginate'))return [[{filename:'src/a.ts',status:'modified'}]];
+  const id=Number(args[1].split('/')[1]);return {id,type:'Bot',login:id===bot.userId?bot.login:BOT_IDENTITIES.coderabbit.login};
+ });
+ expect(result.findings).toHaveLength(1);expect(result.findings[0].provenance[0].reviewer).toBe('codex');expect(result.approvals.find(s=>s.reviewer==='codex').approved).toBe(false);
+});
+test('request overrides use shared durable receipts and cannot evade resets across heads',()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);const job=s.enqueue('p','i','spec');let clock=1000;
+ const requests=new ReviewRequests(s,()=>clock),schedule={head:'head1',signature:'configuration',blocker:null,incremental:false};
+ const p={requestReview:false,reviewMode:'full' as const,cooldown:600000,retryLimit:2};
+ expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(false);
+ p.requestReview=true;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(true);
+ expect(requests.get('o/r',1,'head1').mode).toBe('full');
+ expect(requests.claim(job,'o/r',1,{...schedule,head:'head2',requestPolicy:p})).toBe(false);
+ requests.settle('o/r',1,'head1','rate_limited','HTTP 429',200000);
+ expect(requests.claim(job,'o/r',2,{...schedule,head:'head2',requestPolicy:p})).toBe(false);
+ clock=200001;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(false);
+ clock=601001;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(true);
+ requests.settle('o/r',1,'head1','rate_limited','HTTP 429',700000);
+ clock=2000000;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(false);
+ expect(requests.get('o/r',1,'head1').attempts).toBe(2);s.close();
+});

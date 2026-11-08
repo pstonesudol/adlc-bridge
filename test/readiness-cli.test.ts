@@ -7,10 +7,13 @@ import {CONFIG_QUERY} from '../src/coderabbit-scheduling';
 test('real readiness CLI gates otherwise-successful metadata checks on body evidence, but not an empty policy',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-readiness-cli-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
-  const pr={number:1,changed_files:1,labels:[],head:{sha:head,repo:{full_name:'owner/repo'}},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
+   const pr={number:1,user:{id:8},changed_files:1,labels:[],head:{sha:head,repo:{full_name:'owner/repo'}},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
   const checks=['CI','Metadata','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
-  const review={user:{login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
-  const responses:any={
+   const review={user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
+   const responses:any={
+    'user':{id:9},
+    'user/136622811':{id:136622811,login:'coderabbitai[bot]',type:'Bot'},
+    'user/199175422':{id:199175422,login:'chatgpt-codex-connector[bot]',type:'Bot'},
    'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/a.ts'}]],
    'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
@@ -60,10 +63,10 @@ console.log(JSON.stringify(result));
 for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-pageInfo','nested-repeat','nested-null','nested-errors','nested-pageInfo'])test(`readiness pagination: ${mode}`,()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-review-threads-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
-  const pr={head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
+   const pr={number:1,user:{id:8},changed_files:1,head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
   const checks=['CI','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
-  const review={user:{login:'coderabbitai[bot]'},state:'CHANGES_REQUESTED',commit_id:'f'.repeat(40),submitted_at:'2026-11-01T00:00:00Z',body:'Actionable comments posted'};
-  const comment=(id:string,body:string)=>({id,body,author:{login:'coderabbitai[bot]',__typename:'Bot'},originalCommit:{oid:'dcf66943'}});
+   const review={user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},state:'CHANGES_REQUESTED',commit_id:'f'.repeat(40),submitted_at:'2026-11-01T00:00:00Z',body:'Actionable comments posted'};
+   const comment=(id:string,body:string)=>({id,body,author:{login:'coderabbitai[bot]',__typename:'Bot',databaseId:136622811},originalCommit:{oid:'dcf66943'}});
   const thread=(id:string,over:any={})=>({id,isResolved:false,isOutdated:false,path:'src/workflow.ts',line:10,startLine:null,comments:{nodes:[comment(`${id}-c1`,`${id} first`)],pageInfo:{hasNextPage:false,endCursor:null}},...over});
   const page1={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T1',{comments:{nodes:[comment('C1','Planning slot leak')],pageInfo:{hasNextPage:true,endCursor:'c1'}}})],pageInfo:{hasNextPage:true,endCursor:'t2'}}}}}};
   const page2={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T2',{isOutdated:true,path:'src/other.ts'})],pageInfo:{hasNextPage:false}}}}}};
@@ -77,7 +80,11 @@ for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-p
   if(mode==='nested-null')inner.pageInfo={hasNextPage:true,endCursor:null};
   if(mode==='nested-errors')(commentPage as any).errors=[{message:'Unavailable'}];
   if(mode==='nested-pageInfo')delete inner.pageInfo;
-  const responses:any={
+   const responses:any={
+    'user':{id:9},
+    'user/136622811':{id:136622811,login:'coderabbitai[bot]',type:'Bot'},
+    'user/199175422':{id:199175422,login:'chatgpt-codex-connector[bot]',type:'Bot'},
+    'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/workflow.ts'}]],
    'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],

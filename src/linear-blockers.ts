@@ -164,7 +164,7 @@ export class LinearBlockers{
   // A provenance gap is not an approval timeout or permission to fabricate an
   // attestation. Reuse the existing publisher/receipts for the concrete blocker.
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()){
-   const reviews=this.s.db.query("SELECT t.job,t.reason,j.plan_hash FROM review_targets t JOIN jobs j ON j.id=t.job JOIN runs r ON r.job=j.id WHERE j.project=? AND t.state IN ('blocked','needs_reconciliation') AND (t.reason LIKE 'CodeRabbit custom-check%' OR t.reason LIKE 'CodeRabbit review unavailable:%') AND j.state='approved' AND j.approved_hash=j.plan_hash AND r.plan_hash=j.plan_hash AND r.owner='orchestrator'").all(c.linear.projectId) as any[];
+   const reviews=this.s.db.query("SELECT t.job,t.reason,j.plan_hash FROM review_targets t JOIN jobs j ON j.id=t.job JOIN runs r ON r.job=j.id WHERE j.project=? AND t.state IN ('blocked','needs_reconciliation') AND (t.reason LIKE 'CodeRabbit custom-check%' OR t.reason LIKE 'CodeRabbit review unavailable:%' OR t.reason LIKE 'Reviewer %' OR t.reason LIKE 'Unresolved review threads%') AND j.state='approved' AND j.approved_hash=j.plan_hash AND r.plan_hash=j.plan_hash AND r.owner='orchestrator'").all(c.linear.projectId) as any[];
    for(const review of reviews){
     // Match ReviewLoop's execution gate, including the recomputed plan/spec
     // hash and standing-policy eligibility. Old targets survive specification

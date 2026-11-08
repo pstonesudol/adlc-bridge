@@ -17,6 +17,7 @@ import {recordDispatchedFeedback} from './review-feedback';
 import {assertWorktreeAvailable} from './worktree-reservation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
+import {boundReviewerPolicy,reviewerInput} from './reviewer-policy';
 import {scopeAllows} from './file-scope';
 import {readCIFailure,classifyCIFailure,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 export function codeRemediationInstructions(verification?:Verification,context?:VerificationContext,worktree?:string){return `Fix only actionable findings within the approved ticket scope. ${verificationInstructions(verification,context,worktree)} Commit and push the existing feature branch, then STOP for host review.`;}
@@ -38,7 +39,7 @@ export async function observePilot(s:Store,job:string,repo:string,pr:number,requ
  assertDeliveryTarget(s,job,e.session,repo,pr,snapshot);
  if(local.branch!==snapshot.branch)throw Error('Blocked — branch mismatch: worktree differs from verified delivery branch');
  if(local.head!==snapshot.head)throw Error('Worktree and remote PR HEAD differ; wait for owned branch synchronization before remediation');
- const result=await io.readiness(repo,pr,required,metadataChecks);
+  const result=await io.readiness(repo,pr,required,metadataChecks,reviewerInput(boundReviewerPolicy(s,job)));
  s.event(job,'pilot_review_observed',JSON.stringify({...result,pr,repo}));return result;
 }
 export async function sendPilotRemediation(s:Store,job:string,head:string,findings:string,repo:string,pr:number,required:string[],policy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,metadataChecks:string[]=[],overrides:Partial<typeof pilotIO>={}){
@@ -97,7 +98,7 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
    const verification=metadataOnly&&!parsed.some((f:any)=>f.source==='coderabbit-custom')?undefined:remediationVerification(s,job),context=verification?remediationRuntime(s,job):undefined;
    if(verification?.mode==='container'&&!context&&!parsed.some((f:any)=>f.source==='coderabbit-custom'))return {blocked:true,reason:'Container remediation requires validated runtime context; supply it before retrying'};
    const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT allowed_paths FROM review_targets WHERE job=?').get(job) as any:null;
-   if(parsed.some((f:any)=>f.kind!=='pr_description'&&(!target||!scopeAllows(f.path,JSON.parse(target.allowed_paths))||f.source==='required-ci'&&f.paths.some((p:string)=>!scopeAllows(p,JSON.parse(target.allowed_paths))))))throw Error('Review findings exceed approved file scope');
+   if(parsed.some((f:any)=>f.kind!=='pr_description'&&(!target||!(f.source==='github-review'&&f.path===null)&&!scopeAllows(f.path,JSON.parse(target.allowed_paths))||f.source==='required-ci'&&f.paths.some((p:string)=>!scopeAllows(p,JSON.parse(target.allowed_paths))))))throw Error('Review findings exceed approved file scope');
    const evidenceInstructions=`First inspect existing session transcript/artifacts and current-head CI. Verify that any reused result tested exactly ${head}; label older checks historical, not current verification. Before and after running checks, verify the clean reserved worktree HEAD and remote PR head equal ${head}; stop for divergence or unavailable prerequisites, never switch branches or discard work. Use only configured or already-approved verification, never install dependencies or expand scope to satisfy review prose. ${verificationInstructions(verification,context,r.worktree)} Record actual argv/commands, working directory, runtime, tested SHA, exit codes and observed results, including browser surface, mocks and limitations where required. Preserve accurate evidence and valid requirements; never fabricate results, attestation or approval and never remove a requirement simply to pass. If access, runtime, browser prerequisites or a scope decision is missing, report the exact blocker using the worker outcome and discovery receipts below so the host can use the Linear clarification flow. Do not change Linear directly.`;
    const action=metadataOnly?
     `This is PR-description evidence remediation only for https://github.com/${repo}/pull/${pr}. ${evidenceInstructions} Read the current repository PR template and PR-body validator. Update the PR description truthfully; N/A/not-run must include a reason and does not satisfy an outstanding verification requirement. Do not modify application files, commit, push, deploy, or bypass checks. After updating the description, STOP so the host coordinator can re-request CodeRabbit once.`:

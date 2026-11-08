@@ -58,7 +58,7 @@ export function jobViews(path:string,project?:string,reference?:string){
      nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
       watchdog:actionStatus(s,j.id),
        receipts,
-       maintenance:maintenanceStatus(s,j.id),review:table('review_targets',j.id),
+       maintenance:maintenanceStatus(s,j.id),review:table('review_targets',j.id),reviewerPolicy:table('reviewer_policy',j.id),reviewerEvidence:table('reviewer_observations',j.id),
      worker:{activity:'unknown',session:implementation?.session_id??planning?.session_id??null,dispatchState:implementation?.state??planning?.state??null,outcome:currentOutcome?.outcome??null},
     evidence:{freshness:'unknown',persistedUpdatedAt:j.updated,note:'Persisted state only; no live worker or provider refresh performed.'}};
   });

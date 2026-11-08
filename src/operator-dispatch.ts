@@ -1,6 +1,7 @@
 import {groups,OperatorError,jobViews,humanJobs} from './operator-cli';
 import {projectEntries,selectProject,projectConfig,authStatus,queueView,versionView,completion} from './operator-discovery';
 import {configView,configDefaults,editConfig,configPolling} from './operator-config';
+import {reviewerPolicyView} from './reviewer-policy';
 import {serviceControl} from './service-control';
 import {validate} from './linear';
 import {autonomyMetrics,humanMetrics} from './autonomy-metrics';
@@ -41,14 +42,14 @@ export async function dispatchOperator(command:string,args:string[],db:string){
  const entry=selectProject(entries,command==='projects'?position[1]:requested),c=projectConfig(entry);
  if(command==='projects'){requireCount(2);emit({project:entry.project,name:entry.name,linearProject:entry.linear_project});return;}
  if(command==='status'){requireCount(0);const jobs=jobViews(db,entry.linear_project);emit({project:entry.project,jobs},humanJobs(jobs));return;}
- if(command==='doctor'){requireCount(0);emit({project:entry.project,auth:authStatus(c),nextAction:'Use config validate and services status with this project; no repair or dispatch was performed.',readOnly:true});return;}
+ if(command==='doctor'){requireCount(0);emit({project:entry.project,auth:authStatus(c),reviewers:reviewerPolicyView(c.reviewers),nextAction:'Reviewers require fresh provider identity/membership evidence. Unsupported adapters/options fail config validate. No repair or dispatch was performed.',readOnly:true});return;}
  if(command==='auth'){requireCount(1);if(position[0]!=='status')throw new OperatorError('Use auth status');emit({project:entry.project,...authStatus(c)});return;}
  if(command==='queue'){requireCount(1);if(position[0]!=='list')throw new OperatorError('Use queue list');const result=await queueView(c,db);emit(result);if(!result.provider.complete)process.exitCode=1;return;}
  const verb=position[0],key=position[1];
  if(!['show','get','set','validate','diff','reset'].includes(verb))throw new OperatorError('Unknown config command');
  requireCount(verb==='set'?3:['get','reset'].includes(verb)?2:1);
  if(['set','reset','get'].includes(verb)&&!Object.hasOwn(configDefaults,key))throw new OperatorError('Key must be one of: '+Object.keys(configDefaults).join(', '));
- if(verb==='validate'){try{validate(c);}catch{throw new OperatorError('Project configuration invalid. Check project identity, required checks, polling (5–86400), planning capacity (1–32), and remediation schema.',1);}emit({valid:true});return;}
+ if(verb==='validate'){try{validate(c);}catch(error){if(error instanceof Error&&error.message.startsWith('reviewers '))throw new OperatorError(error.message,1);throw new OperatorError('Project configuration invalid. Check project identity, required checks, polling (5–86400), planning capacity (1–32), and remediation schema.',1);}emit({valid:true,reviewers:reviewerPolicyView(c.reviewers)});return;}
  if(['show','get','diff'].includes(verb)){
   const values=configView(c).filter(v=>verb!=='get'||v.key===key);
   const service=verb==='get'?undefined:await configPolling(entry.project,false,(action,project,apply)=>serviceControl(action,project,apply,{requireEnabled:true,statePath:db}));

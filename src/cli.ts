@@ -62,6 +62,7 @@ import {modernCommand,dispatchOperator} from './operator-dispatch';
 import {projectEntries,selectProject} from './operator-discovery';
 import {ActionWatchdog,retryWatchdogObservation} from './action-watchdog';
 import {integrationPreview,integrationRuntime,verifyIntegrations} from './integration-capabilities';
+import {reviewerPolicyView} from './reviewer-policy';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
@@ -375,7 +376,7 @@ Registered approved review targets can request bounded in-scope fixes from their
    }
    if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository')),ci=a.indexOf('--config'),c=ci>=0?JSON.parse(readFileSync(req(a[ci+1],'Config'),'utf8')):{};if(ci>=0)validate(c);return out({repo,mode:'preview_only',integrations:integrationPreview(c),existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
   if(command==='handoff')return out(handoffChecklist(req(a[0],'Worktree')));
-   if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out({...await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata),integrations:integrationPreview(c)});}
+   if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out({...await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata,c.reviewers),reviewerPolicy:reviewerPolicyView(c.reviewers),integrations:integrationPreview(c)});}
   if(command.startsWith('feature-')){
     const s=new Store(db),features=new FeaturePlanning(s,featureAgents);try{
       if(command==='feature-start'){
