@@ -105,7 +105,7 @@ export class ActionWatchdog{
    if(row(this.s,'watchdog_evaluations',job).failures>=WATCHDOG_LIMITS.maxEvaluationFailures){this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');return this.get(id);}
    if(old.state==='escalated'){
     if(old.outcome!=='human_required')return old;
-    if(!eligibility(this.s,job,c,this.now())||worktreeReservation(this.s,job)){this.stop(id,'unsupported','authority_unavailable','Ordinary review suspended: current authority or worktree reservation prevents evaluation');return this.get(id);}
+     if(!eligibility(this.s,job,c,this.now())||worktreeReservation(this.s,job)&&!worktreeReservation(this.s,job)?.branchSync){this.stop(id,'unsupported','authority_unavailable','Ordinary review suspended: current authority or worktree reservation prevents evaluation');return this.get(id);}
     // Only a cleared human blocker may resume observations on the same binding.
     // Uncertain effects and every other escalation remain terminal here.
     if(evaluateAction(blocker,0,this.now()).kind==='escalate'||budget.attempts>=budget.max_attempts)return old;
@@ -175,7 +175,9 @@ export class ActionWatchdog{
   try{assertConfiguredProjectIntakeEnabled(c,this.s,this.stateRoot);}catch(error){if(error instanceof TurnSubmissionBlocked)throw new ObservationDeferred(this.now()+WATCHDOG_LIMITS.intervalMs,'Project intake paused; observation deferred');throw error;}
   if(turnBarrier(this.stateRoot).isPaused())throw new ObservationDeferred(this.now()+WATCHDOG_LIMITS.intervalMs,'Intake paused; observation deferred');
   if(JSON.stringify(actionBinding(this.s,a.job,c))!==a.binding||!eligibility(this.s,a.job,c,this.now()))throw new StaleAction();
-  if(worktreeReservation(this.s,a.job))throw new UnsupportedAction();
+   // DEV-94's retained sync reservation is consumed only by the ordinary
+   // evaluator's existing BranchSync guards, never by this read-only action.
+   if(worktreeReservation(this.s,a.job)&&!worktreeReservation(this.s,a.job)?.branchSync)throw new UnsupportedAction();
  }
  async observeReview(id:string,c:any,io:ReviewObservationIO):Promise<{session:any;snapshot:any}>{
   const observations=new RecoveryObservation(this.s,this.now,this.random),token=randomUUID();

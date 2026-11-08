@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';
+import {test,expect,spyOn} from 'bun:test';
 import {mkdtempSync,writeFileSync,rmSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -7,7 +7,7 @@ import {Workflow} from '../src/workflow';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {recordReadiness} from '../src/readiness';
-import {BranchUpdates,branchUpdateBinding,type BranchSnapshot} from '../src/branch-updates';
+import {BranchUpdates,branchUpdateBinding,branchTransport,type BranchSnapshot} from '../src/branch-updates';
 import {BranchSync} from '../src/branch-sync';
 import {ReviewLoop} from '../src/review-loop';
 import {command} from '../src/delivery-evidence';
@@ -53,6 +53,34 @@ test('exact ADLC merge fast-forwards the owned worktree once and completes both 
   expect(f.s.db.query('SELECT state FROM branch_updates').get()).toMatchObject({state:'observed'});expect(worktreeReservation(f.s,f.id)).toBeUndefined();
   expect(await f.sync().ensure(f.id,f.c,'owner/repo',7)).toBeNull();expect(f.updates()).toBe(1);
  }finally{f.close();}
+});
+for(const lost of [false,true])test(`DEV-95 lifecycle: incomplete review survives update, synchronization and restart (lost response: ${lost})`,async()=>{
+ const f=fixture(),blocker='CodeRabbit custom-check failure: pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary';
+ let requests=0,reads=0,evidenceHead=f.old;
+ f.s.db.exec('DELETE FROM branch_updates');
+ f.b.head=f.old;f.b.behind=1;
+ const update=spyOn(branchTransport,'update').mockImplementation(async()=>{requests++;f.b.head=f.target;f.b.behind=0;if(lost)throw Error('Provider accepted update but response lost');});
+ const original=BranchSync.prototype.ensure;
+ const sync=spyOn(BranchSync.prototype,'ensure').mockImplementation(function(job,c,repo,pr){return original.call(f.sync(),job,c,repo,pr);});
+ try{
+  const session={receiptObservation:{complete:true,observed:Date.now()},session:{id:'worker',projectId:'ao',branch:f.b.branch,isTerminated:false,prs:[{number:7,url:'https://github.com/owner/repo/pull/7'}]},transcript:{controller:'ready',entries:[],turns:[]}};
+  const io:any={readBranchSnapshot:f.transport.read,contains:f.transport.contains,worktreeIdentity:async()=>({tree:f.tree,branch:f.b.branch,head:f.git(['rev-parse','HEAD'],f.tree)}),sessionEvidence:async()=>({...session,receiptObservation:{complete:true,observed:Date.now()}}),readiness:async()=>{reads++;return {head:evidenceHead,clear:false,customCheckBlocker:blocker,reasons:[blocker],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[],coderabbitPending:true};}};
+  let loop=new ReviewLoop(f.s,async()=>{throw Error('No review mutation');},io);loop.configureMetadataChecks('project',[]);loop.register(f.id,'owner/repo',7,['CI'],['src/**'],true);
+  loop.record(f.id,{state:'blocked',head:f.old,reason:blocker});
+  const policy={enabled:true,authorizedBy:'human',maxUpdates:3};
+  expect((await loop.tick(f.id,policy,undefined,undefined,f.c)).state).toBe(lost?'blocked':'updating_branch');
+  expect(requests).toBe(1);expect(reads).toBe(1);expect(loop.get(f.id).reason).toBe(blocker);
+  // Restart evaluator, then run the real DEV-94 fast-forward path. Stale review
+  // evidence for the predecessor cannot clear or bind to the resulting commit.
+  loop=new ReviewLoop(f.s,async()=>{throw Error('No review mutation');},io);
+  expect(await loop.tick(f.id,policy,undefined,undefined,f.c)).toMatchObject({state:'updating_branch',maintenance:{state:'completed'}});
+  expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.target);expect(f.updates()).toBe(1);
+  expect(loop.get(f.id)).toMatchObject({state:'blocked',reason:blocker});
+  evidenceHead=f.target;
+  expect((await loop.tick(f.id,policy,undefined,undefined,f.c)).state).toBe('blocked');
+  expect(loop.get(f.id)).toMatchObject({state:'blocked',head:f.target,reason:blocker});
+  expect(requests).toBe(1);expect(f.updates()).toBe(1);expect(reads).toBe(3);
+ }finally{sync.mockRestore();update.mockRestore();f.close();}
 });
 test('synchronization keeps independent custom obligations and historical remediation evidence',async()=>{
  const f=fixture();try{
