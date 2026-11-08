@@ -7,6 +7,17 @@ import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('metrics CLI is bounded, versioned, sanitized and strictly read-only',()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-metrics-'));try{
+ const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','PRIVATE SPEC');s.event(id,'review_state_changed',JSON.stringify({state:'ready_for_human',head:'a'.repeat(40),reason:'PRIVATE REASON'}));s.close();
+ const run=(...args:string[])=>Bun.spawnSync([process.execPath,cli,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:path}});
+ const before=readFileSync(path),result=run('jobs','metrics','--project','p','--json');
+ expect(result.exitCode).toBe(0);expect(JSON.parse(result.stdout.toString())).toMatchObject({schemaVersion:1,command:'jobs',data:{readOnly:true,summary:{jobs:1}}});expect(result.stdout.toString()).not.toContain('PRIVATE');
+ expect(run('jobs','metrics','--project','p').stdout.toString()).toContain(`Next: adlc jobs status ${id}`);
+ for(const args of [['--apply'],['--state','working'],['--since','bad'],['--json','--json'],['extra']])expect(run('jobs','metrics',...args).exitCode).toBe(2);
+ expect(run('jobs','list','--since','2026-01-01T00:00:00Z').exitCode).toBe(2);expect(readFileSync(path)).toEqual(before);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('CLI shared cooldown override and job retry remain separate operator actions',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-cooldown-'));try{
  const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','{}'),hash=s.propose(id,'plan');s.approve(id,hash,'human');
