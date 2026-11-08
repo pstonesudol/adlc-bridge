@@ -17,6 +17,7 @@ import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
+import {reviewerPolicy,reviewerApprovals,collectTrustedFeedback,BOT_IDENTITIES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
@@ -187,6 +188,18 @@ test('missing current-head review gets one request after grace, retries only con
   expect(escalated.reason).toContain('requested mode regular');
   expect(escalated.reason).toContain('never automatic escalation');
   expect(escalated.reason).not.toContain('ambiguous');
+ }finally{f.s.close();}
+});
+for(const extra of ['missing-coderabbit','required-human','advisory-trust-failure'])test(`automatic requests distinguish missing approval from other reviewer obligations: ${extra}`,async()=>{
+ const f=templateFixture();try{
+  const now=Date.now(),p=reviewerPolicy(undefined),trust=p.map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
+  const obligations=reviewerApprovals(p,trust,[],f.head,[],now);
+  const blockers=[...obligations.blockers,...(extra==='required-human'?['Reviewer human: explicit current-head approval required']:extra==='advisory-trust-failure'?['Reviewer codex: fresh identity/membership evidence unavailable or mismatched; no trust granted']:[])];
+  Object.assign(f.e,{findings:[],failedChecks:[],reasons:['Explicit latest-SHA CodeRabbit approval missing',...blockers],reviewerEvidence:{blockers,pending:[]},coderabbitPresent:false});
+  f.loop.configureMetadataChecks('project',[]);
+  const result=await f.loop.tick(f.id);
+  expect(f.reviews()).toBe(extra==='missing-coderabbit'?1:0);
+  expect(result.send).toBe(false);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 function pr30Schedule(head:string){
@@ -1018,6 +1031,19 @@ function threadFixture(){
  loop.configureMetadataChecks('project',[]);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,candidate,sends:()=>sends,reviews:()=>reviews};
 }
+test('identical CodeRabbit bodies preserve all legacy receipt IDs across restart without another remediation',async()=>{
+ const f=threadFixture();try{
+  const p=reviewerPolicy(undefined),now=Date.now(),trust=p.map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
+  const feedback=['C1','C2'].map(id=>({id,threadId:'T1',body:'Fix the ownership guard',userId:BOT_IDENTITIES.coderabbit.userId,type:'Bot',login:'coderabbitai[bot]',path:'src/workflow.ts',line:12,originalCommit:'old',outdated:false,resolved:false,original:{id,body:'Fix the ownership guard'}}));
+  f.e.findings=collectTrustedFeedback(p,trust,feedback,{repo:'owner/repo',pr:1,head:f.head,selfIds:[]},now).findings;
+  expect(f.e.findings[0].commentIds).toEqual(['C1','C2']);
+  f.s.db.query('INSERT INTO review_feedback(job,thread_id,comments_hash,path,head,attempt) VALUES (?,?,?,?,?,?)').run(f.id,'T1',digest('C1,C2'),'src/workflow.ts',f.head,1);
+  for(const loop of [f.loop,new ReviewLoop(f.s,async()=>{},f.loop.io)]){
+   const result=await loop.tick(f.id);expect(result).toMatchObject({state:'blocked',send:false});expect(result.reason).toContain('carried-forward already sent');
+  }
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
 test('carried-forward review thread dispatches exactly one provenance-bound remediation',async()=>{
  const f=threadFixture();try{
   expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});

@@ -483,7 +483,7 @@ export class ReviewLoop{
   // Only an established obligation gate supplies a current-head/body baseline;
   // the zero fallback is not evidence that an existing review covers an edit.
   const blockerAlreadyFresh=!!(customObligation&&waiting&&waitStart>0&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
-  if(!schedule?.incremental&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA'))){
+  if(!schedule?.incremental&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA')||r==='Reviewer coderabbit: explicit current-head approval required')){
    const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey,e);
    const stopped=this.get(job);if(stopped?.state==='blocked'&&stopped.reason?.startsWith('CodeRabbit review unavailable:'))return record({state:'blocked',send:false,head:e.head,reason:stopped.reason});
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);

@@ -65,7 +65,23 @@ test('edited bodies change durable identity, exact duplicates retain provenance 
  expect(collect([finding({body:'Different fix',original:{body:'Different fix'}})])[0].commentsHash).not.toBe(first.commentsHash);
  const duplicate=collect([finding(),finding({id:'C2',original:{id:'C2',body:finding().body}})]);
  expect(duplicate).toHaveLength(1);expect(duplicate[0].provenance).toHaveLength(2);expect(duplicate[0].body).toBe(finding().body);
+ expect(duplicate[0].commentIds).toEqual(['C1','C2']);
  expect(collect([finding(),finding({threadId:'T2',body:'Distinct fix'})])).toHaveLength(2);
+});
+test('advisory observation failures block clearance without granting trust or requiring approval',()=>{
+ const p=reviewerPolicy([{id:'human',adapter:'github-review',identity:{userId:3,type:'User'}}]);
+ const review={id:42,user:{id:3,type:'User'},state:'CHANGES_REQUESTED',body:'Fix ownership',commit_id:context.head,submitted_at:new Date(now).toISOString()};
+ const fresh=[...trusts(),{reviewer:'human',observed:now,ids:[3],blocker:null}];
+ expect(reviewerApprovals(p,fresh,[review],context.head,[],now).blockers).toContain('Reviewer human: changes requested (42)');
+ const failure='Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted';
+ const unavailable=[...trusts(),{reviewer:'human',observed:now,ids:[],blocker:failure}];
+ const failed=reviewerApprovals(p,unavailable,[review],context.head,[],now);
+ expect(failed.blockers).toContain(failure);
+ expect(failed.blockers.some(b=>b.includes('human: explicit current-head approval'))).toBe(false);
+ expect(failed.status.find(s=>s.reviewer==='human')).toMatchObject({approved:false,changesRequested:[]});
+ for(const evidence of [trusts(),[...trusts(),{reviewer:'human',observed:now-RECEIPT_FRESHNESS_MS-1,ids:[3],blocker:null}]])expect(reviewerApprovals(p,evidence,[review],context.head,[],now).blockers).toContain('Reviewer human: fresh identity/membership evidence required before clearance');
+ const recovered=reviewerApprovals(p,fresh,[],context.head,[],now);
+ expect(recovered.blockers.some(b=>b.startsWith('Reviewer human:'))).toBe(false);
 });
 test('approval is per reviewer/member/current head; comments and dismissal never approve',()=>{
  const p=reviewerPolicy([{id:'human',adapter:'github-review',membership:{kind:'collaborators'},approvalRequired:true}]);

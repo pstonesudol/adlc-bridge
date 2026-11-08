@@ -18,7 +18,7 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
    'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
-   'repos/owner/repo/pulls/1/reviews?per_page=100':[[review]],
+    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review,{id:42,user:{id:3,type:'User',login:'human'},state:'CHANGES_REQUESTED',commit_id:head,submitted_at:'2026-11-01T00:01:00Z',body:'Fix the ownership guard'}]],
    'repos/owner/repo/git/ref/heads/main':{ref:'refs/heads/main',object:{type:'commit',sha:base}},
    [`repos/owner/repo/compare/${base}...${head}`]:{behind_by:0},
   };
@@ -51,14 +51,18 @@ console.log(JSON.stringify(result));
   for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
-  for(const metadata of [['Metadata'],[]]){
-    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']}]}));
+   for(const mode of ['metadata','clear','advisory-outage']){
+    const metadata=mode==='metadata'?['Metadata']:[];
+    // No user/3 response: the fixture rejects the advisory identity lookup.
+    // Its summary-only change request must not disappear into green clearance.
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(mode==='advisory-outage'?[{id:'human',adapter:'github-review',identity:{userId:3,type:'User'},approvalRequired:false}]:[])]}));
    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
     expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
     expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
-   else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);}
+    else if(mode==='advisory-outage'){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted']);expect(output.findings).toEqual([]);}
+    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);}
    expect(existsSync(db)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}

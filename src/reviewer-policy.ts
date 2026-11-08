@@ -120,14 +120,17 @@ export function collectTrustedFeedback(policy:Reviewer[],trust:TrustEvidence[],f
    // Equivalence is deliberately exact and location-bound; no semantic guessing.
    const key=digest(JSON.stringify([f.threadId,f.path,f.line,f.body]));
    const provenance={reviewer:r.id,commentId:f.id,userId:f.userId,original:f.original};
-   const prior=seen.get(key);if(prior){prior.provenance.push(provenance);continue;}
+   const prior=seen.get(key);if(prior){prior.provenance.push(provenance);prior.commentIds.push(f.id);continue;}
    const finding={source:'github-review',kind:'review_thread',threadId:f.threadId,commentIds:[f.id],repo:context.repo,pr:context.pr,sha:context.head,path:f.path,previousPath:f.previousPath??null,line:f.line,body:f.body,originalCommit:f.originalCommit,outdated:false,severity:f.severity??null,provenance:[provenance]};
    seen.set(key,finding);findings.push(finding);
   }
  }
  const groups=new Map<string,any>();
  for(const f of findings){const p=groups.get(f.threadId);if(!p)groups.set(f.threadId,{...f});else{p.body+='\n\n'+f.body;p.commentIds.push(...f.commentIds);p.provenance.push(...f.provenance);}}
- for(const f of groups.values())f.commentsHash=digest(JSON.stringify(f.provenance.map((p:any)=>[p.reviewer,p.commentId,p.original.body,p.original.originalCommit??p.original.commit_id]).sort((a:any,b:any)=>JSON.stringify(a).localeCompare(JSON.stringify(b)))));
+ for(const f of groups.values()){
+  f.commentIds=[...new Set(f.commentIds)].sort();
+  f.commentsHash=digest(JSON.stringify(f.provenance.map((p:any)=>[p.reviewer,p.commentId,p.original.body,p.original.originalCommit??p.original.commit_id]).sort((a:any,b:any)=>JSON.stringify(a).localeCompare(JSON.stringify(b)))));
+ }
  // A raw unresolved thread may be ignored only if every substantive comment
  // was authenticated and excluded under every matching policy. Unknown authors,
  // mixed eligible feedback, stale state and disabled remediation remain blockers.
@@ -141,7 +144,11 @@ export function reviewerApprovals(policy:Reviewer[],trust:TrustEvidence[],review
  const blockers:string[]=[],status:any[]=[];
  for(const r of policy){
   if(!r.enabled)continue;const e=trust.find(e=>e.reviewer===r.id);
-  if(e?.blocker&&r.approvalRequired)blockers.push(e.blocker);
+  // Optional approval is not permission to forget an existing change request
+  // during an identity/membership outage. Process other trusted sources, but
+  // fail clearance closed until this enabled source can be observed safely.
+  if(e?.blocker)blockers.push(e.blocker);
+  else if(!e||now<e.observed||now-e.observed>RECEIPT_FRESHNESS_MS)blockers.push(`Reviewer ${r.id}: fresh identity/membership evidence required before clearance`);
   const authenticated=reviews.filter(v=>!selfIds.includes(v.user?.id)&&authenticatedReviewer(r,e,v.user?.id??null,v.user?.type,now));
   const members=new Map<number,any>();
   for(const v of authenticated.filter(v=>['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(v.state)).sort((a,b)=>Date.parse(a.submitted_at)-Date.parse(b.submitted_at)))members.set(v.user.id,v);
