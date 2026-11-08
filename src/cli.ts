@@ -195,7 +195,7 @@ async function main(){
      if(!existsSync(db))return out([]);
      const store=Store.readonly(db);try{
       if(command==='approvals')return out(store.db.query("SELECT id AS job,project,plan_hash AS hash,reason FROM jobs WHERE state='awaiting_approval' AND (? IS NULL OR project=?)").all(project??null,project??null));
-      return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null):[]);
+       return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?(store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null) as any[]).map(t=>({...t,maintenance:store.db.query("SELECT name FROM sqlite_master WHERE name='branch_maintenance'").get()?store.db.query('SELECT * FROM branch_maintenance WHERE job=?').get(t.job):null})):[]);
      }finally{store.close();}
     }
    }

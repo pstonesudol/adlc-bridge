@@ -173,7 +173,9 @@ export class LinearBlockers{
     const prior=rows.findIndex(r=>r.job===review.job);
     if(prior>=0&&blockerOutcome(rows[prior].outcome))continue;
     if(prior>=0)rows.splice(prior,1);
-    rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason:review.reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
+     const maintenance=this.s.db.query("SELECT 1 FROM sqlite_master WHERE name='branch_maintenance'").get()?this.s.db.query('SELECT state,reason FROM branch_maintenance WHERE job=?').get(review.job) as any:null;
+     const reason=review.reason+(maintenance?`\nIndependent branch maintenance: ${maintenance.state} — ${maintenance.reason}. This does not clear review or authorize merging.`:'');
+     rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
    }
   }
   const observations=new RecoveryObservation(this.s);

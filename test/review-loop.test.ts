@@ -7,6 +7,7 @@ import {Store,reviewGate,digest} from '../src/core';
 import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {ConflictRecovery} from '../src/conflict-recovery';
 import {BranchSync} from '../src/branch-sync';
+import {branchTransport} from '../src/branch-updates';
 import {requiredCheckState} from '../src/github';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
@@ -74,6 +75,46 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+test('DEV-95: behind-base maintenance retains an independent incomplete CodeRabbit review',async()=>{
+ const f=templateFixture(),blocker='CodeRabbit custom-check failure: pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary';
+ let updates=0,reads=0;
+ const update=spyOn(branchTransport,'update').mockImplementation(async()=>{updates++;});
+ try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['inspect','fetch','push-feature','open-pr'],'human');
+  f.loop.io.readBranchSnapshot=async()=>({...await f.io.readBranchSnapshot(),behind:1});
+  f.e.customCheckBlocker=blocker;f.e.findings=[];f.e.failedChecks=[];f.e.pendingChecks=[];f.e.missingChecks=[];
+  f.loop.io.readiness=async()=>{reads++;return f.e;};
+  f.loop.record(f.id,{state:'blocked',send:false,head:f.head,reason:blocker});
+  expect(await f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3})).toMatchObject({state:'updating_branch',send:false});
+  expect(updates).toBe(1);expect(reads).toBe(1);
+  expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason:blocker});
+  expect(f.loop.list()[0].maintenance).toMatchObject({state:'updating_branch',head:f.head});
+  // A new loop over the same durable state cannot resend or erase the blocker.
+  const restarted=new ReviewLoop(f.s,async()=>{throw Error('No request');},f.loop.io);
+  await restarted.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3});
+  expect(updates).toBe(1);expect(restarted.get(f.id).reason).toBe(blocker);
+ }finally{update.mockRestore();f.s.close();}
+});
+for(const guard of ['active','conflicts','identity','budget','cooldown'])test(`DEV-95 lifecycle retains ${guard} guard with incomplete review evidence`,async()=>{
+ const f=templateFixture(),blocker='CodeRabbit custom-check failure: incomplete supported summary';let updates=0;
+ const update=spyOn(branchTransport,'update').mockImplementation(async()=>{updates++;});
+ try{
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['inspect','fetch','push-feature','open-pr'],'human');
+  f.loop.io.readBranchSnapshot=async()=>({...await f.io.readBranchSnapshot(),behind:1,mergeable:guard==='conflicts'?false:true,headRepo:guard==='identity'?'unknown/repo':'owner/repo'});
+  f.e.customCheckBlocker=blocker;f.e.findings=[];f.e.failedChecks=[];f.e.pendingChecks=[];f.e.missingChecks=[];
+  f.loop.record(f.id,{state:'blocked',send:false,head:f.head,reason:blocker});
+  if(guard==='active')f.session.transcript.turns.push({id:'active',state:'running'});
+  if(guard==='budget'){
+   // Create the existing bounded delivery ledger, not a new maintenance budget.
+   const {BranchUpdates}=await import('../src/branch-updates');new BranchUpdates(f.s);
+   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,'c'.repeat(40),'d'.repeat(40),'observed',Date.now(),null);
+  }
+  if(guard==='cooldown')new RecoveryObservation(f.s).failed(f.id,readFailure('github','review','HTTP 429 rate limit',1).evidence);
+  const result=await f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:1});
+  expect(result.send).toBe(false);expect(updates).toBe(0);expect(result.state).not.toBe('ready_for_human');
+  if(guard!=='identity')expect(f.loop.get(f.id)).toMatchObject({state:'blocked',reason:blocker});
+ }finally{update.mockRestore();f.s.close();}
+});
 test('a stale local head reaches synchronization before any review remediation dispatch',async()=>{
  const f=templateFixture();const sync=spyOn(BranchSync.prototype,'ensure').mockResolvedValue({state:'waiting_for_worker',send:false,head:f.head,reason:'Synchronization awaits quiescence'});
  try{
