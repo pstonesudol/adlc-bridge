@@ -224,9 +224,13 @@ function pr30LoopFixture(){
 }
 for(const current of [false,true])test(`CodeRabbit ${current?'current':'stale'} change request preserves bounded scheduling guard`,async()=>{
  const f=pr30LoopFixture();try{
-  f.e.reasons.push('Reviewer coderabbit: explicit current-head approval required','Reviewer coderabbit: changes requested (5810360982)');
+  const blockers=['Reviewer coderabbit: explicit current-head approval required','Reviewer coderabbit: changes requested (5810360982)'];
+  f.e.reasons.push(...blockers);
+  f.e.reviewerEvidence={blockers,pending:[]};
   if(current){f.e.reviewSchedule.evidence.review.stale=false;f.e.reviewSchedule.evidence.review.commit=f.head;f.e.reviewSchedule.evidence.recoverable=false;}
-  await f.loop.tick(f.id);expect(f.reviews()).toBe(current?0:1);expect(f.sends()).toBe(0);
+  const result=await f.loop.tick(f.id);
+  if(current){expect(result).toMatchObject({state:'blocked',send:false});expect(f.loop.get(f.id).state).toBe('blocked');}
+  expect(f.reviews()).toBe(current?0:1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
 for(const failure of [false,true])test(`full review mode is accurate in request audit and ${failure?'uncertain':'accepted'} reasons`,async()=>{
