@@ -11,6 +11,24 @@ import {Database} from 'bun:sqlite';
 import {formatUpdateHistory,parseHistoryArgs,readUpdateHistory} from '../src/update-history';
 
 const repo='acme/adlc';
+import {integrationPreview} from '../src/integration-capabilities';
+test('update previews surface optional degradation and block required integration before activation',async()=>{
+ const f=fixture();try{
+  f.io.integrations=async()=>[{project:'one',report:integrationPreview({})}];
+  const optional=await f.manager.preview();expect(optional.integrations[0].report.matrix.every(r=>!r.enabled&&r.degraded)).toBe(true);expect(optional.ready).toBe(true);
+  f.io.integrations=async()=>[{project:'one',report:integrationPreview({integrationPolicy:{required:['blockerPublication']}})}];
+  const required=await f.manager.preview();expect(required.ready).toBe(false);expect(required.blockers.join()).toContain('one: blockerPublication');
+  await expect(f.manager.apply()).rejects.toThrow('Update is not ready');expect(f.installs).toEqual([]);expect(f.services).toEqual({one:true,two:false});
+ }finally{f.close();}
+});
+test('config drift after update preview prevents installation and preserves configs during recovery',async()=>{
+ const f=fixture();let reads=0;try{
+  const config=join(f.root,'project.json');writeFileSync(config,'{"operator":"preserved"}');
+  f.io.integrations=async()=>[{project:'one',report:integrationPreview(++reads===1?{}:{blockerSync:{enabled:false}})}];
+  await expect(f.manager.apply()).rejects.toThrow('Integration configuration changed after preview');
+  expect(f.installs).toEqual([]);expect(readFileSync(config,'utf8')).toBe('{"operator":"preserved"}');expect(f.services).toEqual({one:true,two:false});
+ }finally{f.close();}
+});
 test('database rollback fingerprints include committed WAL writes and WAL absence',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-wal-')),path=join(root,'state.sqlite');let db:Database|undefined;
  try{

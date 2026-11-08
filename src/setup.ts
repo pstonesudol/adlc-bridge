@@ -1,6 +1,7 @@
 import {existsSync,readFileSync,realpathSync,writeFileSync,lstatSync,statSync} from 'node:fs';
 import {isAbsolute,dirname,resolve,basename} from 'node:path';
 import {installedCLI} from './install-state';
+import {integrationPreview,integrationRuntime} from './integration-capabilities';
 import {Store} from './core';
 import {ProjectServices,projectServiceLabel,legacyLabel,registryPath} from './project-services';
 import {validate} from './linear';
@@ -89,8 +90,9 @@ export function setupPreview(c:any,r:RuntimeConfig,probe=liveProbe,runtimePath?:
   checks.push({name,passed,kind:'live-path'});
  }
  if(existsSync(r.projectConfig)){let matches=false;try{matches=JSON.stringify(JSON.parse(readFileSync(r.projectConfig,'utf8')))===JSON.stringify(c);}catch{}checks.push({name:'project-config-content',passed:matches,kind:'live-file'});}
- const conflict=existing!==undefined&&existing!==definition;
- return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict,checks,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['Existing local service registration is checked read-only; absent registration permits only the generated project label. No live provider, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
+  const conflict=existing!==undefined&&existing!==definition;
+  const integrations=integrationPreview(c,{},integrationRuntime(resolve(import.meta.dir,'..'),resolve(r.controller,'../..')));
+  return {mode:'preview_only',passed:checks.every(c=>c.passed)&&!conflict&&integrations.dispatchAllowed,checks,integrations,service:existing===undefined?'create':conflict?'conflict-existing-preserved':'unchanged',definition,verification:verificationInstructions(c.verification,runtimePath?{projectConfig:r.projectConfig,runtimeConfig:runtimePath,bun:r.tools.bun.path,cli:r.controller}:undefined),activation:false,limitations:['Existing local service registration is checked read-only; absent registration permits only the generated project label. No live provider, credential, image availability or running-service verification performed.','An existing semantically equivalent plist with different formatting is conservatively treated as a conflict.']};
 }
 export function writeSetupService(c:any,r:RuntimeConfig,runtimePath?:string,projectPath?:string){
  const preview=setupPreview(c,r,liveProbe,runtimePath,projectPath);if(!preview.passed)throw Error('Setup validation failed; existing configuration preserved');
