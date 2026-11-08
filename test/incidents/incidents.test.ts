@@ -1,5 +1,5 @@
 /** DEV-78 incident acceptance matrix. Runner: bun test test/incidents
- * Status: 13 active, 0 skip, 0 todo (13 tests).
+ * Includes DEV-88 restart/throttling measurement assertions; see README for coverage limits.
  * 1 duplicate/cancelled CI (#150): active DEV-77
  * 2 skipped current-head review + stale CHANGES_REQUESTED (#30): active DEV-65
  * 3 missing body-bound attestation: active DEV-70 (wait for provider evidence)
@@ -16,6 +16,8 @@ import {REVIEW_GRACE_MS} from '../../src/coderabbit-scheduling';
 import {RecoveryObservation} from '../../src/recovery-observation';
 import {readFailure} from '../../src/provider-read';
 import {incident,seededRandom} from './harness';
+import {ReviewLoop} from '../../src/review-loop';
+import {projectMetrics} from '../../src/autonomy-metrics';
 
 afterEach(()=>setSystemTime());
 function clock(){setSystemTime(new Date('2026-01-01T00:00:00Z'));}
@@ -30,6 +32,26 @@ async function replay(run:(f:ReturnType<typeof incident>)=>Promise<void>){
 test('approved baseline is stable across repeated polling, with zero operator commands',()=>replay(async f=>{
  for(let i=0;i<3;i++)expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
  expect(f.calls).toEqual([]);f.assertSafe();
+}));
+
+test('DEV-88: restart preserves one durable reviewed handoff and zero rescue observations',()=>replay(async f=>{
+ await f.loop.tick(f.id);
+ const restarted=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
+ for(let i=0;i<3;i++)expect((await restarted.tick(f.id)).state).toBe('ready_for_human');
+ const report=projectMetrics(f.s,{since:'2026-01-01T00:00:00Z',until:'2026-01-01T00:01:00Z'},Date.now()+60000);
+ expect(report.summary).toMatchObject({reviewedHandoffs:1,handoffsWithoutRecordedRescue:1,interventions:0});
+ expect(report.jobs[0].provenance.filter(p=>p.category==='review')).toHaveLength(1);f.assertSafe();
+}));
+
+test('DEV-88: throttling survives reconstruction, honors cooldown, then records automatic recovery',()=>replay(async f=>{
+ const original=f.loop.io.readBranchSnapshot;let reads=0;
+ f.loop.io.readBranchSnapshot=async(...args)=>{if(++reads===1)throw readFailure('github','snapshot','HTTP 429',1);return original(...args);};
+ await f.loop.tick(f.id);const status=new RecoveryObservation(f.s).status(f.id);
+ const restarted=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
+ await restarted.tick(f.id);expect(reads).toBe(1);
+ setSystemTime(new Date(status.next_read));expect((await restarted.tick(f.id)).state).toBe('ready_for_human');
+ const row=projectMetrics(f.s,{since:'2026-01-01T00:00:00Z',until:'2026-01-02T00:00:00Z'},Date.parse('2026-01-02T00:00:00Z')).jobs[0];
+ expect(row.interventions).toBe(0);expect(row.retries.throttled).toBe(1);expect(row.recoveries[0]).toMatchObject({outcome:'success',durationMs:status.next_read-Date.parse('2026-01-01T00:00:00Z')});f.assertSafe();
 }));
 
 test('1 DEV-77: duplicate/cancelled CI run instances reach ready_for_human',()=>replay(async f=>{
@@ -145,8 +167,12 @@ test('7 DEV-84: lost worker reply reconciles accepted/running/completed receipt 
  setSystemTime(new Date(Date.now()+31*60000));f.evidence.clear=true;
  for(let n=0;n<3;n++)expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');
  expect(f.calls.filter(c=>c.kind==='send')).toHaveLength(1);
- expect(f.s.db.query('SELECT state FROM remediation WHERE job=?').get(f.id)).toEqual({state:'completed'});
- expect(f.s.get(f.id).attempts).toBe(1);f.assertSafe();
+   expect(f.s.db.query('SELECT state FROM remediation WHERE job=?').get(f.id)).toEqual({state:'completed'});
+   expect(f.s.get(f.id).attempts).toBe(1);f.assertSafe();
+   const measured=projectMetrics(f.s,{since:'2026-01-01T00:00:00Z',until:'2026-01-02T00:00:00Z'},Date.parse('2026-01-02T00:00:00Z')).jobs[0];
+   expect(measured.interventions).toBe(0);expect(measured.handoff).not.toBeNull();expect(measured.retries.worker_remediation).toBe(1);
+   const row=projectMetrics(f.s,{since:'2026-01-01T00:00:00Z',until:'2026-01-02T00:00:00Z'},Date.parse('2026-01-02T00:00:00Z')).jobs[0];
+   expect(row.interventions).toBe(0);expect(row.handoff).not.toBeNull();expect(row.retries.worker_remediation).toBe(1);
 }));
 
 test('7 safety: lost review-request reply reconciles matching receipt without duplicate mutation',()=>replay(async f=>{

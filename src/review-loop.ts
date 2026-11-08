@@ -333,7 +333,7 @@ export class ReviewLoop{
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
   try{e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));}
-  catch(error){if(error instanceof ReadValidationError)observation.clear(job);return record(readStop(error,'Readiness evidence unavailable'));}
+  catch(error){if(error instanceof ReadValidationError)observation.clear(job,false);return record(readStop(error,'Readiness evidence unavailable'));}
    observation.clear(job);
    const reviewed=this.completed(job);if(reviewed)return reviewed;
    // Completed jobs no longer satisfy execution approval; handle that terminal
@@ -495,7 +495,7 @@ export class ReviewLoop{
     // A log read cannot authorize a stale run/head. Re-read logical identities.
     let fresh;
     try{fresh=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks));}
-    catch(error){if(error instanceof ReadValidationError)observation.clear(job);return record({...readStop(error,'Readiness evidence unavailable'),head:e.head});}
+    catch(error){if(error instanceof ReadValidationError)observation.clear(job,false);return record({...readStop(error,'Readiness evidence unavailable'),head:e.head});}
     if(fresh.head!==e.head||failures.some((c:any)=>fresh.failedChecks.filter((x:any)=>sameFailedCheck(c,x)).length!==1||fresh.pendingChecks.includes(c.name)))return record({state:'blocked',send:false,head:e.head,reason:`Required CI ${failures.map((c:any)=>c.name).join(', ')}: unknown; failure identity changed during diagnosis`});
    }
   const d=decision(reviewView,JSON.parse(t.allowed_paths),Date.now()-since);
