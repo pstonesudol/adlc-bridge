@@ -3,6 +3,7 @@ import {localAO} from './workflow-transport';
 import {discoverMode,confirmMode,openCodeModes,NativeModeFailure,ProviderModeFailure} from './provider-mode';
 
 type API=(path:string,method?:string,body?:unknown)=>Promise<any>;
+const approvalPosture=(value:unknown)=>typeof value==='string'&&value?value:undefined;
 export async function preflightRoute(route:Route,api:API=localAO){
  const catalog=await api(`agents/${route.harness}/models?catalogOnly=true`);
  if(!Array.isArray(catalog.models)||!catalog.models.some((m:any)=>m.id===route.model))throw Error('Configured routing model is not in the Orchestrator catalog');
@@ -27,20 +28,18 @@ export async function configureSessionRoute(session:string,route:Route,api:API=l
  if(route.effort)await select('effort',route.effort);
  else if(options().find((o:any)=>o.id==='effort')?.choices?.some((c:any)=>c.value==='default'))await select('effort','default');
  // Mapping belongs to this adapter. A provider mode does not authorize the
-  // workflow phase; existing revision/approval/submission gates remain owners.
-  // Read the existing approval posture, never infer it from the target choice
-  // or PATCH permissions. Unknown posture still rejects annotated modes.
-  const permission=typeof conversation.settings?.approvalMode==='string'&&conversation.settings.approvalMode?conversation.settings.approvalMode:undefined;
-  const mode=discoverMode(route.mode==='plan'?'planning':'execution',openCodeModes,options(),route.mode,permission);
+ // workflow phase; existing revision/approval/submission gates remain owners.
+ // Read the existing approval posture, never infer it from the target choice
+ // or PATCH permissions. Unknown posture still rejects annotated modes.
+ const permission=approvalPosture(conversation.settings?.approvalMode);
+ const mode=discoverMode(route.mode==='plan'?'planning':'execution',openCodeModes,options(),route.mode,permission);
  try{b=await api(`${prefix}/${encodeURIComponent(mode.option)}`,'PATCH',{value:mode.mode});}
  catch(e){throw new ProviderModeFailure(e instanceof NativeModeFailure?e.kind:'uncertain',mode.intent,mode.mode,e instanceof NativeModeFailure?e.observed:'unknown');}
  confirmMode(mode,b.options);
  const after=await api(prefix);b=after;
-  confirmMode(mode,options());
-  if(permission!==undefined){
-   const finalConversation=await api(`sessions/${session}/conversation`);
-   if(finalConversation.settings?.approvalMode!==permission)throw new ProviderModeFailure('rejected',mode.intent,mode.mode,'unknown');
-  }
+ confirmMode(mode,options());
+ const finalConversation=await api(`sessions/${session}/conversation`);
+ if(approvalPosture(finalConversation.settings?.approvalMode)!==permission)throw new ProviderModeFailure('rejected',mode.intent,mode.mode,'unknown');
  if(options().find((o:any)=>o.id==='mode')?.currentValue!==route.mode||options().find((o:any)=>o.id==='model')?.currentValue!==route.model||route.effort&&options().find((o:any)=>o.id==='effort')?.currentValue!==route.effort)throw Error('Routing selection changed before delivery');
  return {harness:route.harness,model:route.model,effort:route.effort,verified:true};
 }

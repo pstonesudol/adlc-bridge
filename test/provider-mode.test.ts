@@ -104,3 +104,52 @@ for(const scenario of ['matching','unknown','conflicting','confirmation-conflict
   expect(calls.some(c=>c.includes('/settings')||c.includes('messages')||c==='POST sessions'||c.includes('restore'))).toBe(false);
  });
 }
+for(const [initial,final,accepted] of [
+ [undefined,'default',false],['default',undefined,false],['','auto',false],['accept-edits','',false],
+ [undefined,'',true],['',null,true],[null,undefined,true],[undefined,undefined,true],['default','default',true]
+] as const){
+ test(`unannotated mode compares normalized posture ${String(initial)} -> ${String(final)}`,async()=>{
+  const route=selectRoute(routingConfig,{choice:'planning',confidence:1}),calls:string[]=[];
+  let selected=false,reads=0;
+  const api=async(path:string,method?:string)=>{
+   calls.push(`${method??'GET'} ${path}`);
+   if(path==='sessions/owned')return {session:{harness:route.harness,isTerminated:false}};
+   if(path.endsWith('/conversation'))return {controller:'ready',turns:[],settings:{approvalMode:reads++===0?initial:final}};
+   if(path.endsWith('/mode')&&method==='PATCH')selected=true;
+   return {options:[
+    {id:'model',currentValue:route.model,choices:[{value:route.model}]},
+    {id:'effort',currentValue:route.effort,choices:[{value:route.effort}]},
+    ...catalog('mode',selected?'plan':'build',['plan','build'])
+   ]};
+  };
+  if(accepted)expect((await configureSessionRoute('owned',route,api)).verified).toBe(true);
+  else await expect(configureSessionRoute('owned',route,api)).rejects.toThrow('Provider mode rejected');
+  expect(reads).toBe(2);
+  expect(calls.filter(c=>c==='PATCH sessions/owned/conversation/config-options/mode')).toHaveLength(1);
+  expect(calls.at(-1)).toBe('GET sessions/owned/conversation');
+  expect(calls.some(c=>c.includes('/settings')||c.includes('messages')||c==='POST sessions'||c.includes('restore'))).toBe(false);
+ });
+}
+test('plain mode PATCH timeout is sanitized uncertain/unknown with no retry or send',async()=>{
+ const route=selectRoute(routingConfig,{choice:'planning',confidence:1}),calls:string[]=[];
+ const raw='timeout: Bearer private provider output';
+ const api=async(path:string,method?:string)=>{
+  calls.push(`${method??'GET'} ${path}`);
+  if(path==='sessions/owned')return {session:{harness:route.harness,isTerminated:false}};
+  if(path.endsWith('/conversation'))return {controller:'ready',turns:[]};
+  if(path.endsWith('/mode')&&method==='PATCH')throw new Error(raw);
+  return {options:[
+   {id:'model',currentValue:route.model,choices:[{value:route.model}]},
+   {id:'effort',currentValue:route.effort,choices:[{value:route.effort}]},
+   ...catalog('mode','build',['plan','build'])
+  ]};
+ };
+ const error=await configureSessionRoute('owned',route,api).then(()=>null,e=>e);
+ expect(error).toBeInstanceOf(Error);
+ expect(error.message).toContain('Provider mode uncertain: intent=planning');
+ expect(error.message).toContain('observed=unknown');
+ for(const secret of [raw,'timeout','Bearer','private provider output'])expect(error.message).not.toContain(secret);
+ expect(calls.filter(c=>c==='PATCH sessions/owned/conversation/config-options/mode')).toHaveLength(1);
+ expect(calls.at(-1)).toBe('PATCH sessions/owned/conversation/config-options/mode');
+ expect(calls.some(c=>c.includes('/settings')||c.includes('messages')||c==='POST sessions'||c.includes('restore'))).toBe(false);
+});
