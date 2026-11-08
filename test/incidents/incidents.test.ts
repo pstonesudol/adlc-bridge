@@ -155,7 +155,7 @@ test('7 safety: lost review-request reply reconciles matching receipt without du
  let marker='';f.loop.postReview=async(_repo,_pr,value)=>{marker=value!;f.calls.push({kind:'review-request',key:marker});throw Error('lost reply');};
  await expect(f.loop.tick(f.id)).rejects.toThrow('lost reply');
  expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
- f.evidence.requestComments=[{id:42,author:'fixture-bot',body:`@coderabbitai full review\n\n${marker}`,created:new Date(Date.now()+1).toISOString()}];
+ f.evidence.requestComments=[{id:42,author:'fixture-bot',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1).toISOString()}];
  expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
  f.evidence.clear=true;f.evidence.botReviewSubmittedAt=Date.now()+2;
  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');

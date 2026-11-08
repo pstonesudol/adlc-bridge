@@ -9,7 +9,7 @@ import {sendPilotRemediation} from './pilot';
 import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
 import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
-import {ReviewRequests,ReviewRateLimit,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,type ReviewSchedule} from './coderabbit-scheduling';
+import {ReviewRequests,ReviewRateLimit,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,reviewRequestBody,reviewRequestMarker,type ReviewSchedule,type ReviewMode} from './coderabbit-scheduling';
 import {readFailure} from './provider-read';
 import {classifyCIFailure,readCIFailure,ciFinding,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 
@@ -64,14 +64,16 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
  if(e.pendingChecks?.length||e.missingChecks?.length)return {state:'waiting_for_ci',send:false,reason:`Waiting for CI: ${[...(e.pendingChecks??[]),...(e.missingChecks??[])].join(', ')}`};
  return {state:'waiting_for_coderabbit',send:false,reason:e.reasons.join('; ')};
 }
-export async function postFullReview(repo:string,pr:number,marker='',spawn=Bun.spawn){
- const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=@coderabbitai full review${marker?'\n\n'+marker:''}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+export async function postCodeRabbitReview(repo:string,pr:number,marker='',spawn=Bun.spawn,mode:ReviewMode='regular'){
+ const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=${reviewRequestBody(mode,marker)}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(code!==0){const failure=readFailure('github','review-request',_err,code,undefined,Date.now(),_out).evidence;
   if(failure.classification==='throttled'&&[403,429].includes(failure.httpStatus??0))throw new ReviewRateLimit(failure.retryAt);
  }
- if(code!==0)throw Error('Full review request delivery uncertain; inspect before retry');
+ if(code!==0)throw Error(`${mode} review request delivery uncertain; inspect before retry`);
 }
+/** Explicit whole-PR reassessment only; never used by automatic scheduling. */
+export async function postFullReview(repo:string,pr:number,marker='',spawn=Bun.spawn){return postCodeRabbitReview(repo,pr,marker,spawn,'full');}
 export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
@@ -79,7 +81,7 @@ const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeed
 export class ReviewLoop{
  io:typeof reviewIO;
  requests:ReviewRequests;
-  constructor(public s:Store,public postReview=postFullReview,overrides:Partial<typeof reviewIO>={},public now=Date.now){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
+  constructor(public s:Store,public postReview=postCodeRabbitReview,overrides:Partial<typeof reviewIO>={},public now=Date.now){this.io={...reviewIO,...overrides};ensureReviewFeedback(s.db);s.db.exec(`CREATE TABLE IF NOT EXISTS review_targets(
   job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,
   required_checks TEXT NOT NULL,allowed_paths TEXT NOT NULL,remediate INTEGER NOT NULL DEFAULT 0,
   head TEXT,state TEXT NOT NULL DEFAULT 'waiting_for_review',reason TEXT,
@@ -156,9 +158,10 @@ export class ReviewLoop{
    private completed(job:string){const t=this.get(job);return t?.state==='completed'?{state:'completed',send:false,head:t.head,reason:t.reason}:undefined;}
    private uncertainReview(job:string,pr:number,head:string){
     const request=this.s.db.query("SELECT state FROM full_review_requests WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain' LIMIT 1").get(job,pr,head) as any;
-    return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:`Full review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
+    const mode=this.requests.get(this.get(job).repo,pr,head)?.mode??'full';
+    return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:`${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
    }
- list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state)}));}
+ list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
   private reconcileRemediation(job:string,head:string,session:any,activeOnly=false){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
     if(!pending)return;
@@ -220,20 +223,20 @@ export class ReviewLoop{
     if(!this.requests.claim(job,t.repo,pr,schedule))return false;
     const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
-    this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason=? WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),`Full review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`,job,pr);
+      this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason=? WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),`Regular review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`,job,pr);
    return true;
   }).immediate();
    if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
-   const marker=`<!-- adlc-coderabbit-request:${digest(JSON.stringify([t.repo,pr,head]))} -->`;
+   const marker=reviewRequestMarker(t.repo,pr,head);
    try{await this.postReview(t.repo,pr,marker);}
    catch(error){assertObservationFence();
      if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);this.s.db.query("DELETE FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
-    this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: full review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
+    this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: regular review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
   assertObservationFence();
    this.s.db.transaction(()=>{this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
    this.requests.settle(t.repo,pr,head,'accepted',marker);}).immediate();
-  this.s.event(job,'coderabbit_full_review_requested',JSON.stringify({pr,head,bodyHash}));
+  this.s.event(job,'coderabbit_review_requested',JSON.stringify({pr,head,bodyHash,mode:'regular'}));
   return true;
  }
    async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
@@ -342,10 +345,10 @@ export class ReviewLoop{
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
    const receipt=this.requests.get(t.repo,t.pr,e.head);
    if(receipt?.state==='delivery_uncertain'){
-    const marker=`<!-- adlc-coderabbit-request:${digest(JSON.stringify([t.repo,t.pr,e.head]))} -->`;
-    const matched=e.requestComments?.filter((c:any)=>c.body===`@coderabbitai full review\n\n${marker}`&&Date.parse(c.created)>=receipt.requested&&c.author&&c.id);
+    const marker=reviewRequestMarker(t.repo,t.pr,e.head);
+    const matched=e.requestComments?.filter((c:any)=>c.body===reviewRequestBody(receipt.mode,marker)&&Date.parse(c.created)>=receipt.requested&&c.author&&c.id);
     if(matched?.length===1){this.requests.settle(t.repo,t.pr,e.head,'accepted',String(matched[0].id));this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain'").run(job,t.pr,e.head);}
-    else return record({state:'needs_reconciliation',send:false,head:e.head,reason:'CodeRabbit review unavailable: request outcome uncertain; reconcile matching request evidence before retry'});
+    else return record({state:'needs_reconciliation',send:false,head:e.head,reason:`CodeRabbit review unavailable: ${receipt.mode} request outcome uncertain; reconcile matching request evidence before retry`});
    }
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
    const since=t.head===e.head?t.head_since:Date.now();
@@ -418,9 +421,9 @@ export class ReviewLoop{
   const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
   if(schedule&&idle&&!e.clear&&!waiting){
    const request=this.requests.get(t.repo,t.pr,e.head),age=Date.now()-(request?.state==='accepted'?request.requested:scheduleWait!.started);
-   if(request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt})});
+   if(request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt,mode:request.mode})});
    if(schedule.evidence?.classification==='rate-limited'&&!request)return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:0,requestState:'none'})});
-   if(age>=REVIEW_TIMEOUT_MS&&request?.state!=='rate_limited')return record({state:'blocked',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request?.attempts??0,requestState:request?.state??'none'})});
+   if(age>=REVIEW_TIMEOUT_MS&&request?.state!=='rate_limited')return record({state:'blocked',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request?.attempts??0,requestState:request?.state??'none',mode:request?.mode})});
    if(schedule.incremental||Date.now()-scheduleWait!.started<REVIEW_GRACE_MS||session.transcript.controller!=='ready')return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:schedule.incremental?'Waiting for automatic incremental CodeRabbit review':'Waiting for final remediation batch and five-minute CodeRabbit grace period'});
   }
   // Only an established obligation gate supplies a current-head/body baseline;
@@ -435,7 +438,7 @@ export class ReviewLoop{
      // A concurrent completion keeps its terminal result; only a rebound target
      // makes this evidence stale.
      if(!headUpdate.changes&&this.get(job)?.pr!==t.pr)return {state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'};
-    return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description'});
+    return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:'Regular CodeRabbit review requested for current commit and description'});
    }
   }
    if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){
@@ -450,14 +453,14 @@ export class ReviewLoop{
    const request=this.s.db.query('SELECT * FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=?').get(job,t.pr,e.head,reviewBodyKey) as any;
     const sinceReview=Math.max(reviewStarted,request?.requested??reviewStarted);
    const surfaceBlocker=freshBlocker&&e.botReviewSubmittedAt>sinceReview;
-   if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return record({state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Template check passed after description update; waiting for fresh CodeRabbit reevaluation'});
+   if(!surfaceBlocker&&(e.coderabbitPending||!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=sinceReview||customObligation&&!e.coderabbitBodyReviewed))return record({state:Date.now()-sinceReview>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:`Template check passed after description update; waiting for fresh CodeRabbit reevaluation; requested mode ${this.requests.get(t.repo,t.pr,e.head)?.mode??(request?'full':'none')}. Regular review may skip a description-only edit; inspect before explicitly requesting whole-PR reassessment, never infer approval`});
   }
   // An accepted request must produce its own review before old custom evidence
   // is judged; otherwise a poll that arrives before the bot starts would report
   // the pre-request blocker as current.
   const pendingReview=this.s.db.query("SELECT * FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='accepted'").get(job,t.pr,e.head,reviewBodyKey) as any;
   if(!blockerAlreadyFresh&&pendingReview&&(!Number.isFinite(e.botReviewSubmittedAt)||e.botReviewSubmittedAt<=pendingReview.requested)&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length)
-   return record({state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:'Full CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence'});
+   return record({state:Date.now()-pendingReview.requested>30*60*1000?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:`${this.requests.get(t.repo,t.pr,e.head)?.mode??'full'} CodeRabbit review requested for current commit and description; awaiting its result before judging custom-check evidence`});
   // Delivery uncertainty takes precedence over dedupe and blocker reporting: an
   // unverified send must be reconciled even when its thread is already recorded
    // as dispatched.
