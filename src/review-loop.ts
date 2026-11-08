@@ -1,4 +1,5 @@
 import {BranchUpdates,BranchObservationFailure,branchTransport,type BranchPolicy} from './branch-updates';
+import {BranchSync} from './branch-sync';
 import {scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
@@ -286,12 +287,12 @@ export class ReviewLoop{
   const wait=observation?.wait(job);if(wait)return record(wait);
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
-   if(recovery){
+   if(recovery&&!recovery.branchSync){
     if(recovery.job!==job||!config)return record({state:'blocked',send:false,reason:'Worktree has a durable conflict reservation; inspect recovery-status with its original config'});
     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
     catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
    }
-  let session,snapshot;
+  let session,snapshot,local;
   try{
     session=await observation.read(job,'orchestrator',()=>io.sessionEvidence(run.session_id),false);
     snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));
@@ -303,7 +304,7 @@ export class ReviewLoop{
      const terminated=observeLiveness(this.s,job,session,snapshot.head,WATCHDOG_LIMITS.livenessMs,this.now());
      return record({...livenessStop(terminated,WATCHDOG_LIMITS.livenessMs,this.now()),head:snapshot.head});
     }
-    const local=await io.worktreeIdentity(this.s,job);
+    local=await io.worktreeIdentity(this.s,job);
    if(local.branch!==snapshot.branch)throw Error(`Blocked — branch mismatch: reserved ${session.session.branch}; actual ${local.branch}; candidate https://github.com/${t.repo}/pull/${t.pr}; preview recover-handoff`);
   }catch(e){return record({state:'blocked',send:false,reason:e instanceof Error?e.message:'Delivery identity unavailable'});}
     const collected=this.completed(job);if(collected)return collected;
@@ -313,6 +314,11 @@ export class ReviewLoop{
      const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery)return record(activeDelivery);
      if(liveStop&&live.classification==='unknown')return record({...liveStop,head:snapshot.head});
      if(live.classification==='idle_no_delivery'&&liveStop?.state==='needs_reconciliation'&&!this.s.db.query("SELECT 1 FROM remediation WHERE job=? AND state='delivery_uncertain'").get(job))return record({...liveStop,head:snapshot.head});
+   if(config&&(local.head!==snapshot.head||recovery?.branchSync)){
+    const synchronized=await new BranchSync(this.s,observedTransport).ensure(job,config,t.repo,t.pr);
+    if(synchronized)return record(synchronized);
+   }
+   if(!config&&recovery?.branchSync)return record({state:'blocked',send:false,reason:'Pending branch synchronization requires the registered project configuration; no review dispatch'});
    let branch;
    if(config?.conflictRecovery?.enabled===true){
     let snapshot;

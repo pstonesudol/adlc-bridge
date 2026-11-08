@@ -6,6 +6,7 @@ import {decision,ReviewLoop,postCodeRabbitReview} from '../src/review-loop';
 import {Store,reviewGate,digest} from '../src/core';
 import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {ConflictRecovery} from '../src/conflict-recovery';
+import {BranchSync} from '../src/branch-sync';
 import {requiredCheckState} from '../src/github';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
@@ -73,6 +74,21 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+test('a stale local head reaches synchronization before any review remediation dispatch',async()=>{
+ const f=templateFixture();const sync=spyOn(BranchSync.prototype,'ensure').mockResolvedValue({state:'waiting_for_worker',send:false,head:f.head,reason:'Synchronization awaits quiescence'});
+ try{
+  f.loop.io.worktreeIdentity=async()=>({tree:'/worktree',branch:f.session.session.branch,head:'c'.repeat(40)});
+  expect(await f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,{})).toMatchObject({state:'waiting_for_worker',send:false});
+  expect(sync).toHaveBeenCalledTimes(1);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{sync.mockRestore();f.s.close();}
+});
+test('the final remediation submit gate rejects a stale local head without spending an attempt',async()=>{
+ const f=templateFixture();try{
+  f.io.worktreeIdentity=async()=>({tree:'/worktree',branch:f.session.session.branch,head:'c'.repeat(40)});
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],DEFAULT_REMEDIATION_POLICY,['PR body structure'],f.io)).rejects.toThrow('Worktree and remote PR HEAD differ');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
 test('resolved passing CI duplicates reach human review without requests or remediation',async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);

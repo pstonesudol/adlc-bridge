@@ -113,7 +113,7 @@ export class ActionWatchdog{
     return this.get(id);
    }
    if(!eligibility(this.s,job,c,this.now()))this.stop(id,'human','authority_unavailable','Inspect current plan, ownership and inspect grant; no authority inferred');
-   else if(worktreeReservation(this.s,job))this.stop(id,'unsupported','unsupported','Conflict recovery retains the worktree reservation; inspect recovery-status through the existing recovery interface');
+   else if(worktreeReservation(this.s,job)&&!worktreeReservation(this.s,job)?.branchSync)this.stop(id,'unsupported','unsupported','Conflict recovery retains the worktree reservation; inspect recovery-status through the existing recovery interface');
    else if(evaluateAction(blocker,old.due_at,this.now()).kind==='escalate'&&!row(this.s,'watchdog_evaluations',job).failures)this.stop(id,blocker,blocker==='unsupported'?'unsupported':'human_required','Existing blocker requires attention; bounded ordinary review may observe changed evidence; automatic recovery is unsupported');
    else if(!idle(this.s,job)&&budget.attempts>=budget.max_attempts)this.stop(id,blocker,'budget_exhausted','Automatic observation budget exhausted; inspect jobs status and use an explicit supervised tick-review after resolving the blocker');
    return this.get(id);
