@@ -18,7 +18,7 @@ import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
-import {reviewerPolicy,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES} from '../src/reviewer-policy';
+import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing reviewer approvals stay in CI/review/rate-limit waits; hard obligations still block',()=>{
  const missing='Reviewer coderabbit: explicit current-head approval required';
@@ -86,6 +86,17 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+test('reviewer lookup throttle persists through review tick without clearing recovery or dispatching',async()=>{
+ const f=templateFixture();try{
+  const reset=Date.now()+180000,failure=readFailure('github','reviewer-read','HTTP/2 429\r\nRetry-After: 180\r\n\r\n',1);failure.evidence.retryAt=reset;
+  let lookups=0;f.loop.io.readiness=async()=>{await reviewerTrust(reviewerPolicy(undefined),'owner/repo',async()=>{lookups++;throw failure;});return f.e;};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_worker',send:false});
+  const observations=new RecoveryObservation(f.s);expect(observations.status(f.id)).toMatchObject({failures:1,next_read:reset,sharedNextRead:reset,evidence:{classification:'throttled',operation:'reviewer-read'}});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_worker',send:false});
+  expect(lookups).toBe(1);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(observations.status(f.id).failures).toBe(1);
+ }finally{f.s.close();}
+});
 test('DEV-95: behind-base maintenance retains an independent incomplete CodeRabbit review',async()=>{
  const f=templateFixture(),blocker='CodeRabbit custom-check failure: pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary';
  let updates=0,reads=0;

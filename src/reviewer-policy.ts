@@ -1,5 +1,7 @@
 import {Store,digest} from './core';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
+import {providerEvidence} from './provider-read';
+import {transient} from './recovery-observation';
 
 export type Severity='info'|'low'|'medium'|'high'|'critical';
 export type ReviewerIdentity={userId:number;type:'Bot'|'User';login?:string};
@@ -90,7 +92,13 @@ export async function reviewerTrust(policy:Reviewer[],repo:string,read:GitHubRea
     if(!complete)throw Error('membership pagination exceeds bound');
    }
    if(now()-observed>RECEIPT_FRESHNESS_MS)throw Error('membership evidence expired during collection');
-  }catch{ids=[];blocker=`Reviewer ${r.id}: fresh identity/membership evidence unavailable or mismatched; no trust granted`;}
+   }catch(error){
+    // The enclosing observation read owns shared backoff. A successful-looking
+    // partial collection would discard its typed cooldown and permit early
+    // retries, so transient failures must abort without granting any trust.
+    const evidence=providerEvidence(error);if(evidence&&transient(evidence))throw error;
+    ids=[];blocker=`Reviewer ${r.id}: fresh identity/membership evidence unavailable or mismatched; no trust granted`;
+   }
   result.push({reviewer:r.id,observed,ids:[...new Set(ids)],blocker});
  }
  return result;

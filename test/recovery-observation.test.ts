@@ -6,6 +6,27 @@ import {readFailure,readEvidence,malformed,MAX_PROVIDER_RETRY_MS} from '../src/p
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {reviewerPolicy,reviewerTrust} from '../src/reviewer-policy';
+for(const lookup of ['identity','membership-page'])test(`reviewer ${lookup} throttling preserves typed shared backoff across jobs and restarts`,async()=>{
+ const s=new Store(':memory:');let now=1000;const job=s.enqueue('p','issue','spec'),other=s.enqueue('q','other','spec'),o=new RecoveryObservation(s,()=>now,()=>0.5);
+ const policies=lookup==='identity'?reviewerPolicy(undefined).filter(r=>r.id==='codex'):reviewerPolicy([{id:'team',adapter:'github-review',membership:{kind:'team',organization:'org',slug:'reviewers'}}]).filter(r=>r.id==='team');
+ const failure=readFailure('github','reviewer-read','HTTP/2 429\r\nRetry-After: 180\r\n\r\n',1,undefined,now);
+ let calls=0;const read=async(args:string[])=>{
+  calls++;const path=args[1];
+  if(path==='orgs/org/teams/reviewers/repos/owner/repo')return {full_name:'owner/repo',permissions:{pull:true}};
+  if(path.endsWith('page=1'))return Array.from({length:100},(_,id)=>({id:id+1,type:'User',login:`human${id}`}));
+  throw failure;
+ };
+ try{
+  await expect(o.read(job,'github',()=>reviewerTrust(policies,'owner/repo',read,()=>now))).rejects.toBe(failure);
+  expect(o.status(job)).toMatchObject({failures:1,next_read:181000,sharedNextRead:181000,evidence:{provider:'github',operation:'reviewer-read',classification:'throttled',retryAt:181000}});
+  expect(calls).toBe(lookup==='identity'?1:3);const before=calls;
+  const restarted=new RecoveryObservation(s,()=>now,()=>0.5);
+  await expect(restarted.read(other,'github',()=>reviewerTrust(policies,'owner/repo',read,()=>now))).rejects.toBeInstanceOf(ObservationDeferred);
+  expect(calls).toBe(before);expect(s.get(job).attempts).toBe(0);expect(s.get(other).attempts).toBe(0);
+  now=181001;expect(await restarted.read(other,'github',async()=>true)).toBe(true);
+ }finally{s.close();}
+});
 test('untyped callback failure cannot create a transient provider cooldown',async()=>{
  const s=new Store(':memory:'),job=s.enqueue('p','i','s'),o=new RecoveryObservation(s);
  try{await expect(o.read(job,'github',async()=>{throw Error('timeout');})).rejects.toThrow('timeout');expect(o.status(job).evidence.classification).toBe('unknown');expect(o.status(job).sharedNextRead).toBeNull();expect(o.wait(job)?.state).toBe('blocked');}finally{s.close();}

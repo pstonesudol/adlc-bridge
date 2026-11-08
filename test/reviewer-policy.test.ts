@@ -7,11 +7,22 @@ import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
 import {ReviewLoop} from '../src/review-loop';
 import {ReviewRequests,reviewRequestBody,reviewRequestMarker} from '../src/coderabbit-scheduling';
 import {decision} from '../src/review-loop';
+import {readFailure} from '../src/provider-read';
 const now=Date.now();
 const policy=()=>reviewerPolicy(undefined);
 const trusts=()=>policy().map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
 const context={repo:'o/r',pr:1,head:'a'.repeat(40),selfIds:[9]};
 const finding=(over:any={}):NormalizedFeedback=>({id:'C1',threadId:'T1',body:'Missing ownership guard',userId:BOT_IDENTITIES.codex.userId,type:'Bot',login:'chatgpt-codex-connector[bot]',path:'src/a.ts',line:4,originalCommit:'older',outdated:false,resolved:false,original:{id:'C1',body:'Missing ownership guard'},...over});
+for(const raw of ['HTTP 429','HTTP 503','ETIMEDOUT','ECONNRESET'])test(`reviewer lookup propagates transient provider evidence: ${raw}`,async()=>{
+ const failure=readFailure('github','reviewer-read',raw,1,undefined,now),wrapped=new Error('Reviewer lookup failed',{cause:failure});
+ await expect(reviewerTrust(policy(),'o/r',async()=>{throw wrapped;},()=>now)).rejects.toBe(wrapped);
+});
+for(const raw of ['HTTP 401','HTTP 403','HTTP 404'])test(`reviewer permanent lookup failure stays a scoped fail-closed blocker: ${raw}`,async()=>{
+ const p=policy(),failure=readFailure('github','reviewer-read',raw,1,undefined,now);
+ const result=await reviewerTrust(p,'o/r',async args=>{const id=Number(args[1].split('/')[1]);if(id===199175422)throw failure;return {id,type:'Bot',login:'coderabbitai[bot]'};},()=>now);
+ expect(result.find(t=>t.reviewer==='codex')).toMatchObject({ids:[],blocker:'Reviewer codex: fresh identity/membership evidence unavailable or mismatched; no trust granted'});
+ expect(result.find(t=>t.reviewer==='coderabbit')).toMatchObject({ids:[136622811],blocker:null});
+});
 test('example reviewer ingestion/remediation stays disabled until operator opt-in',async()=>{
  const example=await Bun.file(new URL('../config/project.example.json',import.meta.url)).json();
  expect(reviewerPolicy(example.reviewers).find(r=>r.id==='codex')).toMatchObject({enabled:false,remediate:false,approvalRequired:false,requestReview:false});
