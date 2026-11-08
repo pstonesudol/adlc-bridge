@@ -687,6 +687,42 @@ with `--confirm HASH`; normal polling registers the review target afterwards.
 
 ### Plan readiness and worker blockers
 
+#### Integration enablement and upgrade readiness
+
+`adlc init REPO --preview --config CONFIG`, `adlc doctor CONFIG`, setup previews,
+PR readiness, and update previews include an integration matrix for blocker
+publication, clarification publication and clarification reply consumption.
+Implemented, configured, enabled, reachable, validated and unavailable are
+separate fields. Unknown evidence is not success; installing code does not prove
+an integration operational. Legacy configurations remain optional and visibly
+degraded; no feature is silently enabled.
+
+Run `adlc doctor CONFIG --verify-integrations` to make **read-only** provider
+requests validating project/team membership, the distinct needs-human label and
+active non-app authorized-human UUIDs. Incomplete inventories and credential
+failures never count as validation. This command does not publish a probe or
+prove comment/label mutation permissions. Publication probes require separate
+explicit operator authorization; no live publication probe is automatically run
+by init, doctor, upgrades, dispatch or tests.
+
+To explicitly require a capability, configure `integrationPolicy.required` with
+any of `blockerPublication`, `clarificationPublication`, `clarificationReplies`.
+Required capabilities fail closed before planning, implementation or continuation
+dispatch when validation is missing; observation/reconciliation remains available.
+**Current limitation:** provider mutation/reply permission verification is unknown
+without independent live evidence. Required capabilities therefore remain paused;
+do not opt into required mode expecting configuration alone to unlock dispatch.
+Doctor gives the missing prerequisites and operator action rather than claiming
+that a configured integration is operational.
+
+Repair output is a field-level **preview only**, not an apply command. Back up the
+original config, retain unknown fields and existing backups, review the proposed
+disabled sections, supply verified local mappings and explicitly authorize any
+enablement. Never copy credentials. Upgrade previews compare integration source
+fingerprints with the installed snapshot and recheck configuration before activation.
+Repairs and runtime installation remain separate operator actions; existing
+upgrade/rollback lifecycle and human-only merge/no-deployment rules are unchanged.
+
 Planning agents must end with a machine-readable `ADLC_PLAN_STATUS` receipt:
 `ready`, `needs-input`, or `blocked-by-dependency`, with concrete questions and
 dependency references. Missing or malformed receipts are non-actionable. The
@@ -1036,13 +1072,39 @@ for CI, Waiting for CodeRabbit, Addressing feedback, Blocked, or Ready for your
 review. These are bridge statuses; the installed Orchestrator board still uses
 its built-in labels.
 
-The bridge requests `@coderabbitai full review` for description-only fixes and
-stale review clearance after required CI is clear. An incremental `review` may
-be declined for an already-reviewed commit. Full review requests are durably
-limited to one per job, commit, and description hash, including uncertain delivery
-outcomes. No empty commits, approval commands, check overrides, or merges are used.
-A full review still has to return actual current-commit clearance; requesting it
-is not approval. If it fails or never responds, coordination blocks for inspection.
+The bridge requests `@coderabbitai review` (regular/incremental review) after a
+completed remediation batch and clear required CI, not after each individual fix.
+Normal scheduling retains the five-minute stable-head grace period. With automatic
+incremental review enabled it waits for the provider instead of posting a command.
+`reviews.auto_review.auto_incremental_review: false` disables triggering on every
+push, not explicit regular-review commands. Repository exclusions, opt-outs and
+intentional pauses remain respected; the bridge does not resume reviews itself.
+
+CodeRabbit's [command guide](https://docs.coderabbit.ai/guides/commands) and
+[configuration reference](https://docs.coderabbit.ai/reference/configuration)
+(verified 2026-11-07) distinguish incremental `review` (changes since the last
+review) from `full review` (all PR changes from scratch). Whole-PR reassessment is
+reserved for an explicit operator comment `@coderabbitai full review`; there is
+no automatic full-review fallback, including for description-only remediation.
+A regular review may skip an already-reviewed SHA or description-only edit. If
+it produces no fresh body/custom-check evidence, coordination waits then blocks
+for inspection rather than weakening freshness requirements or escalating silently.
+
+Requests share a durable repository/PR/head budget across jobs, modes, restarts
+and concurrent polls. Accepted or uncertain legacy full requests still consume
+that budget; changing commands does not replay them. Only confirmed throttling
+allows bounded retries after cooldown (at most three attempts). Mode is recorded
+per request/attempt, not added to its deduplication key. The historical
+`full_review_requests` table remains a compatibility/body-obligation ledger, not
+a selector of full-review mode. Old shared receipts migrate as `full`; new sends
+are `regular`. Markers remain stable and uncertain replies reconcile only against
+the exact recorded command, marker and send time, never trigger a resend.
+
+`adlc review-status`/`status` expose `reviewRequest.mode`; review-state reasons
+carried into CLI/Linear notices name the requested mode and limitations. Neither
+a successful command nor a green check is approval: current-head approval and
+fresh body/custom-check clearance remain required. No empty commits, approval
+commands, check overrides, or merges are used.
 
 #### Carried-forward CodeRabbit threads
 

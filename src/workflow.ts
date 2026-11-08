@@ -18,6 +18,7 @@ import {effectiveSettings} from './project-settings';
 import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 import {PlanningDependencies} from './planning-dependencies';
+import {assertRequiredIntegrations} from './integration-capabilities';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
@@ -71,6 +72,7 @@ export class Workflow{
  private submit<T>(operation:()=>Promise<T>){return this.t.submit?this.t.submit(operation):operation();}
  async startPlanning(job:string,c:WorkflowConfig){return this.submit(()=>this.startPlanningWithinBarrier(job,c));}
   private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
+   assertRequiredIntegrations(c);
    assertWorktreeAvailable(this.s,job);
    const {maxPlanning}=effectiveSettings(c);
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
@@ -173,7 +175,7 @@ export class Workflow{
    this.s.db.query('UPDATE planning_runs SET session_id=? WHERE job=?').run(session,job);
   }
   const route=this.router.get(job,'planning');
-  if(route){const delivery=await this.deliverPlanning(job,session,JSON.parse(route.route));if(delivery.state!=='planning_delivered')return delivery;}
+  if(route){assertRequiredIntegrations(c);const delivery=await this.deliverPlanning(job,session,JSON.parse(route.route));if(delivery.state!=='planning_delivered')return delivery;}
   const e=await this.t.evidence(session);
   if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)return this.blockPlan(job,'Planning session identity changed or terminated');
   if(e.transcript?.controller!=='ready')return {state:'planning',session};
@@ -261,7 +263,8 @@ export class Workflow{
   })();
  }
  async executeApproved(job:string,c?:WorkflowConfig){return this.submit(()=>this.executeApprovedWithinBarrier(job,c));}
-  private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
+   private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
+    if(c)assertRequiredIntegrations(c);
    const reservation=worktreeReservation(this.s,job);
    if(reservation)return {state:reservation.dependency?'waiting_for_dependencies':'conflict_recovery',recovery:reservation.id,stage:reservation.state};
   const d=this.implementation(job);if(!d)return;
@@ -545,6 +548,7 @@ export class Workflow{
  }
  async resume(job:string,c:WorkflowConfig,guard?:()=>Promise<void>,dependencyEvidence?:string){return this.submit(()=>this.resumeWithinBarrier(job,c,guard,dependencyEvidence));}
  private async resumeWithinBarrier(job:string,c:WorkflowConfig,guard?:()=>Promise<void>,dependencyEvidence?:string){
+  assertRequiredIntegrations(c);
    assertWorktreeAvailable(this.s,job);
   const j=this.s.get(job),d=this.implementation(job),r=new Planning(this.s).get(job),run=new Lifecycle(this.s).run(job),policy=new ApprovalPolicyStore(this.s),proof=policy.get(job);
   if(j.project!==c.linear.projectId)throw Error('Job project does not match configured project');

@@ -57,6 +57,10 @@ s.close();`;
  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');return JSON.parse(result.stdout.toString());
 }
+// This disk-backed subprocess executes 603 real poll ticks (303 observation /
+// ordinary-evaluation pairs), including lock and SQLite IO. CI run 42440318138
+// hit the default 5s limit at 5249.75ms; local runs take ~1.2s. Bound this one
+// integration workload at 10s without reducing its 300 cycles or assertions.
 test('idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget',()=>{
  const f=fixture(true);try{
   const r=productionScenario(f,`
@@ -70,7 +74,7 @@ console.log(JSON.stringify({first,idleTicks,idleStatus,current:status(),target:l
   expect(r.first).toBe(1);expect(r.idleTicks).toBe(301);expect(r.idleStatus).toMatchObject({state:'pending',attempts:0,evaluation:{failures:0}});
   expect(r.target).toBe('waiting_for_ci');expect(r.current).toMatchObject({state:'pending',attempts:1});expect(r.ordinary).toBe(303);expect(r.actions).toBe(303);expect(r.errors).toEqual([]);
  }finally{f.close();}
-});
+},10_000);
 test('human-required target sees a worker push through bounded ordinary polling and resumes observation',()=>{
  const f=fixture(true);try{
   const r=productionScenario(f,`

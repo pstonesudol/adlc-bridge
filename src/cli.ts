@@ -60,6 +60,7 @@ import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from '.
 import {modernCommand,dispatchOperator} from './operator-dispatch';
 import {projectEntries,selectProject} from './operator-discovery';
 import {ActionWatchdog,retryWatchdogObservation} from './action-watchdog';
+import {integrationPreview,integrationRuntime,verifyIntegrations} from './integration-capabilities';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
@@ -97,11 +98,15 @@ export async function runCLIReviewTick<T>(operation:()=>Promise<T>):Promise<T>{
 export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}}){
  const {config:startup,loadConfig,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  const identity=(c:any)=>JSON.stringify([realpathSync(c.repo),c.linear.projectId,c.linear.teamId,c.automation?.orchestratorProject,c.githubRepo]);
- const initialIdentity=loadConfig?identity(startup):undefined;
+  const initialIdentity=loadConfig?identity(startup):undefined;
+  let integrationFingerprint=integrationPreview(startup).configurationFingerprint;
  return async()=>runPollTick(async()=>{
   const c=loadConfig?loadConfig():startup;
   assertConfiguredProjectIntakeEnabled(c,s);
-  if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
+   if(loadConfig){validate(c);if(identity(c)!==initialIdentity)throw Error('Project identity changed during serve; explicit restart/reconciliation required');}
+   const integrations=integrationPreview(c);
+   io.out({integrations,configurationDrift:{detected:integrationFingerprint!==integrations.configurationFingerprint,previous:integrationFingerprint,current:integrations.configurationFingerprint}});
+   integrationFingerprint=integrations.configurationFingerprint;
   reviewLoop.configureMetadataChecks(c.linear.projectId,c.prMetadataChecks??[]);
   const remediation=remediationPolicy(c.remediation);
   io.out(await io.poll(c,s,io.linearToken()));
@@ -358,10 +363,17 @@ Registered approved review targets can request bounded in-scope fixes from their
   if(command==='container-check'){const r=await containerCheck(req(a[0],'Worktree'));out(r);if(!r.passed)process.exitCode=1;return;}
   if(command==='runtime-check')return out(await runtimeCheck());
   if(command.startsWith('ao-'))return out(await inspectAO(({ 'ao-status':'status','ao-projects':'projects','ao-agents':'agents','ao-sessions':'sessions'} as any)[command]?? (()=>{throw Error('Unknown command');})()));
-  if(command==='doctor')return out({bun:Bun.version,aoInstalled:existsSync('/Applications/Agent Orchestrator.app'),codex:!!Bun.which('codex'),opencode:!!Bun.which('opencode'),gh:!!Bun.which('gh'),linearTokenConfigured:!!process.env.ADLC_LINEAR_TOKEN||existsSync(tokenPath),executionEnabled:false});
-  if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository'));return out({repo,mode:'preview_only',existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
+   if(command==='doctor'){
+    const path=a[0]?.startsWith('--')?undefined:a[0],c=path?JSON.parse(readFileSync(path,'utf8')):{};
+    if(path)validate(c);
+    if(a.includes('--verify-integrations')&&!path)throw Error('doctor CONFIG --verify-integrations requires a project config');
+    let pin:string|undefined;try{pin=installedCLI();}catch{}
+    const runtime=integrationRuntime(undefined,pin?join(pin,'../..'):undefined);
+    return out({bun:Bun.version,aoInstalled:existsSync('/Applications/Agent Orchestrator.app'),codex:!!Bun.which('codex'),opencode:!!Bun.which('opencode'),gh:!!Bun.which('gh'),linearTokenConfigured:!!process.env.ADLC_LINEAR_TOKEN||existsSync(tokenPath),integrations:integrationPreview(c,a.includes('--verify-integrations')?await verifyIntegrations(c):{},runtime),executionEnabled:false});
+   }
+   if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository')),ci=a.indexOf('--config'),c=ci>=0?JSON.parse(readFileSync(req(a[ci+1],'Config'),'utf8')):{};if(ci>=0)validate(c);return out({repo,mode:'preview_only',integrations:integrationPreview(c),existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
   if(command==='handoff')return out(handoffChecklist(req(a[0],'Worktree')));
-  if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out(await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata));}
+   if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out({...await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata),integrations:integrationPreview(c)});}
   if(command.startsWith('feature-')){
     const s=new Store(db),features=new FeaturePlanning(s,featureAgents);try{
       if(command==='feature-start'){
