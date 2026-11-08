@@ -17,7 +17,7 @@ import {recordDispatchedFeedback} from './review-feedback';
 import {assertWorktreeAvailable} from './worktree-reservation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
-import {boundReviewerPolicy,reviewerInput} from './reviewer-policy';
+import {boundReviewerPolicy,reviewerInput,reviewFindingTrustFresh,BOT_IDENTITIES} from './reviewer-policy';
 import {scopeAllows} from './file-scope';
 import {readCIFailure,classifyCIFailure,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 export function codeRemediationInstructions(verification?:Verification,context?:VerificationContext,worktree?:string){return `Fix only actionable findings within the approved ticket scope. ${verificationInstructions(verification,context,worktree)} Commit and push the existing feature branch, then STOP for host review.`;}
@@ -57,7 +57,9 @@ export async function sendPilotRemediation(s:Store,job:string,head:string,findin
    const ci=parsed.find((f:any)=>f.source==='required-ci');
    if(ci)throw new CIFailureBlocked(`Required CI ${ci.check} (#${ci.checkId}): unknown; current uncleared head changed before delivery`);
    throw Error('Current uncleared PR head required');
-  }
+   }
+   if(parsed.some((f:any)=>f.source==='github-review'&&(f.provenance||review.reviewerEvidence)&&!reviewFindingTrustFresh(f,review.reviewerEvidence)))throw Error('Review feedback trust expired or unavailable; recheck before delivery');
+   if(parsed.some((f:any)=>f.source==='coderabbit-custom')&&review.reviewerEvidence&&!reviewFindingTrustFresh({provenance:[{reviewer:'coderabbit',userId:BOT_IDENTITIES.coderabbit.userId}]},review.reviewerEvidence))throw Error('CodeRabbit feedback trust expired or unavailable; recheck before delivery');
  // Carried-forward threads are authorized by identity: the same observed head
  // must still carry the exact thread and reviewer-comment set. A changed head,
  // edited comment set or resolved thread invalidates this delivery.

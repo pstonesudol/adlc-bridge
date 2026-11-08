@@ -50,10 +50,11 @@ export function reviewerPolicy(value:unknown):Reviewer[]{
 export function reviewerPolicyView(value:unknown){return {reviewers:reviewerPolicy(value).map(r=>({...r,role:r.approvalRequired?'required':'advisory',supported:true,requestAdapter:r.adapter==='coderabbit'?'coderabbit':null})),unknownSeverity:'eligible unless filtered; retained as unclassified when filtered',pathless:'eligible without filters; otherwise unclassified',precedence:'exclude before include; evaluate both rename paths',adoption:'new approved-plan binding; active policy changes block until a new reviewed plan',branchProtection:'Not modified; bridge clearance is independent of GitHub branch protection'};}
 export function ensureReviewerStore(s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS reviewer_policy(job TEXT PRIMARY KEY,plan TEXT NOT NULL,configuration TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS reviewer_observations(job TEXT PRIMARY KEY,head TEXT NOT NULL,observed INTEGER NOT NULL,evidence TEXT NOT NULL);`);}
+const canonicalPolicy=(value:unknown)=>JSON.stringify(value,(_key,v)=>object(v)?Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
 export function bindReviewerPolicy(s:Store,job:string,value:unknown){
- ensureReviewerStore(s);const configuration=JSON.stringify(reviewerPolicy(value)),plan=s.get(job).plan_hash;
+ ensureReviewerStore(s);const configuration=canonicalPolicy(reviewerPolicy(value)),plan=s.get(job).plan_hash;
  return s.db.transaction(()=>{const old=s.db.query('SELECT * FROM reviewer_policy WHERE job=?').get(job) as any;
-  if(old&&old.configuration!==configuration&&old.plan===plan)throw Error('Reviewer policy changed during approved work; a fresh reviewed plan is required; existing obligations retained');
+  if(old&&canonicalPolicy(JSON.parse(old.configuration))!==configuration&&old.plan===plan)throw Error('Reviewer policy changed during approved work; a fresh reviewed plan is required; existing obligations retained');
   s.db.query('INSERT INTO reviewer_policy VALUES (?,?,?) ON CONFLICT(job) DO UPDATE SET plan=excluded.plan,configuration=excluded.configuration').run(job,plan,configuration);
   return JSON.parse(configuration) as Reviewer[];
  }).immediate();
@@ -97,6 +98,23 @@ export async function reviewerTrust(policy:Reviewer[],repo:string,read:GitHubRea
 export type NormalizedFeedback={id:string;threadId:string;body:string;userId:number|null;type:string;login:string;path:string|null;previousPath?:string|null;line:number|null;originalCommit:string|null;outdated:boolean;resolved:boolean;severity?:Severity;original:any};
 export function authenticatedReviewer(r:Reviewer,e:TrustEvidence|undefined,userId:number|null,type:string,now=Date.now()){
  return !!(r.enabled&&e&&!e.blocker&&now>=e.observed&&now-e.observed<=RECEIPT_FRESHNESS_MS&&userId&&e.ids.includes(userId)&&(r.identity?r.identity.type===type:type==='User'));
+}
+export function reviewFindingTrustFresh(f:any,evidence:any,now=Date.now()):boolean{
+ return Array.isArray(f.provenance)&&f.provenance.length>0&&f.provenance.every((p:any)=>{
+  const trust=evidence?.trust?.find((t:any)=>t.reviewer===p.reviewer);
+  return trust&&!trust.blocker&&Number.isSafeInteger(trust.observed)&&now>=trust.observed&&now-trust.observed<=RECEIPT_FRESHNESS_MS&&trust.ids?.includes(p.userId);
+ });
+}
+/** Re-fence after slow metadata/scheduling IO, not just before collection. */
+export function invalidateExpiredReviewerFindings(evidence:any,now=Date.now()){
+ for(const trust of evidence.trust){
+  trust.fresh=Number.isSafeInteger(trust.observed)&&now>=trust.observed&&now-trust.observed<=RECEIPT_FRESHNESS_MS;
+  if(!trust.fresh){const reason=`Reviewer ${trust.reviewer}: trust evidence expired during collection; refresh before clearance or remediation`;evidence.blockers??=[];if(!evidence.blockers.includes(reason))evidence.blockers.push(reason);}
+ }
+ const expired=evidence.findings.filter((f:any)=>!reviewFindingTrustFresh(f,evidence,now));
+ evidence.findings=evidence.findings.filter((f:any)=>!expired.includes(f));
+ for(const f of expired)evidence.pending.push({reviewer:f.provenance?.map((p:any)=>p.reviewer).join(', ')??'unknown',threadId:f.threadId,id:f.threadId,path:f.path,category:'trust-expired',reason:'Reviewer trust expired or unavailable; refresh before remediation',original:f.provenance});
+ return evidence;
 }
 export function feedbackEligibility(r:Reviewer,f:NormalizedFeedback):'eligible'|'excluded'|'unclassified'{
  const includes=r.includePaths??[],excludes=r.excludePaths??[];

@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {reviewerPolicy,reviewerInput,reviewerTrust,authenticatedReviewer,feedbackEligibility,collectTrustedFeedback,reviewerApprovals,bindReviewerPolicy,boundReviewerPolicy,BOT_IDENTITIES,type NormalizedFeedback} from '../src/reviewer-policy';
+import {reviewerPolicy,reviewerInput,reviewerTrust,authenticatedReviewer,feedbackEligibility,collectTrustedFeedback,reviewerApprovals,bindReviewerPolicy,boundReviewerPolicy,reviewFindingTrustFresh,invalidateExpiredReviewerFindings,BOT_IDENTITIES,type NormalizedFeedback} from '../src/reviewer-policy';
 import {configuredReviewEvidence} from '../src/github-reviewers';
 import {normalizeReviewThread} from '../src/github';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
@@ -114,6 +114,32 @@ test('policy drift fails closed across restarts until a new reviewed plan bindin
  bindReviewerPolicy(s,job,undefined);expect(boundReviewerPolicy(s,job)).toEqual(policy());
  expect(()=>bindReviewerPolicy(s,job,[{id:'codex',remediate:false}])).toThrow('fresh reviewed plan');
  const next=s.propose(job,'new plan');s.approve(job,next,'human');bindReviewerPolicy(s,job,[{id:'codex',remediate:false}]);expect(boundReviewerPolicy(s,job)[1].remediate).toBe(false);s.close();
+});
+test('policy binding canonicalizes nested object keys and upgrades legacy noncanonical receipts without weakening drift checks',()=>{
+ const s=new Store(':memory:'),job=s.enqueue('p','i','spec');const hash=s.propose(job,'plan');s.approve(job,hash,'human');
+ const initial=[{id:'codex',enabled:true,remediate:true},{id:'human',adapter:'github-review',identity:{userId:3,type:'User',login:'human'}}];
+ bindReviewerPolicy(s,job,initial);
+ // Simulate a receipt written before canonical serialization, recursively
+ // reversing keys while retaining the same values and all array ordering.
+ const reverse=(value:any):any=>Array.isArray(value)?value.map(reverse):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).reverse().map(k=>[k,reverse(value[k])])):value;
+ const legacy=JSON.stringify(reverse(boundReviewerPolicy(s,job)));s.db.query('UPDATE reviewer_policy SET configuration=? WHERE job=?').run(legacy,job);
+ const reordered=[{remediate:true,enabled:true,id:'codex'},{identity:{login:'human',type:'User',userId:3},adapter:'github-review',id:'human'}];
+ expect(()=>bindReviewerPolicy(s,job,reordered)).not.toThrow();
+ expect(()=>bindReviewerPolicy(s,job,[{...initial[0],remediate:false},initial[1]])).toThrow('fresh reviewed plan');
+ expect(()=>bindReviewerPolicy(s,job,[initial[0],{...initial[1],identity:{userId:4,type:'User',login:'human'}}])).toThrow('fresh reviewed plan');s.close();
+});
+test('end-of-collection freshness fences only affected findings while retaining blockers and provenance',()=>{
+ const p=policy(),proof=trusts(),result=collectTrustedFeedback(p,proof,[finding(),finding({id:'C2',threadId:'T2',userId:136622811,login:'coderabbitai[bot]'})],context,now);
+ result.trust.find(t=>t.reviewer==='codex')!.observed=now-RECEIPT_FRESHNESS_MS-1;
+ const expired=result.findings.find(f=>f.threadId==='T1');
+ expect(reviewFindingTrustFresh(expired,result,now)).toBe(false);
+ invalidateExpiredReviewerFindings(result,now);
+ expect(result.findings.map(f=>f.threadId)).toEqual(['T2']);
+ expect(result.pending).toMatchObject([{threadId:'T1',category:'trust-expired',original:expired.provenance}]);
+ expect(result.trust.find(t=>t.reviewer==='codex')!.fresh).toBe(false);
+ invalidateExpiredReviewerFindings(result,now);expect(result.pending).toHaveLength(1);
+ expect(reviewFindingTrustFresh(result.findings[0],result,now)).toBe(true);
+ expect(reviewFindingTrustFresh(result.findings[0],result,now+RECEIPT_FRESHNESS_MS+1)).toBe(false);
 });
 test('generic adapter ingests authenticated Codex thread without treating bot summary as approval',async()=>{
  const p=policy(),bot=BOT_IDENTITIES.codex;

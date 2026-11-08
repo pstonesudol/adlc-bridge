@@ -17,6 +17,7 @@ import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
+import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
 import {reviewerPolicy,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
 test('missing reviewer approvals stay in CI/review/rate-limit waits; hard obligations still block',()=>{
@@ -1061,6 +1062,16 @@ function threadFixture(){
  loop.configureMetadataChecks('project',[]);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,candidate,sends:()=>sends,reviews:()=>reviews};
 }
+for(const stage of ['initial','final'])test(`expired reviewer membership at ${stage} delivery refresh cannot reserve or send remediation`,async()=>{
+ const f=threadFixture();try{
+  f.e.findings[0].provenance=[{reviewer:'codex',userId:199175422,original:{body:f.e.findings[0].body}}];
+  f.e.reviewerEvidence={trust:[{reviewer:'codex',observed:Date.now(),ids:[199175422],blocker:null}]};
+  let reads=0;const base=f.io.readiness;
+  f.io.readiness=async(...args:any[])=>{const e=await base(...args);if(++reads===(stage==='initial'?1:2))e.reviewerEvidence={trust:[{reviewer:'codex',observed:Date.now()-RECEIPT_FRESHNESS_MS-1,ids:[199175422],blocker:null}]};return e;};
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],DEFAULT_REMEDIATION_POLICY,[],f.io)).rejects.toThrow('Review feedback trust expired or unavailable');
+  expect(reads).toBe(stage==='initial'?1:2);expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
 test('pathless review data cannot authorize an automatic remediation send or consume a reservation',async()=>{
  const f=threadFixture();try{
   f.e.findings[0].path=null;

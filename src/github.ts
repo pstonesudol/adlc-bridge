@@ -7,9 +7,8 @@ import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
 import {collectReviewSchedule} from './coderabbit-scheduling';
-import {reviewerPolicy,authenticatedReviewer,type ReviewerConfig} from './reviewer-policy';
+import {reviewerPolicy,authenticatedReviewer,invalidateExpiredReviewerFindings,type ReviewerConfig} from './reviewer-policy';
 import {configuredReviewEvidence} from './github-reviewers';
-import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 
 async function gh(args: string[]): Promise<any> {
   return githubRead(args,'review-read');
@@ -179,7 +178,11 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(scheduleFinal.head?.sha!==final.head.sha||scheduleFinal.base?.ref!==final.base.ref||scheduleFinal.body!==final.body||scheduleFinal.draft!==final.draft||scheduleFinal.state!=='open'||await baseTip(repo,final.base.ref)!==currentBase)reviewSchedule.blocker='CodeRabbit review unavailable: PR or base changed during configuration collection';
   if(reviewSchedule.blocker){gate.clear=false;gate.reasons.push(reviewSchedule.blocker);}
   if(final.head.sha!==first.head.sha){gate.clear=false;reviewSchedule.blocker='CodeRabbit review unavailable: head changed during collection';}
-  for(const trust of reviewerEvidence.trust){trust.fresh=Date.now()>=trust.observed&&Date.now()-trust.observed<=RECEIPT_FRESHNESS_MS;if(!trust.fresh){gate.clear=false;gate.reasons.push(`Reviewer ${trust.reviewer}: trust evidence expired during collection; refresh before clearance`);}}
+  invalidateExpiredReviewerFindings(reviewerEvidence);
+  const actionable=new Set(reviewerEvidence.findings);
+  for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='github-review'&&!actionable.has(findings[i]))findings.splice(i,1);
+  if(reviewerEvidence.trust.some(t=>t.reviewer==='coderabbit'&&!t.fresh))for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='coderabbit-custom')findings.splice(i,1);
+  for(const trust of reviewerEvidence.trust){if(!trust.fresh){gate.clear=false;gate.reasons.push(`Reviewer ${trust.reviewer}: trust evidence expired during collection; refresh before clearance`);}}
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,reviewerEvidence,
     reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login})),
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
