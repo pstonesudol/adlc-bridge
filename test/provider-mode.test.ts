@@ -82,3 +82,25 @@ for(const failure of ['unsupported','unconfirmed','rejected','transient','uncert
   expect(calls.some(c=>c.includes('messages')||c==='POST sessions'||c.includes('restore'))).toBe(false);
  });
 }
+for(const scenario of ['matching','unknown','conflicting','confirmation-conflict','changed-posture'] as const){
+ test(`routing permission posture: ${scenario}`,async()=>{
+  const route=selectRoute(routingConfig,{choice:'planning',confidence:1}),calls:string[]=[];
+  let selected=false,reads=0;
+  const options=()=>[
+   {id:'model',currentValue:route.model,choices:[{value:route.model}]},
+   {id:'effort',currentValue:route.effort,choices:[{value:route.effort}]},
+   {id:'mode',currentValue:selected?'plan':'build',choices:[{value:'plan',permissionMode:scenario==='conflicting'||selected&&scenario==='confirmation-conflict'?'bypass-permissions':'default'},{value:'build'}]}
+  ];
+  const api=async(path:string,method?:string,body?:unknown)=>{
+   calls.push(`${method??'GET'} ${path}`);
+   if(path==='sessions/owned')return {session:{harness:route.harness,isTerminated:false}};
+   if(path.endsWith('/conversation'))return {controller:'ready',turns:[],settings:{approvalMode:scenario==='unknown'?undefined:scenario==='changed-posture'&&reads++>0?'bypass-permissions':'default'}};
+   if(path.endsWith('/mode')&&method==='PATCH'){expect(body).toEqual({value:'plan'});selected=true;}
+   return {options:options()};
+  };
+  if(scenario==='matching')expect((await configureSessionRoute('owned',route,api)).verified).toBe(true);
+  else await expect(configureSessionRoute('owned',route,api)).rejects.toThrow('rejected');
+  expect(calls.filter(c=>c==='PATCH sessions/owned/conversation/config-options/mode').length).toBe(['unknown','conflicting'].includes(scenario)?0:1);
+  expect(calls.some(c=>c.includes('/settings')||c.includes('messages')||c==='POST sessions'||c.includes('restore'))).toBe(false);
+ });
+}
