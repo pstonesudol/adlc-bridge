@@ -22,7 +22,9 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
    'repos/owner/repo/git/ref/heads/main':{ref:'refs/heads/main',object:{type:'commit',sha:base}},
    [`repos/owner/repo/compare/${base}...${head}`]:{behind_by:0},
   };
-  const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}}}}}};
+   // A wholly authenticated/excluded thread must not re-enter the raw unresolved
+   // gate. Independent metadata and required CodeRabbit approval gates remain.
+   const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[{id:'excluded-codex',path:'src/a.ts',line:1,isResolved:false,isOutdated:false,comments:{nodes:[{id:'excluded-comment',body:'Filtered feedback',author:{login:'chatgpt-codex-connector[bot]',__typename:'Bot',databaseId:199175422},originalCommit:{oid:head}}],pageInfo:{hasNextPage:false}}}],pageInfo:{hasNextPage:false}}}}}};
   const query=REVIEW_THREADS_QUERY;
   const graphqlArgs=['api','graphql','-f',`query=${query}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   const configArgs=['api','graphql','-f',`query=${CONFIG_QUERY}`,'-f','owner=owner','-f','name=repo','-f',`hy=${head}:.coderabbit.yaml`,'-f',`hm=${head}:.coderabbit.yml`,'-f',`by=${base}:.coderabbit.yaml`,'-f',`bm=${base}:.coderabbit.yml`];
@@ -50,10 +52,11 @@ console.log(JSON.stringify(result));
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
   for(const metadata of [['Metadata'],[]]){
-   writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata}));
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']}]}));
    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
-   expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);}
    expect(existsSync(db)).toBe(false);

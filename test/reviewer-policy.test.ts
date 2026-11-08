@@ -6,6 +6,7 @@ import {normalizeReviewThread} from '../src/github';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
 import {ReviewLoop} from '../src/review-loop';
 import {ReviewRequests} from '../src/coderabbit-scheduling';
+import {decision} from '../src/review-loop';
 const now=Date.now();
 const policy=()=>reviewerPolicy(undefined);
 const trusts=()=>policy().map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
@@ -31,6 +32,32 @@ test('unknown severity, pathless, rename exclusion and deleted paths do not sile
  expect(feedbackEligibility({...r,includePaths:['src/**']},finding({path:null}))).toBe('unclassified');
  expect(feedbackEligibility({...r,includePaths:['src/**'],excludePaths:['old/**']},finding({previousPath:'old/a.ts'}))).toBe('excluded');
  expect(feedbackEligibility(r,finding({path:'deleted/file.ts'}))).toBe('eligible');
+});
+test('path and severity exclusions retain provenance without blocking pending feedback',()=>{
+ for(const [options,over] of [[{excludePaths:['src/**']},{}],[{includePaths:['test/**']},{}],[{minimumSeverity:'high'},{severity:'low'}]] as any[]){
+  const p=reviewerPolicy([{id:'codex',...options}]);
+  const result=collectTrustedFeedback(p,trusts(),[finding(over)],context,now);
+  expect(result.findings).toEqual([]);expect(result.pending).toEqual([]);
+  expect(result.excluded).toMatchObject([{id:'C1',category:'excluded',original:finding().original}]);
+  expect(result.ignoredThreadIds).toEqual(['T1']);
+  expect(decision({clear:true,findings:[],failedChecks:[],reviewerEvidence:result},['src/**'],0).state).toBe('ready_for_human');
+ }
+});
+test('exclusions do not hide unclassified, stale, disabled, mixed or untrusted feedback and never approve reviews',()=>{
+ const p=reviewerPolicy([{id:'codex',excludePaths:['src/**'],minimumSeverity:'high',approvalRequired:true}]);
+ for(const over of [{outdated:true},{path:null},{path:'test/a.ts'}]){
+  const result=collectTrustedFeedback(p,trusts(),[finding(over)],context,now);
+  expect(result.pending).toHaveLength(1);expect(result.ignoredThreadIds).toEqual([]);
+  expect(decision({clear:false,findings:[],failedChecks:[],reviewerEvidence:result},['src/**'],0).state).toBe('blocked');
+ }
+ const disabled=collectTrustedFeedback(reviewerPolicy([{id:'codex',excludePaths:['src/**'],remediate:false}]),trusts(),[finding()],context,now);
+ expect(disabled.pending[0].category).toBe('remediation-disabled');expect(disabled.ignoredThreadIds).toEqual([]);
+ const mixed=collectTrustedFeedback(p,trusts(),[finding(),finding({id:'C2',path:'test/a.ts',severity:'critical'})],context,now);
+ expect(mixed.findings).toHaveLength(1);expect(mixed.ignoredThreadIds).toEqual([]);
+ const unknown=collectTrustedFeedback(p,trusts(),[finding(),finding({id:'C2',userId:1})],context,now);
+ expect(unknown.ignoredThreadIds).toEqual([]);
+ expect(reviewerApprovals(p,trusts(),[],context.head,[],now).blockers).toContain('Reviewer codex: explicit current-head approval required');
+ expect(reviewerApprovals(p,trusts(),[{id:42,user:{id:199175422,type:'Bot'},state:'CHANGES_REQUESTED',commit_id:context.head,submitted_at:new Date(now).toISOString()}],context.head,[],now).blockers).toContain('Reviewer codex: changes requested (42)');
 });
 test('edited bodies change durable identity, exact duplicates retain provenance and distinct findings survive',()=>{
  const collect=(fs:NormalizedFeedback[])=>collectTrustedFeedback(policy(),trusts(),fs,context,now).findings;

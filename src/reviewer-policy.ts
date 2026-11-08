@@ -109,13 +109,14 @@ export function feedbackEligibility(r:Reviewer,f:NormalizedFeedback):'eligible'|
  return 'eligible';
 }
 export function collectTrustedFeedback(policy:Reviewer[],trust:TrustEvidence[],feedback:NormalizedFeedback[],context:{repo:string;pr:number;head:string;selfIds:number[]},now=Date.now()){
- const findings:any[]=[],pending:any[]=[];const seen=new Map<string,any>();
+ const findings:any[]=[],pending:any[]=[],excluded:any[]=[];const seen=new Map<string,any>();
  for(const f of feedback){
   if(f.resolved||!f.body.trim()||context.selfIds.includes(f.userId??-1)||/<!--\s*adlc[-_:]/i.test(f.body))continue;
   const sources=policy.filter(r=>authenticatedReviewer(r,trust.find(e=>e.reviewer===r.id),f.userId,f.type,now));
   for(const r of sources){
    const eligibility=feedbackEligibility(r,f);
-   if(f.outdated||!r.remediate||eligibility!=='eligible'){pending.push({reviewer:r.id,id:f.id,threadId:f.threadId,path:f.path,category:f.outdated?'stale':eligibility,reason:f.outdated?'Outdated applicability requires clarification':!r.remediate?'Remediation disabled':`Feedback ${eligibility}`,original:f.original});continue;}
+   if(f.outdated||!r.remediate){pending.push({reviewer:r.id,id:f.id,threadId:f.threadId,path:f.path,category:f.outdated?'stale':'remediation-disabled',reason:f.outdated?'Outdated applicability requires clarification':'Remediation disabled',original:f.original});continue;}
+   if(eligibility!=='eligible'){const item={reviewer:r.id,id:f.id,threadId:f.threadId,path:f.path,category:eligibility,reason:`Feedback ${eligibility}`,original:f.original};(eligibility==='excluded'?excluded:pending).push(item);continue;}
    // Equivalence is deliberately exact and location-bound; no semantic guessing.
    const key=digest(JSON.stringify([f.threadId,f.path,f.line,f.body]));
    const provenance={reviewer:r.id,commentId:f.id,userId:f.userId,original:f.original};
@@ -127,7 +128,14 @@ export function collectTrustedFeedback(policy:Reviewer[],trust:TrustEvidence[],f
  const groups=new Map<string,any>();
  for(const f of findings){const p=groups.get(f.threadId);if(!p)groups.set(f.threadId,{...f});else{p.body+='\n\n'+f.body;p.commentIds.push(...f.commentIds);p.provenance.push(...f.provenance);}}
  for(const f of groups.values())f.commentsHash=digest(JSON.stringify(f.provenance.map((p:any)=>[p.reviewer,p.commentId,p.original.body,p.original.originalCommit??p.original.commit_id]).sort((a:any,b:any)=>JSON.stringify(a).localeCompare(JSON.stringify(b)))));
- return {findings:[...groups.values()],pending,trust:trust.map(e=>({...e,fresh:now>=e.observed&&now-e.observed<=RECEIPT_FRESHNESS_MS})),policy:policy.map(r=>({id:r.id,enabled:r.enabled,remediate:r.remediate,approvalRequired:r.approvalRequired,requestReview:r.requestReview})),observed:now};
+ // A raw unresolved thread may be ignored only if every substantive comment
+ // was authenticated and excluded under every matching policy. Unknown authors,
+ // mixed eligible feedback, stale state and disabled remediation remain blockers.
+ const ignoredThreadIds=[...new Set(excluded.map(e=>e.threadId))].filter(threadId=>feedback.filter(f=>f.threadId===threadId&&!f.resolved&&f.body.trim()&&!context.selfIds.includes(f.userId??-1)&&!/<!--\s*adlc[-_:]/i.test(f.body)).every(f=>{
+  const sources=policy.filter(r=>authenticatedReviewer(r,trust.find(e=>e.reviewer===r.id),f.userId,f.type,now));
+  return !f.outdated&&sources.length>0&&sources.every(r=>r.remediate&&feedbackEligibility(r,f)==='excluded');
+ }));
+ return {findings:[...groups.values()],pending,excluded,ignoredThreadIds,trust:trust.map(e=>({...e,fresh:now>=e.observed&&now-e.observed<=RECEIPT_FRESHNESS_MS})),policy:policy.map(r=>({id:r.id,enabled:r.enabled,remediate:r.remediate,approvalRequired:r.approvalRequired,requestReview:r.requestReview})),observed:now};
 }
 export function reviewerApprovals(policy:Reviewer[],trust:TrustEvidence[],reviews:any[],head:string,selfIds:number[],now=Date.now()){
  const blockers:string[]=[],status:any[]=[];

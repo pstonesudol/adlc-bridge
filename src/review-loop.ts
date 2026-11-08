@@ -523,7 +523,7 @@ export class ReviewLoop{
   const dispatched=dispatchedFeedback(this.s,job);
   const threadFindings=e.findings.filter((f:any)=>f.kind==='review_thread');
    const freshThreadFindings=threadFindings.filter((f:any)=>!dispatched.has(feedbackKey(f.threadId,f.commentsHash))&&!dispatched.has(feedbackKey(f.threadId,digest([...(f.commentIds??[])].sort().join(',')))));
-   const handled=new Set(threadFindings.map((f:any)=>f.threadId));
+   const handled=new Set([...threadFindings.map((f:any)=>f.threadId),...(e.reviewerEvidence?.ignoredThreadIds??[])]);
    const remainingFeedback:any[]=[
     ...(e.reviewThreads?.humanOnly??[]).filter((t:any)=>!handled.has(t.threadId)).map((t:any)=>({category:'human',threadId:t.threadId,path:t.path})),
     ...(e.reviewThreads?.stale??[]).filter((t:any)=>!handled.has(t.threadId)).map((t:any)=>({category:'stale',threadId:t.threadId,path:t.path})),

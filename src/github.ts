@@ -152,7 +152,7 @@ export async function readiness(repo:string, number:number, required:string[],me
   const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,
     checks:checks.map((c:any)=>({id:c.id,started_at:c.started_at,completed_at:c.completed_at,name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
     review:trustedLatest?{sha:trustedLatest.commit_id,author:trustedLatest.user.login,state:trustedLatest.state}:null,
-    unresolved,threadsComplete:true,checksComplete:true,reviewComplete:true};
+    unresolved:threads.filter(t=>!t.isResolved&&!reviewerEvidence.ignoredThreadIds.includes(t.id)).length,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
   const rabbit=reviewerConfiguration.find(r=>r.id==='coderabbit')!;
   const trustedComments=comments.filter(c=>authenticatedReviewer(rabbit,reviewerEvidence.trust.find(t=>t.reviewer==='coderabbit'),c.user?.id??null,c.user?.type));

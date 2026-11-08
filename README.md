@@ -2657,6 +2657,9 @@ Linear clarification/worker outcome flow, not guessed reconciliation.
   negation. Exclusions win, both rename paths are checked conservatively, and
   deleted-path provenance is retained. Pathless feedback is eligible without
   filters; with filters it remains unclassified rather than silently cleared.
+  Explicitly excluded findings are retained as nonblocking provenance, not pending
+  remediation. A thread is ignored only when every substantive comment is trusted
+  and excluded; required approvals and provider change requests still block.
 * `requestReview`: default false for generic GitHub adapters, true for CodeRabbit.
   False does not disable external feedback ingestion. Only `coderabbit` has a
   supported request adapter. Generic GitHub accepts standard review APIs, not
