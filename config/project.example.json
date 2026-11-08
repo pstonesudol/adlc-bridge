@@ -37,8 +37,8 @@
       "id": "codex",
       "adapter": "github-review",
       "identity": {"userId": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"},
-      "enabled": true,
-      "remediate": true,
+      "enabled": false,
+      "remediate": false,
       "approvalRequired": false,
       "requestReview": false
     }

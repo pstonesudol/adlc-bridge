@@ -32,11 +32,24 @@ export async function configuredReviewEvidence(policy:Reviewer[],repo:string,pr:
   feedback.push({id:String(c.id),threadId:`comment:${c.id}`,body:c.body,userId:c.user.id,type:'User',login:c.user.login,path:null,line:null,originalCommit:pr.head.sha,outdated:false,resolved:false,original:c});
  }
  const trust=await reviewerTrust(policy,repo,read);
- const now=Date.now(),collected=collectTrustedFeedback(policy,trust,feedback,{repo,pr:pr.number,head:pr.head.sha,selfIds},now);
+ const now=Date.now(),acknowledged:any[]=[];
+ const active=feedback.filter(f=>{
+  if(!f.threadId.startsWith('comment:')||f.type!=='User'||selfIds.includes(f.userId??-1))return true;
+  if(!policy.some(r=>authenticatedReviewer(r,trust.find(t=>t.reviewer===r.id),f.userId,f.type,now)))return true;
+  const substantive=reviews.filter(r=>r.user?.id===f.userId&&r.user?.type==='User'&&['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state)).sort((a,b)=>Date.parse(a.submitted_at)-Date.parse(b.submitted_at));
+  const latest=substantive.at(-1),version=Date.parse(f.original.updated_at??f.original.created_at);
+  if(substantive.some(r=>!Number.isFinite(Date.parse(r.submitted_at)))||substantive.some(r=>r.state!=='APPROVED'&&r.submitted_at===latest?.submitted_at))return true;
+  // The same authenticated author's later, current-head explicit approval
+  // acknowledges only preceding issue-comment versions. Edits, stale heads,
+  // dismissal and subsequent change requests reopen the finding.
+  if(latest?.state!=='APPROVED'||latest.commit_id!==pr.head.sha||!Number.isFinite(version)||!Number.isFinite(Date.parse(latest.submitted_at))||Date.parse(latest.submitted_at)<=version)return true;
+  acknowledged.push({id:f.id,threadId:f.threadId,userId:f.userId,head:pr.head.sha,reviewId:latest.id,commentVersion:version,original:f.original,review:latest});return false;
+ });
+ const collected=collectTrustedFeedback(policy,trust,active,{repo,pr:pr.number,head:pr.head.sha,selfIds},now);
  const approvals=reviewerApprovals(policy,trust,reviews,pr.head.sha,selfIds,now);
  // Unknown/untrusted unresolved threads continue to block via the legacy gate.
  // Record the missing evidence without preventing unrelated eligible feedback.
  const blockers=[...approvals.blockers,...collected.pending.filter(p=>p.category==='unclassified').map(p=>`Reviewer ${p.reviewer}: unclassified finding ${p.id}; exact clarification required`)];
  const trustedReviews=reviews.filter(v=>policy.some(r=>authenticatedReviewer(r,trust.find(t=>t.reviewer===r.id),v.user?.id??null,v.user?.type,now)));
- return {...collected,approvals:approvals.status,blockers,trustedReviews};
+ return {...collected,acknowledged,approvals:approvals.status,blockers,trustedReviews};
 }

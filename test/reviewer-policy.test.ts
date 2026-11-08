@@ -12,6 +12,10 @@ const policy=()=>reviewerPolicy(undefined);
 const trusts=()=>policy().map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
 const context={repo:'o/r',pr:1,head:'a'.repeat(40),selfIds:[9]};
 const finding=(over:any={}):NormalizedFeedback=>({id:'C1',threadId:'T1',body:'Missing ownership guard',userId:BOT_IDENTITIES.codex.userId,type:'Bot',login:'chatgpt-codex-connector[bot]',path:'src/a.ts',line:4,originalCommit:'older',outdated:false,resolved:false,original:{id:'C1',body:'Missing ownership guard'},...over});
+test('example reviewer ingestion/remediation stays disabled until operator opt-in',async()=>{
+ const example=await Bun.file(new URL('../config/project.example.json',import.meta.url)).json();
+ expect(reviewerPolicy(example.reviewers).find(r=>r.id==='codex')).toMatchObject({enabled:false,remediate:false,approvalRequired:false,requestReview:false});
+});
 test('defaults keep CodeRabbit required and Codex advisory with no request adapter',()=>{
  expect(policy()).toMatchObject([{id:'coderabbit',approvalRequired:true,requestReview:true},{id:'codex',approvalRequired:false,requestReview:false}]);
  expect(reviewerPolicy(reviewerInput(policy()))).toEqual(policy());
@@ -119,6 +123,42 @@ test('generic adapter ingests authenticated Codex thread without treating bot su
   const id=Number(args[1].split('/')[1]);return {id,type:'Bot',login:id===bot.userId?bot.login:BOT_IDENTITIES.coderabbit.login};
  });
  expect(result.findings).toHaveLength(1);expect(result.findings[0].provenance[0].reviewer).toBe('codex');expect(result.approvals.find(s=>s.reviewer==='codex').approved).toBe(false);
+});
+for(const scenario of ['unapproved','approved','edited','stale-head','dismissed','changes-requested','other-author','unverified','missing-time','invalid-review-time','ambiguous-time'])test(`human issue-comment acknowledgement: ${scenario}`,async()=>{
+ const p=reviewerPolicy([{id:'human',adapter:'github-review',identity:{userId:3,type:'User'}}]);
+ const pr={number:1,user:{id:8},head:{sha:context.head},changed_files:1};
+ const comment:any={id:10,body:'Fix ownership',user:{id:3,type:'User',login:'human'},created_at:'2026-11-01T00:00:00Z',updated_at:'2026-11-01T00:01:00Z'};
+ const approval:any={id:42,user:{id:3,type:'User',login:'human'},state:'APPROVED',commit_id:context.head,submitted_at:'2026-11-01T00:02:00Z'};
+ let reviews:any[]=scenario==='unapproved'?[]:[approval];
+ if(scenario==='edited')comment.updated_at='2026-11-01T00:03:00Z';
+ if(scenario==='stale-head')approval.commit_id='older';
+ if(scenario==='other-author')approval.user.id=4;
+ if(scenario==='missing-time'){delete comment.created_at;delete comment.updated_at;}
+ if(scenario==='invalid-review-time')approval.submitted_at='invalid';
+ if(scenario==='ambiguous-time')reviews.push({...approval,id:44,state:'DISMISSED'});
+ if(['dismissed','changes-requested'].includes(scenario))reviews.push({...approval,id:43,state:scenario==='dismissed'?'DISMISSED':'CHANGES_REQUESTED',submitted_at:'2026-11-01T00:03:00Z'});
+ const read=async(args:string[])=>{
+  const path=args[1];if(path==='user')return {id:9};if(args.includes('--paginate'))return [[{filename:'src/a.ts'}]];
+  if(path==='user/3'){if(scenario==='unverified')throw Error('unavailable');return {id:3,type:'User',login:'human'};}
+  if(path.endsWith('/permission'))return {user:{id:3},permission:'write'};
+  const id=Number(path.split('/')[1]);return {id,type:'Bot',login:id===136622811?'coderabbitai[bot]':'chatgpt-codex-connector[bot]'};
+ };
+ const collect=()=>configuredReviewEvidence(p,'o/r',pr,[],reviews,[comment],read);
+ const result=await collect();
+ if(scenario==='approved'){
+  expect(result.findings).toEqual([]);expect(result.acknowledged).toMatchObject([{threadId:'comment:10',reviewId:42,userId:3,head:context.head,original:comment}]);
+  expect((await collect()).acknowledged).toHaveLength(1);
+  expect(result.blockers.some(b=>b.startsWith('Reviewer human:'))).toBe(false);
+ }else if(scenario==='unverified'){expect(result.acknowledged).toEqual([]);expect(result.blockers).toContain('Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted');}
+ else{expect(result.acknowledged).toEqual([]);expect(result.findings.some(f=>f.threadId==='comment:10')).toBe(true);}
+});
+test('a provider reset beyond 24 hours cannot be truncated into an early global retry',()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);const job=s.enqueue('p','i','spec');let clock=1000;
+ const schedule={head:'head',signature:'configuration',blocker:null,incremental:false},requests=new ReviewRequests(s,()=>clock),reset=clock+3*86400000;
+ expect(requests.claim(job,'o/r',1,schedule)).toBe(true);requests.settle('o/r',1,'head','rate_limited','verified provider reset',reset);
+ expect(requests.get('o/r',1,'head').next_attempt).toBe(reset);
+ clock+=86400001;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'another-head'})).toBe(false);
+ clock=reset+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);s.close();
 });
 test('request overrides use shared durable receipts and cannot evade resets across heads',()=>{
  const s=new Store(':memory:');new ReviewLoop(s);const job=s.enqueue('p','i','spec');let clock=1000;

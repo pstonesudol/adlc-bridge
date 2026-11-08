@@ -14,11 +14,13 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
     'user':{id:9},
     'user/136622811':{id:136622811,login:'coderabbitai[bot]',type:'Bot'},
     'user/199175422':{id:199175422,login:'chatgpt-codex-connector[bot]',type:'Bot'},
+    'user/3':{id:3,type:'User',login:'human'},
+    'repos/owner/repo/collaborators/human/permission':{user:{id:3},permission:'write'},
    'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/a.ts'}]],
-   'repos/owner/repo/issues/1/comments?per_page=100':[[]],
+    'repos/owner/repo/issues/1/comments?per_page=100':[[{id:100,user:{id:3,type:'User',login:'human'},body:'Fix ownership',created_at:'2026-11-01T00:00:00Z',updated_at:'2026-11-01T00:01:00Z'}]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
-    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review,{id:42,user:{id:3,type:'User',login:'human'},state:'CHANGES_REQUESTED',commit_id:head,submitted_at:'2026-11-01T00:01:00Z',body:'Fix the ownership guard'}]],
+    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review,{id:42,user:{id:4,type:'User',login:'unavailable'},state:'CHANGES_REQUESTED',commit_id:head,submitted_at:'2026-11-01T00:01:00Z',body:'Fix the ownership guard'},{id:43,user:{id:3,type:'User',login:'human'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:02:00Z',body:''}]],
    'repos/owner/repo/git/ref/heads/main':{ref:'refs/heads/main',object:{type:'commit',sha:base}},
    [`repos/owner/repo/compare/${base}...${head}`]:{behind_by:0},
   };
@@ -51,18 +53,18 @@ console.log(JSON.stringify(result));
   for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
-   for(const mode of ['metadata','clear','advisory-outage']){
+   for(const mode of ['metadata','clear','advisory-outage','acknowledged']){
     const metadata=mode==='metadata'?['Metadata']:[];
-    // No user/3 response: the fixture rejects the advisory identity lookup.
+    // No user/4 response: the fixture rejects the advisory identity lookup.
     // Its summary-only change request must not disappear into green clearance.
-    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(mode==='advisory-outage'?[{id:'human',adapter:'github-review',identity:{userId:3,type:'User'},approvalRequired:false}]:[])]}));
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
     expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
     expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
     else if(mode==='advisory-outage'){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted']);expect(output.findings).toEqual([]);}
-    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);}
+    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
    expect(existsSync(db)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}

@@ -2502,6 +2502,11 @@ attempts per head. Unknown outcomes are never retried blindly. Matching marked
 GitHub request comments can reconcile uncertain delivery; otherwise operator
 inspection is required. Missing review evidence after 30 minutes yields a specific
 CodeRabbit blocker through the existing optional Linear blocker synchronization.
+Verified provider reset times are never shortened to a 24-hour retry cap: that
+could send before the provider permits it. Long or implausible reset evidence
+requires operator inspection rather than shortening the reset, silently retrying
+or enabling paid usage. This CodeRabbit request ledger is
+distinct from bounded GitHub observation/read backoff hints.
 
 Conservative fallback: missing/competing filenames, malformed or inherited YAML,
 unsupported filters/branch expressions, unavailable changed-file evidence, and
@@ -2657,6 +2662,9 @@ Linear clarification/worker outcome flow, not guessed reconciliation.
   negation. Exclusions win, both rename paths are checked conservatively, and
   deleted-path provenance is retained. Pathless feedback is eligible without
   filters; with filters it remains unclassified rather than silently cleared.
+  Ingestion eligibility is not send authorization: pathless code findings remain
+  visible but automatic remediation stops until concrete approved paths are known.
+  Trusted reviewer identity alone never expands the worker's file scope.
   Explicitly excluded findings are retained as nonblocking provenance, not pending
   remediation. A thread is ignored only when every substantive comment is trusted
   and excluded; required approvals and provider change requests still block.
@@ -2697,3 +2705,12 @@ still match the current head. Membership-selected required reviewers need at lea
 one current approval and no remaining member change request. Durable legacy
 thread receipts prevent replay on upgrade; legacy feedback needing edit validation
 requires human inspection instead of an unbounded automatic resend.
+Human issue comments have no GitHub resolve operation. A subsequent explicit
+current-head approval by the same freshly authenticated human acknowledges their
+preceding issue-comment versions; observations retain comment/review originals.
+An edit after that approval, a new head, dismissal, or a later change request
+reopens the finding. Another reviewer's approval, unavailable timestamps or failed
+identity evidence cannot acknowledge it. Inline thread resolution stays separate.
+The example project file deliberately disables Codex ingestion/remediation until
+an operator opts in; built-in defaults for configurations that omit this override
+are unchanged.

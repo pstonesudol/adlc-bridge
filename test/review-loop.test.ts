@@ -17,8 +17,17 @@ import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
-import {reviewerPolicy,reviewerApprovals,collectTrustedFeedback,BOT_IDENTITIES} from '../src/reviewer-policy';
+import {reviewerPolicy,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
+test('missing reviewer approvals stay in CI/review/rate-limit waits; hard obligations still block',()=>{
+ const missing='Reviewer coderabbit: explicit current-head approval required';
+ const e={...pending(),reasons:[missing],reviewerEvidence:{blockers:[missing],pending:[]}};
+ expect(decision({...e,pendingChecks:['CI']},['src/**'],0).state).toBe('waiting_for_ci');
+ expect(decision(e,['src/**'],0).state).toBe('waiting_for_coderabbit');
+ expect(decision({...e,coderabbitRateLimited:true},['src/**'],0)).toMatchObject({state:'waiting_for_coderabbit',reason:'CodeRabbit rate limited; wait for the provider limit to reset'});
+ expect(decision(e,['src/**'],30*60*1000).state).toBe('blocked');
+ for(const reason of ['Reviewer human: changes requested (42)','Reviewer human: fresh identity/membership evidence required before clearance'])expect(decision({...e,reviewerEvidence:{blockers:[missing,reason],pending:[]}},['src/**'],0)).toMatchObject({state:'blocked',reason});
+});
 test('missing/pending review waits then blocks; never becomes success or spends an attempt',()=>{
  expect(decision(pending(),['a'],0).state).toBe('waiting_for_coderabbit');
  expect(decision(pending(),['a'],30*60*1000)).toMatchObject({state:'blocked',send:false});
@@ -213,6 +222,22 @@ function pr30LoopFixture(){
  f.loop.requests.wait('owner/repo',1,schedule);f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return f;
 }
+for(const current of [false,true])test(`CodeRabbit ${current?'current':'stale'} change request preserves bounded scheduling guard`,async()=>{
+ const f=pr30LoopFixture();try{
+  f.e.reasons.push('Reviewer coderabbit: explicit current-head approval required','Reviewer coderabbit: changes requested (5810360982)');
+  if(current){f.e.reviewSchedule.evidence.review.stale=false;f.e.reviewSchedule.evidence.review.commit=f.head;f.e.reviewSchedule.evidence.recoverable=false;}
+  await f.loop.tick(f.id);expect(f.reviews()).toBe(current?0:1);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+for(const failure of [false,true])test(`full review mode is accurate in request audit and ${failure?'uncertain':'accepted'} reasons`,async()=>{
+ const f=pr30LoopFixture();try{
+  const config=[{id:'coderabbit',reviewMode:'full'}];bindReviewerPolicy(f.s,f.id,config);
+  let mode:string|undefined,reservation='';f.loop.postReview=async(_repo,_pr,_marker,_spawn,requestedMode)=>{mode=requestedMode;reservation=f.loop.get(f.id).reason;if(failure)throw Error('lost reply');};
+  if(failure){await expect(f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,{reviewers:config})).rejects.toThrow('lost reply');expect(f.loop.get(f.id).reason).toContain('full review request');}
+  else{expect((await f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,{reviewers:config})).reason).toContain('Full CodeRabbit review requested');const event=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='coderabbit_review_requested'").get(f.id) as any;expect(JSON.parse(event.detail).mode).toBe('full');}
+  expect(mode).toBe('full');expect(reservation).toContain('Full review request');
+ }finally{f.s.close();}
+});
 test('PR #30 shape requests one fresh review, survives concurrent ticks and a restart without duplication',async()=>{
  const f=pr30LoopFixture();try{
   const first=await f.loop.tick(f.id);
@@ -1031,6 +1056,14 @@ function threadFixture(){
  loop.configureMetadataChecks('project',[]);loop.register(id,'owner/repo',1,['CI'],['src/**'],true);
  return {s,id,head,e,session,loop,io,candidate,sends:()=>sends,reviews:()=>reviews};
 }
+test('pathless review data cannot authorize an automatic remediation send or consume a reservation',async()=>{
+ const f=threadFixture();try{
+  f.e.findings[0].path=null;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:'Review findings require concrete approved paths before automatic remediation'});
+  await expect(sendPilotRemediation(f.s,f.id,f.head,JSON.stringify(f.e.findings),'owner/repo',1,['CI'],DEFAULT_REMEDIATION_POLICY,[],f.io)).rejects.toThrow('require concrete approved paths');
+  expect(f.sends()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual([]);
+ }finally{f.s.close();}
+});
 test('identical CodeRabbit bodies preserve all legacy receipt IDs across restart without another remediation',async()=>{
  const f=threadFixture();try{
   const p=reviewerPolicy(undefined),now=Date.now(),trust=p.map(r=>({reviewer:r.id,observed:now,ids:[r.identity!.userId],blocker:null}));
