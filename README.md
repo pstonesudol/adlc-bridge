@@ -2495,6 +2495,78 @@ provider's pause state rather than automatically resuming. Disabled automatic
 review is never overridden, even if a description keyword could opt in.
 These blockers do not grant approval. Merges remain human-only.
 
+## Provider mode restoration compatibility (DEV-92)
+
+Archived planning authorization (DEV-91) and native provider startup are separate
+gates. This change adds **no** restore controller, restore command, session
+replacement, automatic retry, or turn replay. DEV-91 must use the original native
+restore path before its existing fresh-requirements/authorization checks permit
+replanning. A provider mode never grants ADLC implementation authority. Live
+DEV-90 recovery still requires both paths and a separately reviewed operator
+runtime activation; it has not been performed by these fixture tests.
+
+`src/provider-mode.ts` separates `planning`/`execution` intent from adapter-owned
+mode identifiers. Discovery accepts only explicitly mapped advertised choices;
+ambiguous aliases, missing capabilities, permission-posture changes and
+unconfirmed selection fail closed. Existing OpenCode routing pins `plan`/`build`
+without alias fallback. Tests also use an independent `inspect`/`edit` adapter.
+Model/effort selection still precedes mode selection and all existing approval,
+revision, setup, ownership and submission fences remain in force.
+
+The isolated native regression reproduces the reported confirmation boundary:
+an ACP provider advertises a mode picker, acknowledges `session/set_config_option`
+without a rebuilt catalog, and confirms via `current_mode_update`. At pinned
+Orchestrator revision `403a8c8385ed43bbf9e9289e3f3bbaa6517dc437`, that notification
+is ignored and startup reports an unconfirmed mode. This is a **reproduced
+compatibility failure**, not proof of the live incident's provider response.
+An empty modern config-option acknowledgement alone must never become confirmation.
+
+Supported native remediation is that exact pinned source plus the reviewed
+`patches/orchestrator-provider-mode.patch` (alongside the existing CI patch).
+It adds shared ACP notification confirmation, capability discovery and classified
+sanitized restore errors. Observation is bounded to 250 ms after an empty modern
+mode response, with **one setter call and no retry**. Only fresh advertised mode
+evidence counts. A rejected/unsupported/unconfirmed/uncertain mode blocks controller
+publication. The existing persistent ACP relay invalidates mode evidence before
+selection and retains uncertainty across daemon attachments; a late older response
+cannot confirm a newer request. Reconnection verifies saved intent against that
+host-owned evidence, not its original setup snapshot, without changing an in-flight
+host. Old hosts lacking this provenance fail closed: inspect/quiesce them through
+a separately authorized native operator workflow before same-session restoration;
+never kill uncertain work or silently replace the host. Legacy ACP `set_mode`
+success retains its protocol-defined selection confirmation. The OpenCode v2 binding
+also stops mapping every permission posture to Build on each turn: its existing
+permission policy remains responsible for approvals, independently of workflow
+mode. No unadvertised custom mode or Build fallback is introduced.
+
+Reproduce/build only in a new scratch directory with Go 1.27.1:
+
+```sh
+export ADLC_GO='/absolute/path/to/go1.27.1/go/bin/go'
+export PATH="$(dirname "$ADLC_GO"):$PATH"
+# Use isolated HOME, GOCACHE and GOMODCACHE for native verification.
+bun scripts/build-orchestrator.ts /absolute/new/scratch/build-directory
+```
+
+The script verifies the upstream archive SHA-256, applies both patches, runs
+full race-enabled ACP/persistent-host/GitHub suites plus focused OpenCode-v2,
+chat, session-API and session-manager restoration tests, then builds `ao`.
+Its test/build environment excludes inherited provider credentials and live-test
+flags and uses temporary HOME/AO data. It does **not** install, start, restore, activate services, merge or
+deploy. The launcher remains a pinned-binary launcher; changing bridge source
+does not repair the installed native runtime. If a provider still does not
+advertise/confirm the requested mode, preserve the original session, worktree,
+history, revision, harness/model and permissions; inspect the reported requested
+and observed mode and establish provider compatibility before explicit recovery.
+Never test recovery by sending a prompt or inspecting/editing live databases.
+
+Broader native-suite limitations observed during development: the unchanged
+session-manager scratch-provisioning test requires an available `tmux` on macOS;
+the existing wrong-major OpenCode fixture can fall through to a system-installed
+binary outside its temporary PATH/HOME. These are not exercised by the focused
+reproduction path, which uses only fake providers. Neither failure is reported as
+a passing full native suite or repaired by weakening production prerequisites.
+
 ## Same-spec planning evidence recovery
 
 When a captured plan has invalid readiness (for example, `ready` with blocking

@@ -1,5 +1,6 @@
 import type {Route} from './task-routing';
 import {localAO} from './workflow-transport';
+import {discoverMode,confirmMode,openCodeModes,NativeModeFailure,ProviderModeFailure} from './provider-mode';
 
 type API=(path:string,method?:string,body?:unknown)=>Promise<any>;
 export async function preflightRoute(route:Route,api:API=localAO){
@@ -25,8 +26,14 @@ export async function configureSessionRoute(session:string,route:Route,api:API=l
  await select('model',route.model);
  if(route.effort)await select('effort',route.effort);
  else if(options().find((o:any)=>o.id==='effort')?.choices?.some((c:any)=>c.value==='default'))await select('effort','default');
- await select('mode',route.mode);
+ // Mapping belongs to this adapter. A provider mode does not authorize the
+ // workflow phase; existing revision/approval/submission gates remain owners.
+ const mode=discoverMode(route.mode==='plan'?'planning':'execution',openCodeModes,options(),route.mode);
+ try{b=await api(`${prefix}/${encodeURIComponent(mode.option)}`,'PATCH',{value:mode.mode});}
+ catch(e){throw new ProviderModeFailure(e instanceof NativeModeFailure?e.kind:'uncertain',mode.intent,mode.mode,e instanceof NativeModeFailure?e.observed:'unknown');}
+ confirmMode(mode,b.options);
  const after=await api(prefix);b=after;
+ confirmMode(mode,options());
  if(options().find((o:any)=>o.id==='mode')?.currentValue!==route.mode||options().find((o:any)=>o.id==='model')?.currentValue!==route.model||route.effort&&options().find((o:any)=>o.id==='effort')?.currentValue!==route.effort)throw Error('Routing selection changed before delivery');
  return {harness:route.harness,model:route.model,effort:route.effort,verified:true};
 }
