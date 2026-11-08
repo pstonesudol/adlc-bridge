@@ -33,7 +33,8 @@ export const branchTransport:BranchTransport={
  async update(repo,pr,head){await gh(['api','--method','PUT',`repos/${repo}/pulls/${pr}/update-branch`,'-f',`expected_head_sha=${head}`]);}
 };
 export class BranchUpdates{
- constructor(public s:Store,public transport:BranchTransport=branchTransport){s.db.exec(`CREATE TABLE IF NOT EXISTS branch_updates(job TEXT NOT NULL REFERENCES jobs(id),head TEXT NOT NULL,base TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,reason TEXT,PRIMARY KEY(job,head,base));`);}
+ constructor(public s:Store,public transport:BranchTransport=branchTransport){s.db.exec(`CREATE TABLE IF NOT EXISTS branch_updates(job TEXT NOT NULL REFERENCES jobs(id),head TEXT NOT NULL,base TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,reason TEXT,PRIMARY KEY(job,head,base));
+ CREATE TABLE IF NOT EXISTS branch_update_intents(job TEXT NOT NULL,head TEXT NOT NULL,base TEXT NOT NULL,binding TEXT NOT NULL,PRIMARY KEY(job,head,base));`);}
   async observeAccepted(job:string,repo:string,pr:number,b:BranchSnapshot){
    // A changed SHA is insufficient: prove both recorded inputs in current head.
    // Keep uncertainty separate; operator reconciliation handles rewritten history.
@@ -42,7 +43,7 @@ export class BranchUpdates{
     if(!this.transport.contains||!await providerObservation(()=>this.transport.contains!(repo,row.head,b.head))||!await providerObservation(()=>this.transport.contains!(repo,row.base,b.head)))continue;
     const fresh=await providerObservation(()=>this.transport.read(repo,pr));
     if(fresh.head!==b.head||fresh.base!==b.base)continue;
-    this.s.db.transaction(()=>{new Lifecycle(this.s).current(job);this.s.db.query("UPDATE branch_updates SET state='observed' WHERE job=? AND head=? AND base=? AND state='accepted'").run(job,row.head,row.base);}).immediate();
+    this.s.db.transaction(()=>{new Lifecycle(this.s).current(job);this.s.db.query("UPDATE branch_updates SET state='remote_observed' WHERE job=? AND head=? AND base=? AND state='accepted'").run(job,row.head,row.base);}).immediate();
    }
   }
   async ensure(job:string,repo:string,pr:number,session:any,policy?:BranchPolicy){
@@ -72,7 +73,9 @@ export class BranchUpdates{
     assertWorktreeAvailable(this.s,job);
    const count=(this.s.db.query('SELECT count(*) AS n FROM branch_updates WHERE job=?').get(job) as any).n;
    if(policy.maxUpdates!==null&&count>=policy.maxUpdates)return 'limit';
-   return this.s.db.query('INSERT OR IGNORE INTO branch_updates VALUES (?,?,?,?,?,?)').run(job,b.head,b.base,'delivery_uncertain',Date.now(),null).changes?'claimed':'existing';
+   const claimed=this.s.db.query('INSERT OR IGNORE INTO branch_updates VALUES (?,?,?,?,?,?)').run(job,b.head,b.base,'delivery_uncertain',Date.now(),null).changes;
+   if(claimed)this.s.db.query('INSERT OR REPLACE INTO branch_update_intents VALUES (?,?,?,?)').run(job,b.head,b.base,branchUpdateBinding(this.s,job,repo,pr,b.branch));
+   return claimed?'claimed':'existing';
   }).immediate();
   if(claim==='limit')return {state:'blocked',send:false,head:b.head,reason:'Automatic branch update limit reached; human inspection required'};
   if(claim!=='claimed')return {state:'updating_branch',send:false,head:b.head,reason:'Another poll reserved the branch update'};
@@ -87,4 +90,8 @@ export class BranchUpdates{
     assertObservationFence();this.s.db.query('UPDATE branch_updates SET reason=? WHERE job=? AND head=? AND base=?').run('API outcome uncertain; inspect conflicts, permissions and head before recovery',job,b.head,b.base);return {state:'blocked',send:false,head:b.head,reason:'Branch update failed or outcome uncertain; no automatic retry'};}
   return {state:'updating_branch',send:false,head:b.head,reason:'Feature branch update requested; new commit requires fresh CI and CodeRabbit clearance'};
  }
+}
+export function branchUpdateBinding(s:Store,job:string,repo:string,pr:number,branch:string){
+ const l=new Lifecycle(s),j=l.current(job),run=l.run(job),p=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any,g=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+ return JSON.stringify({plan:j.plan_hash,actor:j.actor,approved:j.approved_hash,session:run?.session_id,worktree:run?.worktree,project:p?.project,spec:p?.spec_hash,grant:g?.operations,grantActor:g?.actor,repo,pr,branch});
 }
