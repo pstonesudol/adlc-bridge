@@ -1,5 +1,5 @@
 import {existsSync} from 'node:fs';
-import {Database} from 'bun:sqlite';
+import {Database,constants} from 'bun:sqlite';
 import {Store,digest} from './core';
 import {AO} from './orchestrator';
 import {appState} from './install-state';
@@ -157,8 +157,8 @@ async function processInventory(run=command){const r=await run(['/bin/ps','-axo'
 type LifecycleIO={run?:typeof command;evidence?:typeof sessionEvidence;trust?:typeof trustedDaemon;list?:(port:number,timeout:number)=>Promise<any>};
 export function checkpointDatabase(path:string){
  if(!existsSync(path))return;
- // Bun requires a writable open flag; create:false alone supplies neither mode.
- const db=new Database(path,{create:true});
+ // Explicit read/write without CREATE: never recreate a file lost after the check.
+ const db=new Database(path,constants.SQLITE_OPEN_READWRITE);
  try{
   const r=db.query('PRAGMA wal_checkpoint(FULL)').get() as {busy:number;log:number;checkpointed:number};
   if(r?.busy)throw Error('Durable checkpoint busy; backend preserved');

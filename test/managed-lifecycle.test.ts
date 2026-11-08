@@ -27,6 +27,30 @@ test('missing checkpoint database is a no-op and creates no files',()=>{
   for(const file of [path,`${path}-wal`,`${path}-shm`])expect(existsSync(file)).toBe(false);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
+test('checkpoint fails closed if the database disappears after the existence check',()=>{
+ const root=mkdtempSync(join(tmpdir(),'managed-checkpoint-race-')),path=join(root,'state.sqlite');
+ try{
+  const db=new Database(path,{create:true});db.exec('CREATE TABLE evidence(value TEXT)');db.close();
+  // Isolate the existence-check mock so other tests retain the real fs module.
+  const script=`
+   import {mock,expect} from 'bun:test';
+   import * as fs from 'node:fs';
+   const path=${JSON.stringify(path)},exists=fs.existsSync,remove=fs.unlinkSync;
+   let removed=false;
+   mock.module('node:fs',()=>({...fs,existsSync:(file)=>{
+    const present=exists(file);
+    if(file===path&&present){remove(path);removed=true;}
+    return present;
+   }}));
+   const {checkpointDatabase}=await import(${JSON.stringify(join(import.meta.dir,'../src/managed-lifecycle.ts'))});
+   expect(()=>checkpointDatabase(path)).toThrow('unable to open database file');
+   expect(removed).toBe(true);expect(exists(path)).toBe(false);
+  `;
+  const result=Bun.spawnSync([process.execPath,'-e',script],{timeout:10000});
+  expect(result.stderr.toString()).toBe('');expect(result.exitCode).toBe(0);
+  expect(existsSync(path)).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 test('real busy WAL checkpoint aborts lifecycle and preserves backend and workers',async()=>{
  const root=mkdtempSync(join(tmpdir(),'managed-checkpoint-busy-')),path=join(root,'state.sqlite'),db=new Database(path,{create:true});let reader:Database|undefined;
  try{
