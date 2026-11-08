@@ -230,6 +230,7 @@ for(const current of [false,true])test(`CodeRabbit ${current?'current':'stale'} 
   if(current){f.e.reviewSchedule.evidence.review.stale=false;f.e.reviewSchedule.evidence.review.commit=f.head;f.e.reviewSchedule.evidence.recoverable=false;}
   const result=await f.loop.tick(f.id);
   if(current){expect(result).toMatchObject({state:'blocked',send:false});expect(f.loop.get(f.id).state).toBe('blocked');}
+  else expect(result).toMatchObject({state:'waiting_for_coderabbit',send:false});
   expect(f.reviews()).toBe(current?0:1);expect(f.sends()).toBe(0);
  }finally{f.s.close();}
 });
