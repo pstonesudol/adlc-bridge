@@ -14,6 +14,7 @@ import {serviceControl} from './service-control';
 import {Store} from './core';
 import {ProjectServices,registryPath,legacyLabel,readDefinition,assertDefinition} from './project-services';
 import {installedCLI} from './install-state';
+import {integrationPreview,verifyIntegrations} from './integration-capabilities';
 
 export async function collectMetadataChecks(ask:(label:string)=>Promise<string>){
  const names:string[]=[];
@@ -33,7 +34,11 @@ export async function verifyInitConfig(c:any,api:LinearAPI=linearAPI,ao=localAO)
  const state=(id:string,type:string)=>b.team.states.nodes.some((s:any)=>s.id===id&&s.type===type);
  if(!state(c.linear.readyStateId,'unstarted')||!b.team.labels.nodes.some((l:any)=>l.id===c.linear.readyLabelId))throw Error('Select this team’s Todo state and agent-ready label');
  if(c.statusSync?.enabled&&(!state(c.statusSync.inProgress,'started')||!state(c.statusSync.inReview,'started')||!state(c.statusSync.done,'completed')))throw Error('Status mapping does not match this team’s workflow categories');
- if(c.featurePlanning?.enabled&&!state(c.featurePlanning.backlogStateId,'backlog'))throw Error('Feature tickets need this team’s Backlog state');
+  if(c.featurePlanning?.enabled&&!state(c.featurePlanning.backlogStateId,'backlog'))throw Error('Feature tickets need this team’s Backlog state');
+  if(c.blockerSync?.enabled||c.clarifications?.enabled){
+   const evidence=await verifyIntegrations(c,api);
+   if(evidence.identity!==true||evidence.label!==true||c.clarifications?.enabled&&evidence.humans!==true)throw Error('Integration project identity, distinct needs-human label or active authorized-human IDs could not be verified');
+  }
  const p=await ao(`projects/${encodeURIComponent(c.automation.orchestratorProject)}`);
  if(p.status!=='ok'||realpathSync(p.project?.path??'')!==realpathSync(c.repo))throw Error('Registered Orchestrator project must match the repository path');
 }
@@ -85,7 +90,8 @@ export async function initWizard(repoArg?:string,args:string[]=[],overrides:Part
   const rl=io.prompts(),home=io.home();
  const ask=async(label:string,fallback='')=>{const answer=(await rl.question(`${label}${fallback?` [${fallback}]`:''}: `)).trim();return answer||fallback;};
  const yes=async(label:string)=>(await ask(`${label} (yes/no)`,'no')).toLowerCase()==='yes';
- const complete=async(path:string,c:any)=>{
+  const complete=async(path:string,c:any)=>{
+   io.log(JSON.stringify({integrations:integrationPreview(c)},null,2));
   const unchanged=()=>{if(JSON.stringify(JSON.parse(readFileSync(path,'utf8')))!==JSON.stringify(c))throw Error('Saved configuration changed during setup; rerun init to revalidate it');};
   unchanged();
   {const state=new Store(io.registryPath());try{const registry=new ProjectServices(state);registry.discoverLegacy(home);registry.register(path,undefined,false);}finally{state.close();}}

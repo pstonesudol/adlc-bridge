@@ -687,6 +687,42 @@ with `--confirm HASH`; normal polling registers the review target afterwards.
 
 ### Plan readiness and worker blockers
 
+#### Integration enablement and upgrade readiness
+
+`adlc init REPO --preview --config CONFIG`, `adlc doctor CONFIG`, setup previews,
+PR readiness, and update previews include an integration matrix for blocker
+publication, clarification publication and clarification reply consumption.
+Implemented, configured, enabled, reachable, validated and unavailable are
+separate fields. Unknown evidence is not success; installing code does not prove
+an integration operational. Legacy configurations remain optional and visibly
+degraded; no feature is silently enabled.
+
+Run `adlc doctor CONFIG --verify-integrations` to make **read-only** provider
+requests validating project/team membership, the distinct needs-human label and
+active non-app authorized-human UUIDs. Incomplete inventories and credential
+failures never count as validation. This command does not publish a probe or
+prove comment/label mutation permissions. Publication probes require separate
+explicit operator authorization; no live publication probe is automatically run
+by init, doctor, upgrades, dispatch or tests.
+
+To explicitly require a capability, configure `integrationPolicy.required` with
+any of `blockerPublication`, `clarificationPublication`, `clarificationReplies`.
+Required capabilities fail closed before planning, implementation or continuation
+dispatch when validation is missing; observation/reconciliation remains available.
+**Current limitation:** provider mutation/reply permission verification is unknown
+without independent live evidence. Required capabilities therefore remain paused;
+do not opt into required mode expecting configuration alone to unlock dispatch.
+Doctor gives the missing prerequisites and operator action rather than claiming
+that a configured integration is operational.
+
+Repair output is a field-level **preview only**, not an apply command. Back up the
+original config, retain unknown fields and existing backups, review the proposed
+disabled sections, supply verified local mappings and explicitly authorize any
+enablement. Never copy credentials. Upgrade previews compare integration source
+fingerprints with the installed snapshot and recheck configuration before activation.
+Repairs and runtime installation remain separate operator actions; existing
+upgrade/rollback lifecycle and human-only merge/no-deployment rules are unchanged.
+
 Planning agents must end with a machine-readable `ADLC_PLAN_STATUS` receipt:
 `ready`, `needs-input`, or `blocked-by-dependency`, with concrete questions and
 dependency references. Missing or malformed receipts are non-actionable. The
