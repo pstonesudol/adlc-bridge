@@ -79,7 +79,7 @@ export async function reviewerTrust(policy:Reviewer[],repo:string,read:GitHubRea
     ids=[u.id];}
    else{
     const m=r.membership!;const path=m.kind==='team'?`orgs/${m.organization}/teams/${m.slug}/members`:`repos/${repo}/collaborators`;
-    if(m.kind==='team'){const team=await read(['api',`orgs/${m.organization}/teams/${m.slug}/repos/${repo}`]);if(team.full_name!==repo||team.permissions?.pull!==true)throw Error('team repository access unavailable');}
+    if(m.kind==='team'){const team=await read(['api',`orgs/${m.organization}/teams/${m.slug}/repos/${repo}`,'-H','Accept: application/vnd.github.v3.repository+json']);if(team?.full_name!==repo||team.permissions?.pull!==true)throw Error('team repository access unavailable');}
     let complete=false;
     for(let page=1;page<=100;page++){
      const users=await read(['api',`${path}?per_page=100&page=${page}`]);
@@ -129,7 +129,10 @@ export function feedbackEligibility(r:Reviewer,f:NormalizedFeedback):'eligible'|
 export function collectTrustedFeedback(policy:Reviewer[],trust:TrustEvidence[],feedback:NormalizedFeedback[],context:{repo:string;pr:number;head:string;selfIds:number[]},now=Date.now()){
  const findings:any[]=[],pending:any[]=[],excluded:any[]=[];const seen=new Map<string,any>();
  for(const f of feedback){
-  if(f.resolved||!f.body.trim()||context.selfIds.includes(f.userId??-1)||/<!--\s*adlc[-_:]/i.test(f.body))continue;
+  // The executing account is established by authenticated /user evidence, so
+  // actual bridge control comments are already excluded as self output. A
+  // marker inside another reviewer's body is task data, not bridge provenance.
+  if(f.resolved||!f.body.trim()||context.selfIds.includes(f.userId??-1))continue;
   const sources=policy.filter(r=>authenticatedReviewer(r,trust.find(e=>e.reviewer===r.id),f.userId,f.type,now));
   for(const r of sources){
    const eligibility=feedbackEligibility(r,f);
@@ -152,7 +155,7 @@ export function collectTrustedFeedback(policy:Reviewer[],trust:TrustEvidence[],f
  // A raw unresolved thread may be ignored only if every substantive comment
  // was authenticated and excluded under every matching policy. Unknown authors,
  // mixed eligible feedback, stale state and disabled remediation remain blockers.
- const ignoredThreadIds=[...new Set(excluded.map(e=>e.threadId))].filter(threadId=>feedback.filter(f=>f.threadId===threadId&&!f.resolved&&f.body.trim()&&!context.selfIds.includes(f.userId??-1)&&!/<!--\s*adlc[-_:]/i.test(f.body)).every(f=>{
+ const ignoredThreadIds=[...new Set(excluded.map(e=>e.threadId))].filter(threadId=>feedback.filter(f=>f.threadId===threadId&&!f.resolved&&f.body.trim()&&!context.selfIds.includes(f.userId??-1)).every(f=>{
   const sources=policy.filter(r=>authenticatedReviewer(r,trust.find(e=>e.reviewer===r.id),f.userId,f.type,now));
   return !f.outdated&&sources.length>0&&sources.every(r=>r.remediate&&feedbackEligibility(r,f)==='excluded');
  }));

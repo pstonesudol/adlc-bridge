@@ -5,7 +5,7 @@ import {configuredReviewEvidence} from '../src/github-reviewers';
 import {normalizeReviewThread} from '../src/github';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
 import {ReviewLoop} from '../src/review-loop';
-import {ReviewRequests} from '../src/coderabbit-scheduling';
+import {ReviewRequests,reviewRequestBody,reviewRequestMarker} from '../src/coderabbit-scheduling';
 import {decision} from '../src/review-loop';
 const now=Date.now();
 const policy=()=>reviewerPolicy(undefined);
@@ -25,9 +25,42 @@ test('defaults keep CodeRabbit required and Codex advisory with no request adapt
 test('authenticated Codex feedback retains originals, source and head; spoofed, stale, self and control content excluded',()=>{
  const result=collectTrustedFeedback(policy(),trusts(),[finding()],context,now);
  expect(result.findings).toHaveLength(1);expect(result.findings[0]).toMatchObject({source:'github-review',repo:'o/r',pr:1,sha:context.head,originalCommit:'older',provenance:[{reviewer:'codex',userId:199175422,original:finding().original}]});
- for(const over of [{userId:1},{type:'User'},{resolved:true},{userId:9},{body:'<!-- adlc-control:x -->'},{body:''}])expect(collectTrustedFeedback(policy(),trusts(),[finding(over)],context,now).findings).toEqual([]);
+ for(const over of [{userId:1},{type:'User'},{resolved:true},{userId:9},{body:''}])expect(collectTrustedFeedback(policy(),trusts(),[finding(over)],context,now).findings).toEqual([]);
  expect(collectTrustedFeedback(policy(),trusts(),[finding()],context,now+RECEIPT_FRESHNESS_MS+1).findings).toEqual([]);
  expect(collectTrustedFeedback(policy(),trusts(),[finding({outdated:true})],context,now).pending[0].category).toBe('stale');
+});
+test('reviewer text quoting ADLC markers is actionable; authenticated bridge/self output is not',()=>{
+ const control=reviewRequestBody('regular',reviewRequestMarker(context.repo,context.pr,context.head));
+ for(const body of ['Validate `<!-- adlc-coderabbit-request:abc -->` before retrying.','```html\n<!-- adlc-control:x -->\n```',control]){
+  const result=collectTrustedFeedback(policy(),trusts(),[finding({body,original:{body}})],context,now);
+  expect(result.findings).toHaveLength(1);expect(result.findings[0].body).toBe(body);
+  expect(result.pending).toEqual([]);expect(result.excluded).toEqual([]);
+ }
+ const ownControl=finding({id:'42',threadId:'comment:42',userId:context.selfIds[0],type:'User',path:null,body:control,original:{body:control}});
+ expect(collectTrustedFeedback(policy(),trusts(),[ownControl],context,now).findings).toEqual([]);
+ // A marker quotation cannot hide an untrusted comment when deciding whether
+ // an entire unresolved thread has been intentionally excluded.
+ const p=reviewerPolicy([{id:'codex',excludePaths:['src/**']}]);
+ const mixed=collectTrustedFeedback(p,trusts(),[finding(),finding({id:'C2',userId:999,body:'Quoted <!-- adlc-control:x -->'})],context,now);
+ expect(mixed.ignoredThreadIds).toEqual([]);
+});
+for(const response of ['repository','empty','wrong-repository','no-access'])test(`team access requests repository media type and fails safely: ${response}`,async()=>{
+ const p=reviewerPolicy([{id:'team',adapter:'github-review',membership:{kind:'team',organization:'org',slug:'reviewers'}}]);
+ let verified=false,members=0;
+ const read=async(args:string[])=>{
+  const path=args[1];
+  if(path.startsWith('user/')){const id=Number(path.split('/')[1]);return {id,type:'Bot',login:id===136622811?'coderabbitai[bot]':'chatgpt-codex-connector[bot]'};}
+  if(path==='orgs/org/teams/reviewers/repos/o/r'){
+   expect(args).toEqual(['api',path,'-H','Accept: application/vnd.github.v3.repository+json']);verified=true;
+   return response==='empty'?null:{full_name:response==='wrong-repository'?'other/repo':'o/r',permissions:{pull:response!=='no-access'}};
+  }
+  if(path.startsWith('orgs/org/teams/reviewers/members?')){members++;return [{id:3,type:'User',login:'human'},{id:4,type:'Bot',login:'automation'}];}
+  throw Error('Unexpected read');
+ };
+ const trust=(await reviewerTrust(p,'o/r',read,()=>now)).find(t=>t.reviewer==='team')!;
+ expect(verified).toBe(true);
+ if(response==='repository'){expect(trust).toMatchObject({ids:[3],blocker:null});expect(members).toBe(1);}
+ else{expect(trust.ids).toEqual([]);expect(trust.blocker).toContain('no trust granted');expect(members).toBe(0);}
 });
 test('unknown severity, pathless, rename exclusion and deleted paths do not silently clear findings',()=>{
  const r=policy()[1];expect(feedbackEligibility(r,finding({path:null}))).toBe('eligible');

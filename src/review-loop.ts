@@ -64,7 +64,7 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
   return {state:'blocked',send:false,reason:`Unresolved review threads require human decision (${parts.join(', ')}): ${paths.join(', ')||'path unavailable'}`};
  }
   const hardBlockers=(e.reviewerEvidence?.blockers??[]).filter((b:string)=>!/^Reviewer [a-z][a-z0-9-]{0,63}: explicit current-head approval required$/.test(b));
-  if(hardBlockers.length||e.reviewerEvidence?.pending?.length)return {state:'blocked',send:false,reason:[...hardBlockers,...(e.reviewerEvidence.pending??[]).map((p:any)=>`${p.reviewer}: ${p.reason} (${p.id})`)].join('; ')};
+  if(hardBlockers.length||e.reviewerEvidence?.pending?.length)return {state:'blocked',send:false,reason:[...hardBlockers,...(e.reviewerEvidence.pending??[]).map((p:any)=>`Reviewer ${p.reviewer}: ${p.reason} (${p.id})`)].join('; ')};
   if(e.coderabbitRateLimited)return {state:waitingMs>=30*60*1000?'blocked':'waiting_for_coderabbit',send:false,reason:'CodeRabbit rate limited; wait for the provider limit to reset'};
  if(waitingMs>=30*60*1000)return {state:'blocked',send:false,reason:e.reasons.join('; ')};
  if(e.pendingChecks?.length||e.missingChecks?.length)return {state:'waiting_for_ci',send:false,reason:`Waiting for CI: ${[...(e.pendingChecks??[]),...(e.missingChecks??[])].join(', ')}`};
