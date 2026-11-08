@@ -1,16 +1,25 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {ReviewLoop,postFullReview} from '../src/review-loop';
+import {ReviewLoop,postFullReview,postCodeRabbitReview} from '../src/review-loop';
 import {deriveReviewSchedule,parseReviewConfig,ReviewRequests,collectReviewSchedule,ReviewRateLimit,reviewEscalationReason} from '../src/coderabbit-scheduling';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 const yaml=(incremental=false)=>`reviews:\n  auto_review:\n    enabled: true\n    auto_incremental_review: ${incremental}\n    auto_pause_after_reviewed_commits: 0\n  path_filters: ['!dist/**']\n`;
+test('publication defaults to regular review; whole-PR reassessment requires explicit full selection',async()=>{
+ const calls:string[][]=[];
+ const spawn:any=(args:string[])=>{calls.push(args);return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};};
+ await postCodeRabbitReview('owner/repo',19,'marker',spawn);
+ await postFullReview('owner/repo',19,'marker',spawn);
+ expect(calls[0]).toContain('body=@coderabbitai review\n\nmarker');
+ expect(calls[0]).not.toContain('body=@coderabbitai full review\n\nmarker');
+ expect(calls[1]).toContain('body=@coderabbitai full review\n\nmarker');
+});
 test('only protocol-confirmed throttling permits a new request attempt',async()=>{
- for(const status of [429,403,500]){
+ for(const publish of [postCodeRabbitReview,postFullReview])for(const status of [429,403,500]){
   const out=`HTTP/2 ${status}\r\nRetry-After: 120\r\n\r\n${JSON.stringify({message:status===500?'server error':'API rate limit exceeded'})}`;
   const spawn:any=()=>({stdout:new Response(out).body,stderr:new Response('').body,exited:Promise.resolve(1)});
-  let failure:any;try{await postFullReview('owner/repo',19,'marker',spawn);}catch(e){failure=e;}
+  let failure:any;try{await publish('owner/repo',19,'marker',spawn);}catch(e){failure=e;}
   expect(failure instanceof ReviewRateLimit).toBe(status!==500);
   if(status===500)expect(failure.message).toContain('uncertain');
  }
@@ -89,7 +98,8 @@ test('terminal escalation names the head, exact check/review IDs, configuration 
  expect(reason).toContain(`at ${STALE}`);
  expect(reason).toContain('auto_pause_after_reviewed_commits=2');
  expect(reason).toContain('reviewed commits=1');
- expect(reason).toContain("Safe next action: post one '@coderabbitai full review'");
+ expect(reason).toContain('requested mode regular');
+ expect(reason).toContain('never automatic escalation');
  expect(reason).not.toContain('ambiguous');
  const limited=deriveReviewSchedule(pr30({reviews:[],checks:[skippedRun({conclusion:'failure',output:{title:'Rate limit exceeded',summary:'',text:''}})]}));
  const retryAt=Date.now()+120000,rateReason=reviewEscalationReason({repo:'owner/repo',pr:19,head:HEAD,schedule:limited,attempts:3,requestState:'rate_limited',retryAt});
@@ -138,4 +148,22 @@ test('durable per-repository/head dedupe survives reopening, uncertain delivery 
   now+=86400000;expect(requests.claim(job,'owner/repo',19,{...schedule,signature:'config-changed'})).toBe(false);
   expect(requests.claim(job,'owner/second',19,schedule)).toBe(true);
  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('pre-mode shared receipts migrate as full without replay; a confirmed rejected retry becomes regular without resetting budget',()=>{
+ for(const state of ['accepted','delivery_uncertain','rate_limited']){
+  const s=new Store(':memory:');new ReviewLoop(s);const job=s.enqueue('p','i','spec'),schedule=deriveReviewSchedule(input());
+  try{
+   s.db.exec('ALTER TABLE coderabbit_requests DROP COLUMN mode; ALTER TABLE coderabbit_request_attempts DROP COLUMN mode');
+   s.db.query('INSERT INTO coderabbit_requests VALUES (?,?,?,?,?,?,1,?,0,?)').run('owner/repo',19,schedule.head,job,schedule.signature,state,1,'old evidence');
+   s.db.query('INSERT INTO coderabbit_request_attempts VALUES (?,?,?,?,?,?,?,?,?)').run('owner/repo',19,schedule.head,1,schedule.signature,state,1,'old evidence',0);
+   const requests=new ReviewRequests(s,()=>100000);
+   expect(requests.get('owner/repo',19,schedule.head)).toMatchObject({mode:'full',state,attempts:1});
+   expect(requests.claim(job,'owner/repo',19,schedule)).toBe(state==='rate_limited');
+   if(state==='rate_limited'){
+    expect(requests.get('owner/repo',19,schedule.head)).toMatchObject({mode:'regular',attempts:2});
+    expect(s.db.query('SELECT mode FROM coderabbit_request_attempts ORDER BY attempt').all()).toEqual([{mode:'full'},{mode:'regular'}]);
+   }else expect(requests.get('owner/repo',19,schedule.head).mode).toBe('full');
+   new ReviewRequests(s); // migration is repeatable
+  }finally{s.close();}
+ }
 });

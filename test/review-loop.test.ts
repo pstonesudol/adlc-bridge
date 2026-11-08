@@ -2,7 +2,7 @@ import {test,expect,setSystemTime,spyOn} from 'bun:test';
 import {readFailure,ReadValidationError} from '../src/provider-read';
 import {RecoveryObservation,ObservationDeferred} from '../src/recovery-observation';
 import {ObservationLeaseLost} from '../src/observation-fence';
-import {decision,ReviewLoop} from '../src/review-loop';
+import {decision,ReviewLoop,postCodeRabbitReview} from '../src/review-loop';
 import {Store,reviewGate,digest} from '../src/core';
 import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {ConflictRecovery} from '../src/conflict-recovery';
@@ -127,7 +127,8 @@ test('missing current-head review gets one request after grace, retries only con
   const escalated=await f.loop.tick(f.id);
   expect(escalated).toMatchObject({state:'blocked',send:false});
   expect(escalated.reason).toContain(`head ${'a'.repeat(40)}`);
-  expect(escalated.reason).toContain("Safe next action: post one '@coderabbitai full review'");
+  expect(escalated.reason).toContain('requested mode regular');
+  expect(escalated.reason).toContain('never automatic escalation');
   expect(escalated.reason).not.toContain('ambiguous');
  }finally{f.s.close();}
 });
@@ -189,7 +190,7 @@ test('an uncertain PR #30 request is reconciled before any retry',async()=>{
   expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
   expect(posts).toBe(1);
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai full review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
   expect(posts).toBe(1);
  }finally{f.s.close();}
@@ -213,9 +214,68 @@ test('matching marked comment reconciles uncertain request without replay or inf
   Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);
   let marker='',posts=0;f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('lost');};
   await expect(f.loop.tick(f.id)).rejects.toThrow('lost');
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai full review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(posts).toBe(1);
   expect(f.loop.requests.get('owner/repo',1,f.head).state).toBe('accepted');expect(f.e.clear).toBe(false);
+ }finally{f.s.close();}
+});
+test('new regular receipts reject a full-command match, while pre-mode uncertain full receipts reconcile without replay',async()=>{
+ for(const legacy of [false,true]){
+  const f=pr30LoopFixture();try{
+   let marker='',posts=0;f.loop.postReview=async(_repo,_pr,value)=>{marker=value??'';posts++;throw Error('lost');};
+   await expect(f.loop.tick(f.id)).rejects.toThrow('lost');
+   if(legacy){
+    // Simulate an old database that sent full review before modes existed.
+    f.s.db.exec('ALTER TABLE coderabbit_requests DROP COLUMN mode; ALTER TABLE coderabbit_request_attempts DROP COLUMN mode');
+    f.loop=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
+   }
+   const comment=(command:string)=>[{id:42,author:'operator',body:`@coderabbitai ${command}\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+   f.e.requestComments=comment(legacy?'review':'full review');
+   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
+   f.e.requestComments=comment(legacy?'full review':'review');
+   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+   expect(f.loop.requests.get('owner/repo',1,f.head)).toMatchObject({mode:legacy?'full':'regular',state:'accepted',attempts:1});
+   expect(f.loop.list()[0].reviewRequest.mode).toBe(legacy?'full':'regular');
+   expect(posts).toBe(1);expect(f.e.clear).toBe(false);
+  }finally{f.s.close();}
+ }
+});
+test('code and metadata remediation publish one regular command only after the batch completes',async()=>{
+ for(const metadata of [false,true]){
+  const f=templateFixture();try{
+   if(!metadata){
+    f.loop.configureMetadataChecks('project',[]);
+    new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['commit','push-feature'],'human');
+    f.e.findings=[{path:'src/one.ts',body:'fix one',sha:f.head},{path:'src/two.ts',body:'fix two',sha:f.head}];f.e.failedChecks=[];
+   }
+   const commands:string[][]=[];
+   const spawn:any=(args:string[])=>{commands.push(args);return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};};
+   f.loop.postReview=async(repo,pr,marker)=>postCodeRabbitReview(repo,pr,marker,spawn);
+   expect((await f.loop.tick(f.id)).state).toBe('remediation_pending');
+   await f.loop.tick(f.id);expect(commands).toHaveLength(0);expect(f.sends()).toBe(1);
+   f.session.transcript.turns[0].state='completed';
+   if(metadata)f.e.descriptionHash='batch-description';
+   else{
+    f.e.head='c'.repeat(40);f.e.reviewSchedule={...f.e.reviewSchedule,head:f.e.head,signature:'batch-completed'};
+    f.loop.io.readBranchSnapshot=async()=>({...await f.io.readBranchSnapshot(),head:f.e.head});
+    f.loop.io.worktreeIdentity=async()=>({...await f.io.worktreeIdentity(),head:f.e.head});
+    f.loop.requests.wait('owner/repo',1,f.e.reviewSchedule);f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
+   }
+   Object.assign(f.e,{findings:[],failedChecks:[],reasons:['Explicit latest-SHA CodeRabbit approval missing'],metadataCheckEvidence:bodyEvidence(f.e)});
+   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
+   await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);
+   expect(commands).toHaveLength(1);
+   expect(commands[0].find(a=>a.startsWith('body='))).toStartWith('body=@coderabbitai review\n\n<!-- adlc-coderabbit-request:');
+   expect(f.loop.requests.get('owner/repo',1,f.e.head)).toMatchObject({mode:'regular',attempts:1,state:'accepted'});
+   expect(f.e.clear).toBe(false);
+  }finally{f.s.close();}
+ }
+});
+test('accepted legacy body receipts consume the head budget across description changes',async()=>{
+ const f=pr30LoopFixture();try{
+  f.s.db.query('INSERT INTO full_review_requests VALUES (?,?,?,?,?,?)').run(f.id,1,f.head,'earlier-body','accepted',Date.now());
+  expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).toBe(false);
+  expect(f.reviews()).toBe(0);expect(f.loop.requests.get('owner/repo',1,f.head)).toBeNull();
  }finally{f.s.close();}
 });
 function customLoopFixture(){
@@ -246,7 +306,7 @@ test('a custom-check blocker without an obligation or wait baseline requests a f
  const f=customLoopFixture();try{
   const reason='CodeRabbit custom-check failure: description changed after the bot review';
   Object.assign(f.e,{descriptionHash:'edited-before-remediation',findings:[],coderabbitBodyReviewed:false,customCheckBlocker:reason,reasons:[reason],botReviewSubmittedAt:Date.now()-10000});
-  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'Full CodeRabbit review requested for current commit and description'});
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false,reason:'Regular CodeRabbit review requested for current commit and description'});
   expect(f.reviews()).toBe(1);expect(f.sends()).toBe(0);
   expect(f.s.db.query('SELECT * FROM full_review_requests WHERE job=?').all(f.id)).toHaveLength(1);
   // A poll before the bot starts must not publish the pre-request blocker.
