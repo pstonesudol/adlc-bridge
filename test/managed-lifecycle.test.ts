@@ -1,11 +1,44 @@
 import {test,expect} from 'bun:test';
-import {controlManagedLifecycle,LifecycleFailure,workerOwnership,featureWorkerProject,liveLifecycleOps,parseProcesses,descendants,type LifecycleOps,type LifecycleOptions,type Worker,type Inventory} from '../src/managed-lifecycle';
+import {controlManagedLifecycle,LifecycleFailure,workerOwnership,featureWorkerProject,liveLifecycleOps,checkpointDatabase,parseProcesses,descendants,type LifecycleOps,type LifecycleOptions,type Worker,type Inventory} from '../src/managed-lifecycle';
+import {Database} from 'bun:sqlite';
 import {parseLifecycle,lifecycleCLI} from '../src/lifecycle-cli';
 import {Store} from '../src/core';
 import {ProjectServices} from '../src/project-services';
 import {turnBarrier,projectIntakePaused,setProjectIntakePaused,assertProjectIntakeEnabled} from '../src/turn-submission';
 import {withStackLock} from '../src/stack-control';
-import {mkdtempSync,rmSync,existsSync,writeFileSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {mkdtempSync,rmSync,existsSync,writeFileSync,statSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+test('real WAL checkpoint flushes uncheckpointed frames and preserves readable data',()=>{
+ const root=mkdtempSync(join(tmpdir(),'managed-checkpoint-')),path=join(root,'state.sqlite'),db=new Database(path,{create:true});
+ try{
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence(value TEXT); PRAGMA wal_checkpoint(TRUNCATE)');
+  db.query('INSERT INTO evidence VALUES (?)').run('durable');
+  // Keep the writer open: closing its last connection would checkpoint for us.
+  expect(statSync(`${path}-wal`).size).toBeGreaterThan(32);
+  const result=checkpointDatabase(path);
+  expect(result?.busy).toBe(0);expect(result!.log).toBeGreaterThan(0);expect(result!.checkpointed).toBe(result!.log);
+  const reader=new Database(path,{readonly:true,create:false});
+  try{expect(reader.query('SELECT value FROM evidence').get()).toEqual({value:'durable'});}finally{reader.close();}
+ }finally{db.close();rmSync(root,{recursive:true,force:true});}
+});
+test('missing checkpoint database is a no-op and creates no files',()=>{
+ const root=mkdtempSync(join(tmpdir(),'managed-checkpoint-missing-')),path=join(root,'missing.sqlite');
+ try{
+  expect(checkpointDatabase(path)).toBeUndefined();
+  for(const file of [path,`${path}-wal`,`${path}-shm`])expect(existsSync(file)).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test('real busy WAL checkpoint aborts lifecycle and preserves backend and workers',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'managed-checkpoint-busy-')),path=join(root,'state.sqlite'),db=new Database(path,{create:true});let reader:Database|undefined;
+ try{
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE evidence(value TEXT); PRAGMA wal_checkpoint(TRUNCATE)');
+  reader=new Database(path,{readonly:true,create:false});reader.exec('BEGIN');reader.query('SELECT * FROM evidence').all();
+  db.query('INSERT INTO evidence VALUES (?)').run('pending');
+  const f=fixture();f.ops.checkpoint=async()=>{checkpointDatabase(path);};
+  await expect(apply(f,'restart',{all:true,timeout:2})).rejects.toThrow('Durable checkpoint busy; backend preserved');
+  expect(f.paused()).toBe(true);expect(f.calls).not.toContain('exit:one-1');expect(f.calls).not.toContain('backend:stop');expect(f.calls).not.toContain('backend:start');
+  reader.exec('ROLLBACK');expect(checkpointDatabase(path)?.busy).toBe(0);
+ }finally{reader?.close();db.close();rmSync(root,{recursive:true,force:true});}
+});
 const worker=(extra:Partial<Worker>={}):Worker=>({session:'one-1',project:'one',branch:'adlc/work',owned:true,exited:false,busy:false,reason:'owned',...extra});
 function fixture(){
  const calls:string[]=[];let clock=0,paused=false,backend=true;let workers=[worker()];
@@ -27,6 +60,22 @@ test('project stop preserves workers and backend; all-stack pause persists its f
 test('disruptive preview has no mutations and exact confirmation is required before pause',async()=>{
  const f=fixture(),o={all:true,mode:'workers' as const,timeout:2};const p=await controlManagedLifecycle('stop',o,f.ops);expect(f.calls).toEqual([]);expect(p.preview).toBe(true);
  f.setWorkers([worker({session:'different'})]);await expect(controlManagedLifecycle('stop',{...o,apply:true,confirm:p.confirm},f.ops)).rejects.toThrow('stale');expect(f.calls).toEqual([]);
+});
+test('restart --all --preview returns a confirmation hash without mutations',async()=>{
+ const f=fixture();
+ const result=await lifecycleCLI('restart',['--all','--preview'],'unused',async(action,options)=>controlManagedLifecycle(action,options,f.ops));
+ expect(result.preview).toBe(true);expect(result.confirm).toMatch(/^[a-f0-9]{64}$/);expect(f.calls).toEqual([]);expect(f.paused()).toBe(false);
+});
+test('isolated CLI restart preview emits a confirmation hash without creating state',()=>{
+ const root=mkdtempSync(join(tmpdir(),'managed-restart-preview-'));try{
+  const db=join(root,'missing.sqlite'),ao=join(root,'fixture-ao');
+  // No live daemon or service control: this fixture accepts only a status read.
+  writeFileSync(ao,`#!${process.execPath}\nif(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['status','--json']))process.exit(99);\nconsole.log(JSON.stringify({state:'not_running'}));\n`,{mode:0o700});
+  const r=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'restart','--all','--preview','--json'],{env:{HOME:root,PATH:process.env.PATH,ADLC_DB:db,ADLC_AO_PATH:ao},timeout:10000});
+  expect(r.exitCode).toBe(0);const result=JSON.parse(r.stdout.toString());
+  expect(result.preview).toBe(true);expect(result.confirm).toMatch(/^[a-f0-9]{64}$/);
+  expect(existsSync(db)).toBe(false);expect(existsSync(join(root,'Library/Application Support/ADLC Bridge'))).toBe(false);
+ }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('confirmation cannot interrupt a later turn in the same session',async()=>{
  const f=fixture(),o={project:'one',mode:'workers' as const,timeout:1};f.setWorkers([worker({turns:['old']})]);const p=await controlManagedLifecycle('stop',o,f.ops);f.setWorkers([worker({turns:['old','new'],busy:true})]);await expect(controlManagedLifecycle('stop',{...o,apply:true,confirm:p.confirm},f.ops)).rejects.toThrow('stale');expect(f.calls).toEqual([]);
