@@ -2,6 +2,10 @@ import {digest,Store} from './core';
 import {assertObservationFence} from './observation-fence';
 
 export const REVIEW_GRACE_MS=5*60*1000, REVIEW_TIMEOUT_MS=30*60*1000;
+export type ReviewMode='regular'|'full';
+export const reviewCommand=(mode:ReviewMode)=>mode==='full'?'@coderabbitai full review':'@coderabbitai review';
+export const reviewRequestMarker=(repo:string,pr:number,head:string)=>`<!-- adlc-coderabbit-request:${digest(JSON.stringify([repo,pr,head]))} -->`;
+export const reviewRequestBody=(mode:ReviewMode,marker='')=>`${reviewCommand(mode)}${marker?'\n\n'+marker:''}`;
 /** Evidence shapes are reported explicitly. A skipped, neutral or stale result is
  * never clearance; it only decides whether one bounded fresh review is supported. */
 export type ReviewClassification='current-review'|'pending-current-run'|'stale-submitted-review'|'current-head-skipped'|'no-review-no-run'|'provider-error'|'rate-limited'|'intentional-pause'|'explicit-opt-out'|'configuration-gap';
@@ -89,7 +93,7 @@ export function deriveReviewSchedule(input:{head:string;headText:string;baseText
   const commands=comments.filter(c=>typeof c.body==='string'&&/^@coderabbitai\s+(pause|resume|ignore)\s*$/im.test(c.body)).sort((a,b)=>Date.parse(a.created_at)-Date.parse(b.created_at));
   const command=commands.at(-1);
   if(command&&!/^@coderabbitai\s+resume\s*$/im.test(command.body)){const ignore=/ignore/i.test(command.body);return fail(`explicit ${ignore?'ignore':'pause'} command; no automatic resume; ${action("post '@coderabbitai resume' in the PR, then run 'adlc tick-review'")}`,ignore?'explicit-opt-out':'intentional-pause');}
-  if(evidence.reviewedCommits>=evidence.pauseThreshold&&evidence.pauseThreshold>0&&!(evidence.review&&!evidence.review.stale)&&!runs.some(c=>c.status!=='completed'))return fail(`auto-pause threshold reached (${evidence.reviewedCommits} reviewed commits >= auto_pause_after_reviewed_commits=${evidence.pauseThreshold}); the provider intentionally paused automatic review; ${action("post one '@coderabbitai full review' manually if another review is intended, or raise/remove auto_pause_after_reviewed_commits")}`,'intentional-pause');
+  if(evidence.reviewedCommits>=evidence.pauseThreshold&&evidence.pauseThreshold>0&&!(evidence.review&&!evidence.review.stale)&&!runs.some(c=>c.status!=='completed'))return fail(`auto-pause threshold reached (${evidence.reviewedCommits} reviewed commits >= auto_pause_after_reviewed_commits=${evidence.pauseThreshold}); the provider intentionally paused automatic review; ${action("post one '@coderabbitai review' manually if another review is intended, or raise/remove auto_pause_after_reviewed_commits")}`,'intentional-pause');
  }catch(error){return fail(`${error instanceof ScheduleGap?error.message:'malformed YAML (payload omitted)'}; no speculative request or clearance`,'configuration-gap');}
  const current=evidence.review&&!evidence.review.stale;
  // A current submitted review is judged by the explicit review gate, never by
@@ -110,15 +114,15 @@ export function deriveReviewSchedule(input:{head:string;headText:string;baseText
 /** Exact terminal evidence for a bounded request that did not become a current
  * review. The reason always names the head, the check/review identities, the
  * effective configuration and one safe next action; never "ambiguous". */
-export function reviewEscalationReason(input:{repo:string;pr:number;head:string;schedule:ReviewSchedule;attempts:number;requestState:string;retryAt?:number|null}):string{
+export function reviewEscalationReason(input:{repo:string;pr:number;head:string;schedule:ReviewSchedule;attempts:number;requestState:string;retryAt?:number|null;mode?:ReviewMode}):string{
  const {repo,pr,head,schedule,attempts,requestState,retryAt}=input,e=schedule.evidence;
  const check=e?.check?`check ${e.check.id} '${e.check.name}' ${e.check.status}/${e.check.conclusion??'no conclusion'}`:e?.runs?`${e.runs} current-head CodeRabbit runs`:'no current-head CodeRabbit run';
  const review=e?.review?`review ${e.review.id} at ${e.review.commit} (${e.review.state}${e.review.stale?', stale':''})`:'no submitted CodeRabbit review';
  const configuration=`auto_incremental_review=${e?.incremental??schedule.incremental}, auto_pause_after_reviewed_commits=${e?.pauseThreshold??'unknown'}, reviewed commits=${e?.reviewedCommits??'unknown'}`;
- const evidence=`head ${head}; ${check}; ${review}; ${configuration}; ${attempts} request attempt(s), state ${requestState}${retryAt?`; provider limit resets ${new Date(retryAt).toISOString()}`:''}`;
+ const evidence=`head ${head}; ${check}; ${review}; ${configuration}; ${attempts} request attempt(s), state ${requestState}, requested mode ${input.mode??'regular'}${retryAt?`; provider limit resets ${new Date(retryAt).toISOString()}`:''}`;
  if(e?.classification==='rate-limited')return `CodeRabbit review unavailable: ${evidence}; the provider is rate limiting review requests. Safe next action: wait for the provider limit to reset, then run 'adlc tick-review' (do not post another review request).`;
  if(e?.classification==='provider-error')return `CodeRabbit review unavailable: ${evidence}; the provider run did not complete normally. Safe next action: inspect ${e.check?`run ${e.check.id}`:'the CodeRabbit runs'}, then run 'adlc tick-review'.`;
- return `CodeRabbit review unavailable: ${evidence}; no current-head CodeRabbit review exists. Safe next action: post one '@coderabbitai full review' comment on https://github.com/${repo}/pull/${pr}, then run 'adlc tick-review'.`;
+ return `CodeRabbit review unavailable: ${evidence}; no current-head CodeRabbit review exists. Safe next action: inspect the review request/result on https://github.com/${repo}/pull/${pr}, then run 'adlc tick-review'. Regular review may skip an already-reviewed commit or description-only edit; whole-PR reassessment requires an explicit operator '@coderabbitai full review' request, never automatic escalation.`;
 }
 
 /** One receipt per repository/PR/head, shared across jobs and restarts. Reserving
@@ -127,7 +131,15 @@ export function reviewEscalationReason(input:{repo:string;pr:number;head:string;
 export class ReviewRequests{
  constructor(public s:Store,public now=Date.now){s.db.exec(`CREATE TABLE IF NOT EXISTS coderabbit_requests(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,job TEXT NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,requested INTEGER NOT NULL,next_attempt INTEGER NOT NULL,evidence TEXT,PRIMARY KEY(repo,pr,head));
  CREATE TABLE IF NOT EXISTS coderabbit_waits(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(repo,pr,head));
- CREATE TABLE IF NOT EXISTS coderabbit_request_attempts(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,evidence TEXT,next_attempt INTEGER NOT NULL,PRIMARY KEY(repo,pr,head,attempt));`);}
+  CREATE TABLE IF NOT EXISTS coderabbit_request_attempts(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,evidence TEXT,next_attempt INTEGER NOT NULL,PRIMARY KEY(repo,pr,head,attempt));`);
+  // Every pre-mode request used full review. Keep its command and budget across
+  // upgrade; mode is evidence, never part of the per-head deduplication key.
+  s.db.transaction(()=>{
+   for(const table of ['coderabbit_requests','coderabbit_request_attempts']){
+    const columns=s.db.query(`PRAGMA table_info(${table})`).all() as any[];
+    if(!columns.some(c=>c.name==='mode'))s.db.exec(`ALTER TABLE ${table} ADD COLUMN mode TEXT NOT NULL DEFAULT 'full' CHECK(mode IN ('regular','full'))`);
+   }
+  }).immediate();}
  get(repo:string,pr:number,head:string):any{return this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? AND head=?').get(repo,pr,head);}
  wait(repo:string,pr:number,schedule:ReviewSchedule){
   assertObservationFence();const {head,signature}=schedule;
@@ -141,8 +153,8 @@ export class ReviewRequests{
    // request budget. This upgrade must not replay requests from old databases.
    const legacy=this.s.db.query("SELECT r.state FROM full_review_requests r JOIN review_targets t ON t.job=r.job AND t.pr=r.pr WHERE t.repo=? AND r.pr=? AND r.head=? AND r.state IN ('accepted','delivery_uncertain') LIMIT 1").get(repo,pr,schedule.head);
    if(legacy)return false;
-   const changed=!!this.s.db.query(`INSERT INTO coderabbit_requests VALUES (?,?,?,?,?,'delivery_uncertain',1,?,0,NULL) ON CONFLICT(repo,pr,head) DO UPDATE SET state='delivery_uncertain',signature=excluded.signature,attempts=attempts+1,requested=excluded.requested,evidence=NULL WHERE state='rate_limited' AND next_attempt<=? AND attempts<3`).run(repo,pr,schedule.head,job,schedule.signature,this.now(),this.now()).changes;
-   if(changed){const r=this.get(repo,pr,schedule.head);this.s.db.query('INSERT INTO coderabbit_request_attempts VALUES (?,?,?,?,?,?,?,?,?)').run(repo,pr,schedule.head,r.attempts,schedule.signature,r.state,r.requested,null,0);}
+   const changed=!!this.s.db.query(`INSERT INTO coderabbit_requests(repo,pr,head,job,signature,state,attempts,requested,next_attempt,evidence,mode) VALUES (?,?,?,?,?,'delivery_uncertain',1,?,0,NULL,'regular') ON CONFLICT(repo,pr,head) DO UPDATE SET state='delivery_uncertain',signature=excluded.signature,attempts=attempts+1,requested=excluded.requested,evidence=NULL,mode=excluded.mode WHERE state='rate_limited' AND next_attempt<=? AND attempts<3`).run(repo,pr,schedule.head,job,schedule.signature,this.now(),this.now()).changes;
+   if(changed){const r=this.get(repo,pr,schedule.head);this.s.db.query('INSERT INTO coderabbit_request_attempts(repo,pr,head,attempt,signature,state,requested,evidence,next_attempt,mode) VALUES (?,?,?,?,?,?,?,?,?,?)').run(repo,pr,schedule.head,r.attempts,schedule.signature,r.state,r.requested,null,0,r.mode);}
    return changed;
   }).immediate();
  }
