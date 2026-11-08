@@ -7,6 +7,7 @@ import {validateClarifications} from './linear-clarifications';
 import {validateVerification,type Verification} from './verification';
 import {effectiveSettings} from './project-settings';
 import {validateDependencies,type DependencyPolicy} from './dependency-policy';
+import {validateIntegrationPolicy,type IntegrationPolicy} from './integration-capabilities';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -23,6 +24,7 @@ export type ProjectConfig = {
   planApproval?:{enabled:boolean;approverIds:string[];scope:string[]};
   blockerSync?:{enabled:boolean;labelId?:string};
   clarifications?:{enabled:boolean;humanIds:string[]};
+  integrationPolicy?:IntegrationPolicy;
   workflow?:{prGraceMs?:number};
   featurePlanning?:{enabled:boolean;backlogStateId:string;maxAgents?:number;maxTickets?:number};
   remediation?:RemediationConfig;
@@ -39,6 +41,7 @@ export function metadataCheckNames(value:unknown):string[]{
 export function validate(c: any): asserts c is ProjectConfig {
   if(c?.verification!==undefined)validateVerification(c.verification);
   effectiveSettings(c??{});
+  validateIntegrationPolicy(c);
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');
   requiredCheckNames(c.requiredChecks);
   validateClarifications(c);

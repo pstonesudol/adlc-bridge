@@ -8,6 +8,9 @@ import {atomicFile} from './atomic-file';
 import {distributionFiles,distributionVersion,installBridge,installIO} from './install';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {liveStackOps,type StackOps} from './stack-control';
+import {registeredProjects} from './service-control';
+import {validate} from './linear';
+import {integrationPreview,integrationRuntime} from './integration-capabilities';
 
 export type UpdateMode='manual'|'automatic';
 export type UpdatePolicy={
@@ -207,6 +210,7 @@ export type UpdateIO={
  checks(policy:UpdatePolicy,candidate:Candidate):Promise<CheckEvidence>;
  tests(policy:UpdatePolicy,staged:Staged):Promise<TestEvidence>;
  compatibility?(staged:Staged):{compatible:boolean;detail:string};
+ integrations?(staged:Staged):Promise<{project:string;report:ReturnType<typeof integrationPreview>}[]>;
  reattachment?():Promise<{safe:boolean;detail:string}>;
  stack:StackOps;
  install(apply:boolean,source:string,launcher?:string):Promise<any>;
@@ -226,6 +230,16 @@ export function liveUpdateIO(state=appState(),adapters:{stack?:StackOps;installa
   checks:githubChecks,
   tests:(policy,staged)=>runCandidateTests(policy,staged,state),
   compatibility:candidateCompatibility,
+  integrations:async staged=>{
+   const installed=installationRecord(state)?.cli;
+   const reports=[];
+   for(const entry of await registeredProjects(true)){
+    const c=JSON.parse(readFileSync(entry.config,'utf8'));validate(c);
+    if(c.linear.projectId!==entry.linear_project||c.automation?.orchestratorProject!==entry.project)throw Error('Integration project registration drift; reconcile the registered project config before upgrade');
+    reports.push({project:entry.project,report:integrationPreview(c,{},integrationRuntime(staged.root,installed?join(installed,'../..'):undefined))});
+   }
+   return reports;
+  },
   get stack(){return stack??=liveStackOps(false);},
   install:(apply,source,launcher)=>installBridge(apply,source,launcher,adapters.installation??{...installIO,state:()=>state}),
   launcher:()=>installationRecord(state)?.launcher as string|undefined,
@@ -269,11 +283,15 @@ export class UpdateManager{
  }
  async preview(){
   const policy=this.policy(),state=this.io.state(),candidate=await this.io.resolve(policy),current=installedVersion(state),installed=readInstalledState(state);
-  const staged=await this.io.stage(policy,candidate);
-  if(staged.commit!==candidate.commit)throw Error('Source changed during staging; candidate is now ambiguous');
-  if(staged.version===current.record.version)return {upToDate:true,candidate,installedVersion:current.record.version,policy};
+   const staged=await this.io.stage(policy,candidate);
+   if(staged.commit!==candidate.commit)throw Error('Source changed during staging; candidate is now ambiguous');
+   let integrations:Awaited<ReturnType<NonNullable<UpdateIO['integrations']>>>=[],integrationError:string|undefined;
+   try{integrations=await this.io.integrations?.(staged)??[];}catch{integrationError='Integration configuration could not be validated; inspect registered configs with doctor CONFIG before upgrade';}
+   if(staged.version===current.record.version)return {upToDate:true,candidate,installedVersion:current.record.version,policy,integrations,integrationError};
   const classification=classifyChangedFiles(changedFiles(join(state,'versions',current.record.version),staged.root,current.files,staged.files)),checks=await this.io.checks(policy,candidate),tests=await this.io.tests(policy,staged),compatibility=(this.io.compatibility??candidateCompatibility)(staged);
-  const blockers:string[]=[];
+   const blockers:string[]=[];
+   if(integrationError)blockers.push(integrationError);
+   for(const entry of integrations)blockers.push(...entry.report.blockers.map(reason=>`${entry.project}: ${reason}`));
   if(!compatibility.compatible)blockers.push(compatibility.detail);
   if(!checks.passed)blockers.push(checks.detail);
   if(!tests.passed)blockers.push(tests.detail);
@@ -286,7 +304,7 @@ export class UpdateManager{
   let quiescence:{session:string;reason:string}[]=[],activityUnknown:string|undefined,reattachment:{safe:boolean;detail:string}|undefined;
   if(classification!=='hot'){try{reattachment=await this.io.reattachment?.();}catch(error){reattachment={safe:false,detail:`Controller reattachment is unverified: ${error instanceof Error?error.message:String(error)}`};}reattachment??={safe:false,detail:'Controller reattachment safety is unverified; backend restart will defer'};}
   try{quiescence=await this.io.stack.blockers();}catch(error){activityUnknown=`Worker activity is unknown: ${error instanceof Error?error.message:String(error)}`;}
-  return {upToDate:false,candidate,staged:{commit:staged.commit,version:staged.version,root:staged.root},installedVersion:current.record.version,classification,policy,checks,tests,compatibility,reattachment,migration,migrationEvidence:migration?.detail??null,quiescence,activityUnknown,blockers,ready:blockers.length===0,waitingForIdle:quiescence.length>0||!!activityUnknown,note:'Preview stages an isolated checkout; it does not install, stop or restart anything.'};
+   return {upToDate:false,candidate,staged:{commit:staged.commit,version:staged.version,root:staged.root},installedVersion:current.record.version,classification,policy,checks,tests,compatibility,integrations,integrationError,reattachment,migration,migrationEvidence:migration?.detail??null,quiescence,activityUnknown,blockers,ready:blockers.length===0,waitingForIdle:quiescence.length>0||!!activityUnknown,note:'Preview stages an isolated checkout; it does not install, stop or restart anything.'};
  }
  async apply(options:{automatic?:boolean}={}){
   const policy=this.policy(),state=this.io.state();
@@ -335,7 +353,8 @@ export class UpdateManager{
     advance(state,intent,'installing');
     const confirmed=await this.io.resolve(policy);if(confirmed.commit!==plan.candidate.commit)throw Error('Authoritative candidate changed during activation; no installation attempted');
     const verified=await this.io.stage(policy,confirmed);
-    if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version)throw Error('Staged candidate changed after verification; no installation attempted');
+     if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version)throw Error('Staged candidate changed after verification; no installation attempted');
+     if(this.io.integrations&&JSON.stringify(await this.io.integrations(verified))!==JSON.stringify(plan.integrations))throw Error('Integration configuration changed after preview; preserve config and preview again');
     installAttempted=true;
     const result=await this.io.install(true,plan.staged.root,this.io.launcher());
     advance(state,intent,'starting',{installed:true,evidence:{installedSnapshot:plan.staged.version}});
