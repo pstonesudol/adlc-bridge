@@ -53,6 +53,39 @@ function linearSurface(f:Awaited<ReturnType<typeof fixture>>,onRead?:(count:numb
  };
  return {blockers:new LinearBlockers(f.s,api),comments,counts:()=>({creates,adds})};
 }
+test('DEV-66: legacy approved plan without a dependency binding refuses dispatch and reports operator action',async()=>{
+ const f=await fixture();try{
+  // This approval and worker receipt predate any configured dependency binding
+  // or persisted wait. Enabling polling must not infer a binding from the refs.
+  f.c.dependencyRecovery.jobs=[];
+  const approved=f.s.get(f.job),dispatch=f.w.implementation(f.job),outcome=f.w.outcomes(f.job);
+  const grant=f.s.db.query('SELECT * FROM git_grants WHERE job=?').get(f.job);
+  const sends=[...f.sends],missing='No configured dependency binding; operator must supply exact issue/PR/capabilities and current plan/spec hashes';
+  expect(approved.state).toBe('approved');expect(approved.approved_hash).toBe(approved.plan_hash);
+  expect(outcome).toMatchObject({outcome:'blocked_dependency',source:'receipt'});
+  expect(f.r.status()).toMatchObject({waits:[],updates:[]});
+  await expect(f.r.preview(f.job,f.c)).rejects.toThrow(missing);
+  expect(f.r.status()).toMatchObject({waits:[],updates:[]});
+
+  const surface=linearSurface(f);
+  expect(await f.r.sync(f.c)).toEqual([expect.objectContaining({job:f.job,state:'waiting_for_dependencies',reason:missing})]);
+  expect(f.r.status().waits).toEqual([expect.objectContaining({job:f.job,plan:approved.plan_hash,reason:missing})]);
+  expect(await f.r.notices(f.c,surface.blockers)).toEqual([{job:f.job,state:'posted'}]);
+  expect(surface.comments).toHaveLength(1);
+  expect(surface.comments[0].body).toContain(missing);
+  expect(surface.comments[0].body).toContain('reconcile failed evidence before dependency-resume');
+  expect(surface.comments[0].body).toContain(`Plan: ${approved.plan_hash}`);
+  // Repeated polling/publication neither replays delivery nor duplicates notice.
+  await f.r.sync(f.c);await f.r.notices(f.c,surface.blockers);
+  expect(surface.counts()).toEqual({creates:1,adds:1});
+  expect(f.r.status().updates).toEqual([]);
+  expect(f.fetches()).toBe(0);expect(f.updates()).toBe(0);expect(f.sends).toEqual(sends);
+  expect(f.s.db.query('SELECT * FROM continuations WHERE job=?').all(f.job)).toEqual([]);
+  expect(f.s.get(f.job)).toEqual(approved);
+  expect(f.w.implementation(f.job)).toEqual(dispatch);expect(f.w.outcomes(f.job)).toEqual(outcome);
+  expect(f.s.db.query('SELECT * FROM git_grants WHERE job=?').get(f.job)).toEqual(grant);
+ }finally{f.s.close();}
+});
 function transitionFixture(f:Awaited<ReturnType<typeof fixture>>,transition:string){
  f.r.install();const j=f.s.get(f.job);let evidence:any={};
  if(transition==='resumed'){
