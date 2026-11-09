@@ -141,3 +141,101 @@ test('concurrent polls share the submission fence and do not duplicate mutation'
   expect(outcomes.some(x=>x.status==='fulfilled'&&x.value?.state==='updating_branch')).toBe(true);expect(f.updates()).toBe(1);
  }finally{f.close();}
 });
+
+function externalFixture(){
+ const f=fixture();f.s.db.exec('DELETE FROM branch_updates');
+ new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['inspect','fetch','push-feature','open-pr','merge-base-feature'],'human');
+ f.s.db.query('UPDATE implementation_dispatch SET paths=? WHERE job=?').run(JSON.stringify(['feature']),f.id);
+ (f.c as any).conflictRecovery={baseBranch:'main'};
+ const loop=new ReviewLoop(f.s);loop.register(f.id,'owner/repo',7,['CI'],['feature'],true);loop.record(f.id,{state:'waiting_for_review',head:f.old,reason:'Previously observed feature head'});
+ f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(f.old,f.id);
+ return f;
+}
+for(const incident of ['DEV-64 / #52','DEV-67 / #53'])test(`${incident} isolated external base merge resynchronizes once without a receipt`,async()=>{
+ const f=externalFixture();try{
+  f.s.db.query("UPDATE review_targets SET state='ready_for_human',last_signature='stale' WHERE job=?").run(f.id);
+  expect(await f.sync().ensure(f.id,f.c,'owner/repo',7)).toMatchObject({state:'updating_branch',maintenanceComplete:true});
+  expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.target);expect(f.updates()).toBe(1);
+  expect(f.s.db.query('SELECT state,last_signature FROM review_targets').get()).toMatchObject({state:'waiting_for_review',last_signature:null});
+  expect(JSON.parse((f.s.db.query('SELECT proof FROM branch_syncs').get() as any).proof).source).toBe('external-base-merge');
+  expect(f.s.db.query('SELECT count(*) AS n FROM branch_updates').get()).toMatchObject({n:0});
+  expect(await f.sync().ensure(f.id,f.c,'owner/repo',7)).toBeNull();expect(f.updates()).toBe(1);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.close();}
+});
+for(const stage of ['fetch','update'])test(`external merge retry after lost ${stage} response is idempotent`,async()=>{
+ const f=externalFixture();try{
+  if(stage==='fetch')f.loseFetch();else f.loseUpdate();
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('blocked');
+  const reopened=new Store(f.db);try{expect((await new BranchSync(reopened,f.transport,f.run,f.inspect,f.barrier.submit).ensure(f.id,f.c,'owner/repo',7))?.maintenanceComplete).toBe(true);}finally{reopened.close();}
+  expect(f.updates()).toBe(1);
+ }finally{f.close();}
+});
+test('external merge defers active workers and preserves dirty work',async()=>{
+ const f=externalFixture();try{
+  f.setIdle(false);expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('waiting_for_worker');expect(f.fetches()).toBe(0);
+  f.setIdle(true);writeFileSync(join(f.tree,'local'),'local');expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('local edits');expect(f.updates()).toBe(0);
+ }finally{f.close();}
+});
+for(const change of ['head','base','approval','ownership','base-ref'])test(`external ${change} race preserves predecessor`,async()=>{
+ const f=externalFixture();try{
+  f.onFetch(()=>{if(change==='head')f.b.head=f.old;if(change==='base')f.b.base=f.old;if(change==='approval')f.s.db.exec('DELETE FROM git_grants');if(change==='ownership')f.setOwners(['other']);if(change==='base-ref')f.git(['--git-dir',f.remote,'update-ref','refs/heads/main',f.old]);});
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('blocked');expect(f.updates()).toBe(0);expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.old);
+ }finally{f.close();}
+});
+for(const missing of ['inspect','merge-base-feature'])test(`external merge requires current ${missing} grant`,async()=>{
+ const f=externalFixture();try{
+  const g=f.s.db.query('SELECT operations FROM git_grants WHERE job=?').get(f.id) as any;
+  f.s.db.query('UPDATE git_grants SET operations=? WHERE job=?').run(JSON.stringify(JSON.parse(g.operations).filter((x:string)=>x!==missing)),f.id);
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain(missing);expect(f.fetches()).toBe(0);
+ }finally{f.close();}
+});
+for(const invalid of ['independent-edit','appended-commit','wrong-base','scope','unverified-head','uncertain-receipt'])test(`external ${invalid} is rejected without fast-forward`,async()=>{
+ const f=externalFixture();try{
+  if(invalid==='independent-edit'){
+   f.git(['checkout','producer']);writeFileSync(join(f.repo,'feature'),'independent edit');f.git(['add','.']);f.git(['commit','--amend','--no-edit']);f.b.head=f.git(['rev-parse','HEAD']);
+  }
+  if(invalid==='appended-commit'){
+   f.git(['checkout','producer']);writeFileSync(join(f.repo,'extra'),'extra');f.git(['add','.']);f.git(['commit','-m','unrelated']);f.b.head=f.git(['rev-parse','HEAD']);
+  }
+  if(invalid==='wrong-base'){
+   const tree=f.git(['rev-parse',`${f.target}^{tree}`]);f.b.head=f.git(['commit-tree',tree,'-p',f.old,'-p',f.target,'-m','Wrong second parent']);
+  }
+  if(invalid==='scope')f.s.db.query('UPDATE implementation_dispatch SET paths=? WHERE job=?').run(JSON.stringify(['src/**']),f.id);
+  if(invalid==='unverified-head')f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(f.base,f.id);
+  if(invalid==='uncertain-receipt')f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,f.base,f.old,'delivery_uncertain',Date.now(),'unknown');
+  f.git(['push',f.remote,`${f.b.head}:refs/heads/fixture-object`]);
+  f.git(['--git-dir',f.remote,'update-ref',`refs/heads/${f.b.branch}`,f.b.head]);
+  const result=await f.sync().ensure(f.id,f.c,'owner/repo',7);
+  expect(result?.state).toBe('blocked');
+  const reasons={'independent-edit':'independent feature edits','appended-commit':'two-parent','wrong-base':'second parent','scope':'approved scope','unverified-head':'previously verified','uncertain-receipt':'Unmatched recorded'};
+  expect(result?.reason).toContain(reasons[invalid]);expect(f.updates()).toBe(0);expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.old);
+ }finally{f.close();}
+});
+test('external synchronization defers if worker starts during fetch, then resumes without replay',async()=>{
+ const f=externalFixture();try{
+  f.onFetch(()=>f.setIdle(false));
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('waiting_for_worker');expect(f.updates()).toBe(0);
+  f.setIdle(true);f.onFetch(()=>{});
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.maintenanceComplete).toBe(true);expect(f.updates()).toBe(1);
+ }finally{f.close();}
+});
+test('external retry does not treat an already advanced local head as merge-tree proof',async()=>{
+ const f=externalFixture();try{
+  f.git(['checkout','producer']);writeFileSync(join(f.repo,'feature'),'independent edit');f.git(['add','.']);f.git(['commit','--amend','--no-edit']);f.b.head=f.git(['rev-parse','HEAD']);
+  f.git(['push',f.remote,`${f.b.head}:refs/heads/fixture-object`]);f.git(['--git-dir',f.remote,'update-ref',`refs/heads/${f.b.branch}`,f.b.head]);
+  f.loseFetch();expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('blocked');
+  // Simulate external intervention after the persisted fetch intent. Restart
+  // must still prove the tree instead of releasing the existing reservation.
+  f.git(['merge','--ff-only',f.b.head],f.tree);
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('independent feature edits');
+  expect(worktreeReservation(f.s,f.id)).toBeDefined();expect(f.updates()).toBe(0);
+ }finally{f.close();}
+});
+test('historical completed update receipts do not block a later external merge',async()=>{
+ const f=externalFixture();try{
+  const initial=f.git(['rev-parse',`${f.old}^`]);
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,initial,initial,'observed',1,null);
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.maintenanceComplete).toBe(true);
+  expect(f.s.db.query('SELECT state FROM branch_updates').get()).toMatchObject({state:'observed'});
+ }finally{f.close();}
+});
