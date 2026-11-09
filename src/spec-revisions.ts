@@ -124,9 +124,21 @@ export function handoffPr(result:any,openPrs:any[]){
 export type HandoffProof={dispatch:string;session:string;spec:string;turn:string;repo:string;head:string};
 export function recordHandoff(s:Store,job:string,plan:string|null,pr:any,at=Date.now(),proof?:HandoffProof){
  if(!plan||!pr?.number)return;
- const revision=latestRevision(s,job)?.id??'';
-  s.db.query('INSERT OR IGNORE INTO revision_handoffs VALUES (?,?,?,?,?)').run(job,plan,revision,pr.number,at);
-  if(proof)s.db.query(`INSERT INTO revision_handoff_proofs VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job,plan_hash,revision) DO UPDATE SET dispatch=excluded.dispatch,session=excluded.session,spec=excluded.spec,turn=excluded.turn,repo=excluded.repo,pr=excluded.pr,head=excluded.head`).run(job,plan,revision,proof.dispatch,proof.session,proof.spec,proof.turn,proof.repo,pr.number,proof.head);
+ s.db.transaction(()=>{
+  const revision=latestRevision(s,job)?.id??'';
+  if(!proof){
+   // An unproven observation cannot replace an existing authoritative candidate.
+   s.db.query('INSERT OR IGNORE INTO revision_handoffs VALUES (?,?,?,?,?)').run(job,plan,revision,pr.number,at);
+   return;
+  }
+  const previous=s.db.query('SELECT * FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
+  const previousProof=s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
+  if((previous&&previous.pr!==pr.number)||(previousProof&&previousProof.pr!==pr.number))s.event(job,'revision_handoff_reconciled',JSON.stringify({revision,previous:{handoff:previous,proof:previousProof},current:{...proof,pr:pr.number}}));
+  // Marker and proof describe one verified candidate. Preserve replaced evidence
+  // in the audit above, but never leave the active pair naming different PRs.
+  s.db.query(`INSERT INTO revision_handoffs VALUES (?,?,?,?,?) ON CONFLICT(job,plan_hash,revision) DO UPDATE SET pr=excluded.pr,at=excluded.at WHERE revision_handoffs.pr!=excluded.pr`).run(job,plan,revision,pr.number,at);
+  s.db.query(`INSERT INTO revision_handoff_proofs VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job,plan_hash,revision) DO UPDATE SET dispatch=excluded.dispatch,session=excluded.session,spec=excluded.spec,turn=excluded.turn,repo=excluded.repo,pr=excluded.pr,head=excluded.head`).run(job,plan,revision,proof.dispatch,proof.session,proof.spec,proof.turn,proof.repo,pr.number,proof.head);
+ }).immediate();
 }
 export function revisedHandoff(s:Store,job:string){
  const plan=s.get(job).plan_hash;
@@ -134,8 +146,8 @@ export function revisedHandoff(s:Store,job:string){
  const revision=latestRevision(s,job)?.id??'';
  const handoff=s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
   if(!handoff)return false;
-  // Old plan/PR-only markers are historical, not proof of this dispatch. Keep
-  // them intact while the workflow automatically refreshes exact evidence.
+  // Old plan/PR-only markers are historical, not proof of this dispatch. The
+  // workflow must refresh exact evidence before this gate can be released.
   if(!s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoff_proofs'").get())return false;
   const proof=s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
   const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;

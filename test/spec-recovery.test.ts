@@ -953,16 +953,37 @@ test('recovered delivery records the single open PR as the current revision hand
   expect(revisedHandoff(f.s,f.job)).toBe(true);
  }finally{f.s.close();}
 });
-test('a verified revised candidate is recorded before explicit target rebind; review and Done stay gated',async()=>{
+for(const retained of ['none','legacy','proven','split'])test(`a verified revised candidate reconciles ${retained} retained handoff before explicit target rebind; review and Done stay gated`,async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
   f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
   new ReviewLoop(f.s).register(f.job,'owner/repo',7,['CI'],['src/**']);
+  if(retained==='legacy')recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:7});
+  if(retained==='proven'||retained==='split')expect(await publishRevised(f,7)).toMatchObject({state:'pr_handoff'});
+  if(retained==='split'){
+   // Reproduce the persisted state left by the old independent proof upsert.
+   f.s.db.query('UPDATE revision_handoff_proofs SET pr=9 WHERE job=?').run(f.job);
+   f.e.session.prs=[{state:'open',number:9,url:'https://github.com/owner/repo/pull/9'}];
+  }
+  const previousHandoff=f.s.db.query('SELECT * FROM revision_handoffs WHERE job=?').get(f.job);
+  const previousProof=f.s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=?').get(f.job);
   expect(await publishRevised(f,9)).toMatchObject({state:'pr_handoff'});
   expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
   expect(f.s.db.query('SELECT repo,pr,head FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({repo:'owner/repo',pr:9,head:'a'.repeat(40)});
   expect(new ReviewLoop(f.s).get(f.job).pr).toBe(7);
   expect(revisedHandoff(f.s,f.job)).toBe(false);
+  if(retained!=='none'){
+   const audit=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='revision_handoff_reconciled'").get(f.job) as any;
+   expect(JSON.parse(audit.detail)).toMatchObject({previous:{handoff:previousHandoff,proof:previousProof},current:{pr:9}});
+  }
+  // Unproven callers and repeated workflow polls cannot undo the verified pair.
+  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:7});
+  const sends=f.sends.length;
+  expect(await f.w.tick(config)).toContainEqual(expect.objectContaining({state:'pr_handoff'}));
+  expect(f.sends.length).toBe(sends);
+  expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
+  expect(f.s.db.query('SELECT pr FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({pr:9});
+  expect(f.s.db.query("SELECT * FROM events WHERE job=? AND kind='revision_handoff_reconciled'").all(f.job)).toHaveLength(retained==='none'?0:1);
   // The registered target still cannot be released by the other PR.
   expect(await new ReviewLoop(f.s).tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).toMatchObject({state:'waiting_for_revised_handoff'});
   let linearCalls=0,prCalls=0;
@@ -1006,6 +1027,22 @@ test('a verified revised candidate is recorded before explicit target rebind; re
   // A different repository cannot rebind the target.
   f.s.db.query('INSERT INTO revision_handoffs VALUES (?,?,?,?,?)').run(f.job,f.s.get(f.job).plan_hash,'handoff-revision',9,Date.now());
   expect(()=>loop.rebind(f.job,'other/repo',9)).toThrow('Existing review target for this repository required');
+ }finally{f.s.close();}
+});
+test('reconciling a verified handoff rolls marker, proof and retained audit back together on proof-write failure',async()=>{
+ const f=await revisedFixture();try{
+  await publishRevised(f,7);
+  const snapshot=()=>({handoff:f.s.db.query('SELECT * FROM revision_handoffs WHERE job=?').get(f.job),proof:f.s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=?').get(f.job),events:f.s.db.query('SELECT * FROM events WHERE job=?').all(f.job)});
+  const before=snapshot(),proof=before.proof as any;
+  f.s.db.exec("CREATE TRIGGER fail_handoff_proof BEFORE INSERT ON revision_handoff_proofs WHEN NEW.pr=9 BEGIN SELECT RAISE(ABORT,'injected proof failure'); END");
+  expect(()=>recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:9},Date.now(),proof)).toThrow('injected proof failure');
+  expect(snapshot()).toEqual(before);
+  f.s.db.exec('DROP TRIGGER fail_handoff_proof');
+  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:9},Date.now(),proof);
+  expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
+  expect(f.s.db.query('SELECT pr FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({pr:9});
+  const audit=f.s.db.query("SELECT detail FROM events WHERE job=? AND kind='revision_handoff_reconciled'").get(f.job) as any;
+  expect(JSON.parse(audit.detail)).toMatchObject({previous:{handoff:before.handoff,proof:before.proof},current:{pr:9}});
  }finally{f.s.close();}
 });
 test('revision notices are bounded per poll and advance past failures',async()=>{
