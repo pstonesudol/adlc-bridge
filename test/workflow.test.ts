@@ -177,8 +177,13 @@ for(const historical of [false,true])test(`failed continuation recovery respects
    await stale();
    bind('revision-recovery','earlier-dispatch');
    await stale();
-   bind('revision-recovery',w.implementation(id).client_id);
-   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+    bind('revision-recovery',w.implementation(id).client_id);
+    const loop=new ReviewLoop(s);loop.register(id,'owner/repo',7,['CI'],['src/**']);
+    expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+    expect(s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND revision=?').get(id,'revision-recovery')).toEqual({pr:1});
+    expect(revisedHandoff(s,id)).toBe(false);
+    expect(loop.get(id).pr).toBe(7);
+    expect(loop.rebind(id,'owner/repo',1)).toMatchObject({state:'rebound',pr:1});
   expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
    expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe(historical?'failed':'recovered');

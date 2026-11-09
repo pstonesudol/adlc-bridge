@@ -332,7 +332,9 @@ export class Workflow{
   const d=this.implementation(job);if(!d)return;
    const observedJob=this.s.get(job);
    const originalLedger=new ReceiptReconciliation(this.s),originalBinding=originalLedger.get(d.client_id);
-   const revised=revisedExecution(this.s,job);
+    const revised=revisedExecution(this.s,job);
+    const reviewTarget=()=>this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
+    const observedTarget=revised?reviewTarget():null;
    if(d.state==='approved_pending'&&!originalBinding&&!e.transcript?.entries?.some((x:any)=>x.clientMessageId===d.client_id))return {state:'approved_pending',outcome:'pending',reason:'Implementation dispatch has not been attempted; await normal authorized dispatch',session:d.session_id,source:'dispatch',confidence:'high'};
    // Revised work cannot borrow a continuation or historical PR as evidence
    // that its own implementation was delivered. Missing legacy reservations
@@ -375,9 +377,11 @@ export class Workflow{
     if(!persist)return {...result,session:d.session_id};
     if(result.state==='pr_handoff'&&revised&&!publishedProof)return {state:'needs_reconciliation',outcome:'uncertain',session:d.session_id,reason:'Exact revised published-head proof missing; review remains gated'};
     if(result.state==='pr_handoff'&&revised){
-     const planning=new Planning(this.s).get(job),target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
-     const pr=handoffPr(result,prs);
-     if(planning?.session_id!==d.session_id||planning?.project!==e.session.projectId||planning?.branch!==e.session.branch||!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured||target&&(target.repo!==publishedProof!.repo||target.pr!==pr?.number))return {state:'stale_execution',applied:false,session:d.session_id,reason:'Revised owner or review target changed during evidence collection'};
+     const planning=new Planning(this.s).get(job),target=reviewTarget();
+     // A stable historical target may differ from the verified candidate. Save
+     // the candidate first so explicit rebind can align it; revisedHandoff keeps
+     // review and Done gated until then. Concurrent target changes still stop.
+     if(planning?.session_id!==d.session_id||planning?.project!==e.session.projectId||planning?.branch!==e.session.branch||!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured||target?.repo!==observedTarget?.repo||target?.pr!==observedTarget?.pr)return {state:'stale_execution',applied:false,session:d.session_id,reason:'Revised owner or review target changed during evidence collection'};
     }
     if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now,publishedProof);
    // A later remediation may be selected for the workflow outcome, but only
@@ -428,8 +432,6 @@ export class Workflow{
     assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,b);
      if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
      if(!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Exact published HEAD required');
-     const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
-     if(revised&&target&&(target.repo!==c.githubRepo||target.pr!==prs[0].number))throw Error('Revised handoff differs from registered review target');
      publishedProof={dispatch:d.client_id,session:d.session_id,spec:digest(observedJob.spec),turn:originalLedger.get(d.client_id)?.turn??turn.id,repo:c.githubRepo,head:b.head};
    }
   }catch(err){
@@ -488,8 +490,7 @@ export class Workflow{
     if(!matches)return false;
     if(onProof&&revisedExecution(this.s,job)){
      const receipt=new ReceiptReconciliation(this.s).get(d.client_id);
-     const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
-     if(receipt?.state!=='completed'||!receipt.turn||!/^[a-f0-9]{40,64}$/.test(remote.head)||target&&(target.repo!==c.githubRepo||target.pr!==prs[0].number)||e.transcript?.controller!=='ready'||e.transcript?.turns?.some((t:any)=>!['completed','failed','cancelled','interrupted','recovered'].includes(t.state)))return false;
+     if(receipt?.state!=='completed'||!receipt.turn||!/^[a-f0-9]{40,64}$/.test(remote.head)||e.transcript?.controller!=='ready'||e.transcript?.turns?.some((t:any)=>!['completed','failed','cancelled','interrupted','recovered'].includes(t.state)))return false;
      onProof({dispatch:d.client_id,session:d.session_id,spec:digest(this.s.get(job).spec),turn:receipt.turn,repo:c.githubRepo,head:remote.head});
     }
     return true;

@@ -177,7 +177,7 @@ for(const state of ['approved_pending','delivery_uncertain'])test(`DEV-64 missin
   expect(revisedHandoff(f.s,f.job)).toBe(false);
  }finally{f.s.close();}
 });
-for(const fault of ['missing-ledger','pending-with-receipt','head','worker','stale','duplicate','target','active'])test(`DEV-64 revised handoff refuses ${fault} without replay`,async()=>{
+for(const fault of ['missing-ledger','pending-with-receipt','head','worker','stale','duplicate','active'])test(`DEV-64 revised handoff refuses ${fault} without replay`,async()=>{
  const f=await revisedFixture();try{
   await f.w.executeApproved(f.job,config);
   f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
@@ -189,7 +189,6 @@ for(const fault of ['missing-ledger','pending-with-receipt','head','worker','sta
   if(fault==='worker')f.e.session.id='other';
   if(fault==='stale')f.e.receiptObservation.observed-=120001;
   if(fault==='duplicate')f.e.transcript.entries.push({...f.e.transcript.entries.at(-1)});
-  if(fault==='target')new ReviewLoop(f.s).register(f.job,'owner/repo',18,['CI'],['src/**']);
   if(fault==='active')f.e.transcript.turns.push({id:'other',state:'running'});
   await f.w.tick(config);
   expect(f.sends.length).toBe(count);expect(revisedHandoff(f.s,f.job)).toBe(false);
@@ -954,15 +953,25 @@ test('recovered delivery records the single open PR as the current revision hand
   expect(revisedHandoff(f.s,f.job)).toBe(true);
  }finally{f.s.close();}
 });
-test('a revised handoff must belong to the registered review target PR',async()=>{
+test('a verified revised candidate is recorded before explicit target rebind; review and Done stay gated',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
   f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
   new ReviewLoop(f.s).register(f.job,'owner/repo',7,['CI'],['src/**']);
-  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:9});
+  expect(await publishRevised(f,9)).toMatchObject({state:'pr_handoff'});
+  expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
+  expect(f.s.db.query('SELECT repo,pr,head FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({repo:'owner/repo',pr:9,head:'a'.repeat(40)});
+  expect(new ReviewLoop(f.s).get(f.job).pr).toBe(7);
   expect(revisedHandoff(f.s,f.job)).toBe(false);
   // The registered target still cannot be released by the other PR.
   expect(await new ReviewLoop(f.s).tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).toMatchObject({state:'waiting_for_revised_handoff'});
+  let linearCalls=0,prCalls=0;
+  const linear=new LinearLifecycle(f.s,async()=>{linearCalls++;throw Error('No Linear write before rebind');},(async()=>{prCalls++;return {merged:true,state:'closed'};}) as any);
+  // Revision-notice delivery is independent of the status-transition gate.
+  linear.revisionNotices=async()=>[];
+  expect(await linear.sync({...config,statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}})).toContainEqual(expect.objectContaining({job:f.job,state:'revised_handoff_pending'}));
+  expect(linearCalls).toBe(0);expect(prCalls).toBe(0);
+  expect(f.s.get(f.job).state).toBe('approved');
   // The recorded handoff is authoritative: aligning the target to it succeeds,
   // but substituting a different PR is refused.
   const loop=new ReviewLoop(f.s);
@@ -971,7 +980,7 @@ test('a revised handoff must belong to the registered review target PR',async()=
   f.s.db.query("UPDATE review_targets SET state='ready',head=?,last_signature='old' WHERE job=?").run('a'.repeat(40),f.job);
   expect(loop.rebind(f.job,'owner/repo',9)).toMatchObject({state:'rebound',pr:9});
   expect(loop.get(f.job)).toMatchObject({pr:9,state:'waiting_for_review',head:null,last_signature:null});
-  await publishRevised(f,9);
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
   // The rebound target must not look ready before the new PR's evidence exists.
   // An isolated adapter keeps provider calls local; the rebound target is not
   // reported ready and its stored state reflects the fresh review cycle.
