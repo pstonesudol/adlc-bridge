@@ -36,7 +36,7 @@ export function actionBinding(s:Store,job:string,c:any):ActionBinding{
  return {job,project:j.project,spec:digest(j.spec),revision:latestRevision(s,job)?.id??null,plan:j.plan_hash??null,session:run?.session_id??null,owner:run?.owner??null,repo:t?.repo??null,pr:t?.pr??null,head:t?.head??null,
   authority:digest(JSON.stringify([j.state,j.approved_hash,j.actor,grant,proof,row(s,'ticket_approval_requirements',job)])),
   ownership:digest(JSON.stringify([run,row(s,'implementation_dispatch',job),row(s,'planning_runs',job)])),
-  target:digest(JSON.stringify(t?[t.repo,t.pr,t.head,t.required_checks,t.allowed_paths,t.remediate]:null)),
+  target:digest(JSON.stringify(t?[t.repo,t.pr,t.head,t.required_checks,t.allowed_paths,t.remediate,row(s,'review_bindings',job)]:null)),
   configuration:digest(JSON.stringify([c.linear.projectId,c.githubRepo,c.automation?.orchestratorProject,c.approval,c.requiredChecks,c.prMetadataChecks,c.branchUpdate,c.conflictRecovery,c.remediation,c.verification]))};
 }
 function eligibility(s:Store,job:string,c:any,now:number):boolean{
@@ -120,7 +120,7 @@ export class ActionWatchdog{
   }).immediate();
  }
   finishReview(id:string,result?:{state?:string;reason?:string},evaluated=true){
-  const a=this.get(id);if(!a||a.state==='superseded'||a.state==='escalated'&&a.outcome!=='human_required'||completed(this.s,a.job))return;
+  const a=this.get(id);if(!a||a.state==='superseded'||a.state==='escalated'&&!['human_required','recurrent_binding'].includes(a.outcome)||completed(this.s,a.job))return;
   const blocker=classifyBlocker(this.s,a.job),read=row(this.s,'recovery_observations',a.job);
   // Observation success must never reset consecutive effectful evaluation failures.
   if(evaluated){
@@ -142,6 +142,7 @@ export class ActionWatchdog{
    }
   }
   if(!result?.state)return;
+  if(a.outcome==='recurrent_binding')return; // only a fresh binding may replace this historical claim
   const live=livenessStatus(this.s,a.job);
   if(result.state==='blocked'&&live&&['terminated','stuck','unknown'].includes(live.classification)){this.stop(id,'human',`worker_${live.classification}`,result.reason??'Worker requires inspection');return;}
   if(read&&['human','unsupported'].includes(blocker)){this.stop(id,'provider_wait','unsupported','Provider read failure requires inspection; use retry-observation JOB after correcting access; no mutation replay');return;}
@@ -152,7 +153,7 @@ export class ActionWatchdog{
  // poll fence and ReviewLoop's lease still serialize all mutation entrypoints.
  beginReview(id:string,c:any){
   return this.s.db.transaction(()=>{
-   const a=this.get(id);if(!a||completed(this.s,a.job)||a.state==='superseded'||a.state==='claimed'||a.state==='escalated'&&(a.outcome!=='human_required'||a.due_at>this.now()))return false;
+   const a=this.get(id);if(!a||completed(this.s,a.job)||a.state==='superseded'||a.state==='claimed'||a.state==='escalated'&&(!['human_required','recurrent_binding'].includes(a.outcome)||a.due_at>this.now()))return false;
    this.assertCurrent(a,c);
    return this.s.db.query('UPDATE watchdog_evaluations SET next_tick=? WHERE job=? AND next_tick<=? AND failures<?').run(this.now()+(a.state==='escalated'||idle(this.s,a.job)?WATCHDOG_LIMITS.idleMs:WATCHDOG_LIMITS.intervalMs),a.job,this.now(),WATCHDOG_LIMITS.maxEvaluationFailures).changes===1;
   }).immediate();
@@ -162,7 +163,7 @@ export class ActionWatchdog{
   // Retained actions are history once their job/target completes, even if they
   // were pending before completion. Neither polling nor status revives them.
   const reviewFilter=has(this.s,'review_targets')?"AND NOT EXISTS (SELECT 1 FROM review_targets t WHERE t.job=a.job AND t.state='completed')":'';
-  const humanFilter=includeHuman?"OR (a.state='escalated' AND a.outcome='human_required')":'';
+  const humanFilter=includeHuman?"OR (a.state='escalated' AND a.outcome IN ('human_required','recurrent_binding'))":'';
   return this.s.db.query(`SELECT a.* FROM watchdog_actions a JOIN jobs j ON j.id=a.job LEFT JOIN watchdog_evaluations e ON e.job=a.job WHERE a.project=? AND j.state!='done' ${reviewFilter} AND (a.state='pending' OR (a.state='claimed' AND a.lease_until<=?) ${humanFilter}) AND a.due_at<=? AND COALESCE(e.next_tick,0)<=? AND COALESCE(e.failures,0)<? ORDER BY MAX(a.due_at,COALESCE(e.next_tick,0)),a.id LIMIT ?`).all(project,this.now(),this.now(),this.now(),WATCHDOG_LIMITS.maxEvaluationFailures,limit) as ActionRow[];
  }
  assertReviewAction(id:string,job:string,c:any){

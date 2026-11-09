@@ -142,9 +142,10 @@ for(const ending of ['Incomplete…','Incomplete...','**Incomplete…**','**Inco
 test('PR #30 skipped current-head run plus stale CHANGES_REQUESTED is historical, not a custom blocker',()=>{
  const f=pr30CustomFixture();
  expect(f.evidence()).toEqual({findings:[],blocker:null,bodyReviewed:false});
- // The same evidence for a current review still fails closed on Inconclusive.
+ // Inconclusive is recognized, but the old review cannot attest this edited
+ // summary: run-time provenance must still fail closed.
  const current=pr30CustomFixture();current.review.commit_id=current.head;
- const result=current.evidence();expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toContain('unclassifiable');
+ const result=current.evidence();expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toContain('outside the current completed review run');
 });
 test('a stale review with a missing custom summary is historical rather than a currency blocker',()=>{
  const f=pr30CustomFixture();f.review.body='Pre-merge checks failed. Please resolve the failing checks before merging.';
