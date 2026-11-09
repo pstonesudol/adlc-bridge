@@ -39,7 +39,7 @@ import {validateVerification,validateVerificationContext,type Verification,type 
 import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
 import {ActionWatchdog,WATCHDOG_LIMITS} from './action-watchdog';
 import {observeLiveness,livenessStop} from './worker-liveness';
-import {bindReviewerPolicy,boundReviewerPolicy,ensureReviewerStore,reviewerInput} from './reviewer-policy';
+import {bindReviewerPolicy,boundReviewerPolicy,ensureReviewerStore,reviewerInput,reviewFindingTrustFresh} from './reviewer-policy';
 
 function staleCodeRabbitChangeRequestReason(e:any):string|null{
  const review=e.reviewSchedule?.evidence?.review,approval=e.reviewerEvidence?.approvals?.find((a:any)=>a.reviewer==='coderabbit');
@@ -47,8 +47,15 @@ function staleCodeRabbitChangeRequestReason(e:any):string|null{
  const change=approval.changesRequested[0];return change.id===review.id&&change.head===review.commit?`Reviewer coderabbit: changes requested (${review.id})`:null;
 }
 export function decision(e:any,allowedPaths:string[],waitingMs:number){
- if(e.customCheckBlocker)return {state:'blocked',send:false,reason:e.customCheckBlocker};
-  if(e.clear)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
+  // An incomplete custom summary is a clearance obligation, not a veto on
+  // independently authenticated current feedback. Never generalize this to
+  // arbitrary/untrusted findings or to explicit human-review obligations.
+  if(e.customCheckBlocker){
+   const humanBlockers=(e.reviewerEvidence?.blockers??[]).filter((b:string)=>!b.startsWith('Reviewer coderabbit:'));
+   const independent=e.findings.length>0&&e.findings.every((f:any)=>f.source==='github-review'&&f.kind==='review_thread'&&f.sha===e.head&&f.provenance?.length&&reviewFindingTrustFresh(f,e.reviewerEvidence));
+   if(!independent||humanBlockers.length)return {state:'blocked',send:false,reason:humanBlockers.join('; ')||e.customCheckBlocker};
+  }
+  if(e.clear&&!e.customCheckBlocker)return {state:'ready_for_human',send:false,reason:'Latest-SHA CI and CodeRabbit gate passed'};
  if(e.failedChecks.length&&!e.failedChecks.every((c:any)=>metadataFailureCovered(e,c)||e.findings.some((f:any)=>f.source==='required-ci'&&f.checkId===c.id&&f.sha===e.head&&f.check===c.name)))return {state:'blocked',send:false,reason:`Required CI ${e.failedChecks.map((c:any)=>c.name).join(', ')}: unknown; current failure diagnosis required`};
  if(e.findings.length){
    if(e.findings.some((f:any)=>f.source==='github-review'&&f.path===null))return {state:'blocked',send:false,reason:'Review findings require concrete approved paths before automatic remediation'};
@@ -107,7 +114,8 @@ export class ReviewLoop{
   CREATE TABLE IF NOT EXISTS full_review_requests(job TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,body_hash TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,PRIMARY KEY(job,pr,head,body_hash));
   CREATE TABLE IF NOT EXISTS review_verification(job TEXT PRIMARY KEY REFERENCES jobs(id),configuration TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS custom_description_obligations(job TEXT PRIMARY KEY REFERENCES jobs(id),baseline_body_hash TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);`);
+  CREATE TABLE IF NOT EXISTS review_verification_runtime(job TEXT PRIMARY KEY REFERENCES jobs(id),context TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS review_bindings(job TEXT PRIMARY KEY REFERENCES jobs(id),generation INTEGER NOT NULL,fingerprint TEXT NOT NULL);`);
   // Existing databases keep their PR receipts under an unknown-PR key; the
   // request key now also scopes by PR so a rebound target cannot inherit them.
   this.s.db.transaction(()=>{
@@ -320,6 +328,7 @@ export class ReviewLoop{
     try{
      const e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,[...new Set([...JSON.parse(t.required_checks),...metadataChecks])],metadataChecks));
      l.current(job);
+     this.observeReviewers(job,e,t.pr);
      if(this.get(job).pr===t.pr&&this.get(job).state!=='completed'){
       if(e.head===result.head){
        this.s.db.query("UPDATE review_targets SET head=?,head_since=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,t.head===e.head?t.head_since:Date.now(),job,t.pr);
@@ -362,7 +371,7 @@ export class ReviewLoop{
     const liveStop=livenessStop(live,WATCHDOG_LIMITS.livenessMs,this.now());
      if(liveStop&&['terminated','stuck'].includes(live.classification))return record({...liveStop,head:snapshot.head});
       const activeDelivery=this.reconcileRemediation(job,snapshot.head,session,true);if(activeDelivery){
-       try{const pending=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,JSON.parse(t.required_checks),metadataChecks,reviewerInput(boundReviewerPolicy(this.s,job))));this.observeReviewers(job,pending);}catch(error){if(error instanceof ObservationLeaseLost)throw error;}
+       try{const pending=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,JSON.parse(t.required_checks),metadataChecks,reviewerInput(boundReviewerPolicy(this.s,job))));this.observeReviewers(job,pending,t.pr);}catch(error){if(error instanceof ObservationLeaseLost)throw error;}
        return record(activeDelivery);
       }
      if(liveStop&&live.classification==='unknown')return record({...liveStop,head:snapshot.head});
@@ -400,7 +409,7 @@ export class ReviewLoop{
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
-   try{e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks,reviewerInput(boundReviewerPolicy(this.s,job))));this.observeReviewers(job,e);}
+   try{e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks,reviewerInput(boundReviewerPolicy(this.s,job))));this.observeReviewers(job,e,t.pr);}
   catch(error){if(error instanceof ReadValidationError)observation.clear(job,false);return record(readStop(error,'Readiness evidence unavailable'));}
    observation.clear(job);
    const reviewed=this.completed(job);if(reviewed)return reviewed;
@@ -484,7 +493,7 @@ export class ReviewLoop{
   const scheduleWait=schedule?this.requests.wait(t.repo,t.pr,schedule):null;
   if(schedule&&session.transcript.controller!=='ready')this.s.db.query('UPDATE coderabbit_waits SET started=? WHERE repo=? AND pr=? AND head=?').run(Date.now(),t.repo,t.pr,e.head);
   const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
-  if(schedule&&idle&&!e.clear&&!waiting){
+  if(schedule&&idle&&!e.clear&&!waiting&&!e.customCheckBlocker){
    const request=this.requests.get(t.repo,t.pr,e.head),age=Date.now()-(request?.state==='accepted'?request.requested:scheduleWait!.started);
    if(request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt,mode:request.mode})});
    if(schedule.evidence?.classification==='rate-limited'&&!request)return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:0,requestState:'none'})});
@@ -602,5 +611,24 @@ export class ReviewLoop{
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};
   }
-  private observeReviewers(job:string,e:any){if(!e.reviewerEvidence)return;assertObservationFence();this.s.db.query('INSERT INTO reviewer_observations VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET head=excluded.head,observed=excluded.observed,evidence=excluded.evidence').run(job,e.head,Date.now(),JSON.stringify(e.reviewerEvidence));}
+  private observeReviewers(job:string,e:any,pr:number){
+   assertObservationFence();
+   // Persist observation currency before decision/receipt early returns. A
+   // generation distinguishes A -> B -> A without reviving superseded claims.
+   if(!e.head||e.reasons?.includes('Head changed')||e.customCheckBlocker==='PR head or description changed during custom-check collection')return;
+   this.s.db.transaction(()=>{
+    assertObservationFence();new Lifecycle(this.s).current(job);
+    const t=this.get(job);if(!t||t.pr!==pr||t.state==='completed')return;
+    const reviewers=e.reviewerEvidence?{blockers:e.reviewerEvidence.blockers,approvals:e.reviewerEvidence.approvals,pending:e.reviewerEvidence.pending,trust:e.reviewerEvidence.trust?.map((t:any)=>({reviewer:t.reviewer,ids:t.ids,blocker:t.blocker,fresh:t.fresh}))}:null;
+    const fingerprint=digest(JSON.stringify([t.repo,pr,e.head,e.descriptionHash,e.descriptionVersion,e.reviewEvidenceVersion,e.reviewSchedule?.signature,reviewers,e.customCheckBlocker,e.coderabbitBodyReviewed,e.botReviewSubmittedAt,e.findings,e.pendingChecks,e.missingChecks,e.failedChecks]));
+    const prior=this.s.db.query('SELECT * FROM review_bindings WHERE job=?').get(job) as any;
+    if(prior?.fingerprint!==fingerprint){
+     const generation=(prior?.generation??0)+1;
+     this.s.db.query('INSERT INTO review_bindings VALUES (?,?,?) ON CONFLICT(job) DO UPDATE SET generation=excluded.generation,fingerprint=excluded.fingerprint').run(job,generation,fingerprint);
+     this.s.event(job,'review_binding_observed',JSON.stringify({pr,head:e.head,previousHead:t.head,generation,fingerprint}));
+     this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=CASE WHEN state='ready_for_human' THEN 'waiting_for_review' ELSE state END,reason=CASE WHEN state='ready_for_human' THEN 'Review evidence changed; fresh clearance required' ELSE reason END WHERE job=? AND pr=?").run(e.head,t.head===e.head?t.head_since:this.now(),job,pr);
+    }
+    if(e.reviewerEvidence)this.s.db.query('INSERT INTO reviewer_observations VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET head=excluded.head,observed=excluded.observed,evidence=excluded.evidence').run(job,e.head,this.now(),JSON.stringify(e.reviewerEvidence));
+   }).immediate();
+  }
 }

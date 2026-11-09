@@ -28,6 +28,24 @@ function fixture(disk=false){
  const io={sessionEvidence:async()=>{reads++;session.receiptObservation={complete:true,observed:now};return session;},readBranchSnapshot:async()=>{reads++;return snapshot;}};
  return {root,path,s,job,loop,c,w,session,snapshot,io,now:()=>now,advance:(ms=60000)=>now+=ms,reads:()=>reads,close:()=>{s.close();rmSync(root,{recursive:true,force:true});}};
 }
+test('DEV-97: recurrent binding permits bounded fresh evaluation, never a historical read claim or budget reset',async()=>{
+ const f=fixture();try{
+  f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(f.snapshot.head,f.job);
+  const first=f.w.scheduleReview(f.job,f.c);
+  f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run('c'.repeat(40),f.job);f.w.scheduleReview(f.job,f.c);
+  f.s.db.query('UPDATE review_targets SET head=? WHERE job=?').run(f.snapshot.head,f.job);
+  const recurrent=f.w.scheduleReview(f.job,f.c);expect(recurrent).toMatchObject({id:first.id,state:'escalated',outcome:'recurrent_binding'});
+  f.s.db.query('UPDATE watchdog_budgets SET attempts=9 WHERE job=?').run(f.job);
+  expect(f.w.due('p')).toEqual([]);expect(f.w.due('p',undefined,true).map(a=>a.id)).toEqual([recurrent.id]);
+  expect(f.w.beginReview(recurrent.id,f.c)).toBe(true);
+  expect(f.w.beginReview(recurrent.id,f.c)).toBe(false);
+  f.loop.io={...f.loop.io,...f.io,worktreeIdentity:async()=>({tree:'/worktree',branch:f.snapshot.branch,head:f.snapshot.head}),readiness:async()=>({head:f.snapshot.head,clear:false,reasons:[],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[],descriptionHash:'current-body',reviewEvidenceVersion:'edited-summary'}) as any};
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(recurrent.id,result);
+  expect(f.w.get(recurrent.id).outcome).toBe('recurrent_binding');
+  const fresh=f.w.scheduleReview(f.job,f.c);expect(fresh.id).not.toBe(recurrent.id);expect(f.w.get(recurrent.id).state).toBe('superseded');
+  expect(actionStatus(f.s,f.job)?.attempts).toBe(9);
+ }finally{f.close();}
+});
 test('DEV-95: a review blocker does not strand the existing branch synchronization reservation',()=>{
  const f=fixture();try{
   f.s.db.exec('CREATE TABLE branch_syncs(job TEXT PRIMARY KEY,worktree TEXT,state TEXT,proof TEXT,reason TEXT)');
@@ -147,7 +165,8 @@ try{await tick();}catch(error){errors.push(error.message);}
 console.log(JSON.stringify({blocked,current:status(),ordinary,actions,errors}));`);
   expect(r.blocked.outcome).toBe('human_required');expect(r.ordinary).toBe(1);expect(r.actions).toBe(1);
   if(guard==='completed')expect(r.current).toBeNull();
-  if(guard==='grant'||guard==='reservation')expect(r.current).toMatchObject({state:'escalated',outcome:'authority_unavailable'});
+  if(guard==='grant')expect(r.current).toMatchObject({state:'escalated',outcome:'authority_unavailable'});
+  if(guard==='reservation')expect(r.current).toMatchObject({state:'escalated',outcome:'unsupported'});
  }finally{f.close();}}
 });
 test('ordinary evaluation cadence and failure count survive a connection restart',()=>{
@@ -412,10 +431,11 @@ test('supervised review clears a same-head human blocker and bounded polling res
   expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c)).state).toBe('waiting_for_ci');
   f.advance(WATCHDOG_LIMITS.idleMs);
   const resumed=f.w.scheduleReview(f.job,f.c);
-  expect(resumed).toMatchObject({id:a.id,binding:a.binding,state:'pending',next_action:'observe',outcome:'blocker_cleared',attempts:1});
-  expect(f.w.due('p').map(r=>r.id)).toEqual([a.id]);
-  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:a.id})).state).toBe('observed');
-  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(a.id,result);
+  expect(resumed).toMatchObject({state:'pending',next_action:'observe',outcome:'scheduled',attempts:1});
+  expect(resumed.id).not.toBe(a.id);expect(f.w.get(a.id).state).toBe('superseded');
+  expect(f.w.due('p').map(r=>r.id)).toEqual([resumed.id]);
+  expect((await f.loop.tick(f.job,undefined,undefined,undefined,f.c,{watchdog:f.w,id:resumed.id})).state).toBe('observed');
+  const result=await f.loop.tick(f.job,undefined,undefined,undefined,f.c);f.w.finishReview(resumed.id,result);
   expect(result.state).toBe('waiting_for_ci');expect(actionStatus(f.s,f.job)?.attempts).toBe(2);expect(sends).toBe(0);
  }finally{f.close();}
 });
@@ -521,7 +541,7 @@ const config={linear:{projectId:'p'},githubRepo:'owner/repo',automation:{orchest
 const tick=createCLIPollTick({config,store:s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>{polls++;return [];},linearToken:()=>'',out:()=>{}}});
 await tick();const first=reads;await tick();const second=reads;await tick();const paired=phases.length===12&&phases.every(([job,phase],i)=>phase===(i%2?'review':'observe')&&(i%2===0||job===phases[i-1][0]));console.log(JSON.stringify({first,second,reads,sends,polls,paired,ordinaryReads,branchEvaluations,actions:s.db.query('SELECT count(*) AS n FROM watchdog_actions').get().n}));s.close();`;
   const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:root},stdout:'pipe',stderr:'pipe'});
-  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({first:8,second:12,reads:12,sends:0,polls:3,paired:true,ordinaryReads:6,branchEvaluations:6,actions:6});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(JSON.parse(result.stdout.toString())).toEqual({first:8,second:12,reads:12,sends:0,polls:3,paired:true,ordinaryReads:6,branchEvaluations:6,actions:12});
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('production poll never follows a failed or deferred read action with effectful evaluation',()=>{

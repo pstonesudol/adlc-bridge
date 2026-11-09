@@ -62,9 +62,11 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
   if(/^Check name$/i.test(name)&&/^Status$/i.test(status))continue;
   if(cells.slice(1,-1).every(c=>/^:?-+:?$/.test(c)))continue;
   dataRows++;
-  const classified=status.match(/^!\[(Error|Warning|Passed)\]\([^\s)]+\)$/i);
+   // Inconclusive is a real failing Verification Evidence result, not a pass
+   // or a reason to guess from the (often truncated) explanation cell.
+   const classified=status.match(/^!\[(Error|Inconclusive|Warning|Passed)\]\([^\s)]+\)$/i);
   if(!name||!classified){unclassified=true;continue;}
-  if(classified[1].toLowerCase()==='error')errors.push(row);
+   if(['error','inconclusive'].includes(classified[1].toLowerCase()))errors.push(row);
  }
  if(!dataRows)unclassified=true;
  const blocked=(reason:string)=>({...empty,blocker:errors.length||unclassified?`CodeRabbit custom-check failure: ${reason}`:null});

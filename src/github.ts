@@ -187,6 +187,7 @@ export async function readiness(repo:string, number:number, required:string[],me
     reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login})),
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
     coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
+     reviewEvidenceVersion:digest(JSON.stringify([trustedLatest,trustedComments.filter(c=>(c.body??'').includes('<!-- pre_merge_checks_walkthrough_start -->')).map(c=>[c.id,c.updated_at,c.body]),version,botChecks.map(c=>[c.id,c.head_sha,c.status,c.conclusion,c.started_at,c.completed_at])])),
     metadataCheckEvidence:currentBodyEvidence,
      botReviewSubmittedAt:latest?Date.parse(latest.submitted_at):null,templateSignature:templateSignature(checks,first.head.sha,metadataChecks),branchBehind:comparison.behind_by,base:currentBase,coderabbitPresent:botChecks.length>0||!!latest,coderabbitPending:botChecks.some((c:any)=>c.status!=='completed'),descriptionHash,mergeEnabled:false};
 }
