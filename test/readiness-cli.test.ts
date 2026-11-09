@@ -34,6 +34,15 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
   // Replace gh entirely; this process has no credentials or network fallback.
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
+const mode=process.env.FIXTURE_MODE;
+if(mode?.startsWith('rabbit-')){
+ const review=responses['repos/owner/repo/pulls/1/reviews?per_page=100'][0][0];
+ review.state=mode==='rabbit-changes'?'CHANGES_REQUESTED':'COMMENTED';
+ const checks=responses[${JSON.stringify(`repos/owner/repo/commits/${head}/check-runs?per_page=100`)}][0].check_runs;
+ if(mode==='rabbit-pending')checks.find(c=>c.name==='CodeRabbit').status='in_progress';
+ if(mode==='rabbit-skipped')checks.find(c=>c.name==='CodeRabbit').conclusion='skipped';
+ if(mode==='rabbit-ci-failed')checks.find(c=>c.name==='CI').conclusion='failure';
+}
 if(args.at(-1)==='--include')args.pop();
 if(args[0]!=='api')throw Error('Read-only fixture only');
 let result;
@@ -53,18 +62,23 @@ console.log(JSON.stringify(result));
   for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
-   for(const mode of ['metadata','clear','advisory-outage','acknowledged']){
+   for(const mode of ['metadata','clear','advisory-outage','acknowledged','rabbit-strict','rabbit-advisory','rabbit-changes','rabbit-pending','rabbit-skipped','rabbit-ci-failed']){
     const metadata=mode==='metadata'?['Metadata']:[];
     // No user/4 response: the fixture rejects the advisory identity lookup.
     // Its summary-only change request must not disappear into green clearance.
-    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
-   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(mode.startsWith('rabbit-')?[{id:'coderabbit',approvalRequired:mode==='rabbit-strict'}]:[]),...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
+   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db,FIXTURE_MODE:mode}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
-    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output.failedChecks).toHaveLength(mode==='rabbit-ci-failed'?1:0);
     expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
     else if(mode==='advisory-outage'){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted']);expect(output.findings).toEqual([]);}
-    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
+    else if(mode.startsWith('rabbit-')&&mode!=='rabbit-advisory'){
+     expect(output.clear).toBe(false);
+     const reason=mode==='rabbit-strict'?'Explicit latest-SHA CodeRabbit approval missing':mode==='rabbit-changes'?'Reviewer coderabbit: changes requested':mode==='rabbit-ci-failed'?'Required check not clear: CI':'CodeRabbit check not clear';
+     expect(output.reasons.some((r:string)=>r.includes(reason))).toBe(true);
+    }else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
    expect(existsSync(db)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}

@@ -44,6 +44,19 @@ test('fifth failed remediation blocks and missing review stays pending',()=>{
   expect(remediationDecision(5,true,false)).toBe('blocked');
   expect(remediationDecision(0,false,false)).toBe('waiting_for_review');
 });
+test('advisory CodeRabbit approval removes only the vote obligation from the pure gate',()=>{
+ const advisory=():ReviewEvidence=>({...evidence(),review:null,coderabbitApprovalRequired:false});
+ expect(reviewGate(advisory())).toEqual({clear:true,reasons:[]});
+ expect(reviewGate({...advisory(),coderabbitApprovalRequired:true}).clear).toBe(false);
+ expect(reviewGate({...advisory(),coderabbitApprovalRequired:undefined}).clear).toBe(false);
+ const changes=[(e:ReviewEvidence)=>e.observedHead='new',(e:ReviewEvidence)=>e.unresolved=1,
+  (e:ReviewEvidence)=>e.reviewComplete=false,(e:ReviewEvidence)=>e.threadsComplete=false,
+  (e:ReviewEvidence)=>e.checksComplete=false,(e:ReviewEvidence)=>e.required=[],
+  (e:ReviewEvidence)=>e.checks[0].conclusion='failure',(e:ReviewEvidence)=>e.checks[1].status='in_progress',
+  (e:ReviewEvidence)=>e.checks[1].conclusion='skipped',(e:ReviewEvidence)=>e.checks[1].conclusion='neutral',
+  (e:ReviewEvidence)=>e.checks.pop()];
+ for(const change of changes){const e=advisory();change(e);expect(reviewGate(e).clear).toBe(false);}
+});
 test('Linear pagination is scoped and idempotent, errors do not authorize execution',async()=>{
   const fetchOriginal=globalThis.fetch;const s=new Store(':memory:');
   const projectId='25a25ffb-6a31-4851-8ec5-2732cd9174d3',teamId='1e9f847c-2009-4fec-85a8-8b71d9820579',readyStateId='00000000-0000-0000-0000-000000000000';
