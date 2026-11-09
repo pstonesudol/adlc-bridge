@@ -135,6 +135,101 @@ async function fixture(database=':memory:'){
  const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
+async function revisedFixture(){
+ const f=await fixture();
+ f.edit('DEV-51 revised runtime update history requirements');
+ await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);
+ f.complete();await f.recovery.capture(f.job,config);
+ f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+ return f;
+}
+async function publishRevised(f:Awaited<ReturnType<typeof fixture>>,pr=17){
+ await f.w.executeApproved(f.job,config);
+ f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';
+ f.e.session.prs=[{state:'open',number:pr,url:`https://github.com/owner/repo/pull/${pr}`}];
+ f.e.receiptObservation.observed=Date.now();
+ return f.w.executeApproved(f.job,config);
+}
+test('DEV-64 / DEV-51 poll recovers an exact revised handoff without replay and retains published-head proof',async()=>{
+ const f=await revisedFixture();try{
+  const loop=new ReviewLoop(f.s);loop.register(f.job,'owner/repo',17,['CI'],['src/**']);
+  await publishRevised(f);
+  const count=f.sends.length;
+  // Simulate a lost handoff projection, with the exact completed worker retained.
+  f.s.db.query('DELETE FROM revision_handoffs WHERE job=?').run(f.job);
+  f.s.db.query('DELETE FROM revision_handoff_proofs WHERE job=?').run(f.job);
+  f.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=?").run(f.job);
+  const recovered=await f.w.tick(config);
+  expect(recovered).toContainEqual(expect.objectContaining({job:f.job,state:'pr_handoff'}));
+  expect(revisedHandoff(f.s,f.job)).toBe(true);expect(f.sends.length).toBe(count);
+  expect(f.s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=?').get(f.job)).toMatchObject({dispatch:f.w.implementation(f.job).client_id,session:'owner',spec:digest(f.s.get(f.job).spec),repo:'owner/repo',pr:17,head:'a'.repeat(40)});
+  await f.w.tick(config);expect(f.sends.length).toBe(count);
+ }finally{f.s.close();}
+});
+for(const state of ['approved_pending','delivery_uncertain'])test(`DEV-64 missing revised receipt distinguishes ${state} without interpreting historical PR checks`,async()=>{
+ const f=await revisedFixture();try{
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];
+  f.s.db.query('UPDATE implementation_dispatch SET state=? WHERE job=?').run(state,f.job);
+  const count=f.sends.length;
+  const status=await f.w.executionStatus(f.job,f.e,config);
+  expect(status.state).toBe(state==='approved_pending'?'approved_pending':'needs_reconciliation');
+  if(state!=='approved_pending'){await f.w.tick(config);expect(f.sends.length).toBe(count);}
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+ }finally{f.s.close();}
+});
+for(const fault of ['missing-ledger','pending-with-receipt','head','worker','stale','duplicate','active'])test(`DEV-64 revised handoff refuses ${fault} without replay`,async()=>{
+ const f=await revisedFixture();try{
+  await f.w.executeApproved(f.job,config);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];
+  const d=f.w.implementation(f.job),count=f.sends.length;
+  if(fault==='missing-ledger'||fault==='pending-with-receipt')f.s.db.query('DELETE FROM delivery_receipts WHERE client=?').run(d.client_id);
+  if(fault==='pending-with-receipt')f.s.db.query("UPDATE implementation_dispatch SET state='approved_pending' WHERE job=?").run(f.job);
+  if(fault==='head')f.w.t.worktree=async()=>({branch:f.e.session.branch,head:'b'.repeat(40)});
+  if(fault==='worker')f.e.session.id='other';
+  if(fault==='stale')f.e.receiptObservation.observed-=120001;
+  if(fault==='duplicate')f.e.transcript.entries.push({...f.e.transcript.entries.at(-1)});
+  if(fault==='active')f.e.transcript.turns.push({id:'other',state:'running'});
+  await f.w.tick(config);
+  expect(f.sends.length).toBe(count);expect(revisedHandoff(f.s,f.job)).toBe(false);
+ }finally{f.s.close();}
+});
+test('DEV-64 recovered proof survives reopening but cannot authorize a replacement dispatch or contradictory receipt',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-revised-proof-')),path=join(dir,'state.db'),f=await revisedFixture();
+ try{
+  await publishRevised(f);
+  // Copy a consistent SQLite snapshot, then inspect it through a reopened Store.
+  f.s.db.query('VACUUM INTO ?').run(path);
+  const reopened=new Store(path);try{
+   expect(revisedHandoff(reopened,f.job)).toBe(true);
+   reopened.db.query("UPDATE implementation_dispatch SET client_id='replacement' WHERE job=?").run(f.job);
+   expect(revisedHandoff(reopened,f.job)).toBe(false);
+  }finally{reopened.close();}
+  const dispatch=f.w.implementation(f.job);
+  f.s.db.query("UPDATE delivery_receipts SET state='failed' WHERE client=?").run(dispatch.client_id);
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+ }finally{f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
+for(const race of ['dispatch','revision','target','owner'])test(`DEV-64 ${race} change while awaiting published head discards handoff proof`,async()=>{
+ const f=await revisedFixture();try{
+  await f.w.executeApproved(f.job,config);
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];
+  const loop=new ReviewLoop(f.s);loop.register(f.job,'owner/repo',17,['CI'],['src/**']);
+  const snapshot=f.w.t.branchSnapshot!.bind(f.w.t);
+  f.w.t.branchSnapshot=async(...args:any[])=>{
+   const result=await (snapshot as any)(...args);
+   if(race==='dispatch')f.s.db.query("UPDATE implementation_dispatch SET client_id='replacement' WHERE job=?").run(f.job);
+   if(race==='revision')f.edit('Changed while reading published head');
+   if(race==='target')f.s.db.query('UPDATE review_targets SET pr=18 WHERE job=?').run(f.job);
+   if(race==='owner')f.s.db.query("UPDATE planning_runs SET session_id='replacement' WHERE job=?").run(f.job);
+   return result;
+  };
+  expect((await f.w.executionStatus(f.job,f.e,config)).state).not.toBe('pr_handoff');
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  expect(f.s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=?').all(f.job)).toHaveLength(0);
+ }finally{f.s.close();}
+});
 test('a late send acknowledgement cannot downgrade a captured revised plan',async()=>{
  const f=await fixture();let release!:()=>void;
  try{
@@ -839,6 +934,8 @@ test('a handoff for the same plan hash from an earlier revision does not authori
   f.s.db.query('INSERT INTO revision_handoffs VALUES (?,?,?,?,?)').run(f.job,job.plan_hash,'earlier-authorization',1,Date.now());
   expect(revisedHandoff(f.s,f.job)).toBe(false);
   f.s.db.query('INSERT INTO revision_handoffs VALUES (?,?,?,?,?)').run(f.job,job.plan_hash,latest.id,1,Date.now());
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  await publishRevised(f,1);
   expect(revisedHandoff(f.s,f.job)).toBe(true);
  }finally{f.s.close();}
 });
@@ -851,18 +948,30 @@ test('recovered delivery records the single open PR as the current revision hand
   expect(handoffPr({source:'delivery-recovery'},[{number:7},{number:8}])).toBeNull();
   expect(revisedHandoff(f.s,f.job)).toBe(false);
   recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,handoffPr({source:'delivery-recovery',state:'pr_handoff'},[{number:7}]));
+  expect(revisedHandoff(f.s,f.job)).toBe(false);
+  await publishRevised(f,7);
   expect(revisedHandoff(f.s,f.job)).toBe(true);
  }finally{f.s.close();}
 });
-test('a revised handoff must belong to the registered review target PR',async()=>{
+test('a verified revised candidate is recorded before explicit target rebind; review and Done stay gated',async()=>{
  const f=await fixture();try{
   f.edit('v2');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
   f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
   new ReviewLoop(f.s).register(f.job,'owner/repo',7,['CI'],['src/**']);
-  recordHandoff(f.s,f.job,f.s.get(f.job).plan_hash,{number:9});
+  expect(await publishRevised(f,9)).toMatchObject({state:'pr_handoff'});
+  expect(f.s.db.query('SELECT pr FROM revision_handoffs WHERE job=?').get(f.job)).toEqual({pr:9});
+  expect(f.s.db.query('SELECT repo,pr,head FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({repo:'owner/repo',pr:9,head:'a'.repeat(40)});
+  expect(new ReviewLoop(f.s).get(f.job).pr).toBe(7);
   expect(revisedHandoff(f.s,f.job)).toBe(false);
   // The registered target still cannot be released by the other PR.
   expect(await new ReviewLoop(f.s).tick(f.job,undefined,undefined,{project:'p',checks:[]},config)).toMatchObject({state:'waiting_for_revised_handoff'});
+  let linearCalls=0,prCalls=0;
+  const linear=new LinearLifecycle(f.s,async()=>{linearCalls++;throw Error('No Linear write before rebind');},(async()=>{prCalls++;return {merged:true,state:'closed'};}) as any);
+  // Revision-notice delivery is independent of the status-transition gate.
+  linear.revisionNotices=async()=>[];
+  expect(await linear.sync({...config,statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}})).toContainEqual(expect.objectContaining({job:f.job,state:'revised_handoff_pending'}));
+  expect(linearCalls).toBe(0);expect(prCalls).toBe(0);
+  expect(f.s.get(f.job).state).toBe('approved');
   // The recorded handoff is authoritative: aligning the target to it succeeds,
   // but substituting a different PR is refused.
   const loop=new ReviewLoop(f.s);
@@ -871,6 +980,7 @@ test('a revised handoff must belong to the registered review target PR',async()=
   f.s.db.query("UPDATE review_targets SET state='ready',head=?,last_signature='old' WHERE job=?").run('a'.repeat(40),f.job);
   expect(loop.rebind(f.job,'owner/repo',9)).toMatchObject({state:'rebound',pr:9});
   expect(loop.get(f.job)).toMatchObject({pr:9,state:'waiting_for_review',head:null,last_signature:null});
+  expect(revisedHandoff(f.s,f.job)).toBe(true);
   // The rebound target must not look ready before the new PR's evidence exists.
   // An isolated adapter keeps provider calls local; the rebound target is not
   // reported ready and its stored state reflects the fresh review cycle.
