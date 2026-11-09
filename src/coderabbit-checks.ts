@@ -40,10 +40,11 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  // cannot prove a current-head failure and must not park the target on a generic
  // currency blocker. Inline findings from the same review remain available as
  // review-thread candidates; the explicit review gate still refuses clearance.
- if(!review)return empty;
- if(!bot(review.user))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} is not authored by the trusted CodeRabbit bot; inspect the review before retry`};
- if(typeof review.commit_id!=='string'||!/^[a-f0-9]{40}$/.test(review.commit_id))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} has no usable commit binding; inspect the review before retry`};
- if(review.commit_id!==head)return empty;
+ if(review){
+  if(!bot(review.user))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} is not authored by the trusted CodeRabbit bot; inspect the review before retry`};
+  if(typeof review.commit_id!=='string'||!/^[a-f0-9]{40}$/.test(review.commit_id))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} has no usable commit binding; inspect the review before retry`};
+  if(review.commit_id!==head)return empty;
+ }
  // Never choose a random newer bot reply or silently fall back to an old summary.
  if(summaries.length!==1)return {...empty,blocker:`CodeRabbit custom-check summary provenance is ambiguous: ${summaries.length} bot summaries (${summaries.map((s:any)=>s.id).join(', ')}); inspect and retain one current summary`};
  const summary=summaries[0],section=customCheckSection(summary.body);
@@ -75,6 +76,10 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
  if(unclassified)return blocked('pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary');
  if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
+ // Advisory approval can leave us with no substantive review. Still inspect
+ // trusted summaries above: reported errors must fail closed, but without review
+ // provenance they cannot authorize remediation or attest description coverage.
+ if(!review)return blocked('current bot review provenance is unavailable');
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
  if(version?.headRefOid!==head||version.body!==body||!Number.isFinite(time(version.createdAt))||!(version.lastEditedAt===null||Number.isFinite(time(version.lastEditedAt))))return blocked('current description version is unavailable');

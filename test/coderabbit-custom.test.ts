@@ -2,6 +2,21 @@ import {test,expect} from 'bun:test';
 import {customCheckEvidence} from '../src/coderabbit-checks';
 import {decision} from '../src/review-loop';
 import {customFixture,pr30CustomFixture} from './coderabbit-fixture';
+for(const state of ['absent','COMMENTED'])test(`custom failures remain blocking without a substantive vote: ${state}`,()=>{
+ for(const status of ['Error','Inconclusive','Unknown']){
+  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]',`![${status}]`);
+  const review=state==='absent'?null:{...f.review,state};
+  const result=customCheckEvidence(review,f.head,f.comments,f.context);
+  expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toContain('CodeRabbit custom-check failure');
+ }
+});
+test('missing substantive vote alone does not turn passing custom summaries into blockers or attestations',()=>{
+ for(const status of ['Passed','Warning']){
+  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]',`![${status}]`);
+  expect(customCheckEvidence(null,f.head,f.comments,f.context)).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ }
+ expect(customCheckEvidence(null,'a'.repeat(40),[])).toEqual({findings:[],blocker:null,bodyReviewed:false});
+});
 test('PR108 regression: green run plus custom Verification Evidence error is scoped remediation, never approval',()=>{
  const f=customFixture(),e=f.evidence();
  expect(e.blocker).toBeNull();expect(e.findings).toHaveLength(1);
