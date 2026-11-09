@@ -41,6 +41,16 @@ test('invalid plan evidence cannot publish a misleading manual approval notice',
   const result=(await f.surface.sync(f.c))[0];expect(result.state).toBe('approval_blocked');expect(result.reason).toContain('plan-reconcile');expect(f.counts().creates).toBe(0);
  }finally{f.s.close();}
 });
+test('human approval notices summarize eligibility and gate without embedding agent control context',async()=>{
+ const f=fixture();try{
+  await f.surface.sync(f.c);const body=f.comments[0].body;
+  expect(body).toContain('Ticket eligibility verified from current Linear state and readiness label');
+  expect(body).toContain('explicit human plan approval required');
+  expect(body).not.toContain('host control data');expect(body).not.toContain('Do not ask the human');
+  expect(body).not.toContain('"planApprovalRequired"');expect(body).not.toContain('"evidence"');
+  expect(body).toContain('Approve ADLC plan');expect(body).toContain('Only configured human approvers');
+ }finally{f.s.close();}
+});
 test('unrevised plans preserve the legacy approval notice binding and pending token',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-legacy-approval-')),path=join(dir,'state.db'),f=fixture(path);let reopened:Store|undefined,closed=false;
  try{
