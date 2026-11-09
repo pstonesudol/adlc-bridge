@@ -4,9 +4,17 @@ import {discoverMode,confirmMode,openCodeModes,NativeModeFailure,ProviderModeFai
 
 type API=(path:string,method?:string,body?:unknown)=>Promise<any>;
 const approvalPosture=(value:unknown)=>typeof value==='string'&&value?value:undefined;
+export class RoutePreflightFailure extends Error{
+ constructor(public kind:'unavailable'|'transient'){
+  super(kind==='unavailable'?'Pinned model is not advertised by Orchestrator':'Model catalog could not be verified; retry preflight');
+ }
+}
 export async function preflightRoute(route:Route,api:API=localAO){
- const catalog=await api(`agents/${route.harness}/models?catalogOnly=true`);
- if(!Array.isArray(catalog.models)||!catalog.models.some((m:any)=>m.id===route.model))throw Error('Configured routing model is not in the Orchestrator catalog');
+ let catalog:any;
+ try{catalog=await api(`agents/${route.harness}/models?catalogOnly=true`);}catch{throw new RoutePreflightFailure('transient');}
+ // Incomplete/malformed evidence is not proof that a model is unavailable.
+ if(!Array.isArray(catalog?.models)||catalog.models.some((m:any)=>typeof m?.id!=='string')||catalog.nextCursor||catalog.hasMore===true||catalog.pageInfo?.hasNextPage===true||catalog.complete===false)throw new RoutePreflightFailure('transient');
+ if(!catalog.models.some((m:any)=>m.id===route.model))throw new RoutePreflightFailure('unavailable');
 }
 export async function configureSessionRoute(session:string,route:Route,api:API=localAO){
  if(!/^[\w-]+$/.test(session))throw Error('Invalid routing session');

@@ -3,6 +3,8 @@ import {Store} from '../src/core';import {Planning} from '../src/planning';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
 import {TaskRouting,type Route} from '../src/task-routing';
 import {routingConfig,settings} from './routing-fixture';
+import {RoutePreflightFailure} from '../src/routing-session';
+import {LinearRouteNotices} from '../src/linear-route-notices';
 const config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1},routing:settings};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
 class Fake implements WorkflowTransport{
@@ -26,6 +28,48 @@ class Fake implements WorkflowTransport{
  }
 }
 function fixture(){const s=new Store(':memory:'),f=new Fake(s),router=new TaskRouting(s,async()=>({config:routingConfig,classify:async()=>({choice:'implement',confidence:0.95})})),w=new Workflow(s,f,router),id=s.enqueue('p','i','Update src/a.ts');return {s,f,router,w,id};}
+for(const kind of ['unavailable','transient','unknown'] as const)test(`approved route ${kind} preflight persists next action without configuring or sending`,async()=>{
+ const {s,f,w,id,router}=fixture();try{
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  const before=w.implementation(id),route=router.get(id,'implementation'),configured=f.configured.length;
+  f.preflightRoute=async()=>{if(kind==='unknown')throw Error('secret');throw new RoutePreflightFailure(kind);};
+  for(let i=0;i<2;i++)expect(await w.executeApproved(id,config)).toMatchObject({state:kind==='unavailable'?'route_approval_required':'route_preflight_retry'});
+  expect(w.implementation(id)).toEqual({...before,reason:expect.any(String)});
+  expect(router.get(id,'implementation')).toEqual(route);expect(f.messages).toHaveLength(1);expect(f.configured).toHaveLength(configured);
+  const checks=s.db.query('SELECT * FROM dispatch_route_checks').all() as any[];
+  expect(checks).toHaveLength(1);expect(checks[0].state).toBe(kind==='unavailable'?'unavailable':'transient');expect(JSON.stringify(checks)).not.toContain('secret');
+  f.drop=true;f.preflightRoute=async()=>{};await w.executeApproved(id,config);expect(f.messages).toHaveLength(2);expect(w.implementation(id).state).toBe('delivery_uncertain');
+  f.preflightRoute=async()=>{throw Error('must not preflight/replay an accepted dispatch');};await w.executeApproved(id,config);expect(f.messages).toHaveLength(2);
+ }finally{s.close();}
+});
+test('approval changed during a catalog preflight cannot persist stale availability or deliver',async()=>{
+ const {s,f,w,id}=fixture();try{
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  f.preflightRoute=async()=>{s.db.query("UPDATE jobs SET approved_hash=NULL,state='awaiting_approval' WHERE id=?").run(id);throw new RoutePreflightFailure('unavailable');};
+  await expect(w.executeApproved(id,config)).rejects.toThrow();
+  expect(s.db.query('SELECT * FROM dispatch_route_checks').all()).toEqual([]);expect(f.messages).toHaveLength(1);
+ }finally{s.close();}
+});
+test('Linear route requests are current-plan scoped, deduplicated and cannot approve or replay',async()=>{
+ const {s,f,w,id}=fixture();try{
+  const spec=JSON.stringify({identifier:'DEV-67',title:'Task',description:'Model unavailable'});s.db.query('UPDATE jobs SET spec=? WHERE id=?').run(spec,id);
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  f.preflightRoute=async()=>{throw new RoutePreflightFailure('unavailable');};await w.executeApproved(id,config);
+  let posts=0;const comments:any[]=[];
+  const api=async(query:string,vars:any)=>{
+   if(query.includes('commentCreate')){posts++;const comment={id:vars.input.id,body:vars.input.body};comments.push(comment);throw Error('lost response');}
+   if(query.includes('comments('))return {issue:{id:'i',comments:{nodes:comments,pageInfo:{hasNextPage:false}}}};
+   return {issue:{id:'i',...JSON.parse(spec),project:{id:'p'},team:{id:'t'},labels:{nodes:[],pageInfo:{hasNextPage:false}}}};
+  };
+  const notices=new LinearRouteNotices(s,api),c={linear:{projectId:'p',teamId:'t'}};
+  expect(await notices.sync(c)).toEqual([{job:id,state:'route_notice_blocked',reason:expect.any(String)}]);
+  expect(await notices.sync(c)).toEqual([{job:id,state:'route_approval_requested'}]);await notices.sync(c);expect(posts).toBe(1);
+  expect(comments[0].body).toContain(s.get(id).plan_hash);expect(comments[0].body).toContain('openai/sol');expect(comments[0].body).toContain('generic reply does not authorize');
+  expect(w.implementation(id).state).toBe('approved_pending');expect(f.messages).toHaveLength(1);
+  s.db.query("UPDATE jobs SET state='awaiting_approval',approved_hash=NULL WHERE id=?").run(id);
+  expect(await notices.sync(c)).toEqual([]);expect(posts).toBe(1);
+ }finally{s.close();}
+});
 test('planning and approved implementation use separate pinned routes in the same session',async()=>{
  const {s,f,router,w,id}=fixture();try{
  await w.tick(config);expect(f.messages.length).toBe(1);expect(f.messages[0].route.model).toBe('openai/luna');expect(f.messages[0].route.mode).toBe('plan');

@@ -3,6 +3,7 @@ import {Store,digest} from './core';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
 import {latestRevision,revisedExecution,revisedHandoff} from './spec-revisions';
+import {LinearRouteNotices} from './linear-route-notices';
 export type StatusMapping={enabled:boolean;inProgress:string;inReview:string;done:string};
 export type SyncConfig={linear:{projectId:string;teamId:string;readyStateId:string;readyLabelId:string};githubRepo?:string;statusSync?:StatusMapping};
 const driftBody=(reason:string)=>reason+'\nOriginal planning reservation and audit history are preserved. Recovery defaults to read-only preview; application requires explicit --confirm HASH.';
@@ -188,11 +189,12 @@ export class LinearLifecycle{
    if(retryRow)this.s.db.query('INSERT INTO spec_notice_retry_cursor VALUES (?,?) ON CONFLICT(project) DO UPDATE SET last_rowid=excluded.last_rowid').run(c.linear.projectId,retryRow.rid);
    return results;
   }
-   async sync(c:SyncConfig){
-    if(!c.statusSync?.enabled)return [];
+    async sync(c:SyncConfig){
+     const routeNotices=await new LinearRouteNotices(this.s,this.api).sync(c);
+     if(!c.statusSync?.enabled)return routeNotices;
     const notices=await this.revisionNotices(c);
   const rows=this.s.db.query("SELECT j.id,j.state,p.spec_hash FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state IN ('awaiting_plan','awaiting_approval','approved','blocked')").all(c.linear.projectId) as any[];
-   const results:any[]=[...notices];
+    const results:any[]=[...routeNotices,...notices];
    for(const row of rows)try{
     const revision=latestRevision(this.s,row.id);
     if(revision&&!['authorized','preplanning'].includes(revision.state)){results.push({job:row.id,state:'requirements_changed',reason:'Current requirements need replanning and fresh approval; PR state is historical'});continue;}

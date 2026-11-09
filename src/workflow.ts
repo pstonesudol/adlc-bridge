@@ -20,6 +20,8 @@ import {SpecRecovery} from './spec-recovery';
 import {ensurePlanningRestores} from './planning-restore';
 import {PlanningDependencies} from './planning-dependencies';
 import {assertRequiredIntegrations} from './integration-capabilities';
+import {RoutePreflightFailure} from './routing-session';
+import {ensureDispatchRoutes,recordDispatchRoute} from './dispatch-route';
 
 export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
@@ -44,7 +46,8 @@ export class Workflow{
  constructor(public s:Store,public t:WorkflowTransport,router?:TaskRouting,readonly=false){
   this.planningDependencies=new PlanningDependencies(s,this);
   if(readonly){this.router=router??({} as TaskRouting);return;}
-  ensurePlanningRestores(s);
+   ensurePlanningRestores(s);
+   ensureDispatchRoutes(s);
   this.router=router??new TaskRouting(s);
   new Planning(s);new Lifecycle(s);new ApprovalPolicyStore(s);ensureReadinessStore(s);
   s.db.exec('CREATE TABLE IF NOT EXISTS project_execution_policy(project TEXT PRIMARY KEY,runtime TEXT NOT NULL)');
@@ -289,8 +292,22 @@ export class Workflow{
   const managed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&(this.s.db.query("SELECT context FROM clarification_receipts WHERE job=? AND state!='superseded'").all(job) as any[]).some(row=>{const context=JSON.parse(row.context);return context.planHash===j.plan_hash&&context.specHash===digest(j.spec);});
   if(managed)assertApprovalReadiness(this.s,job,j.actor,false);
   if(e.transcript?.controller!=='ready')return {state:'waiting_for_worker'};
-  const route=this.router.approved(job,j.plan_hash);
-  if(route){if(!this.t.configureRoute)throw Error('Routing controls are unavailable');await this.t.configureRoute(d.session_id,route);this.router.verified(job,'implementation');}
+   const route=this.router.approved(job,j.plan_hash);
+   if(route){
+    if(!this.t.configureRoute||!this.t.preflightRoute)throw Error('Routing controls are unavailable');
+    let state:'available'|'unavailable'|'transient'='available';
+    try{await this.t.preflightRoute(route);}catch(error){state=error instanceof RoutePreflightFailure?error.kind:'transient';}
+    // An awaited catalog read must not update a replacement plan/dispatch.
+    l.current(job);
+    if(JSON.stringify(this.implementation(job))!==JSON.stringify(d)||JSON.stringify(this.router.approved(job,j.plan_hash))!==JSON.stringify(route))throw Error('Dispatch changed during model preflight');
+    const check=recordDispatchRoute(this.s,job,d,route,state);
+    if(state!=='available'){
+     this.s.db.query("UPDATE implementation_dispatch SET reason=? WHERE job=? AND client_id=? AND state='approved_pending'").run(check.nextAction,job,d.client_id);
+     return {state:state==='unavailable'?'route_approval_required':'route_preflight_retry',reason:check.nextAction,binding:check.binding};
+    }
+    this.s.db.query("UPDATE implementation_dispatch SET reason=NULL WHERE job=? AND client_id=? AND state='approved_pending'").run(job,d.client_id);
+    await this.t.configureRoute(d.session_id,route);this.router.verified(job,'implementation');
+   }
   l.current(job);
   await this.planningDependencies.guard(job,c);
   l.current(job);
