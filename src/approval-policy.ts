@@ -37,11 +37,13 @@ export class ApprovalPolicyStore{
   const q=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;
   const fresh=!!row&&!!q&&q.ready===1&&q.project===j.project&&q.spec_hash===digest(j.spec)&&row.spec_hash===q.spec_hash&&row.observed===q.observed&&now-row.observed<=120000&&row.observed<=now+5000;
   const evidence=fresh?JSON.parse(row.evidence):null;
-  const policy=p??evidence?.policy??{mode:'manual'};
+  // An expired observation says nothing about the current project policy.
+  // Status callers without configuration must not invent a manual gate.
+  const policy:ApprovalPolicy|undefined=p??evidence?.policy;
   const standing=this.get(job),manualApproved=!standing&&j.state==='approved'&&!!j.plan_hash&&j.approved_hash===j.plan_hash&&j.plan_hash===digest(JSON.stringify([j.spec,j.plan]));
-  const gate=manualApproved?'Recorded human approval covers the current plan; dispatch still requires current ownership, scoped grants and safety checks':this.evaluate(job,j.project,policy,now,!standing).reason;
+  const gate=manualApproved?'Recorded human approval covers the current plan; dispatch still requires current ownership, scoped grants and safety checks':policy?this.evaluate(job,j.project,policy,now,!standing).reason:'Current authorization policy unavailable; refresh intake evidence or supply current project configuration. Recorded grants alone do not authorize dispatch';
   return {source:'verified Linear intake',fresh,eligible:fresh,observed:fresh?row.observed:null,evidence,
-   authorization:{mode:policy.mode,policyId:policy.id??null,planApprovalRequired:this.requiresManual(job),recordedActor:standing?.authorized_by??j.actor??null,gate},
+   authorization:{mode:policy?.mode??'unknown',policyId:policy?.id??null,planApprovalRequired:this.requiresManual(job),recordedActor:standing?.authorized_by??j.actor??null,gate},
    legacyQueueNote:/\b(?:created in |initial(?:ly)? )?Backlog without [`]?agent-ready\b/i.test(j.spec)};
  }
  promptContext(job:string,p?:ApprovalPolicy){

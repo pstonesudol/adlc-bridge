@@ -31,6 +31,16 @@ test('DEV-81: current owned In Progress evidence reaches planning and authorized
   s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest(s.get(id).spec),'awaiting_approval','worker','planning-message');
   const result=await w.tick(c);expect(result.filter(x=>x.error)).toEqual([]);expect(sends).toHaveLength(1);expect(sends[0]).toContain('"state":"'+c.statusSync.inProgress+'"');expect(sends[0]).toContain('delegated authorization');expect(sends[0]).toContain(legacy);
   expect(store.get(id).policy_id).toBe('standing');
+  const observed=store.context(id).observed!;
+  const expired=store.context(id,undefined,observed+120001);
+  expect(expired.fresh).toBe(false);expect(expired.authorization.mode).toBe('unknown');
+  expect(expired.authorization.recordedActor).toBe('human');
+  expect(expired.authorization.gate).toContain('refresh intake evidence');
+  expect(expired.authorization.gate).not.toContain('Manual plan approval required');
+  const configured=store.context(id,policy,observed+120001);
+  expect(configured.authorization.mode).toBe('ready-queue');expect(configured.authorization.gate).toContain('Fresh complete');
+  expect(store.context(id,{mode:'manual'},observed+120001).authorization.gate).toBe('Manual plan approval required');
+  expect(store.get(id).policy_id).toBe('standing');
  }finally{globalThis.fetch=old;s.close();}
 });
 test('removed readiness, stale observation and changed scope cannot be presented as current eligible evidence',async()=>{
