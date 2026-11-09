@@ -190,8 +190,8 @@ export class LinearLifecycle{
    return results;
   }
     async sync(c:SyncConfig){
+     if(!c.statusSync?.enabled)return [];
      const routeNotices=await new LinearRouteNotices(this.s,this.api).sync(c);
-     if(!c.statusSync?.enabled)return routeNotices;
     const notices=await this.revisionNotices(c);
   const rows=this.s.db.query("SELECT j.id,j.state,p.spec_hash FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state IN ('awaiting_plan','awaiting_approval','approved','blocked')").all(c.linear.projectId) as any[];
     const results:any[]=[...routeNotices,...notices];

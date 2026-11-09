@@ -14,7 +14,7 @@ export async function preflightRoute(route:Route,api:API=localAO){
  try{catalog=await api(`agents/${route.harness}/models?catalogOnly=true`);}catch{throw new RoutePreflightFailure('transient');}
  // Incomplete/malformed evidence is not proof that a model is unavailable.
  if(!Array.isArray(catalog?.models)||catalog.models.some((m:any)=>typeof m?.id!=='string')||catalog.nextCursor||catalog.hasMore===true||catalog.pageInfo?.hasNextPage===true||catalog.complete===false)throw new RoutePreflightFailure('transient');
- if(!catalog.models.some((m:any)=>m.id===route.model))throw new RoutePreflightFailure('unavailable');
+ if(!catalog.models.some((m:any)=>m.id===route.model))throw new RoutePreflightFailure(catalog.refreshState==='refreshing'?'transient':'unavailable');
 }
 export async function configureSessionRoute(session:string,route:Route,api:API=localAO){
  if(!/^[\w-]+$/.test(session))throw Error('Invalid routing session');

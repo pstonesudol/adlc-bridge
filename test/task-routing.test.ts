@@ -14,6 +14,15 @@ test('catalog preflight distinguishes unavailable models from transient or incom
  await expect(preflightRoute(route,async()=>({models:[]}))).rejects.toBeInstanceOf(RoutePreflightFailure);
  await expect(preflightRoute(route,async()=>({models:[{id:'other/model'}]}))).rejects.toMatchObject({kind:'unavailable'});
 });
+test('a refreshing catalog miss is transient until discovery completes',async()=>{
+ const route=selectRoute(routingConfig,{choice:'implement',confidence:1});
+ for(const models of [[],[{id:'other/model'}]]){
+  await expect(preflightRoute(route,async()=>({models,refreshState:'refreshing'}))).rejects.toMatchObject({kind:'transient'});
+  await expect(preflightRoute(route,async()=>({models,refreshState:'idle'}))).rejects.toMatchObject({kind:'unavailable'});
+ }
+ // A refresh does not invalidate positive evidence already in the catalog.
+ await preflightRoute(route,async()=>({models:[{id:route.model}],refreshState:'refreshing'}));
+});
 test('task categories preserve provider, model and effort rather than using one default',()=>{
  for(const [category,model,effort] of [['planning','openai/luna','high'],['implement','openai/sol','medium'],['hard','openai/astra','high'],['testing','openai/sol','low']]){
   const route=selectRoute(routingConfig,{choice:category,confidence:0.9});expect(route.model).toBe(model);expect(route.effort).toBe(effort);
