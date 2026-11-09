@@ -4,7 +4,7 @@ import {Workflow} from '../src/workflow';
 import {LinearBlockers} from '../src/linear-blockers';
 import {validate} from '../src/linear';
 import {ConflictRecovery} from '../src/conflict-recovery';
-import {ReviewLoop} from '../src/review-loop';
+import {ReviewLoop,decision} from '../src/review-loop';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 test('posted observation notice is rechecked hourly without duplicates',async()=>{
@@ -179,7 +179,8 @@ test('blocker comment and label are idempotent across polls and restarts',async(
   const restarted=await f.blockers().sync(f.config);expect(restarted[0].state).toBe('posted');expect(f.comments.length).toBe(1);
  }finally{f.s.close();}
 });
-for(const reason of ['CodeRabbit custom-check failure: full Verification Evidence explanation/resolution is missing or truncated','CodeRabbit review unavailable: automatic review disabled','CodeRabbit review unavailable: request outcome uncertain'])test(`concrete review blocker is deduplicated: ${reason}`,async()=>{
+const pendingReviewReason=decision({clear:false,findings:[],failedChecks:[],reasons:[],reviewerEvidence:{blockers:[],pending:[{reviewer:'human',id:'1',reason:'Outdated applicability requires clarification'}]}},['src/**'],0).reason;
+for(const reason of ['CodeRabbit custom-check failure: full Verification Evidence explanation/resolution is missing or truncated','CodeRabbit review unavailable: automatic review disabled','CodeRabbit review unavailable: request outcome uncertain','Review findings require concrete approved paths before automatic remediation',pendingReviewReason])test(`concrete review blocker is deduplicated: ${reason}`,async()=>{
  const f=fixture();try{
   new ReviewLoop(f.s);f.running();
   f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree) VALUES (?,?,?,?,?,?)').run(f.id,'owned',f.s.get(f.id).plan_hash,'running','session','/worktree');

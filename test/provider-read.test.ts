@@ -18,6 +18,20 @@ test('untyped callback messages remain unknown but nested typed evidence is pres
 test('operational retry-hint cap applies to seconds and quota reset timestamps',()=>{
  for(const headers of ['Retry-After: 999999999','x-ratelimit-remaining: 0\nx-ratelimit-reset: 8000000000'])expect(readFailure('github','branch-read',`HTTP 429\n${headers}\n`,1,undefined,1000).evidence.retryAt).toBe(1000+MAX_PROVIDER_RETRY_MS);
 });
+test('review-request parsing preserves full resets while observation hints remain bounded',()=>{
+ const now=1000,deadline=now+48*60*60*1000;
+ for(const header of ['Retry-After: 172800',`x-ratelimit-remaining: 0\nx-ratelimit-reset: ${deadline/1000}`]){
+  const raw=`HTTP 429\n${header}\n`;
+  expect(readFailure('github','review-request',raw,1,undefined,now,'','preserve').evidence.retryAt).toBe(deadline);
+  expect(readFailure('github','review-read',raw,1,undefined,now).evidence.retryAt).toBe(now+MAX_PROVIDER_RETRY_MS);
+ }
+});
+test('unrepresentable or unsupported request reset hints require inspection, not a shorter fallback',()=>{
+ for(const header of ['Retry-After: 9000000000000','Retry-After: invalid','x-ratelimit-remaining: 0\nx-ratelimit-reset: 9000000000000','x-ratelimit-remaining: 0\nx-ratelimit-reset: invalid','Retry-After: 60\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 9000000000000']){
+  const e=readFailure('github','review-request',`HTTP 429\n${header}\n`,1,undefined,1000,'','preserve').evidence;
+  expect(e.retryAtUnrepresentable).toBe(true);expect(e.retryAt).toBeUndefined();
+ }
+});
 test('partial response headers preserve failed transport classification',async()=>{
  for(const [code,signal,err,classification] of [[143,'SIGTERM','','timeout'],[1,undefined,'ECONNRESET','network'],[0,undefined,'','malformed']] as const){
  try{await githubRead(['api','fixture'],'branch-read',spawn('HTTP/2.0 200 OK\r\nx-partial: value',err,code,signal));throw Error('Expected failure');}catch(error){expect(error).toBeInstanceOf(ProviderReadError);expect((error as ProviderReadError).evidence.classification).toBe(classification);}

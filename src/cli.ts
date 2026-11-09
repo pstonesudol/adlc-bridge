@@ -62,6 +62,8 @@ import {modernCommand,dispatchOperator} from './operator-dispatch';
 import {projectEntries,selectProject} from './operator-discovery';
 import {ActionWatchdog,retryWatchdogObservation} from './action-watchdog';
 import {integrationPreview,integrationRuntime,verifyIntegrations} from './integration-capabilities';
+import {reviewerPolicyView} from './reviewer-policy';
+import {ReviewRequests,reviewProviderHoldPreview} from './coderabbit-scheduling';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
@@ -335,6 +337,7 @@ receipt-reconcile JOB CONFIG ATTEMPT [--confirm HASH] settle an original complet
   register-review JOB REPO PR CONFIG    register bounded review target
   rebind-review-target JOB REPO PR     reconcile a revised handoff recorded on another PR
   review-status                        show CI/review waits, blockers and remediation budget
+  reconcile-review-provider JOB [--confirm HASH --human NAME] inspect/clear a provider request hold; no replay
   tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
                                        preview or apply an audited exhausted-budget extension
@@ -375,7 +378,7 @@ Registered approved review targets can request bounded in-scope fixes from their
    }
    if(command==='init'){if(!a.includes('--preview'))return out(await initWizard(a[0]?.startsWith('--')?undefined:a[0],a));const repo=realpathSync(req(a[0],'Repository')),ci=a.indexOf('--config'),c=ci>=0?JSON.parse(readFileSync(req(a[ci+1],'Config'),'utf8')):{};if(ci>=0)validate(c);return out({repo,mode:'preview_only',integrations:integrationPreview(c),existing:['AGENTS.md','.coderabbit.yaml','.github/workflows'].filter(x=>existsSync(join(repo,x))),controller:'Agent Orchestrator',interactive:'OpenChamber',executionEnabled:false});}
   if(command==='handoff')return out(handoffChecklist(req(a[0],'Worktree')));
-   if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out({...await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata),integrations:integrationPreview(c)});}
+   if(command==='readiness'){const c=JSON.parse(readFileSync(req(a[2],'Config'),'utf8')),required=requiredCheckNames(c.requiredChecks),metadata=metadataCheckNames(c.prMetadataChecks);return out({...await readiness(req(a[0],'Repository'),Number(a[1]),[...new Set([...required,...metadata])],metadata,c.reviewers),reviewerPolicy:reviewerPolicyView(c.reviewers),integrations:integrationPreview(c)});}
   if(command.startsWith('feature-')){
     const s=new Store(db),features=new FeaturePlanning(s,featureAgents);try{
       if(command==='feature-start'){
@@ -442,7 +445,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-   if(!['approvals','review-status','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+   if(!['approvals','review-status','reconcile-review-provider','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
@@ -478,7 +481,12 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,true);
     try{return out(await new Workflow(store,liveTransport,undefined,true).previewReconcile(config));}finally{store.close();}
    }
-   const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);const clarifications=new LinearClarifications(s,workflow,blockers);
+    if(command==='reconcile-review-provider'){
+     if(a.length!==1&&!(a.length===5&&a[1]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[2])&&a[3]==='--human'&&a[4].trim()))throw Error('Use reconcile-review-provider JOB [--confirm HASH --human NAME]');
+     if(!existsSync(db))throw Error('Existing state database required');
+     const store=new Store(db,a.length===1);try{if(a.length===1)return out(reviewProviderHoldPreview(store,a[0]));new Lifecycle(store).current(a[0]);return out(new ReviewRequests(store).reconcileProviderHold(a[0],a[2],a[4]));}finally{store.close();}
+    }
+    const s=new Store(db);const bridge=new Bridge(s);const lifecycle=new Lifecycle(s);const reviewLoop=new ReviewLoop(s);const workflow=new Workflow(s,liveTransport);const features=new FeaturePlanning(s,featureAgents);const linearLifecycle=new LinearLifecycle(s);const linearApprovals=new LinearApprovals(s,workflow);const blockers=new LinearBlockers(s);const clarifications=new LinearClarifications(s,workflow,blockers);
   const reviewStatus=()=>reviewLoop.list().map(t=>{
     const job=s.get(t.job),remediation=lifecycle.budgetSummary(t.job),blocked=job.state==='blocked'&&t.state!=='needs_reconciliation';
     const revision=revisionStatus(s,t.job),stale=revision?.blocking===true;

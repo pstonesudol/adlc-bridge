@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
 import {ReviewLoop,postFullReview,postCodeRabbitReview} from '../src/review-loop';
-import {deriveReviewSchedule,parseReviewConfig,ReviewRequests,collectReviewSchedule,ReviewRateLimit,reviewEscalationReason} from '../src/coderabbit-scheduling';
+import {deriveReviewSchedule,parseReviewConfig,ReviewRequests,collectReviewSchedule,ReviewRateLimit,ReviewResetUnrepresentable,reviewEscalationReason,reviewProviderHoldPreview} from '../src/coderabbit-scheduling';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -23,6 +23,49 @@ test('only protocol-confirmed throttling permits a new request attempt',async()=
   expect(failure instanceof ReviewRateLimit).toBe(status!==500);
   if(status===500)expect(failure.message).toContain('uncertain');
  }
+});
+for(const header of ['retry-after','quota-reset'])test(`publication-to-ledger preserves a 48-hour ${header} embargo`,async()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);let now=Date.now();const job=s.enqueue('p','i','spec'),schedule={head:'head',signature:'config',blocker:null,incremental:false},requests=new ReviewRequests(s,()=>now);
+ const reset=Math.ceil((now+48*60*60*1000)/1000)*1000,headers=header==='retry-after'?'Retry-After: 172800':`x-ratelimit-remaining: 0\r\nx-ratelimit-reset: ${reset/1000}`;
+ const spawn:any=()=>({stdout:new Response(`HTTP/2 429\r\n${headers}\r\n\r\n{"message":"rate limit exceeded"}`).body,stderr:new Response('').body,exited:Promise.resolve(1)});
+ try{
+  expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
+  let error:any;try{await postCodeRabbitReview('o/r',1,'marker',spawn);}catch(e){error=e;}
+  expect(error).toBeInstanceOf(ReviewRateLimit);expect(error.retryAt).toBeGreaterThanOrEqual(now+48*60*60*1000);
+  requests.settle('o/r',1,'head','rate_limited','verified HTTP 429',error.retryAt);
+  now+=24*60*60*1000+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'new-head'})).toBe(false);
+  expect(requests.get('o/r',1,'head').attempts).toBe(1);
+  now=error.retryAt+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
+ }finally{s.close();}
+});
+test('publication rejects unrepresentable rate-limit hints instead of supplying a sendable retry',async()=>{
+ const spawn:any=()=>({stdout:new Response('HTTP/2 429\r\nRetry-After: 9000000000000\r\n\r\n{"message":"rate limit exceeded"}').body,stderr:new Response('').body,exited:Promise.resolve(1)});
+ await expect(postCodeRabbitReview('o/r',1,'marker',spawn)).rejects.toBeInstanceOf(ReviewResetUnrepresentable);
+});
+test('inspection-required provider hold survives restart and only explicit bound reconciliation clears it without replay',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-review-hold-')),path=join(root,'state.sqlite');let s=new Store(path),clock=1000;
+ try{
+  new ReviewLoop(s);const job=s.enqueue('p','i','spec'),hash=s.propose(job,'plan');s.approve(job,hash,'human');
+  const other=s.enqueue('q','other','spec'),schedule={head:'head',signature:'configuration',blocker:null,incremental:false};let requests=new ReviewRequests(s,()=>clock);
+  expect(requests.claim(job,'o/r',1,schedule)).toBe(true);const original=requests.get('o/r',1,'head');
+  const hold=requests.holdForInspection(job,'o/r',1,'head');expect(requests.holdForInspection(job,'o/r',1,'head').id).toBe(hold.id);
+  expect(s.db.query("SELECT count(*) AS n FROM events WHERE kind='coderabbit_provider_hold_recorded'").get()).toEqual({n:1});
+  s.close();s=new Store(path);requests=new ReviewRequests(s,()=>clock);clock+=7*86400000;
+  expect(requests.providerHold().id).toBe(hold.id);
+  expect(requests.claim(other,'other/repo',2,{...schedule,head:'new-head'})).toBe(false);
+  expect(requests.get('other/repo',2,'new-head')).toBeNull();
+  const readonly=Store.readonly(path);const preview=reviewProviderHoldPreview(readonly,job);readonly.close();
+  expect(()=>requests.reconcileProviderHold(job,'wrong','human')).toThrow('changed');
+  expect(()=>requests.reconcileProviderHold(job,preview.confirmation!,'')).toThrow('Named human');
+  expect(()=>reviewProviderHoldPreview(s,other)).toThrow('original job');
+  s.db.query('UPDATE jobs SET approved_hash=NULL WHERE id=?').run(job);
+  expect(()=>requests.reconcileProviderHold(job,preview.confirmation!,'human')).toThrow('Current approved');s.db.query('UPDATE jobs SET approved_hash=? WHERE id=?').run(hash,job);
+  expect(requests.reconcileProviderHold(job,preview.confirmation!,'human')).toMatchObject({state:'provider_hold_cleared',mutationReplay:false});
+  expect(requests.providerHold()).toBeNull();expect(requests.get('o/r',1,'head')).toEqual(original);
+  expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(other,'other/repo',2,{...schedule,head:'new-head'})).toBe(true);
+  requests.holdForInspection(job,'o/r',1,'head');expect(()=>requests.reconcileProviderHold(job,preview.confirmation!,'human')).toThrow('changed');
+  expect(s.db.query("SELECT count(*) AS n FROM events WHERE kind='coderabbit_provider_hold_reconciled'").get()).toEqual({n:1});
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
 });
 const HEAD='371f36b47194ee754aaa354bd64e1942625ac6f8',STALE='82855a5877ac91d9b7b87f95d3228112f562099e';
 const configured=(pause:number,incremental:boolean,drafts=false)=>`reviews:\n  auto_review:\n    enabled: true\n    auto_incremental_review: ${incremental}\n    auto_pause_after_reviewed_commits: ${pause}\n    drafts: ${drafts}\n  path_filters: ['!dist/**']\n`;
