@@ -85,6 +85,55 @@ test('Linear route requests are current-plan scoped, deduplicated and cannot app
   expect(await notices.sync(c)).toEqual([]);expect(posts).toBe(1);
  }finally{s.close();}
 });
+test('a complete route-notice readback miss retries the persisted ID/body after a transient failure',async()=>{
+ const {s,f,w,id}=fixture();try{
+  const spec=JSON.stringify({identifier:'DEV-67',title:'Task',description:'Model unavailable'});s.db.query('UPDATE jobs SET spec=? WHERE id=?').run(spec,id);
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  f.preflightRoute=async()=>{throw new RoutePreflightFailure('unavailable');};await w.executeApproved(id,config);
+  const dispatch=w.implementation(id),posts:any[]=[],pages:any[]=[];
+  const api=async(query:string,vars:any)=>{
+   if(query.includes('commentCreate')){
+    posts.push(structuredClone(vars.input));if(posts.length===1)throw Error('transient request failure');
+    return {commentCreate:{success:true,comment:{id:vars.input.id,body:vars.input.body}}};
+   }
+   if(query.includes('comments(')){
+    pages.push(vars.after);
+    return {issue:{id:'i',comments:{nodes:vars.after?[]:[{id:'other',body:'unrelated'}],pageInfo:{hasNextPage:!vars.after,endCursor:vars.after?null:'next'}}}};
+   }
+   return {issue:{id:'i',...JSON.parse(spec),project:{id:'p'},team:{id:'t'}}};
+  };
+  const notices=new LinearRouteNotices(s,api),c={linear:{projectId:'p',teamId:'t'}};
+  expect(await notices.sync(c)).toEqual([{job:id,state:'route_notice_blocked',reason:expect.any(String)}]);
+  expect(await notices.sync(c)).toEqual([{job:id,state:'route_notice_retry'}]);expect(posts).toHaveLength(1);expect(pages).toEqual([null,'next']);
+  expect(await notices.sync(c)).toEqual([{job:id,state:'route_approval_requested'}]);expect(posts).toHaveLength(2);expect(posts[1]).toEqual(posts[0]);
+  expect(s.db.query('SELECT state FROM dispatch_route_notices WHERE job=?').get(id)).toEqual({state:'posted'});
+  await notices.sync(c);expect(posts).toHaveLength(2);expect(w.implementation(id)).toEqual(dispatch);expect(f.messages).toHaveLength(1);
+ }finally{s.close();}
+});
+for(const fault of ['malformed','wrong-issue','malformed-node','cursor-cycle','scan-limit','read-error','changed-body','stale-plan'])test(`route notice ${fault} readback cannot authorize a retry`,async()=>{
+ const {s,f,w,id}=fixture();try{
+  const spec=JSON.stringify({identifier:'DEV-67',title:'Task',description:'Model unavailable'});s.db.query('UPDATE jobs SET spec=? WHERE id=?').run(spec,id);
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  f.preflightRoute=async()=>{throw new RoutePreflightFailure('unavailable');};await w.executeApproved(id,config);
+  const posts:any[]=[];let reads=0;
+  const api=async(query:string,vars:any)=>{
+   if(query.includes('commentCreate')){posts.push(vars.input);throw Error('uncertain request failure');}
+   if(query.includes('comments(')){
+    reads++;if(fault==='read-error')throw Error('inventory unavailable');
+    if(fault==='stale-plan')s.db.query("UPDATE jobs SET state='awaiting_approval',approved_hash=NULL WHERE id=?").run(id);
+    return {issue:{id:fault==='wrong-issue'?'other':'i',comments:{
+     nodes:fault==='changed-body'?[{id:posts[0].id,body:'different body'}]:fault==='malformed-node'?[{}]:[],
+     ...(fault==='malformed'?{}:{pageInfo:{hasNextPage:['cursor-cycle','scan-limit'].includes(fault),endCursor:fault==='scan-limit'?`page-${reads}`:'same'}})
+    }}};
+   }
+   return {issue:{id:'i',...JSON.parse(spec),project:{id:'p'},team:{id:'t'}}};
+  };
+  const notices=new LinearRouteNotices(s,api),c={linear:{projectId:'p',teamId:'t'}};
+  await notices.sync(c);await notices.sync(c);await notices.sync(c);
+  expect(posts).toHaveLength(1);expect(reads).toBeGreaterThan(0);
+  expect(s.db.query('SELECT state FROM dispatch_route_notices WHERE job=?').get(id)).toEqual({state:'delivery_uncertain'});expect(f.messages).toHaveLength(1);
+ }finally{s.close();}
+});
 test('planning and approved implementation use separate pinned routes in the same session',async()=>{
  const {s,f,router,w,id}=fixture();try{
  await w.tick(config);expect(f.messages.length).toBe(1);expect(f.messages[0].route.model).toBe('openai/luna');expect(f.messages[0].route.mode).toBe('plan');

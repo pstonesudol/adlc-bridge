@@ -5,7 +5,8 @@ import {TaskRouting} from './task-routing';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 
 // This surface requests approval only. It cannot change a route, grant approval,
-// or replay an uncertain implementation or comment delivery.
+// or replay an uncertain implementation. Comment retries require a complete
+// readback miss and reuse the persisted client-generated ID and body.
 export class LinearRouteNotices{
  constructor(public s:Store,public api:LinearAPI=linearAPI){
   ensureDispatchRoutes(s);
@@ -34,16 +35,22 @@ export class LinearRouteNotices{
     n=this.s.db.query('SELECT * FROM dispatch_route_notices WHERE job=? AND binding=?').get(j.id,check.binding) as any;
    }
    if(n.state!=='reserved'){
-    // Read back the exact ID/body after a lost response, never POST again.
-    let after:string|null=null,found=false;const seen=new Set<string>();
+    // Never infer non-delivery from an error or partial inventory. A complete
+    // miss may retry only the same client-generated ID/body, not a new notice.
+    let after:string|null=null,found=false,complete=false;const seen=new Set<string>();
     for(let pages=0;pages<10;pages++){
      const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body}pageInfo{hasNextPage endCursor}}}}',{id:j.issue,after}),page=b.issue?.comments;
-     if(b.issue?.id!==j.issue||!Array.isArray(page?.nodes)||typeof page.pageInfo?.hasNextPage!=='boolean')break;
-     if(page.nodes.some((x:any)=>x.id===n.comment_id&&x.body===n.body)){found=true;break;}
-     if(!page.pageInfo.hasNextPage)break;
+     if(b.issue?.id!==j.issue||!Array.isArray(page?.nodes)||typeof page.pageInfo?.hasNextPage!=='boolean'||page.nodes.some((x:any)=>typeof x?.id!=='string'||typeof x.body!=='string'))break;
+     const posted=page.nodes.find((x:any)=>x.id===n.comment_id);
+     if(posted){if(posted.body!==n.body)throw Error('Route notice ID/body changed; manual reconciliation required');found=true;break;}
+     if(!page.pageInfo.hasNextPage){complete=true;break;}
      after=page.pageInfo.endCursor;if(!after||seen.has(after))break;seen.add(after);
     }
     if(found)this.s.db.query("UPDATE dispatch_route_notices SET state='posted' WHERE job=? AND binding=?").run(j.id,check.binding);
+    else if(complete&&this.current(j.id,check)){
+     const retry=this.s.db.query("UPDATE dispatch_route_notices SET state='reserved' WHERE job=? AND binding=? AND state='delivery_uncertain'").run(j.id,check.binding);
+     if(retry.changes){results.push({job:j.id,state:'route_notice_retry'});continue;}
+    }
     results.push({job:j.id,state:found?'route_approval_requested':'route_notice_uncertain'});continue;
    }
    if(!this.current(j.id,check))continue;
