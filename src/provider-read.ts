@@ -2,7 +2,7 @@ export type ReadClass='authentication'|'permission'|'throttled'|'timeout'|'netwo
 export const validReadTime=(value:unknown):value is number=>typeof value==='number'&&Number.isSafeInteger(value)&&value>=0&&value<=8640000000000000;
 export const MAX_PROVIDER_RETRY_MS=24*60*60*1000;
 export const boundedRetryAt=(value:unknown,now:number)=>validReadTime(value)&&value>now?Math.min(value,now+MAX_PROVIDER_RETRY_MS):undefined;
-export type ReadEvidence={provider:'github'|'orchestrator';operation:string;timestamp:number;classification:ReadClass;exitStatus?:number;httpStatus?:number;retryAt?:number;requestId?:string;detail:string};
+export type ReadEvidence={provider:'github'|'orchestrator';operation:string;timestamp:number;classification:ReadClass;exitStatus?:number;httpStatus?:number;retryAt?:number;retryAtUnrepresentable?:true;requestId?:string;detail:string};
 export class ProviderReadError extends Error{
  constructor(public evidence:ReadEvidence,options?:ErrorOptions){super(`${evidence.provider} ${evidence.operation}: ${evidence.classification}`,options);}
 }
@@ -18,7 +18,7 @@ export function githubOutput(text:string){let json='',protocol='',quoted=false,e
 }
 // Never persist arbitrary stderr, response bodies, URLs, commands or causes.
 // Only recognized protocol facts survive this boundary.
-export function readFailure(provider:ReadEvidence['provider'],operation:string,raw:string,exitStatus?:number,cause?:unknown,now=Date.now(),response=''){
+export function readFailure(provider:ReadEvidence['provider'],operation:string,raw:string,exitStatus?:number,cause?:unknown,now=Date.now(),response='',retryPolicy:'bounded'|'preserve'='bounded'){
  // stdout may contain arbitrary PR/comment bodies. Only its initial HTTP status
  // line is protocol evidence; stderr also supports gh's trailing (HTTP NNN).
  const httpStatus=Number(response.match(/^HTTP\/[\d.]+[ \t]+([45]\d\d)\b/i)?.[1]??raw.match(/^HTTP(?:\/[\d.]+)?[ \t]+([45]\d\d)\b/im)?.[1]??raw.match(/\(HTTP ([45]\d\d)\)[ \t]*$/im)?.[1])||undefined;
@@ -33,9 +33,13 @@ export function readFailure(provider:ReadEvidence['provider'],operation:string,r
  const retry=protocol.match(/^retry-after:[ \t]*(\d+)[ \t]*\r?$/im),reset=protocol.match(/^x-ratelimit-reset:[ \t]*(\d+)[ \t]*\r?$/im);
  const requestId=protocol.match(/^x-github-request-id:[ \t]*([A-F0-9: -]{1,100})\r?$/im)?.[1]?.trim();
  const remaining=protocol.match(/^x-ratelimit-remaining:[ \t]*(\d+)[ \t]*\r?$/im);
- const hint=Math.max(0,...[retry?now+Number(retry[1])*1000:0,reset&&remaining&&Number(remaining[1])===0?Number(reset[1])*1000:0].filter(validReadTime));
- const retryAt=boundedRetryAt(hint,now);
- return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(retryAt!==undefined?{retryAt}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
+ const hints=[...(retry?[now+Number(retry[1])*1000]:[]),...(reset&&remaining&&Number(remaining[1])===0?[Number(reset[1])*1000]:[])];
+ const hint=Math.max(0,...hints.filter(validReadTime));
+ // Read-health probes remain bounded; a mutation retry must never shorten a
+ // provider reset. Invalid/unrepresentable request hints require inspection.
+ const invalid=retryPolicy==='preserve'&&(hints.some(v=>!validReadTime(v))||/^retry-after:/im.test(protocol)&&!retry||remaining&&Number(remaining[1])===0&&/^x-ratelimit-reset:/im.test(protocol)&&!reset);
+ const retryAt=invalid?undefined:retryPolicy==='preserve'?(hint>now?hint:undefined):boundedRetryAt(hint,now);
+ return new ProviderReadError({provider,operation:/^[a-z-]{1,64}$/.test(operation)?operation:'read',timestamp:now,classification,exitStatus,httpStatus,...(retryAt!==undefined?{retryAt}:{}),...(invalid?{retryAtUnrepresentable:true as const}:{}),...(requestId?{requestId}:{}),detail:`${classification}${httpStatus?` (HTTP ${httpStatus})`:''}; raw diagnostic omitted`},{cause});
 }
 // Only typed provider evidence may drive automatic recovery; an untyped error
 // keeps its cause in memory but never classifies itself from its message.

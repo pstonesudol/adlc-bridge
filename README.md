@@ -1086,7 +1086,7 @@ for CI, Waiting for CodeRabbit, Addressing feedback, Blocked, or Ready for your
 review. These are bridge statuses; the installed Orchestrator board still uses
 its built-in labels.
 
-The bridge requests `@coderabbitai review` (regular/incremental review) after a
+By default the bridge requests `@coderabbitai review` (regular/incremental review) after a
 completed remediation batch and clear required CI, not after each individual fix.
 Normal scheduling retains the five-minute stable-head grace period. With automatic
 incremental review enabled it waits for the provider instead of posting a command.
@@ -1097,9 +1097,11 @@ intentional pauses remain respected; the bridge does not resume reviews itself.
 CodeRabbit's [command guide](https://docs.coderabbit.ai/guides/commands) and
 [configuration reference](https://docs.coderabbit.ai/reference/configuration)
 (verified 2026-11-07) distinguish incremental `review` (changes since the last
-review) from `full review` (all PR changes from scratch). Whole-PR reassessment is
-reserved for an explicit operator comment `@coderabbitai full review`; there is
-no automatic full-review fallback, including for description-only remediation.
+review) from `full review` (all PR changes from scratch). Whole-PR reassessment
+requires explicit selection: either a reviewed `reviewMode: "full"` configuration
+with `requestReview: true`, which lets the bounded scheduler send the full-review
+command automatically, or an operator comment `@coderabbitai full review`. There
+is no automatic escalation from regular to full mode, including for description-only remediation.
 A regular review may skip an already-reviewed SHA or description-only edit. If
 it produces no fresh body/custom-check evidence, coordination waits then blocks
 for inspection rather than weakening freshness requirements or escalating silently.
@@ -1111,7 +1113,7 @@ allows bounded retries after cooldown (at most three attempts). Mode is recorded
 per request/attempt, not added to its deduplication key. The historical
 `full_review_requests` table remains a compatibility/body-obligation ledger, not
 a selector of full-review mode. Old shared receipts migrate as `full`; new sends
-are `regular`. Markers remain stable and uncertain replies reconcile only against
+use the configured mode, defaulting to `regular`. Markers remain stable and uncertain replies reconcile only against
 the exact recorded command, marker and send time, never trigger a resend.
 
 `adlc review-status`/`status` expose `reviewRequest.mode`; review-state reasons
@@ -2516,6 +2518,19 @@ attempts per head. Unknown outcomes are never retried blindly. Matching marked
 GitHub request comments can reconcile uncertain delivery; otherwise operator
 inspection is required. Missing review evidence after 30 minutes yields a specific
 CodeRabbit blocker through the existing optional Linear blocker synchronization.
+Verified provider reset times are never shortened to a 24-hour retry cap: that
+could send before the provider permits it. Long or implausible reset evidence
+requires operator inspection rather than shortening the reset, silently retrying
+or enabling paid usage. This CodeRabbit request ledger is
+distinct from bounded GitHub observation/read backoff hints.
+An unrepresentable reset installs a durable provider-wide inspection hold: all
+new CodeRabbit requests stop across jobs, repositories and heads, without making
+the rejected request replayable. The hold survives restarts and does not expire
+automatically. Inspect it with `adlc reconcile-review-provider JOB` using the
+original hold-source job. After human inspection, a currently approved source
+job permits `adlc reconcile-review-provider JOB --confirm HASH --human NAME`.
+The exact preview hash is required and the action is audited; clearing this hold
+does not clear uncertain request receipts, reset budgets, or send a request.
 
 Conservative fallback: missing/competing filenames, malformed or inherited YAML,
 unsupported filters/branch expressions, unavailable changed-file evidence, and
@@ -2619,3 +2634,113 @@ not create execution prerequisites. `ready` with blocking dependencies is invali
 Validated clarification resolutions are reevaluated by the normal standing-policy
 poll, not treated as new authority. `plan-approval-required` still requires explicit
 approval of the current plan. Changed requirements or scope require replanning.
+# Trusted review feedback
+
+ADLC accepts review feedback through one existing-worker remediation loop; native
+Orchestrator CI/review injection stays disabled for bridge-managed workers. GitHub
+branch protection is independent: reviewer configuration does **not** install or
+activate live protection, request paid usage, merge, or deploy.
+
+`reviewers` is an optional project configuration array, merged by reviewer `id`.
+An omitted array retains CodeRabbit's existing required check/approval/custom-check
+gates and adds advisory Codex ingestion. Defaults are pinned to immutable GitHub
+Bot IDs: CodeRabbit `136622811`, Codex `199175422`; both are freshly verified before
+processing. A matching login alone grants no trust. If a descriptive login is
+configured, a rename blocks that identity until the operator reviews the binding.
+
+```json
+{"reviewers":[
+ {"id":"codex","adapter":"github-review","identity":{"userId":199175422,"type":"Bot","login":"chatgpt-codex-connector[bot]"},"enabled":true,"remediate":true,"approvalRequired":false,"requestReview":false},
+ {"id":"maintainers","adapter":"github-review","membership":{"kind":"collaborators"},"approvalRequired":true},
+ {"id":"team","adapter":"github-review","membership":{"kind":"team","organization":"OWNER","slug":"TEAM"},"includePaths":["src/**"],"excludePaths":["src/generated/**"]}
+]}
+```
+
+Humans may instead select `identity: {"userId":123,"type":"User"}` with a verified
+account ID, not a placeholder in live configuration. Explicit users must still
+have current repository read access. Membership is re-read on each collection,
+at most 100 pages of 100 users, within the existing receipt freshness window.
+Revoked/deleted/renamed identities and unavailable evidence grant no trust and
+block affected processing. Bots are never trusted through human membership.
+The authenticated executing GitHub account, PR author, and bridge control-marker
+comments are excluded from remediation. Other automation requires a configured
+stable Bot identity. Provider originals remain untrusted requirements data and
+cannot authorize credentials, security/scope changes, Git permissions, installation,
+merging or deployment. Conflicting/ambiguous feedback must use the existing exact
+Linear clarification/worker outcome flow, not guessed reconciliation.
+
+## Flags and policy adoption
+
+* `enabled`, `remediate`: boolean, default true. Disabling ingestion preserves
+  durable evidence. Disabling remediation never grants clearance.
+* `approvalRequired`: boolean, default false for new reviewers; CodeRabbit remains
+  required. `enabled=false` plus `approvalRequired=true` is invalid. An advisory
+  approval cannot substitute for any required reviewer. COMMENTED, summaries,
+  missing reviews, neutral checks and skipped checks are never approval.
+* `minimumSeverity`: `info|low|medium|high|critical`, absent by default. Standard
+  GitHub APIs do not supply structured severity, so their unknown findings remain
+  eligible without a threshold; with one they remain visibly unclassified and
+  cannot silently clear an obligation. Severity is never guessed from prose.
+* `includePaths` / `excludePaths`: up to 100 repository-relative globs of up to 256
+  characters, supporting `*`, `**`, `?`; no traversal, absolute paths, braces or
+  negation. Exclusions win, both rename paths are checked conservatively, and
+  deleted-path provenance is retained. Pathless feedback is eligible without
+  filters; with filters it remains unclassified rather than silently cleared.
+  Ingestion eligibility is not send authorization: pathless code findings remain
+  visible but automatic remediation stops until concrete approved paths are known.
+  Trusted reviewer identity alone never expands the worker's file scope.
+  Explicitly excluded findings are retained as nonblocking provenance, not pending
+  remediation. A thread is ignored only when every substantive comment is trusted
+  and excluded; required approvals and provider change requests still block.
+* `requestReview`: default false for generic GitHub adapters, true for CodeRabbit.
+  False does not disable external feedback ingestion. Only `coderabbit` has a
+  supported request adapter. Generic GitHub accepts standard review APIs, not
+  custom summary formats, APIs or arbitrary bot issue comments.
+* `reviewMode`: `regular` (default) or explicitly selected `full`, CodeRabbit only.
+* `cooldown`: milliseconds, 60000–86400000, default 60000; `retryLimit`: integer
+  1–3, default 3. CodeRabbit only. These may constrain existing durable retries,
+  never bypass provider resets, shared quotas, budgets or uncertain requests.
+  The existing five-minute initial review grace period remains unchanged.
+
+Unsupported options/adapters fail validation rather than being ignored. Graphite
+and Claude custom adapters are **not supported**. Extensions must provide typed
+capabilities, stable authenticated identity/app provenance where available,
+normalized findings/originals, applicability and review-state semantics, and
+authenticated fixtures; request adapters additionally need durable reservation,
+cooldown and uncertain-delivery reconciliation. A configured name is not provider
+support. No CodeRabbit commands are sent to generic GitHub reviewers.
+
+Policies bind to the approved job plan on its first review tick. A policy change
+during active work blocks until a fresh reviewed plan is approved; restarting or
+reloading alone cannot remove obligations. Serve reloads configuration each poll,
+but source changes do not activate the installed runtime. Use `adlc config show
+--project PROJECT` and `adlc config validate --project PROJECT`; doctor reports
+the effective policy without configuring reviewers. Jobs JSON includes persisted
+policy and observations (timestamps, trust, pending findings and approvals);
+`adlc readiness OWNER/REPO PR CONFIG` collects fresh evidence without mutations.
+
+Unresolved mapped threads may carry older comments after applicability checks;
+outdated threads require clarification. Resolved threads stop being actionable.
+Edited bodies change finding identity; exact same-location duplicates retain all
+provenance. Distinct threads are not semantically collapsed. Dismissal withdraws
+approval/change-request state, not independent unresolved threads. A later
+COMMENTED review does not revoke a substantive review; a later approval must
+still match the current head. Membership-selected required reviewers need at least
+one current approval and no remaining member change request. Durable legacy
+thread receipts prevent replay on upgrade; legacy feedback needing edit validation
+requires human inspection instead of an unbounded automatic resend.
+Worker transport is bounded in UTF-8 bytes: 32 KiB per grouped review body,
+64 KiB per compact findings batch, and 96 KiB per complete remediation prompt.
+Oversized feedback blocks before durable delivery reservation without truncating
+findings or consuming an attempt. Validation, observation records and reservation
+hashes retain provider originals; only provenance IDs and original-content hashes
+are sent in the worker's compact transport copy.
+Human issue comments have no GitHub resolve operation. A subsequent explicit
+current-head approval by the same freshly authenticated human acknowledges their
+preceding issue-comment versions; observations retain comment/review originals.
+An edit after that approval, a new head, dismissal, or a later change request
+reopens the finding. Another reviewer's approval, unavailable timestamps or failed
+identity evidence cannot acknowledge it. Inline thread resolution stays separate.
+The example project file deliberately disables Codex ingestion/remediation until
+an operator opts in; built-in defaults for configurations that omit this override
+are unchanged.

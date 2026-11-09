@@ -4,6 +4,7 @@ import {effectiveSettings} from './project-settings';
 import {remediationPolicy} from './remediation';
 import {validate} from './linear';
 import {OperatorError} from './operator-cli';
+import {reviewerPolicyView} from './reviewer-policy';
 
 export const configDefaults:Record<string,unknown>={'automation.maxPlanning':1,pollingIntervalSeconds:60,'remediation.maxAttempts':5,'remediation.maxNoProgress':5,'remediation.window':'job'};
 const allowed=(key:string)=>{if(!Object.hasOwn(configDefaults,key))throw new OperatorError('Unsupported configuration key. Allowed: '+Object.keys(configDefaults).join(', '));};
@@ -11,7 +12,7 @@ function value(c:any,key:string){return key.split('.').reduce((v,k)=>v?.[k],c);}
 export function configView(c:any){
  const settings=effectiveSettings(c),policy=remediationPolicy(c.remediation);
  const effective:Record<string,unknown>={'automation.maxPlanning':settings.maxPlanning,pollingIntervalSeconds:settings.pollingIntervalSeconds,'remediation.maxAttempts':policy.maxAttempts,'remediation.maxNoProgress':policy.maxNoProgress,'remediation.window':policy.window};
- return Object.keys(configDefaults).map(key=>({key,declared:value(c,key)??null,declaredPresent:value(c,key)!==undefined,default:configDefaults[key],effective:effective[key],source:value(c,key)===undefined?'default':'project'}));
+  return [...Object.keys(configDefaults).map(key=>({key,declared:value(c,key)??null,declaredPresent:value(c,key)!==undefined,default:configDefaults[key],effective:effective[key],source:value(c,key)===undefined?'default':'project'})),{key:'reviewers',declared:c.reviewers??null,declaredPresent:c.reviewers!==undefined,default:reviewerPolicyView(undefined),effective:reviewerPolicyView(c.reviewers),source:c.reviewers===undefined?'default':'project'}];
 }
 export function configValue(key:string,text:string){
  allowed(key);

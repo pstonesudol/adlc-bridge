@@ -7,6 +7,8 @@ import {baseTip} from './branch-updates';
 import { reviewGate, digest, type ReviewEvidence } from './core';
 import {BODY_VERSION_QUERY,customCheckEvidence} from './coderabbit-checks';
 import {collectReviewSchedule} from './coderabbit-scheduling';
+import {reviewerPolicy,authenticatedReviewer,invalidateExpiredReviewerFindings,type ReviewerConfig} from './reviewer-policy';
+import {configuredReviewEvidence} from './github-reviewers';
 
 async function gh(args: string[]): Promise<any> {
   return githubRead(args,'review-read');
@@ -20,11 +22,11 @@ export function effectiveBotReview(reviews:any[]) {
   return reviews.filter(r=>r.user?.login==='coderabbitai[bot]'&&['APPROVED','CHANGES_REQUESTED','DISMISSED'].includes(r.state))
     .sort((a,b)=>Date.parse(a.submitted_at)-Date.parse(b.submitted_at)).at(-1);
 }
-const REVIEW_COMMENT_FIELDS='id body author{login __typename} originalCommit{oid}';
+const REVIEW_COMMENT_FIELDS='id body updatedAt author{login __typename ... on Bot{databaseId} ... on User{databaseId}} originalCommit{oid}';
 const REVIEW_THREAD_FIELDS=`id isResolved isOutdated path line startLine comments(first:100){nodes{${REVIEW_COMMENT_FIELDS}}pageInfo{hasNextPage endCursor}}`;
 export const REVIEW_THREADS_QUERY=`query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{${REVIEW_THREAD_FIELDS}}pageInfo{hasNextPage endCursor}}}}}`;
 export const REVIEW_THREAD_COMMENTS_QUERY=`query($id:ID!,$after:String){node(id:$id){... on ReviewThread{comments(first:100,after:$after){nodes{${REVIEW_COMMENT_FIELDS}}pageInfo{hasNextPage endCursor}}}}}`;
-export type ReviewComment={id:string;login:string;bot:boolean;originalCommit:string|null;body:string};
+export type ReviewComment={id:string;login:string;bot:boolean;originalCommit:string|null;body:string;original?:any};
 export type ReviewThread={id:string;path:string;line:number|null;startLine:number|null;isResolved:boolean;isOutdated:boolean;comments:ReviewComment[]};
 export type ReviewFeedbackCandidate={threadId:string;path:string;line:number|null;commentIds:string[];commentsHash:string;body:string;originalCommit:string|null;outdated:false};
 export type ReviewThreadSummary={unresolved:number;resolved:number;candidates:ReviewFeedbackCandidate[];stale:{threadId:string;path:string;commentIds:string[]}[];humanOnly:{threadId:string;path:string}[]};
@@ -37,7 +39,7 @@ function reviewComment(node:any):ReviewComment{
  const login=node.author===null?'':node.author?.login;
  if(typeof login!=='string'||(node.author!==null&&!login))throw Error('Invalid review comment author');
  const body=typeof node.body==='string'?node.body:'';
- return {id:node.id,login,bot:login==='coderabbitai[bot]'||login==='coderabbitai'&&node.author?.__typename==='Bot',originalCommit:typeof node.originalCommit?.oid==='string'?node.originalCommit.oid:null,body};
+ return {id:node.id,login,bot:login==='coderabbitai[bot]'||login==='coderabbitai'&&node.author?.__typename==='Bot',originalCommit:typeof node.originalCommit?.oid==='string'?node.originalCommit.oid:null,body,original:node};
 }
 export function normalizeReviewThread(node:any,extra:any[]=[]):ReviewThread{
  if(typeof node?.id!=='string'||!node.id||typeof node.isResolved!=='boolean'||typeof node.isOutdated!=='boolean'||typeof node.path!=='string'||!node.path)throw Error('Invalid review thread');
@@ -81,7 +83,8 @@ export function requiredCheckState(checks:any[],head:string,required:string[]){
   missingChecks:required.filter(n=>!current.some(c=>c.name===n))
  };
 }
-export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[]) {
+export async function readiness(repo:string, number:number, required:string[],metadataChecks:string[]=[],reviewers?:ReviewerConfig[]) {
+  const reviewerConfiguration=reviewerPolicy(reviewers);
   if(!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(number) || number<1)throw Error('Valid owner/repository and PR number required');
   required=[...new Set([...required,...metadataChecks])];
   const base=`repos/${repo}`;
@@ -121,11 +124,14 @@ export async function readiness(repo:string, number:number, required:string[],me
   }while(true);
   const reviewThreadSummary=reviewThreadEvidence(threads);
   const unresolved=reviewThreadSummary.unresolved;
-  findings.push(...reviewThreadFindings(reviewThreadSummary,first.head.sha));
   // A later COMMENTED review does not revoke an earlier approval. A real
   // change request or dismissal does; approval still must match the PR head.
   const latest=effectiveBotReview(reviews);
   const comments=await pages(`${base}/issues/${number}/comments?per_page=100`);
+  const reviewerEvidence=await configuredReviewEvidence(reviewerConfiguration,repo,first,threads,reviews,comments,gh);
+  findings.push(...reviewerEvidence.findings);
+  // Only authenticated CodeRabbit data may enter its existing custom gate.
+  const trustedLatest=effectiveBotReview(reviewerEvidence.trustedReviews);
   let version:any;
   if(comments.some(c=>c.user?.login==='coderabbitai[bot]'&&(c.body??'').includes('<!-- pre_merge_checks_walkthrough_start -->'))){
    const result=await gh(['api','graphql','-f',`query=${BODY_VERSION_QUERY}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`]);
@@ -144,10 +150,14 @@ export async function readiness(repo:string, number:number, required:string[],me
   checks=currentMetadataChecks(checks,bodyEvidence,final.body??'');
   const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,
     checks:checks.map((c:any)=>({id:c.id,started_at:c.started_at,completed_at:c.completed_at,name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
-    review:latest?{sha:latest.commit_id,author:latest.user.login,state:latest.state}:null,
-    unresolved,threadsComplete:true,checksComplete:true,reviewComplete:true};
+    review:trustedLatest?{sha:trustedLatest.commit_id,author:trustedLatest.user.login,state:trustedLatest.state}:null,
+    unresolved:threads.filter(t=>!t.isResolved&&!reviewerEvidence.ignoredThreadIds.includes(t.id)).length,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
-  const custom=customCheckEvidence(latest,first.head.sha,comments,{repo,pr:number,body:final.body??'',version,checks});
+  const rabbit=reviewerConfiguration.find(r=>r.id==='coderabbit')!;
+  const trustedComments=comments.filter(c=>authenticatedReviewer(rabbit,reviewerEvidence.trust.find(t=>t.reviewer==='coderabbit'),c.user?.id??null,c.user?.type));
+  const custom=customCheckEvidence(trustedLatest,first.head.sha,trustedComments,{repo,pr:number,body:final.body??'',version,checks});
+  if(reviewerEvidence.blockers.length){gate.clear=false;gate.reasons.push(...reviewerEvidence.blockers);}
+  if(reviewerEvidence.findings.length||reviewerEvidence.pending.length){gate.clear=false;gate.reasons.push('Configured reviewer findings remain unresolved');}
   if(changed){custom.findings=[];custom.bodyReviewed=false;custom.blocker='PR head or description changed during custom-check collection';}
   findings.push(...custom.findings);
   if(custom.blocker||custom.findings.length){gate.clear=false;gate.reasons.push(custom.blocker??'Actionable CodeRabbit Verification Evidence failure');}
@@ -168,7 +178,12 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(scheduleFinal.head?.sha!==final.head.sha||scheduleFinal.base?.ref!==final.base.ref||scheduleFinal.body!==final.body||scheduleFinal.draft!==final.draft||scheduleFinal.state!=='open'||await baseTip(repo,final.base.ref)!==currentBase)reviewSchedule.blocker='CodeRabbit review unavailable: PR or base changed during configuration collection';
   if(reviewSchedule.blocker){gate.clear=false;gate.reasons.push(reviewSchedule.blocker);}
   if(final.head.sha!==first.head.sha){gate.clear=false;reviewSchedule.blocker='CodeRabbit review unavailable: head changed during collection';}
-  return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,
+  invalidateExpiredReviewerFindings(reviewerEvidence);
+  const actionable=new Set(reviewerEvidence.findings);
+  for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='github-review'&&!actionable.has(findings[i]))findings.splice(i,1);
+  if(reviewerEvidence.trust.some(t=>t.reviewer==='coderabbit'&&!t.fresh))for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='coderabbit-custom')findings.splice(i,1);
+  for(const trust of reviewerEvidence.trust){if(!trust.fresh){gate.clear=false;gate.reasons.push(`Reviewer ${trust.reviewer}: trust evidence expired during collection; refresh before clearance`);}}
+  return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,reviewerEvidence,
     reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login})),
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
     coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),

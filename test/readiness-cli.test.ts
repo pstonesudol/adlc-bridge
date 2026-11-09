@@ -7,19 +7,26 @@ import {CONFIG_QUERY} from '../src/coderabbit-scheduling';
 test('real readiness CLI gates otherwise-successful metadata checks on body evidence, but not an empty policy',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-readiness-cli-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
-  const pr={number:1,changed_files:1,labels:[],head:{sha:head,repo:{full_name:'owner/repo'}},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
+   const pr={number:1,user:{id:8},changed_files:1,labels:[],head:{sha:head,repo:{full_name:'owner/repo'}},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
   const checks=['CI','Metadata','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
-  const review={user:{login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
-  const responses:any={
+   const review={user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:00:00Z'};
+   const responses:any={
+    'user':{id:9},
+    'user/136622811':{id:136622811,login:'coderabbitai[bot]',type:'Bot'},
+    'user/199175422':{id:199175422,login:'chatgpt-codex-connector[bot]',type:'Bot'},
+    'user/3':{id:3,type:'User',login:'human'},
+    'repos/owner/repo/collaborators/human/permission':{user:{id:3},permission:'write'},
    'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/a.ts'}]],
-   'repos/owner/repo/issues/1/comments?per_page=100':[[]],
+    'repos/owner/repo/issues/1/comments?per_page=100':[[{id:100,user:{id:3,type:'User',login:'human'},body:'Fix ownership',created_at:'2026-11-01T00:00:00Z',updated_at:'2026-11-01T00:01:00Z'}]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
-   'repos/owner/repo/pulls/1/reviews?per_page=100':[[review]],
+    'repos/owner/repo/pulls/1/reviews?per_page=100':[[review,{id:42,user:{id:4,type:'User',login:'unavailable'},state:'CHANGES_REQUESTED',commit_id:head,submitted_at:'2026-11-01T00:01:00Z',body:'Fix the ownership guard'},{id:43,user:{id:3,type:'User',login:'human'},state:'APPROVED',commit_id:head,submitted_at:'2026-11-01T00:02:00Z',body:''}]],
    'repos/owner/repo/git/ref/heads/main':{ref:'refs/heads/main',object:{type:'commit',sha:base}},
    [`repos/owner/repo/compare/${base}...${head}`]:{behind_by:0},
   };
-  const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}}}}}};
+   // A wholly authenticated/excluded thread must not re-enter the raw unresolved
+   // gate. Independent metadata and required CodeRabbit approval gates remain.
+   const graphql={data:{repository:{pullRequest:{reviewThreads:{nodes:[{id:'excluded-codex',path:'src/a.ts',line:1,isResolved:false,isOutdated:false,comments:{nodes:[{id:'excluded-comment',body:'Filtered feedback',author:{login:'chatgpt-codex-connector[bot]',__typename:'Bot',databaseId:199175422},originalCommit:{oid:head}}],pageInfo:{hasNextPage:false}}}],pageInfo:{hasNextPage:false}}}}}};
   const query=REVIEW_THREADS_QUERY;
   const graphqlArgs=['api','graphql','-f',`query=${query}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   const configArgs=['api','graphql','-f',`query=${CONFIG_QUERY}`,'-f','owner=owner','-f','name=repo','-f',`hy=${head}:.coderabbit.yaml`,'-f',`hm=${head}:.coderabbit.yml`,'-f',`by=${base}:.coderabbit.yaml`,'-f',`bm=${base}:.coderabbit.yml`];
@@ -46,13 +53,18 @@ console.log(JSON.stringify(result));
   for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
-  for(const metadata of [['Metadata'],[]]){
-   writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata}));
+   for(const mode of ['metadata','clear','advisory-outage','acknowledged']){
+    const metadata=mode==='metadata'?['Metadata']:[];
+    // No user/4 response: the fixture rejects the advisory identity lookup.
+    // Its summary-only change request must not disappear into green clearance.
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
    const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
-   expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
-   else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);}
+    else if(mode==='advisory-outage'){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted']);expect(output.findings).toEqual([]);}
+    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
    expect(existsSync(db)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}
@@ -60,10 +72,10 @@ console.log(JSON.stringify(result));
 for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-pageInfo','nested-repeat','nested-null','nested-errors','nested-pageInfo'])test(`readiness pagination: ${mode}`,()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-review-threads-'));try{
   const head='a'.repeat(40),base='b'.repeat(40),config=join(root,'config.json'),db=join(root,'unused.sqlite');
-  const pr={head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
+   const pr={number:1,user:{id:8},changed_files:1,head:{sha:head},base:{sha:base,ref:'main'},state:'open',draft:false,mergeable:true,body:'current PR description',html_url:'https://github.com/owner/repo/pull/1'};
   const checks=['CI','CodeRabbit'].map((name,i)=>({id:i+1,name,head_sha:head,app:{slug:name==='CodeRabbit'?'coderabbitai':'github-actions'},status:'completed',conclusion:'success'}));
-  const review={user:{login:'coderabbitai[bot]'},state:'CHANGES_REQUESTED',commit_id:'f'.repeat(40),submitted_at:'2026-11-01T00:00:00Z',body:'Actionable comments posted'};
-  const comment=(id:string,body:string)=>({id,body,author:{login:'coderabbitai[bot]',__typename:'Bot'},originalCommit:{oid:'dcf66943'}});
+   const review={user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},state:'CHANGES_REQUESTED',commit_id:'f'.repeat(40),submitted_at:'2026-11-01T00:00:00Z',body:'Actionable comments posted'};
+   const comment=(id:string,body:string)=>({id,body,author:{login:'coderabbitai[bot]',__typename:'Bot',databaseId:136622811},originalCommit:{oid:'dcf66943'}});
   const thread=(id:string,over:any={})=>({id,isResolved:false,isOutdated:false,path:'src/workflow.ts',line:10,startLine:null,comments:{nodes:[comment(`${id}-c1`,`${id} first`)],pageInfo:{hasNextPage:false,endCursor:null}},...over});
   const page1={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T1',{comments:{nodes:[comment('C1','Planning slot leak')],pageInfo:{hasNextPage:true,endCursor:'c1'}}})],pageInfo:{hasNextPage:true,endCursor:'t2'}}}}}};
   const page2={data:{repository:{pullRequest:{reviewThreads:{nodes:[thread('T2',{isOutdated:true,path:'src/other.ts'})],pageInfo:{hasNextPage:false}}}}}};
@@ -77,7 +89,11 @@ for(const mode of ['success','outer-repeat','outer-null','outer-errors','outer-p
   if(mode==='nested-null')inner.pageInfo={hasNextPage:true,endCursor:null};
   if(mode==='nested-errors')(commentPage as any).errors=[{message:'Unavailable'}];
   if(mode==='nested-pageInfo')delete inner.pageInfo;
-  const responses:any={
+   const responses:any={
+    'user':{id:9},
+    'user/136622811':{id:136622811,login:'coderabbitai[bot]',type:'Bot'},
+    'user/199175422':{id:199175422,login:'chatgpt-codex-connector[bot]',type:'Bot'},
+    'repos/owner/repo/pulls/1/files?per_page=100':[[{filename:'src/workflow.ts'}]],
    'repos/owner/repo/issues/1/comments?per_page=100':[[]],
    'repos/owner/repo/pulls/1':pr,
    [`repos/owner/repo/commits/${head}/check-runs?per_page=100`]:[{check_runs:checks}],
