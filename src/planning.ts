@@ -1,6 +1,7 @@
 import {Store,digest} from './core';
 import {AO} from './orchestrator';
 import {PLAN_STATUS_INSTRUCTION} from './readiness';
+import {ApprovalPolicyStore,type ApprovalPolicy} from './approval-policy';
 
 export class Planning {
   constructor(public s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS planning_runs (
@@ -24,7 +25,7 @@ export class Planning {
       this.s.event(job,'orchestrator_planning_provisioned',session??worktree);return this.get(job);
     })();
   }
-  request(job:string,allowProvisioned=false){
+  request(job:string,allowProvisioned=false,policy?:ApprovalPolicy){
     const r=this.get(job),j=this.s.get(job);if(!r||r.state!=='reserved'&&!(allowProvisioned&&r.state==='provisioned'))throw Error('Planning reservation required');
     const prompt=[
       `ADLC PLANNING ONLY. Correlation: ${r.correlation}.`,
@@ -33,6 +34,7 @@ export class Planning {
       'Inspect only this provided isolated worktree. Do not inspect home credentials or other projects.',
       'Do not modify application files, install dependencies, run tests, commit, push, open a PR, merge, deploy, or change Linear.',
       'Git inspection is allowed; other Git operations are not authorized to the agent in this stage.',
+      new ApprovalPolicyStore(this.s).promptContext(job,policy),
       'Produce a bounded implementation plan, acceptance criteria, affected files, verification commands, risks and questions.',
       PLAN_STATUS_INSTRUCTION,
       'Return the complete plan in your final response. Then STOP and wait for human approval. Do not implement even if the task looks trivial.',

@@ -663,6 +663,20 @@ New intake requires the configured project/team, Todo state, and `agent-ready`
 label. Already-owned issues remain tracked in configured active states. Removing
 eligibility revokes further execution; it does not undo changes already made.
 
+Planning and implementation prompts include the verified intake state/labels,
+observation time and applicable authorization gate; `adlc status` exposes these
+as `workflow.queueEvidence`. Queue eligibility is not permission: implementation
+still uses the recorded standing policy or human approval, and
+`plan-approval-required` retains its explicit approval gate. Historical creation
+notes such as “created in Backlog without agent-ready” do not override fresh
+eligible Linear fields. Original descriptions are preserved; persistent stops,
+scope/security restrictions and global policies remain binding. Substantive
+ambiguity uses the existing clarification/readiness recovery, not another queue
+action. New feature tickets store queue state in Linear fields, not description
+instructions. Incomplete reads never refresh evidence; observations expire after
+two minutes, measured from poll start, and superseded polls cannot overwrite a
+newer snapshot.
+
 With status synchronization enabled, pickup moves the issue to In Progress,
 an open PR moves it to In Review, and an observed human merge moves it to Done.
 Closing a PR without merging does not mark its ticket Done. Unexpected external

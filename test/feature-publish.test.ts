@@ -9,7 +9,7 @@ test('unapproved batches cannot publish; approved tickets stay in Backlog withou
  const {s,planner,id}=await plannedFeature(),f=apiFixture(),publisher=new FeaturePublish(s,planner,f.api);try{
  await expect(publisher.publish(id)).rejects.toThrow('human-approved');expect(f.creates).toBe(0);planner.approve(id,planner.get(id).hash,'human');
  const result=await publisher.publish(id);expect(result.state).toBe('published');expect(f.creates).toBe(2);expect(f.relations.size).toBe(1);
- for(const issue of f.issues.values()){expect(issue.state.type).toBe('backlog');expect(issue.labelIds).toEqual([]);expect(issue.useDefaultTemplate).toBe(false);}
+ for(const issue of f.issues.values()){expect(issue.state.type).toBe('backlog');expect(issue.labelIds).toEqual([]);expect(issue.useDefaultTemplate).toBe(false);expect(issue.description).not.toContain('Backlog without agent-ready');expect(issue.description).toContain('authorization is evaluated separately');}
  expect((s.db.query('SELECT count(*) AS n FROM feature_issue_holds').get() as any).n).toBe(0);expect((s.db.query('SELECT count(*) AS n FROM feature_dependencies').get() as any).n).toBe(1);
  await publisher.publish(id);expect(f.creates).toBe(2);
  }finally{s.close();}
