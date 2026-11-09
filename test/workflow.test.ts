@@ -158,7 +158,8 @@ for(const historical of [false,true])test(`failed continuation recovery respects
   s.db.query('INSERT INTO delivery_adoptions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'proposal','adopted','session-1','/worktrees/session-1',r.branch,r.branch,'owner/repo',1,'a'.repeat(40),'b'.repeat(40),hash,digest(s.get(id).spec),'{}');
   s.db.query('INSERT INTO continuation_recoveries VALUES (?,?,?,?,?)').run(failed.id,id,'proposal','a'.repeat(40),Date.now());
   // Mark the job as revised so the recovery handoff must bind the current revision.
-  s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a','b','Summary','authorized');
+   s.db.query('INSERT INTO spec_revisions(id,job,old_hash,new_hash,summary,state) VALUES (?,?,?,?,?,?)').run('revision-recovery',id,'a',digest(s.get(id).spec),'Summary','authorized');
+   s.db.query('INSERT INTO spec_replans VALUES (?,?,?,?,?,?,?,?)').run('revision-recovery',id,'replan-recovery','session-1','binding','captured',JSON.stringify({capturedPlanHash:hash}),null);
    const continuationMaxId=Number((s.db.query('SELECT MAX(id) AS id FROM continuations WHERE job=?').get(id) as any)?.id??0);
    s.db.query('INSERT INTO spec_execution_history VALUES (?,?,?)').run('revision-recovery',id,JSON.stringify({continuationMaxId:historical?continuationMaxId:beforeContinuation}));
    expect(revisedHandoff(s,id)).toBe(false);
@@ -176,8 +177,13 @@ for(const historical of [false,true])test(`failed continuation recovery respects
    await stale();
    bind('revision-recovery','earlier-dispatch');
    await stale();
-   bind('revision-recovery',w.implementation(id).client_id);
-   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+    bind('revision-recovery',w.implementation(id).client_id);
+    const loop=new ReviewLoop(s);loop.register(id,'owner/repo',7,['CI'],['src/**']);
+    expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
+    expect(s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND revision=?').get(id,'revision-recovery')).toEqual({pr:1});
+    expect(revisedHandoff(s,id)).toBe(false);
+    expect(loop.get(id).pr).toBe(7);
+    expect(loop.rebind(id,'owner/repo',1)).toMatchObject({state:'rebound',pr:1});
   expect(revisedHandoff(s,id)).toBe(true);
   expect((await w.executionStatus(id,e,config)).state).toBe('pr_handoff');
    expect((s.db.query('SELECT state FROM continuations WHERE id=?').get(failed.id) as any).state).toBe(historical?'failed':'recovered');

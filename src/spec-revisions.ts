@@ -20,8 +20,10 @@ export function installRevisions(s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS 
  revision TEXT PRIMARY KEY,job TEXT NOT NULL,snapshot TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS spec_revision_evidence (
  revision TEXT PRIMARY KEY,job TEXT NOT NULL,snapshot TEXT NOT NULL);
- CREATE TABLE IF NOT EXISTS revision_handoffs (
- job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,pr INTEGER NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(job,plan_hash,revision));
+  CREATE TABLE IF NOT EXISTS revision_handoffs (
+  job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,pr INTEGER NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(job,plan_hash,revision));
+  CREATE TABLE IF NOT EXISTS revision_handoff_proofs (
+  job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,dispatch TEXT NOT NULL,session TEXT NOT NULL,spec TEXT NOT NULL,turn TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,PRIMARY KEY(job,plan_hash,revision));
 `);}
 export function recordRevision(s:Store,old:any,spec:string){
  const id=randomUUID(),detail={id,oldHash:digest(old.spec),newHash:digest(spec),summary:revisionSummary(old.spec,spec),staleApproval:old.approved_hash};
@@ -119,21 +121,31 @@ export function handoffPr(result:any,openPrs:any[]){
 }
 /** Bind a handoff to the current requirement instance. A→B→A can reproduce an
  * earlier plan hash, so a plan-hash-only marker would authorize stale evidence. */
-export function recordHandoff(s:Store,job:string,plan:string|null,pr:any,at=Date.now()){
+export type HandoffProof={dispatch:string;session:string;spec:string;turn:string;repo:string;head:string};
+export function recordHandoff(s:Store,job:string,plan:string|null,pr:any,at=Date.now(),proof?:HandoffProof){
  if(!plan||!pr?.number)return;
  const revision=latestRevision(s,job)?.id??'';
- s.db.query('INSERT OR IGNORE INTO revision_handoffs VALUES (?,?,?,?,?)').run(job,plan,revision,pr.number,at);
+  s.db.query('INSERT OR IGNORE INTO revision_handoffs VALUES (?,?,?,?,?)').run(job,plan,revision,pr.number,at);
+  if(proof)s.db.query(`INSERT INTO revision_handoff_proofs VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job,plan_hash,revision) DO UPDATE SET dispatch=excluded.dispatch,session=excluded.session,spec=excluded.spec,turn=excluded.turn,repo=excluded.repo,pr=excluded.pr,head=excluded.head`).run(job,plan,revision,proof.dispatch,proof.session,proof.spec,proof.turn,proof.repo,pr.number,proof.head);
 }
 export function revisedHandoff(s:Store,job:string){
  const plan=s.get(job).plan_hash;
  if(!plan||!revisedExecution(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoffs'").get())return false;
  const revision=latestRevision(s,job)?.id??'';
  const handoff=s.db.query('SELECT pr FROM revision_handoffs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
- if(!handoff)return false;
+  if(!handoff)return false;
+  // Old plan/PR-only markers are historical, not proof of this dispatch. Keep
+  // them intact while the workflow automatically refreshes exact evidence.
+  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='revision_handoff_proofs'").get())return false;
+  const proof=s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
+  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
+  if(!proof||proof.pr!==handoff.pr||proof.dispatch!==d?.client_id||proof.session!==d?.session_id||proof.spec!==digest(s.get(job).spec)||d.plan_hash!==plan||!proof.turn||!proof.repo||!/^[a-f0-9]{40,64}$/.test(proof.head))return false;
+  const receipt=s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_receipts'").get()?s.db.query('SELECT * FROM delivery_receipts WHERE client=?').get(proof.dispatch) as any:null;
+  if(!receipt||receipt.job!==job||receipt.plan!==plan||receipt.spec!==proof.spec||receipt.session!==proof.session||receipt.attempt!=='implementation:1'||receipt.state!=='completed'||receipt.turn!==proof.turn||!capturedRevision(s,job,plan,proof.session).captured)return false;
  // The handoff must be the PR the review target registered; a different open PR
  // cannot release review or Done while that target still points elsewhere.
- const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT pr FROM review_targets WHERE job=?').get(job) as any:null;
- return !target||target.pr===handoff.pr;
+  const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
+  return !target||target.pr===handoff.pr&&target.repo===proof.repo;
 }
 export function observeLegacyRevision(s:Store,job:string){
  if(latestRevision(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get())return;

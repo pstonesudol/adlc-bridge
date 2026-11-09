@@ -15,7 +15,7 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
-import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision} from './spec-revisions';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision,revisedExecution,type HandoffProof} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 import {ensurePlanningRestores} from './planning-restore';
 import {PlanningDependencies} from './planning-dependencies';
@@ -285,7 +285,9 @@ export class Workflow{
    throw err;
   }
   if(d.runtime!=='supervised-host')throw Error('Existing unsupported runtime requires reconciliation; no automatic conversion');
-  if(d.state!=='approved_pending')return this.executionStatus(job,e,c);
+   // A reserved receipt means a send may already have crossed the boundary,
+   // even if an older dispatch projection still says pending. Never replay it.
+   if(d.state!=='approved_pending'||new ReceiptReconciliation(this.s).get(d.client_id)||e.transcript?.entries?.some((x:any)=>x.clientMessageId===d.client_id))return this.executionStatus(job,e,c);
   const managed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&(this.s.db.query("SELECT context FROM clarification_receipts WHERE job=? AND state!='superseded'").all(job) as any[]).some(row=>{const context=JSON.parse(row.context);return context.planHash===j.plan_hash&&context.specHash===digest(j.spec);});
   if(managed)assertApprovalReadiness(this.s,job,j.actor,false);
   if(e.transcript?.controller!=='ready')return {state:'waiting_for_worker'};
@@ -326,9 +328,24 @@ export class Workflow{
    const recovery=new DeliveryRecovery(this.s,recoveryTransport(this.s));
    return hash?recovery.confirm(job,c,hash):recovery.preview(job,c);
   }
- async executionStatus(job:string,e:any,c?:WorkflowConfig,now=Date.now(),persist=true){
+  async executionStatus(job:string,e:any,c?:WorkflowConfig,now=Date.now(),persist=true){
   const d=this.implementation(job);if(!d)return;
-  const observedJob=this.s.get(job);
+   const observedJob=this.s.get(job);
+   const originalLedger=new ReceiptReconciliation(this.s),originalBinding=originalLedger.get(d.client_id);
+    const revised=revisedExecution(this.s,job);
+    const reviewTarget=()=>this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
+    const observedTarget=revised?reviewTarget():null;
+   if(d.state==='approved_pending'&&!originalBinding&&!e.transcript?.entries?.some((x:any)=>x.clientMessageId===d.client_id))return {state:'approved_pending',outcome:'pending',reason:'Implementation dispatch has not been attempted; await normal authorized dispatch',session:d.session_id,source:'dispatch',confidence:'high'};
+   // Revised work cannot borrow a continuation or historical PR as evidence
+   // that its own implementation was delivered. Missing legacy reservations
+   // remain uncertain rather than acquiring invented provenance.
+   if(revised){
+    const original=originalBinding&&originalLedger.inspect({job,plan:d.plan_hash,spec:digest(observedJob.spec),session:d.session_id,client:d.client_id,attempt:'implementation:1'},e,persist);
+    const planning=new Planning(this.s).get(job);
+    const identity=e.session?.projectId===planning?.project&&e.session?.branch===planning?.branch&&e.session?.isTerminated===false&&capturedRevision(this.s,job,d.plan_hash,d.session_id).captured;
+    if(!original||original.state!=='completed'||!identity)return {state:identity&&original&&['accepted','queued','running'].includes(original.state)?'implementation_running':'needs_reconciliation',outcome:'uncertain',reason:!identity?'Original revised worker or captured-plan identity mismatch; never resend':original?.reason??'Revised implementation receipt is missing; delivery uncertain, never resend',delivery:original??null,session:d.session_id,source:'receipt',confidence:'high'};
+   }
+   let publishedProof:HandoffProof|undefined;
   let graceMs=c?.workflow?.prGraceMs??120000;
   if(!Number.isSafeInteger(graceMs)||graceMs<0)graceMs=120000;
   const latestContinuation=this.continuation(job);
@@ -357,8 +374,16 @@ export class Workflow{
    if(current?.client_id!==d.client_id||current?.plan_hash!==d.plan_hash||current?.session_id!==d.session_id||j.plan_hash!==d.plan_hash||
     (latestRevision(this.s,job)?.id??null)!==(revision?.id??null)||j.plan_hash!==observedJob.plan_hash||j.spec!==observedJob.spec||j.approved_hash!==observedJob.approved_hash||j.state!==observedJob.state)
     return {state:'stale_execution',applied:false,session:d.session_id,reason:'Execution binding changed while evidence was awaited; stale outcome discarded'};
-   if(!persist)return {...result,session:d.session_id};
-   if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now);
+    if(!persist)return {...result,session:d.session_id};
+    if(result.state==='pr_handoff'&&revised&&!publishedProof)return {state:'needs_reconciliation',outcome:'uncertain',session:d.session_id,reason:'Exact revised published-head proof missing; review remains gated'};
+    if(result.state==='pr_handoff'&&revised){
+     const planning=new Planning(this.s).get(job),target=reviewTarget();
+     // A stable historical target may differ from the verified candidate. Save
+     // the candidate first so explicit rebind can align it; revisedHandoff keeps
+     // review and Done gated until then. Concurrent target changes still stop.
+     if(planning?.session_id!==d.session_id||planning?.project!==e.session.projectId||planning?.branch!==e.session.branch||!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured||target?.repo!==observedTarget?.repo||target?.pr!==observedTarget?.pr)return {state:'stale_execution',applied:false,session:d.session_id,reason:'Revised owner or review target changed during evidence collection'};
+    }
+    if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now,publishedProof);
    // A later remediation may be selected for the workflow outcome, but only
    // the continuation's own receipt can settle its durable delivery state.
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
@@ -390,12 +415,13 @@ export class Workflow{
    // A failed continuation's own turn is the selected receipt when no newer
    // remediation exists. Verified, continuation-bound recovery must be reached
    // here as well as after the later completed-turn path.
-   const recovered=await this.recoveredDelivery(job,c,e,prs,d,cont?.id);
+    const recovered=await this.recoveredDelivery(job,c,e,prs,d,cont?.id,proof=>publishedProof=proof);
    if(turn.id===contTurn?.id&&recovered)return finish({state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'delivery-recovery',confidence:'high'});
    if(turn.id===contTurn?.id&&cont?.state==='recovered')return finish({state:'needs_reconciliation',outcome:'failed',reason:'Settled continuation recovery no longer matches current delivery identity; inspect before handoff',questions:[],dependencies:[],source:'delivery-recovery',confidence:'high'});
    return finish({state:'failed',outcome:'failed',reason:'Implementation turn failed or cancelled; explicit recovery required',questions:[],dependencies:[],source:'receipt',confidence:'high'});
   }
-  if(turn.state!=='completed')return finish({state:'implementation_running',outcome:'running',reason:null,questions:[],dependencies:[],source:'receipt',confidence:'high'});
+   if(turn.state!=='completed')return finish({state:'implementation_running',outcome:'running',reason:null,questions:[],dependencies:[],source:'receipt',confidence:'high'});
+   if(revised&&(e.transcript?.controller!=='ready'||e.transcript?.turns?.some((t:any)=>!['completed','failed','cancelled','interrupted','recovered'].includes(t.state))))return finish({state:'implementation_running',outcome:'running',reason:'Original worker still has active or unknown work; await authoritative idle evidence',questions:[],dependencies:[],source:'receipt',confidence:'high'});
   try{
    const local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));
    const expected=deliveryBranch(this.s,job,e.session);
@@ -404,7 +430,9 @@ export class Workflow{
     if(!c?.githubRepo||prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)throw Error('Exact configured PR repository required');
     const b=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
     assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,b);
-    if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
+     if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
+     if(!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Exact published HEAD required');
+     publishedProof={dispatch:d.client_id,session:d.session_id,spec:digest(observedJob.spec),turn:originalLedger.get(d.client_id)?.turn??turn.id,repo:c.githubRepo,head:b.head};
    }
   }catch(err){
    const reason=err instanceof Error?err.message:'Delivery evidence unavailable';
@@ -425,7 +453,7 @@ export class Workflow{
  }
  // Read-only recovery assertion shared by handoff and the review loop. It never
  // publishes, adopts, or repairs delivery evidence.
- async recoveredDelivery(job:string,c:WorkflowConfig|undefined,e:any,prs:any[],d:any,continuationId?:number){
+  async recoveredDelivery(job:string,c:WorkflowConfig|undefined,e:any,prs:any[],d:any,continuationId?:number,onProof?:(proof:HandoffProof)=>void){
   if(prs.length!==1||!c?.githubRepo||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_adoptions'").get()||!this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuation_recoveries'").get())return false;
   if(prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)return false;
   if(!(this.s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))return false;
@@ -458,7 +486,14 @@ export class Workflow{
   try{
    const remote=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
    assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,remote);
-   return settled?remote.head===local.head:remote.head===adopted.head;
+    const matches=settled?remote.head===local.head:remote.head===adopted.head;
+    if(!matches)return false;
+    if(onProof&&revisedExecution(this.s,job)){
+     const receipt=new ReceiptReconciliation(this.s).get(d.client_id);
+     if(receipt?.state!=='completed'||!receipt.turn||!/^[a-f0-9]{40,64}$/.test(remote.head)||e.transcript?.controller!=='ready'||e.transcript?.turns?.some((t:any)=>!['completed','failed','cancelled','interrupted','recovered'].includes(t.state)))return false;
+     onProof({dispatch:d.client_id,session:d.session_id,spec:digest(this.s.get(job).spec),turn:receipt.turn,repo:c.githubRepo,head:remote.head});
+    }
+    return true;
   }catch{return false;}
  }
  continuation(job:string):any{
