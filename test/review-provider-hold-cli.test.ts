@@ -1,0 +1,22 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {Store} from '../src/core';
+import {ReviewLoop} from '../src/review-loop';
+import {ReviewRequests} from '../src/coderabbit-scheduling';
+test('provider hold CLI previews read-only and requires exact confirmation plus named human without replay',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-review-hold-cli-')),db=join(root,'state.sqlite');const s=new Store(db);
+ try{
+  new ReviewLoop(s);const job=s.enqueue('p','i','spec'),hash=s.propose(job,'plan');s.approve(job,hash,'human');const requests=new ReviewRequests(s);
+  requests.claim(job,'o/r',1,{head:'head',signature:'config',blocker:null,incremental:false});requests.holdForInspection(job,'o/r',1,'head');
+  const run=(...args:string[])=>Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'reconcile-review-provider',job,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:db},stdout:'pipe',stderr:'pipe'});
+  const count=()=>s.db.query('SELECT count(*) AS n FROM events').get();const before=count(),preview=run();
+  expect(preview.exitCode).toBe(0);expect(preview.stderr.toString()).toBe('');expect(count()).toEqual(before);
+  const confirmation=JSON.parse(preview.stdout.toString()).confirmation;
+  expect(run('--confirm',confirmation).exitCode).not.toBe(0);expect(requests.providerHold()).not.toBeNull();
+  expect(run('--confirm','0'.repeat(64),'--human','Operator').exitCode).not.toBe(0);expect(requests.providerHold()).not.toBeNull();
+  const applied=run('--confirm',confirmation,'--human','Operator');expect(applied.exitCode).toBe(0);expect(JSON.parse(applied.stdout.toString())).toMatchObject({state:'provider_hold_cleared',mutationReplay:false});
+  expect(requests.providerHold()).toBeNull();expect(requests.get('o/r',1,'head')).toMatchObject({state:'delivery_uncertain',attempts:1});expect(s.get(job).attempts).toBe(0);
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
+});

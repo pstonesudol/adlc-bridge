@@ -172,9 +172,10 @@ export class ReviewLoop{
    private uncertainReview(job:string,pr:number,head:string){
     const request=this.s.db.query("SELECT state FROM full_review_requests WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain' LIMIT 1").get(job,pr,head) as any;
     const mode=this.requests.get(this.get(job).repo,pr,head)?.mode??'full';
-    return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:`${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
+    const hold=this.requests.providerHold();
+    return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:hold?`CodeRabbit review unavailable: provider-wide inspection hold; request remains reserved; preview reconcile-review-provider ${hold.job}`:`${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
    }
-  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,reviewerEvidence:this.reviewerStatus(t.job),maintenance:maintenanceStatus(this.s,t.job),displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
+  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,providerHold:this.requests.providerHold(),reviewerEvidence:this.reviewerStatus(t.job),maintenance:maintenanceStatus(this.s,t.job),displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
   private reviewerStatus(job:string){const row=this.s.db.query('SELECT * FROM reviewer_observations WHERE job=?').get(job) as any;return row?{head:row.head,observed:row.observed,ageMs:Math.max(0,Date.now()-row.observed),persistedOnly:true,...JSON.parse(row.evidence)}:null;}
   private reconcileRemediation(job:string,head:string,session:any,activeOnly=false){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
@@ -217,7 +218,8 @@ export class ReviewLoop{
    async requestReview(job:string,pr:number,head:string,bodyHash:string,expected?:any){
     assertObservationFence();
     const t=this.get(job);if(this.completed(job)||!t||t.pr!==pr)return false;
-    const unresolved=this.uncertainReview(job,pr,head);if(unresolved){this.record(job,unresolved,pr);return false;}
+     const unresolved=this.uncertainReview(job,pr,head);if(unresolved){this.record(job,unresolved,pr);return false;}
+     const hold=this.requests.providerHold();if(hold){this.record(job,{state:'blocked',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; preview reconcile-review-provider ${hold.job} before any new request`},pr);return false;}
     try{new Lifecycle(this.s).current(job);}catch(e){if(this.completed(job))return false;throw e;}
      const reviewers=boundReviewerPolicy(this.s,job),requestPolicy=reviewers.find(r=>r.id==='coderabbit')!;
      if(!requestPolicy.enabled||!requestPolicy.requestReview)return false;
@@ -242,11 +244,12 @@ export class ReviewLoop{
       this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason=? WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),`${requestPolicy.reviewMode==='full'?'Full':'Regular'} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`,job,pr);
    return true;
   }).immediate();
-   if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);return false;}
+    if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);else if(this.requests.providerHold())this.record(job,{state:'blocked',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; preview reconcile-review-provider ${this.requests.providerHold().job} before any new request`},pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
    const marker=reviewRequestMarker(t.repo,pr,head);
     try{await this.postReview(t.repo,pr,marker,Bun.spawn,requestPolicy.reviewMode);}
    catch(error){assertObservationFence();
+     if(error instanceof ReviewResetUnrepresentable){const hold=this.requests.holdForInspection(job,t.repo,pr,head);this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; request remains reserved; preview reconcile-review-provider ${hold.job}`},pr);throw error;}
      if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);this.s.db.query("DELETE FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
     this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: ${requestPolicy.reviewMode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
   assertObservationFence();
@@ -294,7 +297,7 @@ export class ReviewLoop{
     return record({state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'});
    }
    const run=l.run(job);if(!run||run.owner!=='orchestrator'||run.plan_hash!==l.current(job).plan_hash)throw Error('Agent-owned run with current approval required');
-   try{bindReviewerPolicy(this.s,job,config?.reviewers);}catch(error){return record({state:'blocked',send:false,reason:(error as Error).message});}
+   try{if(config)bindReviewerPolicy(this.s,job,config.reviewers);else boundReviewerPolicy(this.s,job);}catch(error){return record({state:'blocked',send:false,reason:(error as Error).message});}
   const observation=new RecoveryObservation(this.s);
    const observedTransport={...branchTransport,
    update:(repo:string,pr:number,head:string)=>fencedIO(branchTransport).update(repo,pr,head),

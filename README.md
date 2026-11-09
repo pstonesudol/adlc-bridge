@@ -2509,6 +2509,14 @@ could send before the provider permits it. Long or implausible reset evidence
 requires operator inspection rather than shortening the reset, silently retrying
 or enabling paid usage. This CodeRabbit request ledger is
 distinct from bounded GitHub observation/read backoff hints.
+An unrepresentable reset installs a durable provider-wide inspection hold: all
+new CodeRabbit requests stop across jobs, repositories and heads, without making
+the rejected request replayable. The hold survives restarts and does not expire
+automatically. Inspect it with `adlc reconcile-review-provider JOB` using the
+original hold-source job. After human inspection, a currently approved source
+job permits `adlc reconcile-review-provider JOB --confirm HASH --human NAME`.
+The exact preview hash is required and the action is audited; clearing this hold
+does not clear uncertain request receipts, reset budgets, or send a request.
 
 Conservative fallback: missing/competing filenames, malformed or inherited YAML,
 unsupported filters/branch expressions, unavailable changed-file evidence, and

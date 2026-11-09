@@ -264,7 +264,31 @@ test('an unrepresentable provider reset keeps the request reserved for operator 
   await expect(f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).rejects.toThrow('operator inspection required');
   expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
   expect(f.loop.requests.get('owner/repo',1,f.head)).toMatchObject({state:'delivery_uncertain',attempts:1});
+  expect(f.loop.requests.providerHold()).toMatchObject({job:f.id,repo:'owner/repo',pr:1,head:f.head});
+  expect(new ReviewLoop(f.s,async()=>{},f.loop.io).requests.claim(f.id,'other/repo',2,{head:'other-head',signature:'configuration',blocker:null,incremental:false})).toBe(false);
   expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).toBe(false);expect(publications).toBe(1);expect(f.sends()).toBe(0);
+ }finally{f.s.close();}
+});
+test('config-less ticks reuse custom approved reviewer policy rather than binding defaults',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);
+  f.e.findings=[];f.e.failedChecks=[];f.e.clear=true;
+  const config={reviewers:[{id:'codex',enabled:false,remediate:false}]};
+  expect((await f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,config)).state).toBe('ready_for_human');
+  const before=f.s.db.query('SELECT * FROM reviewer_policy WHERE job=?').get(f.id);
+  let actual:any;f.loop.io.readiness=async(_repo,_pr,_required,_metadata,reviewers)=>{actual=reviewers;return f.e;};
+  expect((await new ReviewLoop(f.s,async()=>{},f.loop.io).tick(f.id)).state).toBe('ready_for_human');
+  expect(actual.find((r:any)=>r.id==='codex')).toMatchObject({enabled:false,remediate:false});
+  expect(f.s.db.query('SELECT * FROM reviewer_policy WHERE job=?').get(f.id)).toEqual(before);
+  expect((await f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,{reviewers:[]})).reason).toContain('fresh reviewed plan');
+ }finally{f.s.close();}
+});
+test('an unconfigured legacy tick does not create a false default binding before explicit configuration arrives',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);
+  f.e.findings=[];f.e.failedChecks=[];f.e.clear=true;
+  expect((await f.loop.tick(f.id)).state).toBe('ready_for_human');expect(f.s.db.query('SELECT * FROM reviewer_policy WHERE job=?').get(f.id)).toBeNull();
+  expect((await f.loop.tick(f.id,undefined,DEFAULT_REMEDIATION_POLICY,undefined,{reviewers:[{id:'codex',enabled:false}]})).state).toBe('ready_for_human');
  }finally{f.s.close();}
 });
 for(const failure of [false,true])test(`full review mode is accurate in request audit and ${failure?'uncertain':'accepted'} reasons`,async()=>{

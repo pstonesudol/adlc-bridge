@@ -1,5 +1,6 @@
 import {digest,Store} from './core';
 import {assertObservationFence} from './observation-fence';
+import {randomUUID} from 'node:crypto';
 
 export const REVIEW_GRACE_MS=5*60*1000, REVIEW_TIMEOUT_MS=30*60*1000;
 export type ReviewMode='regular'|'full';
@@ -128,10 +129,20 @@ export function reviewEscalationReason(input:{repo:string;pr:number;head:string;
 /** One receipt per repository/PR/head, shared across jobs and restarts. Reserving
  * before I/O makes lost responses non-replayable. Only confirmed rejection can
  * transition back to a sendable state. */
+export function reviewProviderHold(s:Store):any{
+ if(!s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_provider_holds'").get())return null;
+ return s.db.query("SELECT * FROM coderabbit_provider_holds WHERE provider='coderabbit'").get()??null;
+}
+export function reviewProviderHoldPreview(s:Store,job:string){
+ const j=s.get(job),hold=reviewProviderHold(s);if(!hold)return {state:'clear',provider:'coderabbit',mutationReplay:false};
+ if(hold.job!==job)throw Error(`Inspect provider hold with its original job ${hold.job}`);
+ return {state:'inspection_required',hold,confirmation:digest(JSON.stringify([hold,j.id,j.plan_hash,j.approved_hash,j.state])),mutationReplay:false};
+}
 export class ReviewRequests{
  constructor(public s:Store,public now=Date.now){s.db.exec(`CREATE TABLE IF NOT EXISTS coderabbit_requests(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,job TEXT NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,requested INTEGER NOT NULL,next_attempt INTEGER NOT NULL,evidence TEXT,PRIMARY KEY(repo,pr,head));
  CREATE TABLE IF NOT EXISTS coderabbit_waits(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(repo,pr,head));
-  CREATE TABLE IF NOT EXISTS coderabbit_request_attempts(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,evidence TEXT,next_attempt INTEGER NOT NULL,PRIMARY KEY(repo,pr,head,attempt));`);
+   CREATE TABLE IF NOT EXISTS coderabbit_request_attempts(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,evidence TEXT,next_attempt INTEGER NOT NULL,PRIMARY KEY(repo,pr,head,attempt));
+   CREATE TABLE IF NOT EXISTS coderabbit_provider_holds(provider TEXT PRIMARY KEY,id TEXT NOT NULL,job TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,reason TEXT NOT NULL,created INTEGER NOT NULL);`);
   // Every pre-mode request used full review. Keep its command and budget across
   // upgrade; mode is evidence, never part of the per-head deduplication key.
   s.db.transaction(()=>{
@@ -140,7 +151,28 @@ export class ReviewRequests{
     if(!columns.some(c=>c.name==='mode'))s.db.exec(`ALTER TABLE ${table} ADD COLUMN mode TEXT NOT NULL DEFAULT 'full' CHECK(mode IN ('regular','full'))`);
    }
   }).immediate();}
- get(repo:string,pr:number,head:string):any{return this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? AND head=?').get(repo,pr,head);}
+  get(repo:string,pr:number,head:string):any{return this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? AND head=?').get(repo,pr,head);}
+  providerHold(){return reviewProviderHold(this.s);}
+  holdForInspection(job:string,repo:string,pr:number,head:string){
+   assertObservationFence();return this.s.db.transaction(()=>{
+    if(!this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND head=? AND job=? AND state='delivery_uncertain'").get(repo,pr,head,job))throw Error('Original uncertain request required for provider hold');
+    const changed=this.s.db.query('INSERT OR IGNORE INTO coderabbit_provider_holds VALUES (?,?,?,?,?,?,?,?)').run('coderabbit',randomUUID(),job,repo,pr,head,'Provider rate-limit reset cannot be safely represented; operator inspection required',this.now()).changes;
+    if(changed)this.s.event(job,'coderabbit_provider_hold_recorded',JSON.stringify(this.providerHold()));
+    return this.providerHold();
+   }).immediate();
+  }
+  reconcileProviderHold(job:string,confirmation:string,human:string){
+   assertObservationFence();if(!human?.trim()||human.length>200)throw Error('Named human inspection required');
+   return this.s.db.transaction(()=>{
+    const j=this.s.get(job);if(j.state!=='approved'||!j.actor||!j.plan||j.plan_hash!==j.approved_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))throw Error('Current approved hold-source job required');
+    const preview=reviewProviderHoldPreview(this.s,job);
+    if(preview.state!=='inspection_required'||!confirmation||preview.confirmation!==confirmation)throw Error('Provider hold changed; inspect a fresh reconciliation preview');
+    const changed=this.s.db.query("DELETE FROM coderabbit_provider_holds WHERE provider='coderabbit' AND id=? AND job=?").run(preview.hold.id,job).changes;
+    if(changed!==1)throw Error('Provider hold changed before reconciliation');
+    this.s.event(job,'coderabbit_provider_hold_reconciled',JSON.stringify({hold:preview.hold,human:human.trim(),mutationReplay:false}));
+    return {state:'provider_hold_cleared',provider:'coderabbit',mutationReplay:false,originalRequest:'retained; uncertain receipts and budgets unchanged'};
+   }).immediate();
+  }
  wait(repo:string,pr:number,schedule:ReviewSchedule){
   assertObservationFence();const {head,signature}=schedule;
   this.s.db.query('INSERT INTO coderabbit_waits VALUES (?,?,?,?,?) ON CONFLICT(repo,pr,head) DO UPDATE SET signature=excluded.signature,started=excluded.started WHERE signature!=excluded.signature').run(repo,pr,head,signature,this.now());
@@ -149,6 +181,7 @@ export class ReviewRequests{
  claim(job:string,repo:string,pr:number,schedule:ReviewSchedule){
    assertObservationFence();if(schedule.blocker||schedule.evidence?.recoverable===false||schedule.requestPolicy?.requestReview===false)return false;
    return this.s.db.transaction(()=>{
+   if(this.providerHold())return false;
    // A new head/PR cannot evade a verified provider reset or an uncertain
    // request for this PR. This embargo shares the existing durable ledger.
    const embargo=this.s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited'").get() as any;
