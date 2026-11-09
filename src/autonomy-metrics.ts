@@ -41,7 +41,7 @@ export function projectMetrics(s:Store,options:Options={},now=Date.now()){
    if(rescue.has(e.kind)){interventions++;category='operator_rescue';closeProvider(e,'operator_interrupted');}
    else if(expected.has(e.kind)){humanActions++;category='expected_human_action';}
    else if(e.kind==='plan_readiness_resolved'&&['human-answer','dependency-satisfied'].includes(d?.source)){category=d.source==='human-answer'?'expected_human_action':'lifecycle';if(d.source==='human-answer')humanActions++;}
-   else if(neutral.has(e.kind))category='lifecycle';
+   else if(neutral.has(e.kind)||e.kind==='review_binding_observed')category='lifecycle';
    else if(e.kind==='linear_status_changed'&&['done','in-review','in-progress'].includes(d?.phase))category='lifecycle';
    else if(e.kind==='provider_observation_failed'){
     const cause=['throttled','timeout','network','server','authentication','permission','missing','malformed','unknown'].includes(d?.classification)?d.classification:'unknown';
