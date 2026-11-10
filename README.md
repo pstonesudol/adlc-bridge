@@ -2694,8 +2694,16 @@ Linear clarification/worker outcome flow, not guessed reconciliation.
 
 * `enabled`, `remediate`: boolean, default true. Disabling ingestion preserves
   durable evidence. Disabling remediation never grants clearance.
-* `approvalRequired`: boolean, default false for new reviewers; CodeRabbit remains
-  required. `enabled=false` plus `approvalRequired=true` is invalid. An advisory
+* `approvalRequired`: boolean, default false for new reviewers and true for
+  CodeRabbit. Trusted project configuration may explicitly set
+  `{"reviewers":[{"id":"coderabbit","approvalRequired":false}]}` to make
+  CodeRabbit approval advisory. Only the missing approval vote stops blocking:
+  trusted identity, configured review requests, remediation, change requests,
+  actionable/pending findings, pending/skipped reviews, required CI and custom
+  checks retain their existing gates. CodeRabbit must remain enabled with its
+  pinned bot identity. In-flight policy changes require a fresh reviewed plan;
+  GitHub branch protection and human-only merging are unchanged.
+  `enabled=false` plus `approvalRequired=true` is invalid. An advisory
   approval cannot substitute for any required reviewer. COMMENTED, summaries,
   missing reviews, neutral checks and skipped checks are never approval.
 * `minimumSeverity`: `info|low|medium|high|critical`, absent by default. Standard
