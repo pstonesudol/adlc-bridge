@@ -167,6 +167,7 @@ for(const invalid of ['none','valid-pr','origin','common','registration','compet
     if(args.includes('--git-common-dir'))return invalid==='common'&&cwd===tree?other:common;
     if(args.includes('worktree'))return invalid==='registration'?'':`worktree ${tree}\nbranch refs/heads/${f.p.branch}\n`;
     if(args.includes('remote'))return invalid==='origin'?'git@github.com:wrong/repo.git':'git@github.com:owner/repo.git';
+    if(args.includes('--git-path'))return join(root,'absent-operation',args.at(-1)!);
     if(args.includes('status'))return ' M preserved-local-work';
    }
    if(args[1]==='session'&&args[2]==='ls')return JSON.stringify(invalid==='inventory'?{}:{data:[{id:'owner'},...['competing-worker','competing-pr'].includes(invalid)?[{id:'competing'}]:[]]});

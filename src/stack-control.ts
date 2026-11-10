@@ -1,4 +1,4 @@
-import {existsSync,lstatSync,readFileSync,mkdirSync,rmdirSync} from 'node:fs';
+import {existsSync,lstatSync,readFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {AO} from './orchestrator';
@@ -6,6 +6,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {registeredProjects,serviceControl} from './service-control';
 import {readDefinition} from './project-services';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
+import {acquireProcessLock} from './process-lock';
 
 type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number};
 export type StackOps={
@@ -143,8 +144,8 @@ export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,
 const stackIO={state:stateDir,ops:liveStackOps};
 export async function withStackLock<T>(state:string,operation:()=>Promise<T>){
  const lock=join(state,'stack-control.lock');mkdirSync(state,{recursive:true,mode:0o700});
- try{mkdirSync(lock,{mode:0o700});}catch(e:any){if(e?.code==='EEXIST')throw Error('Another stack control is in progress. If interrupted, inspect services before removing stack-control.lock');throw e;}
- try{return await operation();}finally{try{rmdirSync(lock);}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
+  let release:()=>void;try{release=acquireProcessLock(lock);}catch(e){throw Error('Another stack control is in progress or ownership is unproved; inspect stack-control.lock',{cause:e});}
+  try{return await operation();}finally{try{release();}catch{console.error('Stack lock cleanup needs inspection:',lock);}}
 }
 export async function stackControl(action:'start'|'stop'|'status',io=stackIO){
   if(process.platform!=='darwin')throw Error('Full-stack controls require macOS');

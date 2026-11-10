@@ -1,5 +1,6 @@
-import {existsSync,lstatSync,readFileSync,realpathSync,mkdirSync,rmdirSync} from 'node:fs';import {join,dirname} from 'node:path';import {createHash} from 'node:crypto';
+import {existsSync,lstatSync,readFileSync,realpathSync,mkdirSync} from 'node:fs';import {join,dirname} from 'node:path';import {createHash} from 'node:crypto';
 import {appState} from './install-state';import {atomicFile} from './atomic-file';import {withTurnSubmission,TurnSubmissionBlocked} from './turn-submission';
+import {acquireProcessLock} from './process-lock';
 const hash=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const receiptPath=(state:string,config:string)=>join(state,'poll-processes',hash(config)+'.json');
 // Keep every provider mutation and its local receipt in the same scope as sends.
@@ -25,7 +26,7 @@ export async function acknowledgePoll(config:string,cli:string,state=appState(),
   // Serialize receipt claims independently of the submission fence: a stack
   // start holds that fence while waiting for this acknowledgement.
   mkdirSync(dirname(path),{recursive:true,mode:0o700});const claim=path+'.lock';
-  try{mkdirSync(claim,{mode:0o700});}catch(error:any){if(error?.code==='EEXIST')throw Error(`Poll receipt claim is held or abandoned; inspect before retrying: ${claim}`,{cause:error});throw error;}
+   let release:()=>void;try{release=acquireProcessLock(claim);}catch(error){throw Error(`Poll receipt claim is held or abandoned; inspect before retrying: ${claim}`,{cause:error});}
   try{
    if(existsSync(path)){
     const prior=readReceipt(path);
@@ -35,7 +36,7 @@ export async function acknowledgePoll(config:string,cli:string,state=appState(),
     }
    }
    atomicFile(path,JSON.stringify(record));
-  }finally{try{rmdirSync(claim);}catch{console.error('Poll receipt claim cleanup needs inspection:',claim);}}
+   }finally{try{release();}catch{console.error('Poll receipt claim cleanup needs inspection:',claim);}}
   const finished=()=>{const current=readReceipt(path);if(current.pid===record.pid&&current.started===record.started)atomicFile(path,JSON.stringify({...record,idle:true}));};
   const deadline=Date.now()+wait.timeoutMs;let notified=false;
   try{for(;;){try{await submit(async()=>{});break;}catch(error){if(!(error instanceof TurnSubmissionBlocked)||Date.now()>=deadline)throw error;if(!notified){notified=true;wait.onBlocked?.();}await wait.pause();}}}

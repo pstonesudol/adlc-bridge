@@ -754,7 +754,8 @@ export class Workflow{
  }
  status(){return {queueEvidence:(this.s.db.query('SELECT id FROM jobs').all() as any[]).map(j=>({job:j.id,...new ApprovalPolicyStore(this.s).context(j.id)})),deliveries:new ReceiptReconciliation(this.s).list(),dependencies:this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()?this.s.db.query('SELECT * FROM dependency_waits').all():[],policyAuthorizations:new ApprovalPolicyStore(this.s).list(),runtimePolicy:this.s.db.query('SELECT project,runtime FROM project_execution_policy').all(),routing:this.router.list(),planning:this.s.db.query('SELECT * FROM planning_dispatch').all(),implementation:this.s.db.query('SELECT job,plan_hash,session_id,state,paths,runtime,reason FROM implementation_dispatch').all(),
   readiness:this.s.db.query('SELECT job,plan_hash,state,valid,source,reason,questions,dependencies,risks,observed FROM plan_readiness').all(),
-  resolutions:this.s.db.query('SELECT job,plan_hash,binding,source,actor,detail,state,at FROM plan_resolutions WHERE state=?').all('active'),
+   resolutions:this.s.db.query('SELECT job,plan_hash,binding,source,actor,detail,state,at FROM plan_resolutions WHERE state=?').all('active'),
+   startupRecovery:this.s.db.query("SELECT name FROM sqlite_master WHERE name='startup_recovery_results'").get()?this.s.db.query('SELECT * FROM startup_recovery_results ORDER BY observed,job').all():[],
    outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.revision_id,w.dispatch_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
      FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all().map((o:any)=>({...o,historical:!currentOutcome(this.s,o.job,o)})),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
