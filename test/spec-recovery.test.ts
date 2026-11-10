@@ -157,8 +157,10 @@ test('DEV-67 unavailable pinned model on a revised plan retains dispatch and his
   const check=f.s.db.query('SELECT * FROM dispatch_route_checks').get() as any;expect(check.plan_hash).toBe(hash);expect(check.client_id).toBe(before.dispatch.client_id);expect(check.route).toContain('deepseek-v4.1-flash');
   // An uncertain dispatch is reconciliation-only, even if its route later fails.
   f.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=?").run(f.job);
-  f.w.t.preflightRoute=async()=>{throw Error('must never preflight uncertain delivery');};
-  await f.w.executeApproved(f.job,config);expect(f.sends).toHaveLength(2);expect(configured).toBe(0);
+  const checksBefore=f.s.db.query('SELECT * FROM dispatch_route_checks').all();let preflights=0;
+  f.w.t.preflightRoute=async()=>{preflights++;};
+  await f.w.executeApproved(f.job,config);expect(preflights).toBe(0);expect(f.sends).toHaveLength(2);expect(configured).toBe(0);
+  expect(f.s.db.query('SELECT * FROM dispatch_route_checks').all()).toEqual(checksBefore);
  }finally{f.s.close();}
 });
 async function revisedFixture(){

@@ -40,7 +40,10 @@ for(const kind of ['unavailable','transient','unknown'] as const)test(`approved 
   const checks=s.db.query('SELECT * FROM dispatch_route_checks').all() as any[];
   expect(checks).toHaveLength(1);expect(checks[0].state).toBe(kind==='unavailable'?'unavailable':'transient');expect(JSON.stringify(checks)).not.toContain('secret');
   f.drop=true;f.preflightRoute=async()=>{};await w.executeApproved(id,config);expect(f.messages).toHaveLength(2);expect(w.implementation(id).state).toBe('delivery_uncertain');
-  f.preflightRoute=async()=>{throw Error('must not preflight/replay an accepted dispatch');};await w.executeApproved(id,config);expect(f.messages).toHaveLength(2);
+  const checksBefore=s.db.query('SELECT * FROM dispatch_route_checks').all();let preflights=0;
+  f.preflightRoute=async()=>{preflights++;};await w.executeApproved(id,config);
+  expect(preflights).toBe(0);expect(f.messages).toHaveLength(2);
+  expect(s.db.query('SELECT * FROM dispatch_route_checks').all()).toEqual(checksBefore);
  }finally{s.close();}
 });
 test('approval changed during a catalog preflight cannot persist stale availability or deliver',async()=>{
