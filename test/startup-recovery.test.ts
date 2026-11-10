@@ -6,7 +6,7 @@ import {ReviewLoop} from '../src/review-loop';
 import {StartupRecovery,consumeStartupRestore} from '../src/startup-recovery';
 import {turnBarrier,withRecoverySubmission,setProjectIntakePaused} from '../src/turn-submission';
 import {controlManagedLifecycle,type LifecycleOps} from '../src/managed-lifecycle';
-import {assertRecoveryAvailable} from '../src/recovery-runtime';
+import {assertRecoveryAvailable,createRecoveryIO} from '../src/recovery-runtime';
 import {createCLIPollTick} from '../src/cli';
 import {PreSendFailure} from '../src/pre-send';
 import {routingConfig} from './routing-fixture';
@@ -85,6 +85,38 @@ test('uncertain recovery send is reconciled and never replayed after restart',as
 });
 test('unconsumed native restore remains uncertain and is not repeated',async()=>{
  const f=await fixture();try{f.interrupt(true,true);f.flags({consume:false,lostRestore:true});expect((await f.recovery.pass(f.c,true)).blocked).toBe(1);await f.recovery.pass(f.c,true);expect(f.restores).toHaveLength(1);expect(f.sends).toHaveLength(1);}finally{f.close();}
+});
+test('a timed-out restore settles behind the submission fence and retains its uncertain reservation',async()=>{
+ const f=await fixture();let child:any,settled=false,launched=0;
+ try{
+  f.interrupt(true,true);
+  const io=createRecoveryIO(f.s,Date.now()+1000,operation=>f.barrier.submit(operation),{spawn:((_args:any,options:any)=>{launched++;child=Bun.spawn([process.execPath,'-e','await Bun.sleep(10000)'],options);child.exited.then(()=>{settled=true;});return child;}) as any});
+  f.t.restorePlan=io.transport.restorePlan;
+  const result=await f.barrier.run(()=>withRecoverySubmission(()=>f.recovery.pass(f.c,true),f.root));
+  expect(result.blocked).toBe(1);expect(settled).toBe(true);expect(f.s.db.query('SELECT state FROM startup_restores').get()).toEqual({state:'attempting'});
+  expect(worktreeReservation(f.s,f.job)).toMatchObject({state:'attempting'});await f.barrier.submit(async()=>{});
+  await f.recovery.pass(f.c,true);expect(launched).toBe(1);expect(f.sends).toHaveLength(1);
+ }finally{if(child){child.kill();await child.exited;}f.close();}
+});
+test('a completed restore permits later exits of the same worker without replaying its continuation',async()=>{
+ const f=await fixture();try{
+  f.interrupt(true,true);expect((await f.recovery.pass(f.c,true)).resumed).toBe(1);f.complete();
+  for(let exit=0;exit<2;exit++){
+   f.e.session.isTerminated=true;f.e.session.activity.state='exited';f.e.transcript.controller='stopped';
+   expect(await f.recovery.pass(f.c,true)).toMatchObject({reattached:1,blocked:0});
+   expect(f.restores).toHaveLength(exit+2);expect(f.sends).toHaveLength(2);
+   expect(f.s.db.query("SELECT count(*) AS n FROM startup_restores WHERE state='restored'").get()).toEqual({n:exit+2});
+   await f.recovery.pass(f.c,true);expect(f.restores).toHaveLength(exit+2);
+  }
+  expect(readFileSync(join(f.root,'preserved.txt'),'utf8')).toContain('uncommitted');
+ }finally{f.close();}
+});
+for(const outcome of ['needs_input','blocked_dependency','uncertain'])test(`the current ${outcome} worker blocker still denies recovery`,async()=>{
+ const f=await fixture();try{
+  const d=f.w.implementation(f.job);
+  f.s.db.query("INSERT INTO worker_outcomes(job,plan_hash,session_id,outcome,questions,dependencies,source,confidence,first_observed,observed,dispatch_id) VALUES (?,?,?,?,'[]','[]','receipt','high',?,?,?)").run(f.job,d.plan_hash,d.session_id,outcome,Date.now(),Date.now(),d.client_id);
+  f.interrupt(true,true);expect((await f.recovery.pass(f.c,true)).blocked).toBe(1);expect(f.restores).toHaveLength(0);expect(f.sends).toHaveLength(1);
+ }finally{f.close();}
 });
 test('a proved-unlaunched native restore releases its reservation and retries once on a later pass',async()=>{
  const f=await fixture();try{

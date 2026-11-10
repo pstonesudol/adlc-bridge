@@ -10,7 +10,7 @@ import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
 import {verificationInstructions} from './verification';
 import {assertRequiredIntegrations} from './integration-capabilities';
-import {capturedRevision,currentDispatchContinuation} from './spec-revisions';
+import {capturedRevision,currentDispatchContinuation,currentOutcome} from './spec-revisions';
 import {PreSendFailure} from './pre-send';
 
 export type RecoveryResult={job:string;outcome:'reattached'|'resumed'|'waiting'|'blocked';nextAction:string;state?:string};
@@ -39,7 +39,7 @@ export function startupAuthorization(s:Store,job:string,c:WorkflowConfig,binding
  const owner=has(s,'ownership')?s.db.query('SELECT owner FROM ownership WHERE session_id=?').get(auth.session) as any:null;
  if(owner&&owner.owner!=='orchestrator')throw Error('Worker is human-owned; explicit handback required');
  const outcome=row(s,'worker_outcomes',job);
- if(outcome&&['needs_input','blocked_dependency','uncertain'].includes(outcome.outcome))throw Error('Preserve the recorded worker blocker; use resume-job/dependency-preview after its required resolution');
+  if(currentOutcome(s,job,outcome)&&['needs_input','blocked_dependency','uncertain'].includes(outcome.outcome))throw Error('Preserve the recorded worker blocker; use resume-job/dependency-preview after its required resolution');
  const budget=row(s,'remediation_budget',job);if(budget?.stop_reason)throw Error('Preserve the existing budget stop; explicit budget recovery required');
  for(const [table,states] of [
   ['branch_updates',['delivery_uncertain','accepted']],['remediation',['reserved','delivery_uncertain']],['delivery_adoptions',['reserved','claim_uncertain']]
@@ -141,7 +141,9 @@ export class StartupRecovery{
     this.s.db.query("UPDATE startup_restores SET state='restored',reason=NULL WHERE binding=? AND state='setup_consumed'").run(restore.binding);reattached=true;
    }else{
     if(!stopped||!this.w.t.restorePlan)throw Error('Quiescent stopped native session and supported same-session restore required');
-    if(restore&&restore.state!=='not_sent')throw Error('Same-session restore already attempted; inspect without replay');
+     // A completed restore is not an outstanding attempt. Fresh stopped-session
+     // evidence can authorize a later restore, chained to the previous binding.
+     if(restore&&!['not_sent','restored'].includes(restore.state))throw Error('Same-session restore already attempted; inspect without replay');
     const proof={auth,repository,history,previous:restore?.binding??null},key=digest(JSON.stringify(proof));
     this.io.check?.();startupAuthorization(this.s,job,c);
     this.s.db.query("INSERT INTO startup_restores VALUES (?,?,?,?,'attempting',?,NULL)").run(key,job,auth.session,auth.worktree,JSON.stringify(proof));

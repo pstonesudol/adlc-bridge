@@ -179,6 +179,18 @@ async function publishRevised(f:Awaited<ReturnType<typeof fixture>>,pr=17){
  f.e.receiptObservation.observed=Date.now();
  return f.w.executeApproved(f.job,config);
 }
+for(const outcome of ['needs_input','blocked_dependency','uncertain'])test(`DEV-104 revised approval retains but does not enforce a historical ${outcome} worker blocker`,async()=>{
+ const f=await fixture();try{
+  const old=f.w.implementation(f.job);
+  f.s.db.query("INSERT INTO worker_outcomes(job,plan_hash,session_id,outcome,questions,dependencies,source,confidence,first_observed,observed,dispatch_id) VALUES (?,?,?,?,'[]','[]','receipt','high',?,?,?)").run(f.job,old.plan_hash,old.session_id,outcome,Date.now(),Date.now(),old.client_id);
+  const retained=f.w.outcomes(f.job);
+  f.edit('Revised requirements supersede the old worker blocker');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);await f.w.executeApproved(f.job,config);
+  f.e.transcript.turns.at(-1).state='interrupted';f.e.transcript.controller='ready';f.e.session.kind='worker';f.e.session.activity={state:'idle'};
+  const startup=new StartupRecovery(f.s,f.w,{inventory:async()=>[f.e.session],requirements:async()=>{},inspect:async()=>({tree:'/worktree',branch:f.e.session.branch,head:'a'.repeat(40),prs:[]}) as any});
+  expect(await startup.pass(config,true)).toMatchObject({resumed:1,blocked:0});expect(f.w.outcomes(f.job)).toEqual(retained);
+ }finally{f.s.close();}
+});
 for(const historical of [false,true])test(`DEV-104 revised interrupted implementation reaches exact review handoff (historical continuation: ${historical})`,async()=>{
  const f=await fixture();try{
   if(historical){
