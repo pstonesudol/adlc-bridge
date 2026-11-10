@@ -178,7 +178,16 @@ export class LinearBlockers{
      rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
    }
   }
-  const observations=new RecoveryObservation(this.s);
+   const observations=new RecoveryObservation(this.s);
+   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='startup_recovery_results'").get()){
+    for(const recovery of this.s.db.query("SELECT r.* FROM startup_recovery_results r JOIN jobs j ON j.id=r.job WHERE j.project=? AND j.state!='done' AND r.outcome='blocked'").all(c.linear.projectId) as any[]){
+     const j=this.s.get(recovery.job);if(j.plan_hash!==recovery.plan_hash||digest(j.spec)!==recovery.spec_hash)continue;
+     handled.add(j.id);
+     const outcome={plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason:recovery.next_action,questions:'[]',dependencies:'[]'};
+     try{results.push(await this.leave(j.id,outcome,c,{heading:'startup recovery blocked',applyLabel:false,guard:()=>{const latest=this.s.db.query('SELECT * FROM startup_recovery_results WHERE job=?').get(j.id) as any,current=this.s.get(j.id);if(latest?.outcome!=='blocked'||latest.next_action!==recovery.next_action||current.plan_hash!==recovery.plan_hash||digest(current.spec)!==recovery.spec_hash)throw Error('Startup recovery blocker changed; refresh before publication');}}));}
+     catch{results.push({job:j.id,state:'blocked',reason:'Startup recovery notice requires reconciliation; no blind repost'});}
+    }
+   }
   for(const j of this.s.list().filter(j=>j.project===c.linear.projectId)){
    const stop=observations.status(j.id),e=stop?.evidence;
    if(!e||transient(e))continue;

@@ -3,6 +3,7 @@ import {tryVerifiedCoordinator} from './coordinator-gate';
 import {Planning} from './planning';
 import {consumePlanningRestore,restoreRepository} from './planning-restore';
 import {assertCurrentPlanningRequirements} from './spec-recovery';
+import {consumeStartupRestore} from './startup-recovery';
 import {join} from 'node:path';
 import {homedir} from 'node:os';
 
@@ -32,7 +33,17 @@ async function gate(){
     }
     const s=new Store(join(homedir(),'Library','Application Support','ADLC Bridge','state.sqlite'));
     try{
-      new Planning(s);
+       new Planning(s);
+       if(s.db.query("SELECT name FROM sqlite_master WHERE name='startup_restores'").get()){
+        const restore=s.db.query("SELECT job,session FROM startup_restores WHERE worktree=? AND state='attempting'").all(cwd) as any[];
+        if(restore.length){
+         if(restore.length!==1)throw Error('Ambiguous startup restore authorization');
+         const repository=await restoreRepository(s,restore[0].job,c);
+         await assertCurrentPlanningRequirements(s,restore[0].job,c);
+         consumeStartupRestore(s,restore[0].job,c,restore[0].session,project,branch.trim(),cwd,repository);
+         console.log('ADLC: exact one-use same-session startup restore admitted; existing scope and approval unchanged');return;
+        }
+       }
       if(s.db.query("SELECT name FROM sqlite_master WHERE name='planning_restores'").get()){
        const restore=s.db.query("SELECT p.job,p.session_id FROM planning_runs p JOIN planning_restores r ON r.job=p.job WHERE p.project=? AND p.branch=? AND r.state='reserved'").all(project,branch.trim()) as any[];
        if(restore.length){

@@ -334,11 +334,12 @@ must have a clean completion receipt. Services without that proof are preserved:
 before upgrading a pre-barrier installation, an operator must establish
 quiescence and stop/unload its intake services manually. Never interrupt a
 submission or delete uncertain delivery records to force migration.
-Contention or an abandoned `turn-submission.lock` fails closed. Before removing
-one, inspect the stack and delivery receipts and confirm that every possible lock
-holder has exited and cannot resume. An unresponsive holder may resume writing;
-unresponsiveness alone is not evidence that the lock is abandoned. Recovery must
-not interrupt an in-flight submission or discard uncertain delivery records.
+Submission, stack-control and poll-receipt locks persist boot identity, PID and
+process start time. A new process reclaims only an exact proved-dead generation;
+live holders, unavailable evidence and legacy locks without ownership proof fail
+closed. An unresponsive holder may resume writing; unresponsiveness alone is not
+evidence of death. Reclaiming a lock never discards delivery uncertainty or grants
+permission to replay an operation. Legacy locks require operator inspection.
 This barrier cannot fence
 manual requests from the Orchestrator UI or other native clients; keep those idle
 during shutdown as well.
@@ -367,9 +368,29 @@ configuration validation and verifies poll startup acknowledgements.
 Restart stops the selected scope then starts dependencies before intake; it is
 not a reset/retry operation. Worktrees (including uncommitted changes), durable
 queue, session history, approvals, delivery receipts and attempt history survive.
-Exited/interrupted workers are **not automatically resumed**: inspect the existing
-session and use the approved job recovery/resume workflow after current scope and
-receipt reconciliation. No lifecycle command resends a prompt or creates a worker.
+`start --all` runs bounded recovery behind the startup submission fence, including
+when services are already loaded. Enabled login-startup polls and subsequent
+polls after wake, daemon restart or connectivity recovery use the same recovery
+coordinator before workflow dispatch. Deliberate project pauses survive all-stack
+start; use explicit `start PROJECT` to clear one. Automatic polling never clears
+global/project pauses, enables a disabled service or bypasses pending updates.
+
+Recovery requires complete native inventory and current unchanged authorization,
+exact session/worktree/branch ownership, provider evidence and delivery receipts.
+Surviving or disconnected active turns are left alone. Completed published PRs
+return to normal review polling. An authoritative **interrupted implementation**
+may receive one durable same-session continuation per dispatch, never a replay of
+the original request. Exited agents use supported native same-session restoration
+with one-use setup authorization before continuation. Dirty work and history are
+preserved. Failed/cancelled turns, partial Git operations, uncertain submissions,
+missing receipts, changed authority and human/budget/dependency gates remain
+blocked for their existing recovery workflow; no replacement worker is created.
+
+Startup returns reattached/resumed/waiting/blocked counts and per-job next actions.
+`workflow-status` includes durable startup recovery results and retry deadlines;
+configured Linear blocker synchronization publishes current recovery blockers
+without changing queue labels or implementation receipts. Job failures back off
+exponentially to five minutes; each pass inspects at most 16 jobs per project.
 A partial start leaves global intake paused and reports the successful steps;
 fix the reported problem, inspect status, then explicitly retry start.
 
