@@ -1,4 +1,5 @@
-import {existsSync} from 'node:fs';
+import {existsSync,mkdtempSync,mkdirSync,rmSync,realpathSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 import {fencedIO,assertObservationFence,ObservationLeaseLost} from './observation-fence';
 import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
 import {ProviderReadError} from './provider-read';
@@ -14,7 +15,7 @@ import {sessionEvidence} from './session-evidence';
 import {liveTransport} from './workflow-transport';
 import {withTurnSubmission} from './turn-submission';
 import {scopeAllows} from './file-scope';
-import {WORKER_STATUS_INSTRUCTION,assessWorkerReceipt} from './readiness';
+import {CONFLICT_WORKER_STATUS_INSTRUCTION as WORKER_STATUS_INSTRUCTION,assessWorkerReceipt} from './readiness';
 import {validateConflictPolicy} from './conflict-policy';
 import {assertWorktreeAvailable,canonicalWorktree,recoveryRows} from './worktree-reservation';
 import {type RemediationPolicy,DEFAULT_REMEDIATION_POLICY} from './remediation';
@@ -29,10 +30,19 @@ export const recoveryCommand:RecoveryCommand=async(args,cwd)=>{
 // Verification executes worker-edited code. Never select its environment by
 // executable name: even a configured `git` argv must not get host credentials.
 export const verificationCommand:RecoveryCommand=async(args,cwd)=>{
- const env:Record<string,string>={};
- for(const key of ['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI'])if(process.env[key]!==undefined)env[key]=process.env[key]!;
- const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
- const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
+  const env:Record<string,string>={};
+  for(const key of ['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI'])if(process.env[key]!==undefined)env[key]=process.env[key]!;
+  const root=realpathSync(tmpdir()),tree=realpathSync(cwd);
+  if(root===tree||root.startsWith(tree+'/'))throw Error('Verification temporary directory must be outside the worktree');
+  const home=mkdtempSync(resolve(root,'adlc-verification-'));
+  try{
+   env.HOME=home;
+   for(const [key,path] of Object.entries({XDG_CONFIG_HOME:'.config',XDG_STATE_HOME:'.local/state',XDG_CACHE_HOME:'.cache',XDG_DATA_HOME:'.local/share',GH_CONFIG_DIR:'.config/gh'})){
+    env[key]=resolve(home,path);mkdirSync(env[key],{recursive:true,mode:0o700});
+   }
+   const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
+   const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
+  }finally{rmSync(home,{recursive:true,force:true});}
 };
 export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;evidence:typeof sessionEvidence;command:RecoveryCommand;verify:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
 const sha=(v:string)=>/^[a-f0-9]{40,64}$/.test(v);
@@ -344,14 +354,16 @@ export class ConflictRecovery{
    const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
    if(!turn)throw Error('Resolution delivery receipt missing; never resend');
    if(turn.state!=='completed')throw Error(`Resolution turn ${turn.state}; wait or reconcile without resend`);
-   for(const entry of x.e.transcript.entries.filter((e:any)=>e.turnId===turn.id&&e.role==='assistant'&&!e.streaming)){
-    const report=assessWorkerReceipt(entry.text??'');
-    if(report.valid&&['needs-input','blocked-dependency','failed','uncertain'].includes(report.receipt.outcome))throw Error(`Worker stopped on ${JSON.stringify(report.receipt)}; files: ${d.conflicts.join(', ')}`);
-   }
+    const terminal=x.e.transcript.entries.filter((e:any)=>e.turnId===turn.id&&e.kind==='message'&&e.role==='assistant'&&e.origin==='provider'&&!e.streaming).at(-1);
+    const text=terminal?.text??'',markers=[...text.matchAll(/<!--\s*ADLC_WORKER_STATUS\b/g)];
+    const report=assessWorkerReceipt(text,true);
+    if(markers.length!==1||!report.valid||report.receipt?.outcome!=='host-ready')throw Error(`Conflict handoff requires one authoritative host-ready receipt; ${report.valid?JSON.stringify(report.receipt):report.reason}. Inspect the resolution turn and reconcile without resend; files: ${d.conflicts.join(', ')}`);
    if(await this.git(r.worktree,'rev-parse','HEAD')!==r.head||await this.git(r.worktree,'rev-parse','MERGE_HEAD')!==r.base)throw Error('Worker changed merge ancestry');
-   const changed=(await this.git(r.worktree,'diff','--name-only','-z')).split('\0').filter(Boolean);
-   if(changed.some(p=>!d.conflicts.includes(p)))throw Error('Worker changed files beyond the conflict set');
-   this.set(r,'staging',d);await this.git(r.worktree,'add','--',...d.conflicts);
+    const changed=(await this.git(r.worktree,'diff','--name-only','-z')).split('\0').filter(Boolean);
+    if(changed.some(p=>!d.conflicts.includes(p)))throw Error('Worker changed files beyond the conflict set');
+    if(JSON.stringify(await this.index(r))!==JSON.stringify(d.index))throw Error('Worker changed the recorded conflict index; inspect staged work without replay');
+    if(await this.git(r.worktree,'ls-files','--others','--exclude-standard'))throw Error('Untracked work remains; preserve it and reconcile before host staging');
+    this.set(r,'staging',d);await this.git(r.worktree,'add','--',...d.conflicts);
   }
   await this.assertResolved(r,d);
   d.tree=await this.git(r.worktree,'write-tree');if(!sha(d.tree))throw Error('Invalid merged tree');
