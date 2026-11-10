@@ -335,10 +335,12 @@ export class ReviewLoop{
     try{
      const e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,[...new Set([...JSON.parse(t.required_checks),...metadataChecks])],metadataChecks));
      l.current(job);
-     this.observeReviewers(job,e,t.pr);
+     this.observeReviewers(job,e,t.pr,result.maintenanceComplete===true);
      if(this.get(job).pr===t.pr&&this.get(job).state!=='completed'){
       if(e.head===result.head){
-       this.s.db.query("UPDATE review_targets SET head=?,head_since=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,t.head===e.head?t.head_since:Date.now(),job,t.pr);
+        // Pending maintenance must retain the verified predecessor as its
+        // provenance anchor, even when current remote review reads succeed.
+        if(result.maintenanceComplete)this.s.db.query("UPDATE review_targets SET head=?,head_since=? WHERE job=? AND pr=? AND state!='completed'").run(e.head,t.head===e.head?t.head_since:Date.now(),job,t.pr);
        if(e.customCheckBlocker)record({state:'blocked',send:false,head:e.head,reason:e.customCheckBlocker});
       }
      }
@@ -620,7 +622,7 @@ export class ReviewLoop{
   }
   return {...d,head:e.head,send:false,mergeEnabled:false};
   }
-  private observeReviewers(job:string,e:any,pr:number){
+  private observeReviewers(job:string,e:any,pr:number,advanceHead=true){
    assertObservationFence();
    // Persist observation currency before decision/receipt early returns. A
    // generation distinguishes A -> B -> A without reviving superseded claims.
@@ -635,7 +637,7 @@ export class ReviewLoop{
      const generation=(prior?.generation??0)+1;
      this.s.db.query('INSERT INTO review_bindings VALUES (?,?,?) ON CONFLICT(job) DO UPDATE SET generation=excluded.generation,fingerprint=excluded.fingerprint').run(job,generation,fingerprint);
      this.s.event(job,'review_binding_observed',JSON.stringify({pr,head:e.head,previousHead:t.head,generation,fingerprint}));
-     this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=CASE WHEN state='ready_for_human' THEN 'waiting_for_review' ELSE state END,reason=CASE WHEN state='ready_for_human' THEN 'Review evidence changed; fresh clearance required' ELSE reason END WHERE job=? AND pr=?").run(e.head,t.head===e.head?t.head_since:this.now(),job,pr);
+      this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state=CASE WHEN state='ready_for_human' THEN 'waiting_for_review' ELSE state END,reason=CASE WHEN state='ready_for_human' THEN 'Review evidence changed; fresh clearance required' ELSE reason END WHERE job=? AND pr=?").run(advanceHead?e.head:t.head,!advanceHead||t.head===e.head?t.head_since:this.now(),job,pr);
     }
     if(e.reviewerEvidence)this.s.db.query('INSERT INTO reviewer_observations VALUES (?,?,?,?) ON CONFLICT(job) DO UPDATE SET head=excluded.head,observed=excluded.observed,evidence=excluded.evidence').run(job,e.head,this.now(),JSON.stringify(e.reviewerEvidence));
    }).immediate();

@@ -8,7 +8,7 @@ import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {recordReadiness} from '../src/readiness';
 import {BranchUpdates,branchUpdateBinding,branchTransport,type BranchSnapshot} from '../src/branch-updates';
-import {BranchSync} from '../src/branch-sync';
+import {BranchSync,MAX_SYNC_MERGES} from '../src/branch-sync';
 import {ReviewLoop} from '../src/review-loop';
 import {command} from '../src/delivery-evidence';
 import {turnBarrier} from '../src/turn-submission';
@@ -178,7 +178,7 @@ for(const change of ['base','head','approval','ownership'])test(`${change} race 
 test('unrelated appended remote commits are not adopted despite containing both recorded inputs',async()=>{
  const f=fixture();try{
   f.git(['checkout','producer']);writeFileSync(join(f.repo,'unrelated'),'unrelated');f.git(['add','.']);f.git(['commit','-m','Unrelated update']);f.b.head=f.git(['rev-parse','HEAD']);f.git(['push',f.remote,`HEAD:refs/heads/${f.b.branch}`]);
-  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('exact recorded update merge');expect(f.updates()).toBe(0);
+   expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('two-parent');expect(f.updates()).toBe(0);
  }finally{f.close();}
 });
 test('concurrent polls share the submission fence and do not duplicate mutation',async()=>{
@@ -223,7 +223,8 @@ test('external merge defers active workers and preserves dirty work',async()=>{
  }finally{f.close();}
 });
 for(const change of ['head','base','approval','ownership','base-ref'])test(`external ${change} race preserves predecessor`,async()=>{
- const f=externalFixture();try{
+  const f=externalFixture();try{
+   advanceExternal(f,2);
   f.onFetch(()=>{if(change==='head')f.b.head=f.old;if(change==='base')f.b.base=f.old;if(change==='approval')f.s.db.exec('DELETE FROM git_grants');if(change==='ownership')f.setOwners(['other']);if(change==='base-ref')f.git(['--git-dir',f.remote,'update-ref','refs/heads/main',f.old]);});
   expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.state).toBe('blocked');expect(f.updates()).toBe(0);expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.old);
  }finally{f.close();}
@@ -283,5 +284,70 @@ test('historical completed update receipts do not block a later external merge',
   f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,initial,initial,'observed',1,null);
   expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.maintenanceComplete).toBe(true);
   expect(f.s.db.query('SELECT state FROM branch_updates').get()).toMatchObject({state:'observed'});
+ }finally{f.close();}
+});
+
+function advanceExternal(f:ReturnType<typeof externalFixture>,count=1){
+ for(let i=0;i<count;i++){
+  f.git(['checkout','main']);writeFileSync(join(f.repo,`base-${i}`),`base ${i}`);f.git(['add','.']);f.git(['commit','-m',`Base ${i}`]);f.b.base=f.git(['rev-parse','HEAD']);
+  f.git(['checkout','producer']);f.git(['merge','--no-ff','main','-m',`External base merge ${i}`]);f.b.head=f.git(['rev-parse','HEAD']);
+ }
+ f.git(['push',f.remote,'main:refs/heads/main','producer:refs/heads/fixture-chain']);
+ f.git(['--git-dir',f.remote,'update-ref',`refs/heads/${f.b.branch}`,f.b.head]);
+}
+
+for(const count of [0,2])for(const mixed of [false,true])test(`polling reconciles ${count+1} merges with ADLC receipt: ${mixed}`,async()=>{
+ const f=externalFixture();let reads=0;
+ if(mixed)f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,f.old,f.base,'accepted',Date.now(),null);
+ advanceExternal(f,count);
+ const session={receiptObservation:{complete:true,observed:Date.now()},session:{id:'worker',projectId:'ao',branch:f.b.branch,isTerminated:false,prs:[{number:7,url:'https://github.com/owner/repo/pull/7'}]},transcript:{controller:'ready',entries:[],turns:[]}};
+ const original=BranchSync.prototype.ensure;
+ const sync=spyOn(BranchSync.prototype,'ensure').mockImplementation(function(job,c,repo,pr){return original.call(f.sync(),job,c,repo,pr);});
+ const io:any={readBranchSnapshot:f.transport.read,contains:f.transport.contains,worktreeIdentity:async()=>({tree:f.tree,branch:f.b.branch,head:f.git(['rev-parse','HEAD'],f.tree)}),sessionEvidence:async()=>({...session,receiptObservation:{complete:true,observed:Date.now()}}),readiness:async()=>{reads++;return {head:f.b.head,clear:false,customCheckBlocker:'Independent review gate',reasons:['Independent review gate'],findings:[],failedChecks:[],pendingChecks:['CI'],missingChecks:[],coderabbitPending:true};}};
+ try{
+  let loop=new ReviewLoop(f.s,async()=>{throw Error('No review mutation');},io);loop.configureMetadataChecks('project',[]);
+  f.setIdle(false);
+  expect((await loop.tick(f.id,undefined,undefined,undefined,f.c)).state).toBe('waiting_for_worker');
+  expect(loop.get(f.id).head).toBe(f.old);expect(f.updates()).toBe(0);
+  f.setIdle(true);f.loseUpdate();
+  expect((await loop.tick(f.id,undefined,undefined,undefined,f.c)).state).toBe('blocked');
+  expect(loop.get(f.id).head).toBe(f.old);
+  loop=new ReviewLoop(f.s,async()=>{throw Error('No review mutation');},io);
+  expect((await loop.tick(f.id,undefined,undefined,undefined,f.c)).maintenance?.state).toBe('completed');
+  expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.b.head);expect(f.updates()).toBe(1);
+  expect(loop.get(f.id)).toMatchObject({head:f.b.head,state:'blocked',reason:'Independent review gate'});
+  expect(await f.sync().ensure(f.id,f.c,'owner/repo',7)).toBeNull();expect(reads).toBe(3);
+  if(mixed)expect(f.s.db.query('SELECT state FROM branch_updates').get()).toMatchObject({state:'observed'});
+ }finally{sync.mockRestore();f.close();}
+});
+
+for(const invalid of ['earlier-tree','rewritten','bound'])test(`consecutive external chain rejects ${invalid} history`,async()=>{
+ const f=externalFixture();try{
+  if(invalid==='earlier-tree'){
+   f.git(['checkout','producer']);writeFileSync(join(f.repo,'feature'),'untrusted');f.git(['add','.']);f.git(['commit','--amend','--no-edit']);
+  }
+  if(invalid==='rewritten')f.git(['checkout','-B','producer','main']);
+  advanceExternal(f,invalid==='bound'?MAX_SYNC_MERGES:2);
+  const result=await f.sync().ensure(f.id,f.c,'owner/repo',7);
+  expect(result?.state).toBe('blocked');expect(result?.reason).toContain('Unverified commit');expect(result?.reason).toContain('operator reconciliation');
+  expect(f.git(['rev-parse','HEAD'],f.tree)).toBe(f.old);expect(f.updates()).toBe(0);
+ }finally{f.close();}
+},30000);
+
+test('mixed chain rechecks authorization and base ref before fast-forward',async()=>{
+ const f=externalFixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,f.old,f.base,'accepted',Date.now(),null);
+  advanceExternal(f,2);f.onFetch(()=>f.git(['--git-dir',f.remote,'update-ref','refs/heads/main',f.old]));
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('base ref changed');
+  expect(f.updates()).toBe(0);expect(f.s.db.query('SELECT state FROM branch_updates').get()).toMatchObject({state:'accepted'});
+ }finally{f.close();}
+});
+
+test('mixed chain rejects an unmatched receipt added during fetch',async()=>{
+ const f=externalFixture();try{
+  f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,f.old,f.base,'accepted',Date.now(),null);
+  advanceExternal(f,2);
+  f.onFetch(()=>f.s.db.query('INSERT INTO branch_updates VALUES (?,?,?,?,?,?)').run(f.id,f.base,f.old,'delivery_uncertain',Date.now(),'unknown'));
+  expect((await f.sync().ensure(f.id,f.c,'owner/repo',7))?.reason).toContain('Unmatched recorded update provenance');expect(f.updates()).toBe(0);
  }finally{f.close();}
 });

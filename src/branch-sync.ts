@@ -11,6 +11,7 @@ import {BranchUpdates,branchTransport,branchUpdateBinding,type BranchTransport} 
 import {scopeAllows} from './file-scope';
 
 class WorkerBusy extends Error{}
+export const MAX_SYNC_MERGES=32;
 
 // Separate from the provider delivery ledger: remote observation is not local
 // reconciliation. Retain the reservation on uncertain/unsafe outcomes.
@@ -52,7 +53,7 @@ export class BranchSync{
      if(proven.length>1)throw Error('Ambiguous recorded ADLC update provenance; explicit recovery authority required');
      if(proven.length===1){
       intentCurrent(proven[0]);
-      proof={auth:a,repo,pr,branch:b.branch,predecessor:proven[0].head,inputBase:proven[0].base,target:b.head,base:b.base};
+       proof={auth:a,repo,pr,branch:b.branch,baseBranch:b.baseBranch,predecessor:proven[0].head,inputBase:proven[0].base,target:b.head,base:b.base};
      }else{
       const missing=['inspect','fetch','merge-base-feature'].filter(op=>!JSON.parse(a.grant).includes(op));
       if(missing.length)throw Error(`External update provenance requires current grants: ${missing.join(', ')}`);
@@ -69,7 +70,14 @@ export class BranchSync{
      this.s.db.query("INSERT INTO branch_syncs VALUES (?,?,'reserved',?,NULL) ON CONFLICT(job) DO UPDATE SET worktree=excluded.worktree,state=excluded.state,proof=excluded.proof,reason=NULL WHERE branch_syncs.state='completed'").run(job,facts.worktree,JSON.stringify(proof));
     }).immediate();
    }
-   const check=async()=>{
+    const externalGuards=()=>{
+     const missing=['inspect','fetch','merge-base-feature'].filter(op=>!JSON.parse(a.grant).includes(op));
+     if(missing.length)throw Error(`External update provenance requires current grants: ${missing.join(', ')}`);
+     const tracked=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any:null;
+     if(!tracked||tracked.repo!==repo||tracked.pr!==pr||tracked.head!==proof.predecessor||!facts.lineage||!facts.completed)throw Error('External update provenance requires the previously verified tracked PR head and completed owned delivery');
+     if(!c.conflictRecovery?.baseBranch||c.conflictRecovery.baseBranch!==proof.baseBranch)throw Error('Configured base changed; preserve synchronization evidence');
+    };
+    const check=async()=>{
     assertObservationFence();
     assertWorktreeAvailable(this.s,job,undefined,undefined,JSON.stringify(proof));
     if(proof.source==='external-base-merge'){
@@ -77,43 +85,65 @@ export class BranchSync{
      const tracked=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
      if(!tracked||tracked.repo!==repo||tracked.pr!==pr||tracked.head!==proof.predecessor)throw Error('Previously verified tracked head changed; preserve synchronization evidence');
      if(this.s.db.query("SELECT 1 FROM branch_updates WHERE job=? AND state IN ('accepted','remote_observed','delivery_uncertain')").get(job))throw Error('Update receipt changed during external synchronization');
-    }else{
+     }else{
      const update=this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND head=? AND base=? AND state IN ('accepted','observed','remote_observed','delivery_uncertain')").get(job,proof.predecessor,proof.inputBase) as any;
      if(!update)throw Error('Recorded update intent changed; preserve synchronization evidence');
      intentCurrent(update);
-    }
+     }
+     if(proof.externalSuffix){
+      externalGuards();
+      const outstanding=this.s.db.query("SELECT head,base,state FROM branch_updates WHERE job=? AND state!='observed' ORDER BY head,base").all(job);
+      if(JSON.stringify(outstanding)!==proof.receipts)throw Error('Update receipt changed during mixed synchronization; explicit operator reconciliation required');
+     }
      const fresh=await this.transport.read(repo,pr),f=await this.inspect(job,c);validate(f,fresh);
-     if(proof.source==='external-base-merge'&&(!f.lineage||!f.completed))throw Error('Owned delivery completion or retained lineage changed');
+      if((proof.source==='external-base-merge'||proof.externalSuffix)&&(!f.lineage||!f.completed))throw Error('Owned delivery completion or retained lineage changed');
     for(const name of ['MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','sequencer','rebase-apply','rebase-merge','index.lock'])if(existsSync(resolve(f.worktree,await git(f.worktree,'rev-parse','--git-path',name))))throw Error(`Ongoing Git operation ${name}; preserve work and inspect`);
     if(!f.idle)throw new WorkerBusy('Branch synchronization deferred until the existing worker is verifiably idle; reservation retained');
     if(fresh.head!==proof.target||fresh.base!==proof.base||fresh.branch!==proof.branch||proof.source==='external-base-merge'&&fresh.baseBranch!==proof.baseBranch||![proof.predecessor,proof.target].includes(f.head))throw Error('Worker/head/base changed during branch synchronization; preserve reservation and recheck');
      if(await git(f.worktree,'ls-remote','--refs','origin',`refs/heads/${proof.branch}`)!==`${proof.target}\trefs/heads/${proof.branch}`)throw Error('Exact remote feature ref changed; preserve reservation');
-     if(proof.source==='external-base-merge'&&await git(f.worktree,'ls-remote','--refs','origin',`refs/heads/${proof.baseBranch}`)!==`${proof.base}\trefs/heads/${proof.baseBranch}`)throw Error('Exact remote base ref changed; preserve reservation');
+      if((proof.source==='external-base-merge'||proof.externalSuffix)&&await git(f.worktree,'ls-remote','--refs','origin',`refs/heads/${proof.baseBranch}`)!==`${proof.base}\trefs/heads/${proof.baseBranch}`)throw Error('Exact remote base ref changed; preserve reservation');
     if(JSON.stringify(auth())!==JSON.stringify(a))throw Error('Authorization changed immediately before branch synchronization; preserve reservation');
     return f;
    };
     let f=await check();
-    if(f.head===proof.predecessor||proof.source==='external-base-merge'){
+     if(f.head===proof.predecessor||proof.source==='external-base-merge'||proof.externalSuffix){
     this.s.db.query("UPDATE branch_syncs SET state='fetching',reason=NULL WHERE job=?").run(job);
-     await git(f.worktree,'fetch','--no-tags','--no-write-fetch-head','origin',`refs/heads/${proof.branch}`,...proof.source==='external-base-merge'?[`refs/heads/${proof.baseBranch}`]:[]);
+      await git(f.worktree,'fetch','--no-tags','--no-write-fetch-head','origin',`refs/heads/${proof.branch}`,...proof.baseBranch?[`refs/heads/${proof.baseBranch}`]:[]);
     // Both ancestry inputs alone allow unrelated appended commits. Require the
     // exact update-branch merge shape before adopting a provider result.
-    const parents=(await git(f.worktree,'show','-s','--format=%P',proof.target)).split(' ');
-     if(proof.source==='external-base-merge'){
-      if(parents.length!==2||parents[0]!==proof.predecessor)throw Error('External head is not an exact two-parent base merge of the verified feature head');
-      if(await git(f.worktree,'merge-base',parents[1],proof.base)!==parents[1])throw Error('External merge second parent is not from the configured base branch');
+     const chain:{head:string;parents:string[]}[]=[];
+     let cursor=proof.target;
+     while(cursor!==proof.predecessor){
+      const parents=(await git(f.worktree,'show','-s','--format=%P',cursor)).split(' ');
+      if(chain.length>=MAX_SYNC_MERGES||parents.length!==2)throw Error(`Unverified commit ${cursor}: expected a bounded two-parent first-parent chain; preserve work and request explicit operator reconciliation`);
+      chain.unshift({head:cursor,parents});cursor=parents[0];
+     }
+     if(proof.source!=='external-base-merge'&&chain.length>1){
+      proof.externalSuffix=true;externalGuards();
+      const currentRows=this.s.db.query("SELECT * FROM branch_updates WHERE job=? AND state!='observed'").all(job) as any[];
+      const unmatched=currentRows.filter(row=>row.head!==proof.predecessor||row.base!==proof.inputBase);
+      if(unmatched.length)throw Error(`Unverified commit ${chain[0].head}: Unmatched recorded update provenance; explicit operator reconciliation required`);
+      proof.receipts=JSON.stringify(this.s.db.query("SELECT head,base,state FROM branch_updates WHERE job=? AND state!='observed' ORDER BY head,base").all(job));
+      this.s.db.query('UPDATE branch_syncs SET proof=? WHERE job=?').run(JSON.stringify(proof),job);
+     }
+     for(const [index,step] of chain.entries()){
+      const {head,parents}=step,recorded=proof.source!=='external-base-merge'&&index===0;
+      try{
+       if(recorded&&parents[1]!==proof.inputBase)throw Error('Remote result is not the exact recorded update merge; explicit recovery authority required');
+       if(await git(f.worktree,'merge-base',parents[1],proof.base)!==parents[1])throw Error('External merge second parent is not from the configured base branch');
       // Reconstruct without changing HEAD/index/worktree. Disable configured
       // custom merge drivers: untrusted repository content must not select host
       // code execution to establish a provenance proof. Conflicts fail closed.
       const config=(await git(f.worktree,'config','--null','--list')).split('\0');
       const drivers=config.map(entry=>entry.split('\n')[0]).filter(key=>/^merge\..+\.driver$/i.test(key)).flatMap(key=>['-c',`${key}=false`]);
       let expected:string;
-      try{expected=await git(f.worktree,...drivers,'-c','core.attributesFile=/dev/null','-c','merge.renormalize=false','merge-tree','--write-tree',proof.predecessor,parents[1]);}
+       try{expected=await git(f.worktree,...drivers,'-c','core.attributesFile=/dev/null','-c','merge.renormalize=false','merge-tree','--write-tree',parents[0],parents[1]);}
       catch{throw Error('Cannot prove a clean external base merge tree; conflict resolution or merge-driver evidence requires explicit operator reconciliation');}
-      if(!/^[a-f0-9]{40,64}$/.test(expected)||expected!==await git(f.worktree,'rev-parse',`${proof.target}^{tree}`))throw Error('External merge introduces independent feature edits or an ambiguous merge result');
-      const paths=(await git(f.worktree,'diff','--name-only','--no-renames','-z',`${parents[1]}...${proof.target}`)).split('\0').filter(Boolean);
-      if(paths.some(path=>!scopeAllows(path,JSON.parse(a.paths))))throw Error('External merge feature changes exceed approved scope');
-     }else if(parents.length!==2||parents[0]!==proof.predecessor||parents[1]!==proof.inputBase)throw Error('Remote result is not the exact recorded update merge; explicit recovery authority required');
+       if(!/^[a-f0-9]{40,64}$/.test(expected)||expected!==await git(f.worktree,'rev-parse',`${head}^{tree}`))throw Error('External merge introduces independent feature edits or an ambiguous merge result');
+       const paths=(await git(f.worktree,'diff','--name-only','--no-renames','-z',`${parents[1]}...${head}`)).split('\0').filter(Boolean);
+       if(!recorded&&paths.some(path=>!scopeAllows(path,JSON.parse(a.paths))))throw Error('External merge feature changes exceed approved scope');
+      }catch(error){throw Error(`Unverified commit ${head}: ${(error as Error).message}; preserve work and request explicit operator reconciliation`);}
+     }
      f=await check();
      if(f.head===proof.predecessor){
      this.s.db.query("UPDATE branch_syncs SET state='updating' WHERE job=?").run(job);
