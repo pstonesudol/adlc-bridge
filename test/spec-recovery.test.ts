@@ -16,6 +16,8 @@ import {RemediationReceipts,receiptStatus} from '../src/remediation-receipts';
 import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {Lifecycle} from '../src/lifecycle';
 import {jobViews,humanJobs} from '../src/operator-cli';
+import {routingConfig,settings} from './routing-fixture';
+import {RoutePreflightFailure} from '../src/routing-session';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -135,6 +137,32 @@ async function fixture(database=':memory:'){
  const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
+test('DEV-67 unavailable pinned model on a revised plan retains dispatch and historical session/PR/delivery evidence',async()=>{
+ const f=await fixture();try{
+  new ReviewLoop(f.s).register(f.job,'owner/repo',17,['CI'],['src/**']);
+  f.e.session.prs=[{number:17,state:'open',url:'https://github.com/owner/repo/pull/17'}];
+  f.edit('Revised requirements');const preview=await f.recovery.preview(f.job,config);await f.recovery.reconcile(f.job,config,preview.confirmation);f.complete();await f.recovery.capture(f.job,config);
+  const policy={...routingConfig,categories:routingConfig.categories.map(c=>c.id==='implement'?{...c,model:{providerID:'opencode-go',modelID:'deepseek-v4.1-flash'}}:c)};
+  f.w.router.load=async()=>({config:policy,classify:async()=>({choice:'implement',confidence:1})});
+  await f.w.router.choose(f.job,'planning',digest(f.s.get(f.job).spec),'plan',settings,'planning');
+  await f.w.prepareImplementationRoute(f.job,{...config,routing:settings});
+  const hash=f.s.get(f.job).plan_hash;expect(()=>f.w.router.approved(f.job,f.hash)).toThrow('current human approval');
+  f.w.approve(f.job,hash,'human',['src/**'],'supervised-host',featureGit);
+  const snapshot=()=>({dispatch:f.w.implementation(f.job),history:f.s.db.query('SELECT * FROM spec_execution_history').all(),pr:f.s.db.query('SELECT * FROM review_targets').all(),receipts:f.s.db.query('SELECT * FROM delivery_receipts').all(),planning:f.s.db.query('SELECT * FROM planning_runs').all()});
+  const before=snapshot();let configured=0;
+  f.w.t.configureRoute=async()=>{configured++;};f.w.t.preflightRoute=async route=>{expect(route.model).toBe('opencode-go/deepseek-v4.1-flash');throw new RoutePreflightFailure('unavailable');};
+  expect(await f.w.executeApproved(f.job,config)).toMatchObject({state:'route_approval_required'});
+  const after=snapshot();expect(after).toEqual({...before,dispatch:{...before.dispatch,reason:expect.stringContaining('scoped route approval in Linear')}});
+  expect(configured).toBe(0);expect(f.sends).toHaveLength(2);
+  const check=f.s.db.query('SELECT * FROM dispatch_route_checks').get() as any;expect(check.plan_hash).toBe(hash);expect(check.client_id).toBe(before.dispatch.client_id);expect(check.route).toContain('deepseek-v4.1-flash');
+  // An uncertain dispatch is reconciliation-only, even if its route later fails.
+  f.s.db.query("UPDATE implementation_dispatch SET state='delivery_uncertain' WHERE job=?").run(f.job);
+  const checksBefore=f.s.db.query('SELECT * FROM dispatch_route_checks').all();let preflights=0;
+  f.w.t.preflightRoute=async()=>{preflights++;};
+  await f.w.executeApproved(f.job,config);expect(preflights).toBe(0);expect(f.sends).toHaveLength(2);expect(configured).toBe(0);
+  expect(f.s.db.query('SELECT * FROM dispatch_route_checks').all()).toEqual(checksBefore);
+ }finally{f.s.close();}
+});
 async function revisedFixture(){
  const f=await fixture();
  f.edit('DEV-51 revised runtime update history requirements');
