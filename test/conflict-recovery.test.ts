@@ -1,7 +1,7 @@
 import {test,expect,setSystemTime} from 'bun:test';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
-import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync} from 'node:fs';
+import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../src/core';
@@ -42,7 +42,7 @@ async function fixture(filename='app.txt'){
  const snapshot=async()=>({head:await git(remote,'rev-parse',`refs/heads/${reserved.branch}`),base:await git(remote,'rev-parse','refs/heads/main'),branch:reserved.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:false,behind:1});
  const io={command,snapshot,evidence:async()=>e,submit:async<T>(fn:()=>Promise<T>)=>fn(),send:async(_s:string,_p:string,id:string)=>{sends++;if(lost)throw Error('Lost receipt');e.transcript.entries=[{clientMessageId:id,turnId:'resolution'}];e.transcript.turns=[{id:'resolution',state:'running'}];},facts:async()=>{const b=await snapshot();return {session:'worker',project:'ao',reserved:reserved.branch,worktree:tree,branch:await git(tree,'branch','--show-current'),head:await git(tree,'rev-parse','HEAD'),anchor:await git(tree,'rev-parse',reserved.branch),clean:!(await git(tree,'status','--porcelain')),isolated:true,lineage:true,idle,completed:true,owners,candidates:[{repo:'owner/repo',pr:1,url:'https://github.com/owner/repo/pull/1',branch:reserved.branch,head:b.head,baseBranch:'main',defaultBranch:'main',fork:false,state:'open',draft:false}]};}};
  const recovery=new ConflictRecovery(s,io as any);
- return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
+  return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'resolution',text:`<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome:'host-ready',reason:`Resolved ${filename}; host staging, verification and publication remain`,questions:[],dependencies:[]})} -->`});},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
 }
 test('reserved conflict recovery retries six read failures before any mutation',async()=>{
  const f=await fixture();let fail=true,reads=0;
@@ -121,6 +121,55 @@ async function reservedWithReadFailure(f:any){
  return snapshot;
 }
 const mutating=(commands:string[][])=>commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref','commit','push'].includes(a[1]));
+test('DEV-103/DEV-67 host-ready text-only handoff publishes once across repeated polls',async()=>{
+ const f=await fixture();try{
+  let prompt='';const io={...f.io,send:async(s:string,p:string,id:string)=>{prompt=p;return f.io.send(s,p,id);}};
+  const r=new ConflictRecovery(f.s,io as any);
+  await r.tick(f.job,f.config,'owner/repo',1);
+  expect(prompt).toContain('host-ready');expect(prompt).toContain('not uncertainty');
+  f.resolve();expect(await r.tick(f.job,f.config,'owner/repo',1)).toBeNull();
+  const before=f.commands.length;
+  // A completed recovery is observed by the normal review loop with fresh branch facts.
+  const settled={...io,snapshot:async()=>({...await f.io.snapshot(),mergeable:true,behind:0})};
+  for(let n=0;n<3;n++)await expect(new ConflictRecovery(f.s,settled as any).tick(f.job,f.config,'owner/repo',1)).rejects.toThrow('Confirmed base conflict required');
+  expect(mutating(f.commands.slice(before))).toHaveLength(0);expect(f.sends()).toBe(1);
+  expect(f.commands.filter(a=>a[1]==='push'&&a[2]==='origin'&&a[3]?.includes(':refs/heads/'))).toHaveLength(1);
+ }finally{f.close();}
+},60000);
+test('DEV-103 missing, uncertain, malformed and non-authoritative handoffs never stage or publish',async()=>{
+ for(const kind of ['missing','uncertain','malformed','duplicate','wrong-origin','wrong-turn','streaming','later-message','questions']){
+  const f=await fixture();try{
+   await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();const message=f.e.transcript.entries.at(-1);
+   if(kind==='missing')message.text='Resolved files; host work remains';
+   if(kind==='uncertain')message.text='<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"uncertain","reason":"Resolution semantics are uncertain"} -->';
+   if(kind==='malformed')message.text='<!-- ADLC_WORKER_STATUS {bad json} -->';
+   if(kind==='duplicate')message.text+='\n'+message.text;
+   if(kind==='wrong-origin')message.origin='user';
+   if(kind==='wrong-turn')message.turnId='other';
+   if(kind==='streaming')message.streaming=true;
+   if(kind==='later-message')f.e.transcript.entries.push({...message,text:'Actually not ready'});
+   if(kind==='questions')message.text='<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"host-ready","reason":"Resolved","questions":[{"id":"q1","question":"Which behavior?","kind":"requirement"}]} -->';
+   const before=f.commands.length;
+   for(let n=0;n<3;n++)expect((await new ConflictRecovery(f.s,f.io as any).tick(f.job,f.config,'owner/repo',1))?.state).toBe('blocked');
+   expect(f.commands.slice(before).some(a=>['add','commit','push'].includes(a[1]))).toBe(false);
+   expect(f.sends()).toBe(1);expect(f.recovery.row(f.job).state).toBe('resolving');
+  }finally{f.close();}
+ }
+},60000);
+test('DEV-103 verification tool state uses private temporary home and preserves strict cleanliness',async()=>{
+ for(const dirty of [false,true]){
+  const f=await fixture();try{
+   f.config.conflictRecovery.verification=[[process.execPath,'-e',`const fs=require('fs'),path=require('path');const state=process.env.XDG_STATE_HOME||path.join(process.env.HOME||'.','.local/state');fs.mkdirSync(path.join(state,'gh'),{recursive:true});fs.writeFileSync(path.join(state,'gh/device-id'),'fixture');console.log(process.env.HOME);${dirty?"fs.writeFileSync('unexpected-state','keep me');":''}`]];
+   await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+   const result=await f.recovery.tick(f.job,f.config,'owner/repo',1);
+   expect(dirty?result?.state:result).toBe(dirty?'blocked':null);
+   const home=JSON.parse(f.recovery.row(f.job).detail).verification[0].stdout.trim();
+   expect(home.startsWith(f.tree+'/')).toBe(false);expect(existsSync(home)).toBe(false);
+   expect(existsSync(join(f.tree,'.local/state/gh/device-id'))).toBe(false);
+   expect(existsSync(join(f.tree,'unexpected-state'))).toBe(dirty);
+  }finally{f.close();}
+ }
+},60000);
 test('reserved conflict recovery blocks a permanent provider failure without Git mutations',async()=>{
  const f=await fixture();try{
  const snapshot=await reservedWithReadFailure(f);expect(f.recovery.row(f.job)).toMatchObject({state:'reserved',reason:null});
@@ -389,7 +438,7 @@ test('verification allowlist excludes host secrets in automatic and manual recov
  try{
   for(const key of keys)process.env[key]='sentinel-host-secret';
   // NODE_OPTIONS must also be absent: do not allow inherited runtime injection.
-  const argv=[process.execPath,'-e',`const allowed=${JSON.stringify(['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI'])};const bad=Object.keys(process.env).filter(k=>!allowed.includes(k));if(bad.length)process.exit(17);console.log('isolated')`];
+   const argv=[process.execPath,'-e',`const allowed=${JSON.stringify(['PATH','TMPDIR','TMP','TEMP','LANG','LC_ALL','TZ','CI','HOME','XDG_CONFIG_HOME','XDG_STATE_HOME','XDG_CACHE_HOME','XDG_DATA_HOME','GH_CONFIG_DIR'])};const bad=Object.keys(process.env).filter(k=>!allowed.includes(k));if(bad.length)process.exit(17);console.log('isolated')`];
   for(const mode of ['automatic','manual']){
    const f=await fixture();try{
     f.config.conflictRecovery.verification=[argv];
