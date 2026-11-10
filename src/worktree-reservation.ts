@@ -19,7 +19,11 @@ export function worktreeReservation(s:Store,job:string,target?:string):any{
   const paths=[p?.worktree,run?.worktree,target].map(path=>path?canonicalWorktree(path):null);
   // Stored rows may hold an alias (symlink) of a reserved path, so compare the
   // canonical forms in JavaScript rather than raw SQL text equality.
- const aliases=(path:string|null|undefined)=>!!path&&paths.includes(canonicalWorktree(path));
+  const aliases=(path:string|null|undefined)=>!!path&&paths.includes(canonicalWorktree(path));
+  if(s.db.query("SELECT name FROM sqlite_master WHERE name='startup_restores'").get()){
+   const restore=(s.db.query("SELECT * FROM startup_restores WHERE state IN ('attempting','setup_consumed')").all() as any[]).find(r=>r.job===job||aliases(r.worktree));
+   if(restore)return {...restore,id:restore.binding,planningRestore:true};
+  }
  if(s.db.query("SELECT name FROM sqlite_master WHERE name='branch_syncs'").get()){
   const sync=(s.db.query("SELECT * FROM branch_syncs WHERE state!='completed'").all() as any[]).find(r=>r.job===job||aliases(r.worktree));
   if(sync)return {...sync,id:sync.job,branchSync:true};

@@ -1,7 +1,7 @@
-import {realpathSync} from 'node:fs';
+import {realpathSync,existsSync} from 'node:fs';
 import {Database} from 'bun:sqlite';
 import {homedir} from 'node:os';
-import {join} from 'node:path';
+import {join,resolve} from 'node:path';
 import {Store,digest} from './core';
 import type {Workflow,WorkflowConfig} from './workflow';
 import {activePlanning} from './workflow';
@@ -44,7 +44,10 @@ export function restoreRegistry(project:string,session:string,source:string,tree
 // Preserve dirty work: status is evidence, never an instruction to reset/clean.
 export async function restoreRepository(s:Store,job:string,c:WorkflowConfig,run:ProcessRunner=command,registry=restoreRegistry){
  const w=await worktreeIdentity(s,job,run),source=realpathSync(c.repo);
- const git=(cwd:string,...args:string[])=>run(['git','--no-optional-locks',...args],cwd);
+  const git=(cwd:string,...args:string[])=>run(['git','--no-optional-locks',...args],cwd);
+  for(const name of ['MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply','sequencer','index.lock',`refs/heads/${w.branch}.lock`]){
+   if(existsSync(resolve(w.tree,await git(w.tree,'rev-parse','--git-path',name))))throw Error(`In-progress ${name}; preserve partial work for explicit branch recovery`);
+  }
  const common=realpathSync(await git(w.tree,'rev-parse','--path-format=absolute','--git-common-dir'));
  const trees=(await git(source,'worktree','list','--porcelain')).split('\n\n');
  if(w.tree===source||common!==realpathSync(await git(source,'rev-parse','--path-format=absolute','--git-common-dir'))||
@@ -53,7 +56,7 @@ export async function restoreRepository(s:Store,job:string,c:WorkflowConfig,run:
  const repo=/^(?:git@github\.com:|https:\/\/github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(origin)?.[1];
  if(!c.githubRepo||repo!==c.githubRepo)throw Error('Restore repository origin mismatch');
  const inventory=JSON.parse(await run([AO,'session','ls','--all','--include-terminated','--json']));
- if(!Array.isArray(inventory.data))throw Error('Complete restore owner inventory required');
+  if(!Array.isArray(inventory.data)||inventory.nextCursor||inventory.next_cursor||inventory.hasMore===true)throw Error('Complete restore owner inventory required');
  const p=s.db.query('SELECT * FROM planning_runs WHERE job=?').get(job) as any;
  registry(p.project,p.session_id,source,w.tree);
  const owners:any[]=[];let recorded:any;

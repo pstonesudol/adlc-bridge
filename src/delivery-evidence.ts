@@ -6,8 +6,8 @@ import {sessionEvidence} from './session-evidence';
 import type {RecoveryTransport,DeliveryFacts} from './delivery-recovery';
 
 export type ProcessRunner=(args:string[],cwd?:string)=>Promise<string>;
-export const command:ProcessRunner=async(args,cwd)=>{
- const p=Bun.spawn(args,{cwd,stdout:'pipe',stderr:'pipe',timeout:30000});
+export function createProcessRunner(spawn=Bun.spawn):ProcessRunner{return async(args,cwd)=>{
+  const p=spawn(args,{cwd,stdout:'pipe',stderr:'pipe',timeout:30000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  // GitHub and Orchestrator reads carry typed, secret-safe evidence so a
  // transient failure can be retried instead of becoming a permanent reason.
@@ -17,7 +17,8 @@ export const command:ProcessRunner=async(args,cwd)=>{
  throw Error(`Required evidence unavailable: ${args[0]} ${args[1]}`);
  }
  return out.trim();
-}
+};}
+export const command:ProcessRunner=(args,cwd)=>createProcessRunner(Bun.spawn)(args,cwd);
 const json=async(run:ProcessRunner,args:string[])=>JSON.parse(await run(args));
 const git=(run:ProcessRunner,cwd:string,...args:string[])=>run(['git','--no-optional-locks',...args],cwd);
 function githubRepo(url:string){return /^(?:git@github\.com:|https:\/\/github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?$/.exec(url)?.[1];}

@@ -10,6 +10,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {sessionEvidence} from './session-evidence';
 import {OperatorError} from './operator-cli';
 import {turnBarrier,TurnSubmissionBlocked,projectIntakePaused,setProjectIntakePaused,type TurnBarrier} from './turn-submission';
+import {recoverRegisteredProjects,assertRecoveryAvailable} from './recovery-runtime';
 
 export type LifecycleAction='start'|'stop'|'restart'|'status';
 export type LifecycleOptions={project?:string;all?:boolean;mode?:'pause'|'drain'|'workers';timeout:number;persistent?:boolean;preview?:boolean;apply?:boolean;confirm?:string};
@@ -22,7 +23,8 @@ export type LifecycleOps={
  project(action:'start'|'stop'|'service-status',id:string,persistent:boolean):Promise<any>;
  holdProject?(id:string):Promise<void>;
  backend():Promise<any>;backendStart():Promise<void>;backendStop():Promise<void>;
- inventory():Promise<Inventory>;exit(worker:Worker):Promise<void>;checkpoint():Promise<void>;
+  inventory():Promise<Inventory>;exit(worker:Worker):Promise<void>;checkpoint():Promise<void>;
+  recover?(ids:string[]):Promise<any>;
  processesRemain(previous:ProcessIdentity[]):Promise<ProcessIdentity[]>;
  now():number;sleep(ms:number):Promise<unknown>;
 };
@@ -37,7 +39,7 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
  if(!ids.length&&!o.all)throw new OperatorError('Specify a registered project or --all; no project was selected',entries.length?4:3);
  if(ids.some(id=>!entries.some(e=>e.project===id)))throw new OperatorError('Unknown project; use adlc projects',3);
  const persistent=o.persistent??!!o.all;
- const result:any={scope:o.all?'all':'project',projects:ids,action,mode:o.mode??(action==='start'?'start':action==='restart'?'restart':o.all?'shutdown':'pause'),persistent,globalIntakePaused:ops.turns.isPaused(),services:[],workers:null,children:null,inventoryComplete:false,errors:[],resume:'Existing sessions are preserved. Exited/interrupted workers require explicit approved job recovery; no resume or send is performed.'};
+  const result:any={scope:o.all?'all':'project',projects:ids,action,mode:o.mode??(action==='start'?'start':action==='restart'?'restart':o.all?'shutdown':'pause'),persistent,globalIntakePaused:ops.turns.isPaused(),services:[],workers:null,children:null,inventoryComplete:false,errors:[],resume:'Existing sessions and worktrees are preserved; startup recovery requires exact receipts and unchanged current authorization. Ambiguous jobs remain blocked.'};
  const tracked=new Map<string,ProcessIdentity>();
  const scoped=(i:Inventory)=>i.workers.filter(w=>w.owned&&ids.includes(w.project));
  const observe=async()=>{const i=await ops.inventory();for(const p of i.children)tracked.set(`${p.pid}:${p.started}`,p);result.workers=scoped(i);result.sharedOrExternal=i.workers.filter(w=>!w.owned||!ids.includes(w.project));result.children=i.children;result.observedAt=ops.now();result.externalProcesses=i.externalProcesses;result.inventoryComplete=i.complete;return i;};
@@ -73,7 +75,17 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
      let b=await ops.backend();if(!b.ready){await ops.backendStart();b=await ops.backend();}
      result.backend=b;if(!b.ready)throw Error('Backend readiness/compatibility unverified; project intake was not started');
     }
-    for(const id of ids){time();result.services.push(await ops.project('start',id,persistent));}
+     for(const id of ids){time();result.services.push(await ops.project('start',id,persistent));}
+     if(ops.recover){
+      // Services acknowledge the fence while still paused. No intake turn can
+      // compete with reconciliation, even when launchd was already loaded.
+      let attempt=0;
+      for(;;){
+       time();
+       try{const i=await observe();if(!i.complete)throw Error('Authoritative startup session inventory incomplete');result.recovery=await ops.recover(ids);if(!result.recovery.admit)throw Error('Startup reconciliation incomplete; intake remains paused');break;}
+       catch(error){if(ops.now()+Math.min(2000,200*2**attempt)>=deadline)throw error;await ops.sleep(Math.min(2000,200*2**attempt++));}
+      }
+     }
     time();if(o.all||releaseGlobal)ops.turns.resume();
    };
    if(action==='start'){await start();result.globalIntakePaused=ops.turns.isPaused();result.complete=true;return result;}
@@ -110,7 +122,7 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
     result.shutdown={backend:result.backend,remainingObservedChildren:result.children};
     await start();result.children=null;result.childrenAfterRestart='Not re-inventoried; use services status. The new backend and intake are running.';
    }
-   result.globalIntakePaused=ops.turns.isPaused();result.complete=true;result.note=action==='restart'?'Selected coordination restarted; exited workers remain preserved and are not automatically resumed.':o.all&&o.mode!=='pause'?'Managed stack shutdown verified for observed processes. Unrelated apps/windows and detached external processes are not controlled.':'Selected coordination stopped; unrelated services and workers are preserved.';return result;
+    result.globalIntakePaused=ops.turns.isPaused();result.complete=true;result.note=action==='restart'?'Selected coordination restarted; see startup recovery outcomes. Original submissions are never replayed.':o.all&&o.mode!=='pause'?'Managed stack shutdown verified for observed processes. Unrelated apps/windows and detached external processes are not controlled.':'Selected coordination stopped; unrelated services and workers are preserved.';return result;
   }catch(e){result.globalIntakePaused=ops.turns.isPaused();result.complete=false;result.errors.push({message:message(e)});throw new LifecycleFailure(message(e),result);}
  });
 }
@@ -207,11 +219,12 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
    await serviceControl('service-status',id,turns,{statePath:path,run:args=>run(['/bin/launchctl',...args])});
    setProjectIntakePaused(id,true,state);
   },
-  project:async(action,id,persistent)=>{
+   project:async(action,id,persistent)=>{
+    if(action==='start'&&o.all&&projectIntakePaused(id,state))return {project:id,intakePaused:true,note:'Deliberate project pause preserved; explicit project start required'};
    if(action==='stop'){
     // Validate identity/definition before writing a durable intake choice.
     await serviceControl('service-status',id,turns,{statePath:path,run:args=>run(['/bin/launchctl',...args])});
-    setProjectIntakePaused(id,true,state);
+     if(!o.all)setProjectIntakePaused(id,true,state);
    }
    const result=await serviceControl(action,id,turns,{statePath:path,run:args=>run(['/bin/launchctl',...args])});
    if(action==='start')setProjectIntakePaused(id,false,state);
@@ -219,7 +232,8 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
    return {...result,intakePaused:projectIntakePaused(id,state)};
   },
   backend:async()=>{if(o.all)return stack().backend();const b=await verified();return {...b,managed:false,note:'Project scope never changes the shared backend'};},
-  backendStart:()=>stack().backendStart(),backendStop:()=>stack().backendStop(),inventory,
+   backendStart:()=>stack().backendStart(),backendStop:()=>stack().backendStop(),inventory,
+   recover:ids=>recoverRegisteredProjects(ids,path,state,deadline),
   exit:async worker=>{
    const b=await verified();if(!b.ready)throw Error('Backend unavailable; worker exit not attempted');
    const current=await evidence(worker.session);if(!store(s=>workerOwnership(s,current.session,worker.worktree)||featureWorkerProject(s,current)===worker.project))throw Error('Worker ownership changed; exit not sent');
@@ -236,9 +250,9 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
 export async function managedLifecycle(action:LifecycleAction,o:LifecycleOptions,path=registryPath(),state=appState()){
  if(process.platform!=='darwin')throw Error('Managed lifecycle controls require macOS');
  const deadline=Date.now()+o.timeout*1000;
- const run=()=>controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline),deadline);
+  const run=()=>{if(action==='start'||action==='restart')assertRecoveryAvailable(state);return controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline),deadline);};
  if(action==='status'||o.preview||!o.apply&&(action==='restart'||action==='stop'&&o.mode!=='pause'&&(o.all||o.mode)))return run();
- // A busy tick is not interrupted. Drain may wait for its receipt/fence to
- // settle, but never removes stale locks or assumes delivery was rolled back.
+  // A busy tick is not interrupted. Only proved-dead lock generations may be
+  // reclaimed; delivery receipts remain uncertain until separately reconciled.
  for(;;){try{return await withStackLock(state,run);}catch(e){if(!(e instanceof TurnSubmissionBlocked)||o.mode!=='drain'||Date.now()>=deadline)throw e;await Bun.sleep(100);}}
 }
