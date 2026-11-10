@@ -1,9 +1,28 @@
 import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {TaskRouting,selectRoute,type RoutingConfig} from '../src/task-routing';
-import {configureSessionRoute} from '../src/routing-session';
+import {configureSessionRoute,preflightRoute,RoutePreflightFailure} from '../src/routing-session';
 import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
 import {routingConfig,settings} from './routing-fixture';
+test('catalog preflight distinguishes unavailable models from transient or incomplete evidence',async()=>{
+ const route=selectRoute(routingConfig,{choice:'implement',confidence:1});
+ await preflightRoute(route,async()=>({models:[{id:route.model}]}));
+ for(const catalog of [{},{models:null},{models:[null]},{models:[],nextCursor:'more'},{models:[],hasMore:true},{models:[],pageInfo:{hasNextPage:true}},{models:[],complete:false}]){
+  await expect(preflightRoute(route,async()=>catalog)).rejects.toMatchObject({kind:'transient'});
+ }
+ await expect(preflightRoute(route,async()=>{throw Error('secret provider response');})).rejects.toMatchObject({kind:'transient',message:'Model catalog could not be verified; retry preflight'});
+ await expect(preflightRoute(route,async()=>({models:[]}))).rejects.toBeInstanceOf(RoutePreflightFailure);
+ await expect(preflightRoute(route,async()=>({models:[{id:'other/model'}]}))).rejects.toMatchObject({kind:'unavailable'});
+});
+test('a refreshing catalog miss is transient until discovery completes',async()=>{
+ const route=selectRoute(routingConfig,{choice:'implement',confidence:1});
+ for(const models of [[],[{id:'other/model'}]]){
+  await expect(preflightRoute(route,async()=>({models,refreshState:'refreshing'}))).rejects.toMatchObject({kind:'transient'});
+  await expect(preflightRoute(route,async()=>({models,refreshState:'idle'}))).rejects.toMatchObject({kind:'unavailable'});
+ }
+ // A refresh does not invalidate positive evidence already in the catalog.
+ await preflightRoute(route,async()=>({models:[{id:route.model}],refreshState:'refreshing'}));
+});
 test('task categories preserve provider, model and effort rather than using one default',()=>{
  for(const [category,model,effort] of [['planning','openai/luna','high'],['implement','openai/sol','medium'],['hard','openai/astra','high'],['testing','openai/sol','low']]){
   const route=selectRoute(routingConfig,{choice:category,confidence:0.9});expect(route.model).toBe(model);expect(route.effort).toBe(effort);
