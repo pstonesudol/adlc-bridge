@@ -54,6 +54,52 @@ test('exact ADLC merge fast-forwards the owned worktree once and completes both 
   expect(await f.sync().ensure(f.id,f.c,'owner/repo',7)).toBeNull();expect(f.updates()).toBe(1);
  }finally{f.close();}
 });
+test('DEV-105: automatic polls maintain PR #56 despite stale review, base-only change, concurrency and restart',()=>{
+ const home=mkdtempSync(join(tmpdir(),'adlc-maintenance-poll-'));
+ try{
+  const script=`
+import {mkdtempSync,writeFileSync,rmSync,realpathSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+import {Store,digest} from ${JSON.stringify(join(import.meta.dir,'../src/core.ts'))};
+import {Workflow} from ${JSON.stringify(join(import.meta.dir,'../src/workflow.ts'))};
+import {Planning} from ${JSON.stringify(join(import.meta.dir,'../src/planning.ts'))};
+import {Lifecycle} from ${JSON.stringify(join(import.meta.dir,'../src/lifecycle.ts'))};
+import {recordReadiness} from ${JSON.stringify(join(import.meta.dir,'../src/readiness.ts'))};
+import {BranchUpdates,branchTransport} from ${JSON.stringify(join(import.meta.dir,'../src/branch-updates.ts'))};
+import {BranchSync} from ${JSON.stringify(join(import.meta.dir,'../src/branch-sync.ts'))};
+import {ReviewLoop} from ${JSON.stringify(join(import.meta.dir,'../src/review-loop.ts'))};
+import {command} from ${JSON.stringify(join(import.meta.dir,'../src/delivery-evidence.ts'))};
+import {turnBarrier} from ${JSON.stringify(join(import.meta.dir,'../src/turn-submission.ts'))};
+import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
+import {ActionWatchdog} from ${JSON.stringify(join(import.meta.dir,'../src/action-watchdog.ts'))};
+${fixture.toString()}
+const f=fixture();let now=Date.now(),requests=0,reviewReads=0;Date.now=()=>now;
+const c={...f.c,branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}},blocker='PR head or description changed during custom-check collection';
+f.s.db.exec('DELETE FROM branch_updates');f.b.head=f.old;f.b.behind=0;f.b.base=f.old;
+// Provider adapter only: synchronization below still executes the real guarded Git path.
+branchTransport.update=async()=>{requests++;f.b.head=f.target;f.b.behind=0;};
+const original=BranchSync.prototype.ensure;BranchSync.prototype.ensure=function(...args){return original.apply(f.sync(),args);};
+const io={readBranchSnapshot:f.transport.read,contains:f.transport.contains,worktreeIdentity:async()=>({tree:f.tree,branch:f.b.branch,head:f.git(['rev-parse','HEAD'],f.tree)}),sessionEvidence:async()=>({receiptObservation:{complete:true,observed:now},session:{id:'worker',projectId:'ao',branch:f.b.branch,isTerminated:false,prs:[{number:56,url:'https://github.com/owner/repo/pull/56'}]},transcript:{controller:'ready',entries:[],turns:[]}}),readiness:async()=>{reviewReads++;throw Error('Review should remain on its slow cadence');}};
+// Match the recorded PR identity in the inspection fixture, without weakening its checks.
+const inspect=f.inspect;f.inspect=async()=>{const facts=await inspect();facts.candidates[0].pr=56;facts.candidates[0].url='https://github.com/owner/repo/pull/56';return facts;};
+f.sync=()=>new BranchSync(f.s,f.transport,f.run,f.inspect,f.barrier.submit);
+let loop=new ReviewLoop(f.s,async()=>{throw Error('No review request');},io);loop.register(f.id,'owner/repo',56,['CI'],['src/**'],true);loop.record(f.id,{state:'blocked',head:f.old,reason:blocker});
+const makeTick=()=>createCLIPollTick({config:c,store:f.s,reviewLoop:loop,workflow:{tick:async()=>[],implementation:()=>null},linearApprovals:{sync:async()=>[]},linearLifecycle:{sync:async()=>[]},features:{tickProject:async()=>[]},io:{poll:async()=>[],linearToken:()=>'',out:()=>{}}});
+let tick=makeTick();await tick();if(requests!==0)throw Error('Unexpected update before base advances');
+f.b.base=f.base;f.b.behind=2;now+=60000;const concurrent=await Promise.allSettled([tick(),tick()]);if(concurrent.filter(x=>x.status==='rejected').length!==1)throw Error('Expected concurrent poll fence rejection');
+if(requests!==1)throw Error('Expected one guarded automatic update');
+f.s=new Store(f.db);loop=new ReviewLoop(f.s,async()=>{throw Error('No review request');},io);tick=makeTick();await tick();now+=60000;await Promise.allSettled([tick(),tick()]);now+=60000;await tick();
+if(f.git(['rev-parse','HEAD'],f.tree)!==f.target||f.updates()!==1||requests!==1||reviewReads!==0)throw Error('Automatic synchronization/deduplication failed');
+if(loop.get(f.id).state!=='blocked'||loop.get(f.id).reason!==blocker)throw Error('Review blocker erased');
+const status=loop.list()[0].maintenance;if(!status.schedule.next_check)throw Error('Missing maintenance cadence status');
+// A genuine revoked inspect grant must stop even provider observation/mutation.
+new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash,['push-feature'],'human');f.b.behind=2;now+=60000;await tick();
+if(requests!==1||!loop.list()[0].maintenance.schedule.reason.includes('grant'))throw Error('Authorization guard bypassed');
+console.log(JSON.stringify({requests,synchronizations:f.updates(),reviewReads}));f.s.close();f.close();`;
+  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{...process.env,HOME:home},stdout:'pipe',stderr:'pipe'});
+  expect(result.stderr.toString()).toBe('');expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout.toString())).toEqual({requests:1,synchronizations:1,reviewReads:0});
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
 for(const lost of [false,true])test(`DEV-95 lifecycle: incomplete review survives update, synchronization and restart (lost response: ${lost})`,async()=>{
  const f=fixture(),blocker='CodeRabbit custom-check failure: pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary';
  let requests=0,reads=0,evidenceHead=f.old;
