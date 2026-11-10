@@ -113,7 +113,38 @@ export function settleDependencyWait(s:Store,job:string){
 /** Jobs whose plan was renewed after a requirement revision keep their prior PR
  * historical until that exact revised plan completes a handoff. */
 export function revisedExecution(s:Store,job:string){
- return !!(s.db.query("SELECT name FROM sqlite_master WHERE name='spec_execution_history'").get()&&s.db.query('SELECT 1 FROM spec_execution_history WHERE job=?').get(job));
+  return !!(s.db.query("SELECT name FROM sqlite_master WHERE name='spec_execution_history'").get()&&s.db.query('SELECT 1 FROM spec_execution_history WHERE job=?').get(job));
+}
+/** Continuations survive reapproval for audit, including A→B→A plan hashes.
+ * Only a same-instance row after the revised authorization boundary is current. */
+export function currentDispatchContinuation(s:Store,job:string,d:any,id?:number):any{
+ if(!d||!s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get())return null;
+ const cont=id===undefined?s.db.query('SELECT * FROM continuations WHERE job=? ORDER BY id DESC LIMIT 1').get(job) as any:s.db.query('SELECT * FROM continuations WHERE job=? AND id=?').get(job,id) as any;
+ const revision=latestRevision(s,job),history=revision&&s.db.query('SELECT snapshot FROM spec_execution_history WHERE revision=? AND job=?').get(revision.id,job) as any;
+ const boundary=history?JSON.parse(history.snapshot).continuationMaxId:undefined;
+ return cont?.plan_hash===d.plan_hash&&cont.spec_hash===digest(s.get(job).spec)&&cont.session_id===d.session_id&&(!history||Number.isSafeInteger(boundary)&&cont.id>boundary)?cont:null;
+}
+export function implementationRecoveryContinuation(s:Store,job:string,d:any,original:any):any{
+ if(original?.state!=='cancelled'||!original.turn||!s.db.query("SELECT name FROM sqlite_master WHERE name='startup_continuations'").get())return null;
+ const recovery=s.db.query('SELECT continuation FROM startup_continuations WHERE job=? AND dispatch=?').get(job,d.client_id) as any;
+ if(!recovery)return null;
+ const cont=currentDispatchContinuation(s,job,d,recovery.continuation);
+ return cont&&cont.binding===`startup:${d.client_id}:${original.turn}`&&['reserved','delivery_uncertain','delivery_accepted','completed'].includes(cont.state)?cont:null;
+}
+/** A startup continuation may complete the exact interrupted implementation,
+ * never an unrelated cancelled/failed dispatch. Preserve the original receipt;
+ * return the completed delivery whose turn must bind the published-head proof.
+ * Read-only previews may supply freshly inspected receipts without persisting. */
+export function implementationCompletion(s:Store,job:string,d:any,observed?:{original:any;continuation?:any}):any{
+ if(!d||d.plan_hash!==s.get(job).plan_hash||!s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_receipts'").get())return null;
+ const receipt=(client:string)=>s.db.query('SELECT * FROM delivery_receipts WHERE client=?').get(client) as any;
+ const original=observed?observed.original:receipt(d.client_id),spec=digest(s.get(job).spec);
+ const bound=(r:any,client:string,attempt:string)=>r&&r.job===job&&r.plan===d.plan_hash&&r.spec===spec&&r.session===d.session_id&&r.client===client&&r.attempt===attempt&&!!r.turn;
+ if(!bound(original,d.client_id,'implementation:1'))return null;
+ if(original.state==='completed')return original;
+ const cont=implementationRecoveryContinuation(s,job,d,original);if(!cont)return null;
+ const completed=observed?observed.continuation:receipt(cont.client_id);
+ return bound(completed,cont.client_id,`continuation:${cont.id}`)&&completed.state==='completed'?completed:null;
 }
 /** The one open PR a recovered-delivery handoff belongs to. */
 export function handoffPr(result:any,openPrs:any[]){
@@ -140,8 +171,8 @@ export function revisedHandoff(s:Store,job:string){
   const proof=s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=? AND plan_hash=? AND revision=?').get(job,plan,revision) as any;
   const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
   if(!proof||proof.pr!==handoff.pr||proof.dispatch!==d?.client_id||proof.session!==d?.session_id||proof.spec!==digest(s.get(job).spec)||d.plan_hash!==plan||!proof.turn||!proof.repo||!/^[a-f0-9]{40,64}$/.test(proof.head))return false;
-  const receipt=s.db.query("SELECT name FROM sqlite_master WHERE name='delivery_receipts'").get()?s.db.query('SELECT * FROM delivery_receipts WHERE client=?').get(proof.dispatch) as any:null;
-  if(!receipt||receipt.job!==job||receipt.plan!==plan||receipt.spec!==proof.spec||receipt.session!==proof.session||receipt.attempt!=='implementation:1'||receipt.state!=='completed'||receipt.turn!==proof.turn||!capturedRevision(s,job,plan,proof.session).captured)return false;
+   const receipt=implementationCompletion(s,job,d);
+   if(!receipt||receipt.turn!==proof.turn||!capturedRevision(s,job,plan,proof.session).captured)return false;
  // The handoff must be the PR the review target registered; a different open PR
  // cannot release review or Done while that target still points elsewhere.
   const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;

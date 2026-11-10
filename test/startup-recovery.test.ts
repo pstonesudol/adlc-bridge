@@ -8,6 +8,10 @@ import {turnBarrier,withRecoverySubmission,setProjectIntakePaused} from '../src/
 import {controlManagedLifecycle,type LifecycleOps} from '../src/managed-lifecycle';
 import {assertRecoveryAvailable} from '../src/recovery-runtime';
 import {createCLIPollTick} from '../src/cli';
+import {PreSendFailure} from '../src/pre-send';
+import {routingConfig} from './routing-fixture';
+import {selectRoute} from '../src/task-routing';
+import {worktreeReservation} from '../src/worktree-reservation';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';import {tmpdir} from 'node:os';
 
@@ -81,6 +85,35 @@ test('uncertain recovery send is reconciled and never replayed after restart',as
 });
 test('unconsumed native restore remains uncertain and is not repeated',async()=>{
  const f=await fixture();try{f.interrupt(true,true);f.flags({consume:false,lostRestore:true});expect((await f.recovery.pass(f.c,true)).blocked).toBe(1);await f.recovery.pass(f.c,true);expect(f.restores).toHaveLength(1);expect(f.sends).toHaveLength(1);}finally{f.close();}
+});
+test('a proved-unlaunched native restore releases its reservation and retries once on a later pass',async()=>{
+ const f=await fixture();try{
+  f.interrupt(true,true);const restore=f.t.restorePlan!;let launches=0;
+  f.t.restorePlan=async(...args)=>{if(++launches===1)throw new PreSendFailure('Native restore not launched');return restore(...args);};
+  expect((await f.recovery.pass(f.c,true)).blocked).toBe(1);
+  expect(f.s.db.query('SELECT state FROM startup_restores').get()).toEqual({state:'not_sent'});
+  expect(worktreeReservation(f.s,f.job)).toBeUndefined();
+  expect(f.sends).toHaveLength(1);
+  expect((await f.recovery.pass(f.c,true)).resumed).toBe(1);expect(launches).toBe(2);expect(f.restores).toHaveLength(1);
+  await f.recovery.pass(f.c,true);expect(launches).toBe(2);expect(f.sends).toHaveLength(2);
+ }finally{f.close();}
+});
+for(const stopped of [false,true])for(const fault of ['none','approval','preflight','configuration','approval-during-preflight','approval-during-configuration','missing-controls'])test(`recovery confirms the approved native route before delivery (restored: ${stopped}): ${fault}`,async()=>{
+ const f=await fixture();try{
+  f.interrupt(stopped,stopped);const route=selectRoute(routingConfig,{choice:'implement',confidence:1}),encoded=JSON.stringify(route),hash=f.s.get(f.job).plan_hash!,events:string[]=[];
+  f.s.db.query("INSERT INTO task_routes VALUES (?,'planning',?,?,'verified')").run(f.job,digest(f.s.get(f.job).spec),encoded);
+  f.s.db.query("INSERT INTO task_routes VALUES (?,'implementation',?,?,'verified')").run(f.job,digest(JSON.stringify([f.s.get(f.job).spec,hash])),encoded);
+  f.w.router.approve(f.job,hash);
+  const revoke=()=>f.s.db.query('DELETE FROM route_approvals WHERE job=?').run(f.job);
+  if(fault==='approval')revoke();
+  f.t.preflightRoute=async r=>{events.push('preflight');expect(r).toEqual(route);if(fault==='preflight')throw Error('Pinned model unavailable');if(fault==='approval-during-preflight')revoke();};
+  f.t.configureRoute=async(id,r)=>{events.push('configure');expect(id).toBe('worker-1');expect(r).toEqual(route);if(fault==='configuration')throw Error('Native provider refused build mode');if(fault==='approval-during-configuration')revoke();f.e.session.harness=r.harness;f.e.session.model=r.model;f.e.session.mode=r.mode;return {verified:true};};
+  if(fault==='missing-controls')delete f.t.configureRoute;
+  const send=f.t.sendImplementation;f.t.sendImplementation=async(...args)=>{events.push('send');return send(...args);};
+  const result=await f.recovery.pass(f.c,true);
+  if(fault==='none'){expect(result.resumed).toBe(1);expect(events).toEqual(['preflight','configure','send']);expect(f.e.session.mode).toBe('build');}
+  else{expect(result.blocked).toBe(1);expect(events).not.toContain('send');expect(f.sends).toHaveLength(1);expect(f.s.db.query('SELECT count(*) AS n FROM startup_continuations').get()).toEqual({n:0});}
+ }finally{f.close();}
 });
 for(const state of ['cancelled','failed'])test(`${state} is not automatic recovery authority`,async()=>{
  const f=await fixture();try{f.interrupt();f.e.transcript.turns.at(-1).state=state;expect((await f.recovery.pass(f.c)).blocked).toBe(1);expect(f.sends).toHaveLength(1);}finally{f.close();}

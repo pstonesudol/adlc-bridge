@@ -18,6 +18,7 @@ import {Lifecycle} from '../src/lifecycle';
 import {jobViews,humanJobs} from '../src/operator-cli';
 import {routingConfig,settings} from './routing-fixture';
 import {RoutePreflightFailure} from '../src/routing-session';
+import {StartupRecovery} from '../src/startup-recovery';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -178,6 +179,39 @@ async function publishRevised(f:Awaited<ReturnType<typeof fixture>>,pr=17){
  f.e.receiptObservation.observed=Date.now();
  return f.w.executeApproved(f.job,config);
 }
+for(const historical of [false,true])test(`DEV-104 revised interrupted implementation reaches exact review handoff (historical continuation: ${historical})`,async()=>{
+ const f=await fixture();try{
+  if(historical){
+   const old=f.w.implementation(f.job),insert=f.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,'old','old-continuation','owner','completed')").run(f.job,old.plan_hash,digest(f.s.get(f.job).spec));
+   const ledger=new ReceiptReconciliation(f.s);ledger.reserve({job:f.job,plan:old.plan_hash,spec:digest(f.s.get(f.job).spec),session:'owner',client:'old-continuation',attempt:`continuation:${insert.lastInsertRowid}`});
+   f.e.transcript.entries.push({clientMessageId:'old-continuation',turnId:'old-continuation',sequence:f.e.transcript.entries.length+1});f.e.transcript.turns.push({id:'old-continuation',state:'completed'});
+  }
+  f.edit('Revised requirements with interrupted implementation');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  // A repeated spec/plan hash still cannot renew a row before the authorization
+  // boundary; exercise this in addition to the different-plan history case.
+  if(historical)f.s.db.query('UPDATE continuations SET plan_hash=?,spec_hash=? WHERE job=?').run(f.s.get(f.job).plan_hash,digest(f.s.get(f.job).spec),f.job);
+  await f.w.executeApproved(f.job,config);
+  const d=f.w.implementation(f.job),original=f.e.transcript.turns.at(-1);original.state='interrupted';f.e.transcript.controller='ready';f.e.session.kind='worker';f.e.session.activity={state:'idle'};
+  const loop=new ReviewLoop(f.s),startup=new StartupRecovery(f.s,f.w,{inventory:async()=>[f.e.session],requirements:async()=>{},inspect:async()=>({tree:'/worktree',branch:f.e.session.branch,head:'a'.repeat(40),prs:f.e.session.prs}) as any,register:(job,result)=>loop.register(job,'owner/repo',result.pr.number,['CI'],['src/**'],true)});
+  const resumed=await startup.pass(config,true);expect(resumed).toMatchObject({resumed:1,blocked:0});
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];
+  const handed=await startup.pass(config,true);expect(handed).toMatchObject({reattached:1,blocked:0});expect(revisedHandoff(f.s,f.job)).toBe(true);expect(loop.list('p')).toHaveLength(1);
+  const ledger=new ReceiptReconciliation(f.s);expect(ledger.get(d.client_id).state).toBe('cancelled');
+  const cont=f.w.continuation(f.job);expect(ledger.get(cont.client_id).state).toBe('completed');
+  expect(f.s.db.query('SELECT turn FROM revision_handoff_proofs WHERE job=?').get(f.job)).toEqual({turn:cont.client_id});
+  const later=f.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,'later-resolution','later-continuation','owner','completed')").run(f.job,d.plan_hash,digest(f.s.get(f.job).spec));
+  ledger.reserve({job:f.job,plan:d.plan_hash,spec:digest(f.s.get(f.job).spec),session:'owner',client:'later-continuation',attempt:`continuation:${later.lastInsertRowid}`});
+  f.e.transcript.entries.push({clientMessageId:'later-continuation',turnId:'later-continuation',sequence:f.e.transcript.entries.length+1});f.e.transcript.turns.push({id:'later-continuation',state:'completed'});
+  expect(revisedHandoff(f.s,f.job)).toBe(true);expect((await f.w.executionStatus(f.job,f.e,config)).state).toBe('pr_handoff');
+  // Current-dispatch proof cannot be borrowed by an unrelated dispatch, failed
+  // continuation, changed binding, or a cancelled original without startup proof.
+  f.s.db.query("UPDATE implementation_dispatch SET client_id='other' WHERE job=?").run(f.job);expect(revisedHandoff(f.s,f.job)).toBe(false);f.s.db.query('UPDATE implementation_dispatch SET client_id=? WHERE job=?').run(d.client_id,f.job);
+  f.s.db.query("UPDATE delivery_receipts SET state='failed' WHERE client=?").run(cont.client_id);expect(revisedHandoff(f.s,f.job)).toBe(false);f.s.db.query("UPDATE delivery_receipts SET state='completed' WHERE client=?").run(cont.client_id);
+  f.s.db.query("UPDATE continuations SET binding='unrelated' WHERE id=?").run(cont.id);expect(revisedHandoff(f.s,f.job)).toBe(false);f.s.db.query('UPDATE continuations SET binding=? WHERE id=?').run(cont.binding,cont.id);
+  f.s.db.query('DELETE FROM startup_continuations WHERE job=?').run(f.job);expect(revisedHandoff(f.s,f.job)).toBe(false);
+ }finally{f.s.close();}
+});
 test('DEV-64 / DEV-51 poll recovers an exact revised handoff without replay and retains published-head proof',async()=>{
  const f=await revisedFixture();try{
   const loop=new ReviewLoop(f.s);loop.register(f.job,'owner/repo',17,['CI'],['src/**']);

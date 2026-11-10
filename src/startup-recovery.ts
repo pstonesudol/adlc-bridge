@@ -10,7 +10,8 @@ import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
 import {verificationInstructions} from './verification';
 import {assertRequiredIntegrations} from './integration-capabilities';
-import {capturedRevision} from './spec-revisions';
+import {capturedRevision,currentDispatchContinuation} from './spec-revisions';
+import {PreSendFailure} from './pre-send';
 
 export type RecoveryResult={job:string;outcome:'reattached'|'resumed'|'waiting'|'blocked';nextAction:string;state?:string};
 export type RecoverySummary={complete:boolean;admit:boolean;results:RecoveryResult[];reattached:number;resumed:number;waiting:number;blocked:number;reason?:string};
@@ -103,7 +104,7 @@ export class StartupRecovery{
   if(e.session?.id!==d.session_id||e.session.projectId!==p?.project||e.session.branch!==p?.branch||e.session.kind!=='worker'||typeof e.session.isTerminated!=='boolean')throw Error('Exact recorded native worker/project/branch identity required');
   const busy=e.transcript.turns.some((t:any)=>!terminal.has(t.state));
   if(busy)return {job,outcome:'waiting',nextAction:'Existing active/queued or disconnected turn preserved; wait for authoritative terminal evidence'};
-  const ledger=new ReceiptReconciliation(this.s),cont=this.w.continuation(job),client=cont?.plan_hash===d.plan_hash?cont.client_id:d.client_id,binding=ledger.get(client);
+   const ledger=new ReceiptReconciliation(this.s),cont=currentDispatchContinuation(this.s,job,d),client=cont?cont.client_id:d.client_id,binding=ledger.get(client);
   if(!binding){
    if(d.state==='approved_pending')return {job,outcome:'waiting',nextAction:'Original dispatch unattempted; normal current-authority workflow will deliver it'};
    throw Error('Original delivery reservation missing; never invent provenance or resend');
@@ -124,6 +125,7 @@ export class StartupRecovery{
   const restore=this.s.db.query("SELECT * FROM startup_restores WHERE job=? ORDER BY rowid DESC LIMIT 1").get(job) as any;
   const ownRestore=restore&&['attempting','setup_consumed'].includes(restore.state)?restore.binding:undefined;
   let auth=startupAuthorization(this.s,job,c,ownRestore);
+  const route=this.w.router.approved(job,d.plan_hash);
   const inspect=this.io.inspect??restoreRepository;
   let repository=await inspect(this.s,job,c);
   if(repository.branch!==auth.reserved||repository.tree!==canonicalWorktree(auth.worktree))throw Error('Actual reserved worktree/branch mismatch; use recover-handoff preview, never mutate or repair identity');
@@ -144,7 +146,13 @@ export class StartupRecovery{
     this.io.check?.();startupAuthorization(this.s,job,c);
     this.s.db.query("INSERT INTO startup_restores VALUES (?,?,?,?,'attempting',?,NULL)").run(key,job,auth.session,auth.worktree,JSON.stringify(proof));
     this.s.event(job,'startup_restore_reserved',key);
-    try{await this.w.t.restorePlan(auth.session,auth.project);}catch(e){this.s.db.query('UPDATE startup_restores SET reason=? WHERE binding=?').run('Restore outcome uncertain; reconcile only, never replay',key);}
+    try{await this.w.t.restorePlan(auth.session,auth.project);}catch(e){
+     if(e instanceof PreSendFailure){
+      const unlaunched=this.s.db.query("UPDATE startup_restores SET state='not_sent',reason='Native restore not launched; retry with fresh recovery evidence' WHERE binding=? AND state='attempting'").run(key);
+      if(unlaunched.changes)return {job,outcome:'blocked',nextAction:'Native restore not launched; a later recovery pass may retry after refreshing current authority and evidence'};
+     }
+     this.s.db.query('UPDATE startup_restores SET reason=? WHERE binding=?').run('Restore outcome uncertain; reconcile only, never replay',key);
+    }
     // Reconcile authoritative setup consumption immediately, including after a
     // lost CLI acknowledgement. This path cannot replay an attempted restore.
     return this.reconcile(job,c,sessions);
@@ -162,12 +170,22 @@ export class StartupRecovery{
   if(fresh.state!=='cancelled'||fresh.turn!==turn.id||e.transcript.turns.find((t:any)=>t.id===turn.id)?.state!=='interrupted')throw Error('Interrupted delivery evidence changed; never resend');
   const latestRepo=await inspect(this.s,job,c);if(JSON.stringify(latestRepo)!==JSON.stringify(repository)||latestRepo.prs.length)throw Error('Worktree/provider ownership changed before continuation; preserve local edits');
   await (this.io.requirements??assertCurrentPlanningRequirements)(this.s,job,c);
+  if(route){
+   if(!this.w.t.preflightRoute||!this.w.t.configureRoute)throw Error('Approved recovery routing controls unavailable');
+   const unchanged=()=>{if(JSON.stringify(this.w.router.approved(job,d.plan_hash))!==JSON.stringify(route)||JSON.stringify(startupAuthorization(this.s,job,c))!==JSON.stringify(auth)||JSON.stringify(this.w.implementation(job))!==JSON.stringify(d))throw Error('Approved route, dispatch or authority changed during recovery route verification');};
+   await this.w.t.preflightRoute(route);unchanged();
+   await this.w.t.configureRoute(d.session_id,route);unchanged();this.w.router.verified(job,'implementation');
+   const configured=await this.w.t.evidence(d.session_id);
+   if(retained(configured)!==retained(e)||configured.session?.id!==d.session_id||configured.session.projectId!==e.session.projectId||configured.session.branch!==e.session.branch||configured.session.isTerminated!==false||configured.session.activity?.state!=='idle'||configured.transcript.controller!=='ready'||JSON.stringify(configured.session.prs)!==JSON.stringify(e.session.prs))throw Error('Native worker changed during recovery route configuration');
+   e=configured;
+  }
   const last=await this.w.t.evidence(d.session_id);
   if(retained(last)!==retained(e)||JSON.stringify(last.session)!==JSON.stringify(e.session)||last.transcript.controller!=='ready')throw Error('Native worker or delivery changed before continuation reservation; refresh without resending');
   this.io.check?.();
   const clientId=`adlc-recover-${digest(JSON.stringify([job,d.client_id,turn.id])).slice(0,32)}`;
   const reserved=this.s.db.transaction(()=>{
-   if(JSON.stringify(startupAuthorization(this.s,job,c))!==JSON.stringify(auth)||JSON.stringify(this.w.implementation(job))!==JSON.stringify(d))throw Error('Current authorization or delivery changed');
+    if(JSON.stringify(startupAuthorization(this.s,job,c))!==JSON.stringify(auth)||JSON.stringify(this.w.implementation(job))!==JSON.stringify(d))throw Error('Current authorization or delivery changed');
+    if(JSON.stringify(this.w.router.approved(job,d.plan_hash))!==JSON.stringify(route))throw Error('Approved recovery route changed before delivery reservation');
    const claimed=this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,d.plan_hash,auth.spec,`startup:${d.client_id}:${turn.id}`,clientId,d.session_id);
    this.s.db.query('INSERT INTO startup_continuations VALUES (?,?,?)').run(job,d.client_id,claimed.lastInsertRowid);
    ledger.reserve({job,plan:d.plan_hash,spec:auth.spec,session:d.session_id,client:clientId,attempt:`continuation:${claimed.lastInsertRowid}`});
