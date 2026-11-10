@@ -147,7 +147,7 @@ export type ReviewEvidence = {
   head: string; observedHead: string; required: string[]; checks: Check[];
   review: { sha: string; author: string; state: string } | null;
   unresolved: number | null; threadsComplete: boolean; checksComplete: boolean;
-  reviewComplete: boolean;
+  reviewComplete: boolean; coderabbitApprovalRequired?: boolean;
 };
 // Pure gate, not a live GitHub adapter. Missing/paginated/stale evidence fails closed.
 export function reviewGate(e: ReviewEvidence): { clear: boolean; reasons: string[] } {
@@ -162,7 +162,7 @@ export function reviewGate(e: ReviewEvidence): { clear: boolean; reasons: string
   }
   const bot = resolved.filter(c => c.app.slug === 'coderabbitai' && c.name === 'CodeRabbit' && c.sha === e.head);
   if (bot.length !== 1 || bot[0].status !== 'completed' || bot[0].conclusion !== 'success') reasons.push('CodeRabbit check not clear');
-  if (!e.review || e.review.sha !== e.head || e.review.author !== 'coderabbitai[bot]' || e.review.state !== 'APPROVED') reasons.push('Explicit latest-SHA CodeRabbit approval missing');
+  if (e.coderabbitApprovalRequired !== false && (!e.review || e.review.sha !== e.head || e.review.author !== 'coderabbitai[bot]' || e.review.state !== 'APPROVED')) reasons.push('Explicit latest-SHA CodeRabbit approval missing');
   if (e.unresolved !== 0) reasons.push('Unresolved or unknown findings');
   return { clear: reasons.length === 0, reasons };
 }

@@ -44,7 +44,31 @@ test('defaults keep CodeRabbit required and Codex advisory with no request adapt
  expect(policy()).toMatchObject([{id:'coderabbit',approvalRequired:true,requestReview:true},{id:'codex',approvalRequired:false,requestReview:false}]);
  expect(reviewerPolicy(reviewerInput(policy()))).toEqual(policy());
  for(const over of [{adapter:'claude'},{requestReview:true},{reviewMode:'full'},{cooldown:60000},{retryLimit:2},{enabled:false,approvalRequired:true},{minimumSeverity:'urgent'},{includePaths:['../secret']},{excludePaths:['/absolute']},{identity:{login:'fake',type:'Bot'}},{unknown:true}])expect(()=>reviewerPolicy([{id:'codex',...over}])).toThrow();
- expect(()=>reviewerPolicy([{id:'coderabbit',approvalRequired:false}])).toThrow('cannot be weakened');
+  const advisory=reviewerPolicy([{id:'coderabbit',approvalRequired:false}]);
+  expect(advisory[0]).toMatchObject({approvalRequired:false,enabled:true,remediate:true,requestReview:true,identity:BOT_IDENTITIES.coderabbit});
+  expect(reviewerPolicy(reviewerInput(advisory))).toEqual(advisory);
+  for(const over of [{enabled:false},{adapter:'github-review'},{identity:BOT_IDENTITIES.codex},{identity:{...BOT_IDENTITIES.coderabbit,type:'User'}}])expect(()=>reviewerPolicy([{id:'coderabbit',approvalRequired:false,...over}])).toThrow();
+});
+test('CodeRabbit advisory approval retains change-request, trust and finding obligations',()=>{
+ const p=reviewerPolicy([{id:'coderabbit',approvalRequired:false}]);
+ expect(reviewerApprovals(p,trusts(),[],context.head,[],now).blockers).toEqual([]);
+ for(const strict of [policy(),reviewerPolicy([{id:'coderabbit',approvalRequired:true}])])expect(reviewerApprovals(strict,trusts(),[],context.head,[],now).blockers).toContain('Reviewer coderabbit: explicit current-head approval required');
+ const review={id:42,user:{id:136622811,type:'Bot'},state:'CHANGES_REQUESTED',commit_id:'old',submitted_at:new Date(now).toISOString()};
+ expect(reviewerApprovals(p,trusts(),[review],context.head,[],now).blockers).toEqual(['Reviewer coderabbit: changes requested (42)']);
+ expect(reviewerApprovals(p,[],[],context.head,[],now).blockers).toContain('Reviewer coderabbit: fresh identity/membership evidence required before clearance');
+ const f=finding({userId:136622811,login:'coderabbitai[bot]'});
+ expect(collectTrustedFeedback(p,trusts(),[f],context,now).findings).toHaveLength(1);
+ expect(collectTrustedFeedback(p,trusts(),[{...f,outdated:true}],context,now).pending).toHaveLength(1);
+});
+test('CodeRabbit approval-mode drift requires a new reviewed plan in either direction',()=>{
+ const s=new Store(':memory:');try{
+  const job=s.enqueue('p','i','spec');s.approve(job,s.propose(job,'strict'),'human');bindReviewerPolicy(s,job,undefined);
+  expect(()=>bindReviewerPolicy(s,job,[{id:'coderabbit',approvalRequired:false}])).toThrow('fresh reviewed plan');
+  expect(boundReviewerPolicy(s,job)[0].approvalRequired).toBe(true);
+  s.approve(job,s.propose(job,'advisory'),'human');bindReviewerPolicy(s,job,[{id:'coderabbit',approvalRequired:false}]);
+  expect(boundReviewerPolicy(s,job)[0].approvalRequired).toBe(false);
+  expect(()=>bindReviewerPolicy(s,job,undefined)).toThrow('fresh reviewed plan');
+ }finally{s.close();}
 });
 test('authenticated Codex feedback retains originals, source and head; spoofed, stale, self and control content excluded',()=>{
  const result=collectTrustedFeedback(policy(),trusts(),[finding()],context,now);

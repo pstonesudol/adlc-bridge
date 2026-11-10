@@ -8,6 +8,13 @@ export function customCheckSection(body:string){
 }
 const bot=(user:any)=>user?.login==='coderabbitai[bot]'&&user?.type==='Bot'&&Number.isSafeInteger(user.id);
 const time=(value:any)=>typeof value==='string'?Date.parse(value):NaN;
+function summaryCommits(body:string){
+ const start='<!-- recent_review_start -->',end='<!-- recent_review_end -->';
+ const recent=body.split(start).length===2&&body.split(end).length===2&&body.indexOf(end)>body.indexOf(start)?body.split(start)[1].split(end)[0]:null;
+ if(!recent)return [];
+ const commits=[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)];
+ return recent.split('**Commit**').length===commits.length+1?commits:[];
+}
 function ambiguousDetailsTable(text:string){
  let fence:{character:string;length:number}|null=null;
  for(const line of text.split(/\r?\n/)){
@@ -31,7 +38,18 @@ function ambiguousDetailsTable(text:string){
  * PR lastEditedAt is obtained from GitHub, never guessed from updated_at. */
 export function customCheckEvidence(review:any,head:string,comments:any[],context?:{repo:string;pr:number;body:string;version:any;checks:any[]}){
  const empty={findings:[] as any[],blocker:null as string|null,bodyReviewed:false};
- const summaries=comments.filter(c=>bot(c.user)&&typeof c.body==='string'&&c.body.includes('<!-- pre_merge_checks_walkthrough_start -->'));
+ const runsForHead=context?.checks.filter(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.name==='CodeRabbit')??[];
+ const historical=(summary:any)=>{
+  // Without a current substantive vote, exclude only explicitly older-head
+  // summaries whose unchanged version predates a verified completed current run.
+  // An old marker alone cannot hide a newly edited or unbound failure.
+  if(review||!context||runsForHead.length!==1)return false;
+  const run=runsForHead[0],commits=summaryCommits(summary.body),created=time(summary.created_at),edited=time(summary.updated_at),start=time(run.started_at),end=time(run.completed_at);
+  return run.status==='completed'&&run.conclusion==='success'&&Number.isSafeInteger(run.id)&&Number.isSafeInteger(summary.id)&&
+   [created,edited,start,end].every(Number.isFinite)&&created<=edited&&edited<start&&start<=end&&
+   commits.length===1&&commits[0][1]===context.repo&&commits[0][2]!==head&&summary.issue_url===`https://api.github.com/repos/${context.repo}/issues/${context.pr}`;
+ };
+ const summaries=comments.filter(c=>bot(c.user)&&typeof c.body==='string'&&c.body.includes('<!-- pre_merge_checks_walkthrough_start -->')&&!historical(c));
  // With no bot summary there is no custom-check failure to remediate. A current
  // CHANGES_REQUESTED that claims a pre-merge failure still needs its missing
  // details; a stale or unrelated review is historical.
@@ -40,10 +58,11 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  // cannot prove a current-head failure and must not park the target on a generic
  // currency blocker. Inline findings from the same review remain available as
  // review-thread candidates; the explicit review gate still refuses clearance.
- if(!review)return empty;
- if(!bot(review.user))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} is not authored by the trusted CodeRabbit bot; inspect the review before retry`};
- if(typeof review.commit_id!=='string'||!/^[a-f0-9]{40}$/.test(review.commit_id))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} has no usable commit binding; inspect the review before retry`};
- if(review.commit_id!==head)return empty;
+ if(review){
+  if(!bot(review.user))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} is not authored by the trusted CodeRabbit bot; inspect the review before retry`};
+  if(typeof review.commit_id!=='string'||!/^[a-f0-9]{40}$/.test(review.commit_id))return {...empty,blocker:`CodeRabbit review ${review.id??'with unknown id'} has no usable commit binding; inspect the review before retry`};
+  if(review.commit_id!==head)return empty;
+ }
  // Never choose a random newer bot reply or silently fall back to an old summary.
  if(summaries.length!==1)return {...empty,blocker:`CodeRabbit custom-check summary provenance is ambiguous: ${summaries.length} bot summaries (${summaries.map((s:any)=>s.id).join(', ')}); inspect and retain one current summary`};
  const summary=summaries[0],section=customCheckSection(summary.body);
@@ -70,11 +89,13 @@ export function customCheckEvidence(review:any,head:string,comments:any[],contex
  }
  if(!dataRows)unclassified=true;
  const blocked=(reason:string)=>({...empty,blocker:errors.length||unclassified?`CodeRabbit custom-check failure: ${reason}`:null});
- const recentStart='<!-- recent_review_start -->',recentEnd='<!-- recent_review_end -->';
- const recent=summary.body.split(recentStart).length===2&&summary.body.split(recentEnd).length===2&&summary.body.indexOf(recentEnd)>summary.body.indexOf(recentStart)?summary.body.split(recentStart)[1].split(recentEnd)[0]:null;
- const commits=recent?[...recent.matchAll(/\*\*Commit\*\*:\s*\[[^\]]+\]\(<https:\/\/github\.com\/([^/]+\/[^/]+)\/commit\/([a-f0-9]{40})>\)/g)]:[];
+ const commits=summaryCommits(summary.body);
  if(unclassified)return blocked('pre-merge check table contains an unclassifiable row or missing status; obtain the complete supported bot summary');
  if(context?.checks.some(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head&&c.status!=='completed'))return empty;
+ // Advisory approval can leave us with no substantive review. Still inspect
+ // trusted summaries above: reported errors must fail closed, but without review
+ // provenance they cannot authorize remediation or attest description coverage.
+ if(!review)return blocked('current bot review provenance is unavailable');
  if(!context||!bot(review?.user)||review.user.id!==summary.user.id||!['APPROVED','CHANGES_REQUESTED'].includes(review.state)||review.commit_id!==head||!Number.isSafeInteger(review.id)||!Number.isSafeInteger(summary.id))return blocked('current bot review provenance is unavailable');
  const {repo,pr,version,checks,body}=context;
  if(version?.headRefOid!==head||version.body!==body||!Number.isFinite(time(version.createdAt))||!(version.lastEditedAt===null||Number.isFinite(time(version.lastEditedAt))))return blocked('current description version is unavailable');

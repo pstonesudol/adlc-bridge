@@ -148,14 +148,19 @@ export async function readiness(repo:string, number:number, required:string[],me
   if(changed)for(const row of bodyEvidence)row.descriptionHash=null;
   final=observed;
   checks=currentMetadataChecks(checks,bodyEvidence,final.body??'');
-  const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,
+  const rabbit=reviewerConfiguration.find(r=>r.id==='coderabbit')!;
+  const evidence:ReviewEvidence={head:first.head.sha,observedHead:final.head.sha,required,coderabbitApprovalRequired:rabbit.approvalRequired,
     checks:checks.map((c:any)=>({id:c.id,started_at:c.started_at,completed_at:c.completed_at,name:c.name,sha:c.head_sha,app:c.app?.slug,status:c.status,conclusion:c.conclusion})),
     review:trustedLatest?{sha:trustedLatest.commit_id,author:trustedLatest.user.login,state:trustedLatest.state}:null,
     unresolved:threads.filter(t=>!t.isResolved&&!reviewerEvidence.ignoredThreadIds.includes(t.id)).length,threadsComplete:true,checksComplete:true,reviewComplete:true};
   const gate=reviewGate(evidence);
-  const rabbit=reviewerConfiguration.find(r=>r.id==='coderabbit')!;
   const trustedComments=comments.filter(c=>authenticatedReviewer(rabbit,reviewerEvidence.trust.find(t=>t.reviewer==='coderabbit'),c.user?.id??null,c.user?.type));
-  const custom=customCheckEvidence(trustedLatest,first.head.sha,trustedComments,{repo,pr:number,body:final.body??'',version,checks});
+  // A historical vote cannot bind current custom-check clearance when approval
+  // is advisory. Inspect summaries without that vote rather than letting the
+  // parser's historical-review path discard failures; missing provenance blocks
+  // reported errors but never grants remediation or description attestation.
+  const customReview=!rabbit.approvalRequired&&trustedLatest?.commit_id!==first.head.sha?null:trustedLatest;
+  const custom=customCheckEvidence(customReview,first.head.sha,trustedComments,{repo,pr:number,body:final.body??'',version,checks});
   if(reviewerEvidence.blockers.length){gate.clear=false;gate.reasons.push(...reviewerEvidence.blockers);}
   if(reviewerEvidence.findings.length||reviewerEvidence.pending.length){gate.clear=false;gate.reasons.push('Configured reviewer findings remain unresolved');}
   if(changed){custom.findings=[];custom.bodyReviewed=false;custom.blocker='PR head or description changed during custom-check collection';}

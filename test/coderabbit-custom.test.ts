@@ -2,6 +2,43 @@ import {test,expect} from 'bun:test';
 import {customCheckEvidence} from '../src/coderabbit-checks';
 import {decision} from '../src/review-loop';
 import {customFixture,pr30CustomFixture} from './coderabbit-fixture';
+test('a proven unchanged historical summary does not block without a substantive current vote',()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace(f.head,'b'.repeat(40));f.comments[0].updated_at='2026-11-01T00:59:59Z';
+ expect(customCheckEvidence(null,f.head,f.comments,f.context)).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ // Historical evidence is excluded before counting summaries, not used to
+ // suppress a distinct current failure or grant a body attestation.
+ const current=customFixture().comments[0];
+ expect(customCheckEvidence(null,f.head,[...f.comments,{...current,id:21}],f.context).blocker).toContain('current bot review provenance is unavailable');
+});
+for(const state of ['current-head','unbound','edited','invalid-time','wrong-repo','wrong-pr','duplicate-binding','malformed-extra-binding','ambiguous-run','missing-run-time'])test(`uncertain summary remains blocking without a current vote: ${state}`,()=>{
+ const f=customFixture();f.comments[0].body=f.comments[0].body.replace(f.head,'b'.repeat(40));f.comments[0].updated_at='2026-11-01T00:59:59Z';
+ if(state==='current-head')f.comments[0].body=f.comments[0].body.replace('b'.repeat(40),f.head);
+ if(state==='unbound')f.comments[0].body=f.comments[0].body.replace('**Commit**','**Unknown**');
+ if(state==='edited')f.comments[0].updated_at='2026-11-01T01:01:59Z';
+ if(state==='invalid-time')f.comments[0].updated_at='invalid';
+ if(state==='wrong-repo')f.comments[0].body=f.comments[0].body.replace('github.com/owner/repo/commit','github.com/other/repo/commit');
+ if(state==='wrong-pr')f.comments[0].issue_url='https://api.github.com/repos/owner/repo/issues/2';
+ if(state==='duplicate-binding')f.comments[0].body=f.comments[0].body.replace('<!-- recent_review_end -->',`- **Commit**: [current](<https://github.com/owner/repo/commit/${f.head}>)\n<!-- recent_review_end -->`);
+ if(state==='malformed-extra-binding')f.comments[0].body=f.comments[0].body.replace('<!-- recent_review_end -->','- **Commit**: unknown\n<!-- recent_review_end -->');
+ if(state==='ambiguous-run')f.context.checks.push({...f.context.checks[0],id:31});
+ if(state==='missing-run-time')f.context.checks[0].started_at='';
+ const result=customCheckEvidence(null,f.head,f.comments,f.context);expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toBeTruthy();
+});
+for(const state of ['absent','COMMENTED'])test(`custom failures remain blocking without a substantive vote: ${state}`,()=>{
+ for(const status of ['Error','Inconclusive','Unknown']){
+  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]',`![${status}]`);
+  const review=state==='absent'?null:{...f.review,state};
+  const result=customCheckEvidence(review,f.head,f.comments,f.context);
+  expect(result.findings).toEqual([]);expect(result.bodyReviewed).toBe(false);expect(result.blocker).toContain('CodeRabbit custom-check failure');
+ }
+});
+test('missing substantive vote alone does not turn passing custom summaries into blockers or attestations',()=>{
+ for(const status of ['Passed','Warning']){
+  const f=customFixture();f.comments[0].body=f.comments[0].body.replace('![Error]',`![${status}]`);
+  expect(customCheckEvidence(null,f.head,f.comments,f.context)).toEqual({findings:[],blocker:null,bodyReviewed:false});
+ }
+ expect(customCheckEvidence(null,'a'.repeat(40),[])).toEqual({findings:[],blocker:null,bodyReviewed:false});
+});
 test('PR108 regression: green run plus custom Verification Evidence error is scoped remediation, never approval',()=>{
  const f=customFixture(),e=f.evidence();
  expect(e.blocker).toBeNull();expect(e.findings).toHaveLength(1);

@@ -57,7 +57,7 @@ export function reviewerPolicy(value:unknown):Reviewer[]{
   if(!Number.isSafeInteger(p.retryLimit)||p.retryLimit<1||p.retryLimit>3)fail(id,'retryLimit must be from 1 to 3; cannot increase shared budget');
   if(p.adapter!=='coderabbit'&&(p.requestReview||r.reviewMode!==undefined||r.cooldown!==undefined||r.retryLimit!==undefined))fail(id,'requestReview/reviewMode/cooldown/retryLimit require the CodeRabbit request adapter');
   if(p.adapter==='coderabbit'&&(p.id!=='coderabbit'||p.identity?.userId!==BOT_IDENTITIES.coderabbit.userId||p.identity?.type!=='Bot'))fail(id,'CodeRabbit adapter is bound to its pinned bot identity');
-  if(p.id==='coderabbit'&&(!p.enabled||!p.approvalRequired||p.adapter!=='coderabbit'))fail(id,'existing CodeRabbit clearance policy cannot be weakened');
+  if(p.id==='coderabbit'&&(!p.enabled||p.adapter!=='coderabbit'))fail(id,'existing CodeRabbit clearance policy cannot be weakened');
   return p;
  });
 }

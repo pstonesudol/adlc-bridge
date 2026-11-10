@@ -3,6 +3,8 @@ import {mkdtempSync,writeFileSync,existsSync,rmSync} from 'node:fs';import {join
 import {digest} from '../src/core';
 import {REVIEW_THREADS_QUERY,REVIEW_THREAD_COMMENTS_QUERY} from '../src/github';
 import {CONFIG_QUERY} from '../src/coderabbit-scheduling';
+import {BODY_VERSION_QUERY} from '../src/coderabbit-checks';
+import {customFixture} from './coderabbit-fixture';
 
 test('real readiness CLI gates otherwise-successful metadata checks on body evidence, but not an empty policy',()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-readiness-cli-'));try{
@@ -31,15 +33,37 @@ test('real readiness CLI gates otherwise-successful metadata checks on body evid
   const graphqlArgs=['api','graphql','-f',`query=${query}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   const configArgs=['api','graphql','-f',`query=${CONFIG_QUERY}`,'-f','owner=owner','-f','name=repo','-f',`hy=${head}:.coderabbit.yaml`,'-f',`hm=${head}:.coderabbit.yml`,'-f',`by=${base}:.coderabbit.yaml`,'-f',`bm=${base}:.coderabbit.yml`];
   const configGraphql={data:{repository:{defaultBranchRef:{name:'main'},hy:{oid:'blob',text:'reviews: {}'},hm:null,by:{oid:'blob',text:'reviews: {}'},bm:null}}};
+  const bodyArgs=['api','graphql','-f',`query=${BODY_VERSION_QUERY}`,'-f','owner=owner','-f','name=repo','-F','number=1'];
   // Replace gh entirely; this process has no credentials or network fallback.
   writeFileSync(join(root,'gh'),`#!${process.execPath}
 const args=process.argv.slice(2),responses=${JSON.stringify(responses)};
+const mode=process.env.FIXTURE_MODE;
+if(mode?.startsWith('rabbit-')){
+ const review=responses['repos/owner/repo/pulls/1/reviews?per_page=100'][0][0];
+ review.state=mode==='rabbit-changes'?'CHANGES_REQUESTED':'COMMENTED';
+ const checks=responses[${JSON.stringify(`repos/owner/repo/commits/${head}/check-runs?per_page=100`)}][0].check_runs;
+ if(mode==='rabbit-pending')checks.find(c=>c.name==='CodeRabbit').status='in_progress';
+ if(mode==='rabbit-skipped')checks.find(c=>c.name==='CodeRabbit').conclusion='skipped';
+ if(mode==='rabbit-ci-failed')checks.find(c=>c.name==='CI').conclusion='failure';
+ if(mode.startsWith('rabbit-custom-')){
+  const summary=${JSON.stringify(customFixture().comments[0])};
+  if(mode.endsWith('-pass'))summary.body=summary.body.replace('![Error]','![Passed]');
+  if(mode.endsWith('-inconclusive'))summary.body=summary.body.replace('![Error]','![Inconclusive]');
+  if(mode.includes('-stale-'))responses['repos/owner/repo/pulls/1/reviews?per_page=100'][0].push({...review,state:'APPROVED',commit_id:'f'.repeat(40),submitted_at:'2026-10-31T00:00:00Z'});
+  if(mode==='rabbit-custom-stale-historical'){
+   summary.body=summary.body.replace(${JSON.stringify(head)},'f'.repeat(40));summary.updated_at='2026-11-01T00:59:59Z';
+   Object.assign(checks.find(c=>c.name==='CodeRabbit'),${JSON.stringify(customFixture().context.checks[0])});
+  }
+  responses['repos/owner/repo/issues/1/comments?per_page=100'][0].push(summary);
+ }
+}
 if(args.at(-1)==='--include')args.pop();
 if(args[0]!=='api')throw Error('Read-only fixture only');
 let result;
 if(args[1]==='graphql'){
  // Field flags are allowed only for this exact read-only query and variables.
  if(JSON.stringify(args)===JSON.stringify(${JSON.stringify(configArgs)}))result=${JSON.stringify(configGraphql)};
+ else if(JSON.stringify(args)===JSON.stringify(${JSON.stringify(bodyArgs)}))result={data:{repository:{pullRequest:{body:${JSON.stringify(pr.body)},headRefOid:${JSON.stringify(head)},createdAt:'2026-10-31T00:00:00Z',lastEditedAt:null}}}};
  else {if(JSON.stringify(args)!==JSON.stringify(${JSON.stringify(graphqlArgs)}))throw Error('Read-only fixture only');result=${JSON.stringify(graphql)};}
 }else{
  // REST accepts only plain or paginated GET argument shapes: no -f/-F,
@@ -53,18 +77,24 @@ console.log(JSON.stringify(result));
   for(const args of [['api',path,'-f','title=changed'],['api',path,'-F','title=changed'],['api',path,'--field=title=changed'],['api',path,'--raw-field=title=changed'],['api',path,'--method','PATCH'],['api',path,'-X','POST'],['api','--paginate','--slurp',path,'-f','title=changed'],['api','graphql','-f','query=mutation { deleteIssue(input:{issueId:"x"}) { clientMutationId } }'],[...graphqlArgs,'-f','query=mutation { ignored }']]){
    const rejected=Bun.spawnSync([join(root,'gh'),...args],{env:{PATH:root+':/usr/bin:/bin',HOME:root}});expect(rejected.exitCode).not.toBe(0);expect(rejected.stderr.toString()).toContain('Read-only fixture only');expect(rejected.stdout.toString()).toBe('');
   }
-   for(const mode of ['metadata','clear','advisory-outage','acknowledged']){
+   for(const mode of ['metadata','clear','advisory-outage','acknowledged','rabbit-strict','rabbit-advisory','rabbit-changes','rabbit-pending','rabbit-skipped','rabbit-ci-failed','rabbit-custom-error','rabbit-custom-pass','rabbit-custom-stale-error','rabbit-custom-stale-inconclusive','rabbit-custom-stale-pass','rabbit-custom-stale-historical']){
     const metadata=mode==='metadata'?['Metadata']:[];
     // No user/4 response: the fixture rejects the advisory identity lookup.
     // Its summary-only change request must not disappear into green clearance.
-    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
-   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db}});
+    writeFileSync(config,JSON.stringify({requiredChecks:['CI'],prMetadataChecks:metadata,reviewers:[{id:'codex',excludePaths:['src/**']},...(mode.startsWith('rabbit-')?[{id:'coderabbit',approvalRequired:mode==='rabbit-strict'}]:[]),...(['advisory-outage','acknowledged'].includes(mode)?[{id:'human',adapter:'github-review',identity:{userId:mode==='advisory-outage'?4:3,type:'User'},approvalRequired:false}]:[])]}));
+   const result=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'readiness','owner/repo','1',config],{env:{PATH:root+':/usr/bin:/bin',HOME:root,ADLC_DB:db,FIXTURE_MODE:mode}});
    expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');const output=JSON.parse(result.stdout.toString());
-    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output).toMatchObject({head,descriptionHash:digest(pr.body),pendingChecks:[],missingChecks:[],coderabbitPresent:true,mergeEnabled:false});
+    expect(output.failedChecks).toHaveLength(mode==='rabbit-ci-failed'?1:0);
     expect(output.reviewerEvidence.pending).toEqual([]);expect(output.reviewerEvidence.excluded).toHaveLength(1);expect(output.reviewerEvidence.ignoredThreadIds).toEqual(['excluded-codex']);
    if(metadata.length){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Missing body-bound success evidence for every configured metadata check']);expect(output.metadataCheckEvidence).toEqual([{name:'Metadata',checkId:2,sha:head,status:'completed',conclusion:'success',descriptionHash:null}]);}
     else if(mode==='advisory-outage'){expect(output.clear).toBe(false);expect(output.reasons).toEqual(['Reviewer human: fresh identity/membership evidence unavailable or mismatched; no trust granted']);expect(output.findings).toEqual([]);}
-    else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
+    else if(mode.startsWith('rabbit-')&&!['rabbit-advisory','rabbit-custom-pass','rabbit-custom-stale-pass','rabbit-custom-stale-historical'].includes(mode)){
+     expect(output.clear).toBe(false);
+     const reason=mode.startsWith('rabbit-custom-')?'CodeRabbit custom-check failure: current bot review provenance is unavailable':mode==='rabbit-strict'?'Explicit latest-SHA CodeRabbit approval missing':mode==='rabbit-changes'?'Reviewer coderabbit: changes requested':mode==='rabbit-ci-failed'?'Required check not clear: CI':'CodeRabbit check not clear';
+     expect(output.reasons.some((r:string)=>r.includes(reason))).toBe(true);
+     if(mode.startsWith('rabbit-custom-')){expect(output.customCheckBlocker).toBe(reason);expect(output.findings).toEqual([]);expect(output.coderabbitBodyReviewed).toBe(false);}
+    }else{expect(output.clear).toBe(true);expect(output.reasons).toEqual([]);if(mode==='acknowledged'){expect(output.findings).toEqual([]);expect(output.reviewerEvidence.acknowledged).toMatchObject([{threadId:'comment:100',reviewId:43}]);}}
    expect(existsSync(db)).toBe(false);
   }
  }finally{rmSync(root,{recursive:true,force:true});}

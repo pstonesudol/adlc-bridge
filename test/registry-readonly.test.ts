@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,readdirSync,statSync,rmSync,realpathSync} from 'node:fs';import {join,dirname,resolve} from 'node:path';import {tmpdir} from 'node:os';
 import {registeredProjects} from '../src/service-control';import {Store} from '../src/core';import {ProjectServices,legacyLabel} from '../src/project-services';import {serviceDefinition} from '../src/init';
-import {installBridge} from '../src/install';import {readDefinition,assertDefinition} from '../src/project-services';
+import {installBridge,snapshot} from '../src/install';import {readDefinition,assertDefinition} from '../src/project-services';
+import {cpSync} from 'node:fs';
 import {registrations} from '../src/maintenance';
 function fixture(){
  const home=realpathSync(mkdtempSync(join(tmpdir(),'adlc-readonly-registry-'))),repo=join(home,'repo'),config=join(home,'project.json'),path=join(home,'state/state.sqlite'),plist=join(home,'Library/LaunchAgents',legacyLabel+'.plist');mkdirSync(repo);mkdirSync(dirname(plist),{recursive:true});
@@ -30,12 +31,31 @@ test('maintenance registration reads do not initialize tables, change bytes or m
  const f=fixture();try{expect(()=>registrations(f.path)).toThrow();expect(existsSync(f.path)).toBe(false);expect(existsSync(dirname(f.path))).toBe(false);}finally{f.close();}
 });
 test('install preview discovers legacy projects without creating or changing the registry',async()=>{
- for(const existing of [false,true]){const f=fixture();try{
+ for(const existing of [false,true])for(const approvalRequired of [true,false]){const f=fixture();try{
+  const config=JSON.parse(readFileSync(f.config,'utf8'));config.reviewers=[{id:'coderabbit',approvalRequired}];writeFileSync(f.config,JSON.stringify(config));const configBefore=readFileSync(f.config);
   if(existing){const s=new Store(f.path);new ProjectServices(s);s.close();}
   const before=existing?readFileSync(f.path):undefined,files=existing?readdirSync(dirname(f.path)):undefined;
   const io:any={state:()=>join(f.home,'ADLC Bridge'),home:()=>f.home,registeredProjects:(readOnly:boolean)=>registeredProjects(readOnly,f.home,f.path),readDefinition,assertDefinition};
-  const preview=await installBridge(false,f.repo,join(f.home,'adlc'),io);expect(preview.projects).toEqual(['legacy']);
+  const preview=await installBridge(false,f.repo,join(f.home,'adlc'),io);expect(preview.projects).toEqual(['legacy']);expect(preview.preview).toBe(true);expect(readFileSync(f.config)).toEqual(configBefore);expect(existsSync(join(f.home,'ADLC Bridge'))).toBe(false);expect(existsSync(join(f.home,'adlc'))).toBe(false);
   if(existing){expect(readFileSync(f.path)).toEqual(before!);expect(readdirSync(dirname(f.path))).toEqual(files!);const s=Store.readonly(f.path);try{expect(new ProjectServices(s,false).list()).toEqual([]);}finally{s.close();}}
   else{expect(existsSync(f.path)).toBe(false);expect(existsSync(dirname(f.path))).toBe(false);}
  }finally{f.close();}}
+});
+test('application-source snapshot install preview accepts advisory CodeRabbit without a runtime patch',()=>{
+ const f=fixture();try{
+  // Test the packaged application code independently of dependency staging.
+  cpSync(resolve(import.meta.dir,'../src'),join(f.repo,'src'),{recursive:true});
+  const built=snapshot(f.repo,join(f.home,'snapshots')),root=dirname(dirname(built.cli));
+  const config=JSON.parse(readFileSync(f.config,'utf8'));config.reviewers=[{id:'coderabbit',approvalRequired:false}];writeFileSync(f.config,JSON.stringify(config));
+  writeFileSync(join(f.home,'Library/LaunchAgents',legacyLabel+'.plist'),serviceDefinition(f.config,process.execPath,built.cli,f.home));
+  const script=`import {installBridge} from ${JSON.stringify(join(root,'src/install.ts'))};
+import {registeredProjects} from ${JSON.stringify(join(root,'src/service-control.ts'))};
+import {readDefinition,assertDefinition} from ${JSON.stringify(join(root,'src/project-services.ts'))};
+const home=${JSON.stringify(f.home)},path=${JSON.stringify(f.path)};
+console.log(JSON.stringify(await installBridge(false,${JSON.stringify(root)},home+'/adlc',{state:()=>home+'/ADLC Bridge',home:()=>home,registeredProjects:readOnly=>registeredProjects(readOnly,home,path),readDefinition,assertDefinition})));`;
+  const result=Bun.spawnSync([process.execPath,'--no-install','--eval',script],{cwd:root,env:{HOME:f.home,PATH:process.env.PATH}});
+  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');
+  expect(JSON.parse(result.stdout.toString())).toMatchObject({preview:true,source:root,projects:['legacy']});
+  expect(existsSync(f.path)).toBe(false);expect(existsSync(join(f.home,'ADLC Bridge'))).toBe(false);expect(existsSync(join(f.home,'adlc'))).toBe(false);
+ }finally{f.close();}
 });
