@@ -995,6 +995,36 @@ resets or switches a developer checkout or worker worktree. It pins the commit,
 verifies required GitHub checks for that exact commit, checks package and bridge
 entrypoint compatibility, and classifies the change:
 
+From a fresh stage (no dependencies required in any developer checkout), the
+normal operator path after configuring the policy is:
+
+```sh
+adlc update-preview
+adlc update-apply
+adlc update-status
+```
+
+Preview prepares dependencies in a separate private `updates/build/<commit>/tree`
+using `bun install --frozen-lockfile --ignore-scripts --linker hoisted`, before
+validation. Only the root `bun.lock` committed in that exact candidate is used;
+the installed runtime's or operator checkout's lockfile is never substituted.
+Missing/inconsistent lockfiles or failed preparation stop staging with the
+current installation untouched. Preview/apply never generate or repair a
+candidate lockfile. A candidate without a lockfile must first be fixed upstream.
+
+A build receipt binds all prepared contents to the candidate commit and lockfile
+digest. Repeated previews verify and reuse the same artifact, not reinstall it.
+Apply checks the saved successful preview identity and re-verifies source and
+artifact before installation; it never silently repairs tampered output. If the
+authoritative candidate changed, explicitly preview again. If staged source or
+build output changed, inspect the diagnostic's isolated path before removing
+that stage/build and previewing again. Preview neither activates a snapshot nor
+touches live configuration. `update-status` shows installed snapshot/source
+identity and running backend/services plus the executing CLI snapshot identity
+(unknown/null when it cannot be established, such as a source checkout).
+
+Change classifications:
+
 - `hot`: bridge code only; the backend stays running.
 - `backend`: native launcher or scripts changed; a supported graceful backend
   restart is required.

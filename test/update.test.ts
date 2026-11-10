@@ -323,18 +323,84 @@ test('uncertain delivery and configuration incompatibility fail closed before ac
 test('isolated staging pins the exact commit and refuses a modified checkout',async()=>{
  const root=mkdtempSync(join(tmpdir(),'adlc-update-git-'));try{
   const remote=join(root,'remote'),state=join(root,'state');mkdirSync(join(remote,'src'),{recursive:true});writeFileSync(join(remote,'src/cli.ts'),'candidate bytes');
-  const git=(args:string[])=>Bun.spawnSync(['git',...args],{cwd:remote,stdout:'pipe',stderr:'pipe'});
+   writeFileSync(join(remote,'package.json'),JSON.stringify({name:'adlc-bridge',type:'module',bin:{adlc:'src/cli.ts'}}));
+   writeFileSync(join(remote,'bun.lock'),JSON.stringify({lockfileVersion:2,configVersion:1,workspaces:{'':{name:'adlc-bridge'}},packages:{}}));
+   const git=(args:string[])=>Bun.spawnSync(['git',...args],{cwd:remote,stdout:'pipe',stderr:'pipe'});
   expect(git(['init','--quiet']).exitCode).toBe(0);expect(git(['add','.']).exitCode).toBe(0);
   expect(git(['-c','user.name=Test','-c','user.email=test@example.com','commit','--quiet','-m','candidate']).exitCode).toBe(0);
   const commit=Bun.spawnSync(['git','rev-parse','HEAD'],{cwd:remote,stdout:'pipe'}).stdout.toString().trim();
-  const staged=await stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state);
-  expect(staged).toMatchObject({commit,files:['src/cli.ts']});expect(readFileSync(join(staged.root,'src/cli.ts'),'utf8')).toBe('candidate bytes');
+   const staged=await stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state,()=>{});
+   expect(staged).toMatchObject({commit,files:['package.json','src/cli.ts']});expect(readFileSync(join(staged.root,'src/cli.ts'),'utf8')).toBe('candidate bytes');
   expect(candidateCompatibility({...staged,files:['src/cli.ts']}).compatible).toBe(false);
-  writeFileSync(join(staged.root,'src/cli.ts'),'modified');await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow('modified');
-  writeFileSync(join(staged.root,'src/cli.ts'),'candidate bytes');
-  writeFileSync(join(staged.root,'.git/info/exclude'),'src/generated.ts\n');writeFileSync(join(staged.root,'src/generated.ts'),'ignored bytes');
-  await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow(`inspect and remove ${staged.root}, then retry`);
+   writeFileSync(join(staged.sourceRoot!,'src/cli.ts'),'modified');await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state,()=>{})).rejects.toThrow('modified');
+   writeFileSync(join(staged.sourceRoot!,'src/cli.ts'),'candidate bytes');
+   writeFileSync(join(staged.sourceRoot!,'.git/info/exclude'),'src/generated.ts\n');writeFileSync(join(staged.sourceRoot!,'src/generated.ts'),'ignored bytes');
+   await expect(stageCandidate({...policy(),remote} as UpdatePolicy,{commit,ref:'refs/heads/main',source:remote},state)).rejects.toThrow(`inspect and remove ${staged.sourceRoot}, then retry`);
  }finally{rmSync(root,{recursive:true,force:true});}
+});
+function candidateFixture(options:{missing?:boolean;inconsistent?:boolean}={}){
+ const f=fixture(),remote=join(f.root,'remote');mkdirSync(join(remote,'src'),{recursive:true});
+ writeFileSync(join(remote,'src/cli.ts'),'candidate cli');writeFileSync(join(remote,'src/serve-orchestrator.py'),'candidate launcher');
+ const pkg=JSON.parse(readFileSync(join(import.meta.dir,'../package.json'),'utf8'));
+ pkg.scripts={postinstall:'touch lifecycle-ran'};
+ if(options.inconsistent)pkg.dependencies['@opencode/client']='0.0.0';
+ writeFileSync(join(remote,'package.json'),JSON.stringify(pkg));
+ if(!options.missing)writeFileSync(join(remote,'bun.lock'),readFileSync(join(import.meta.dir,'../bun.lock')));
+ const git=(args:string[])=>{const r=Bun.spawnSync(['git',...args],{cwd:remote,stdout:'pipe',stderr:'pipe'});expect(r.exitCode).toBe(0);return r.stdout.toString().trim();};
+ git(['init','--quiet']);git(['add','.']);git(['-c','user.name=Test','-c','user.email=test@example.com','commit','--quiet','-m','candidate']);
+ const commit=git(['rev-parse','HEAD']);f.setCandidate(commit);
+ f.io.stage=(p,c)=>stageCandidate({...p,remote},c,f.state);
+ return {...f,remote,commit,git};
+}
+test('fresh dependency-free preview/apply/status reuse the exact frozen artifact without lifecycle scripts',async()=>{
+ const f=candidateFixture();try{
+  expect(existsSync(join(f.remote,'node_modules'))).toBe(false);
+  const preview=await f.manager.preview();expect(preview.ready).toBe(true);expect(preview.tests.skipped).toBe(true);
+  const stage=await f.io.stage(f.policy,{commit:f.commit,ref:'refs/heads/main',source:f.remote});
+  expect(stage.artifact?.lockfile).toHaveLength(64);expect(stage.files.some(p=>p.startsWith('node_modules/@opencode/client/'))).toBe(true);
+  expect(existsSync(join(stage.root,'lifecycle-ran'))).toBe(false);
+  const repeated=await f.manager.preview();expect(repeated.staged).toEqual(preview.staged);
+  expect(Bun.spawnSync(['git','status','--porcelain','--ignored'],{cwd:stage.sourceRoot,stdout:'pipe'}).stdout.toString()).toBe('');
+  expect(existsSync(join(f.remote,'node_modules'))).toBe(false);expect(f.installs).toEqual([]);
+  f.io.install=async(_apply,root)=>{const built=snapshot(root,join(f.state,'versions'));writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:root,version:built.version,cli:built.cli,launcher:join(f.root,'adlc')}),{mode:0o600});return built;};
+  expect(await f.manager.apply()).toMatchObject({activated:true,version:stage.version});
+  expect(await f.manager.status()).toMatchObject({source:{commit:f.commit,commitKnown:true},installed:{version:stage.version}});
+  expect(f.services).toEqual({one:true,two:false});
+ }finally{f.close();}
+});
+test('missing/inconsistent candidate lockfile and failed preparation preserve the installation',async()=>{
+ for(const mode of ['missing','inconsistent','failure']){
+  const f=candidateFixture({missing:mode==='missing',inconsistent:mode==='inconsistent'});try{
+   const before=readFileSync(join(f.state,'installation.json'));
+   if(mode==='failure')f.io.stage=(p,c)=>stageCandidate({...p,remote:f.remote},c,f.state,()=>{throw Error('preparation failed');});
+   await expect(f.manager.preview()).rejects.toThrow(mode==='missing'?'must commit':mode==='inconsistent'?'dependency preparation failed':'preparation failed');
+   await expect(f.manager.apply()).rejects.toThrow();expect(f.installs).toEqual([]);expect(f.calls).toEqual([]);
+   expect(readFileSync(join(f.state,'installation.json'))).toEqual(before);expect(f.services.one).toBe(true);
+   expect(existsSync(join(f.state,'updates','build',f.commit))).toBe(false);
+  }finally{f.close();}
+ }
+});
+test('tampered staged build, lockfile and source fail closed instead of being rebuilt',async()=>{
+ for(const file of ['src/cli.ts','bun.lock','node_modules/@opencode/client/dist/promise/service.js']){
+  const f=candidateFixture();try{
+   const preview=await f.manager.preview();writeFileSync(join(preview.staged.root,file),'tampered');
+   await expect(f.manager.preview()).rejects.toThrow('artifact was modified');await expect(f.manager.apply()).rejects.toThrow('artifact was modified');expect(f.installs).toEqual([]);expect(f.calls).toEqual([]);
+  }finally{f.close();}
+ }
+},30000);
+test('artifact tampering during activation is caught by the final stage verification',async()=>{
+ const f=candidateFixture();try{
+  const preview=await f.manager.preview(),stop=f.io.stack.project;
+  f.io.stack.project=async(action,id)=>{const result=await stop(action,id);if(action==='stop')writeFileSync(join(preview.staged.root,'src/cli.ts'),'changed during activation');return result;};
+  await expect(f.manager.apply()).rejects.toThrow('artifact was modified');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);expect(f.manager.turns.isPaused()).toBe(false);
+ }finally{f.close();}
+});
+test('a changed authoritative candidate after a saved preview requires a fresh explicit preview',async()=>{
+ const f=fixture();try{
+  f.io.stage=async(_p,c)=>({root:join(f.root,'stage'),commit:c.commit,version:'v2',files:['src/cli.ts'],artifact:{lockfile:'lock',digest:'artifact'}});
+  await f.manager.preview();f.setCandidate('b'.repeat(40));
+  await expect(f.manager.apply()).rejects.toThrow('changed since preview');expect(f.installs).toEqual([]);expect(f.calls).toEqual([]);
+ }finally{f.close();}
 });
 test('a deferral whose intake restoration fails remains paused for operator action',async()=>{
  const f=fixture({blockers:[{session:'worker',reason:'running turn'}],failStart:true});try{
