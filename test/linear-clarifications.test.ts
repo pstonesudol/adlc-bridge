@@ -14,13 +14,16 @@ import {projectMetrics} from '../src/autonomy-metrics';
 const human='11111111-1111-1111-1111-111111111111',label='22222222-2222-2222-2222-222222222222';
 const config:any={repo:'/repo',requiredChecks:['CI'],linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},blockerSync:{enabled:true,labelId:label},clarifications:{enabled:true,humanIds:[human]}};
 const discovery='<!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Inspected ticket, linked copy ticket and src/a.ts; approved display wording is unchanged","necessity":"The exact listing identifier is absent and required to address the correct listing"} -->';
-async function fixture(path=':memory:',planning=false){
+async function fixture(path=':memory:',planning=false,dev66=false){
  const s=new Store(path);let e:any,sends:any[]=[],loseSend=false,loseComment=false,loseBeforeComment=false;const trace:string[]=[],comments:any[]=[],labels=['ready','human-label'];let description='Update approved listing',relationIncomplete=false;
  const t:WorkflowTransport={startPlan:async()=>{throw Error('No spawning permitted');},findPlans:async()=>[],evidence:async()=>e,disableFeedback:async()=>{},worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40)}),sendImplementation:async(id,prompt,clientId)=>{
   sends.push({id,prompt,clientId});e.transcript.entries.push({sequence:e.transcript.entries.length+1,clientMessageId:clientId,turnId:clientId,kind:'message',role:'user',text:prompt});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';if(loseSend)throw Error('Lost send reply');
  }};
- const w=new Workflow(s,t),spec=JSON.stringify({identifier:'DEV-18',title:'Listing',description}),id=s.enqueue('p','issue',spec),p=new Planning(s),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/isolated');
- const plan=planning?`Update src/a.ts. ${discovery}\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"needs-input","questions":[{"id":"q1","question":"What is the exact listing ID?","kind":"requirement"}],"dependencies":[],"risks":[]} -->`:'Update src/a.ts. <!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
+ const identifier=dev66?'DEV-66':'DEV-18',title=dev66?'Recover legacy missing-binding regression':'Listing';
+ if(dev66)description='Test legacy missing-binding recovery; report missing evidence without reopening https://linear.app/example/issue/DEV-43/completed-controls';
+ const w=new Workflow(s,t),spec=JSON.stringify({identifier,title,description}),id=s.enqueue('p','issue',spec),p=new Planning(s),r=p.reserve(id,'ao');p.gate(id,'ao','session',r.branch,'/isolated');
+ const question=dev66?{id:'q1',question:'Should DEV-66 continue the legacy missing-binding regression when DEV-43 capability evidence is unavailable?',kind:'dependency'}:{id:'q1',question:'What is the exact listing ID?',kind:'requirement'};
+ const plan=planning?`Update src/a.ts. ${discovery}\n<!-- ADLC_PLAN_STATUS ${JSON.stringify({version:1,readiness:'needs-input',questions:[question],dependencies:[],risks:[]})} -->`:'Update src/a.ts. <!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
  const hash=s.propose(id,plan);recordReadiness(s,id,plan,hash,digest(spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(id);s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,session_id,client_id) VALUES (?,?,?,?,?)').run(id,digest(spec),'awaiting_approval','session','planning-message');
  e={receiptObservation:{complete:true,observed:Date.now()},session:{id:'session',projectId:'ao',branch:r.branch,isTerminated:false,prs:[]},transcript:{controller:'ready',entries:[],turns:[]}};
  if(!planning){w.approve(id,hash,'Patrick',['src/**'],'supervised-host',['inspect','fetch','worktree','branch','commit','push-feature','open-pr']);await w.executeApproved(id);}
@@ -30,7 +33,9 @@ async function fixture(path=':memory:',planning=false){
   await w.executionStatus(id,e,config);
  };
  if(!planning)await block();
- const issue=()=>({id:'issue',identifier:'DEV-18',title:'Listing',description,project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:labels.map(id=>({id})),pageInfo:{hasNextPage:false}}});
+ const issue=()=>({id:'issue',identifier,title,description,project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:labels.map(id=>({id})),pageInfo:{hasNextPage:false}}});
+ const closed={id:'closed-43',identifier:'DEV-43',title:'Completed controls',description:'Completed; capability evidence unavailable',state:{id:'done'}};
+ const updates:any[]=[];
  const api=async(q:string,v:any)=>{
   if(q.includes('commentCreate')){
    trace.push('publish');if(loseBeforeComment)throw Error('Lost before create');
@@ -40,17 +45,18 @@ async function fixture(path=':memory:',planning=false){
   if(q.includes('comments(first:100')){trace.push('comments');return {issue:{id:v.id,comments:{nodes:v.id==='issue'?comments:[],pageInfo:{hasNextPage:false}}}};}
   if(q.includes('inverseRelations')){trace.push('linked');return {issue:{id:'issue',relations:{nodes:[],pageInfo:{hasNextPage:relationIncomplete}},inverseRelations:{nodes:[],pageInfo:{hasNextPage:false}}}};}
   if(q.includes('issueUpdate')){
+   updates.push(v);if(v.id!=='issue')throw Error('Must not mutate a linked ticket');
    trace.push('labels');if(v.added)for(const l of v.added)if(!labels.includes(l))labels.push(l);
    if(v.removed)for(const l of v.removed){const at=labels.indexOf(l);if(at>=0)labels.splice(at,1);}
    return {issueUpdate:{success:true,issue:issue()}};
   }
-  trace.push('issue');return {issue:issue()};
+  trace.push('issue');return {issue:v.id==='DEV-43'?closed:issue()};
  };
  const blockers=new LinearBlockers(s,api),adapter=()=>new LinearClarifications(s,w,blockers,()=>{trace.push('repository');return ['src/a.ts (hash)'];});
  const reference=()=>JSON.parse((s.db.query('SELECT context FROM clarification_receipts WHERE job=? ORDER BY rowid DESC').get(id) as any).context).reference;
  const reply=(body:string,patch:any={})=>{const x={id:`human-${comments.length}`,body,createdAt:`2026-11-02T10:${String(comments.length+1).padStart(2,'0')}:00Z`,editedAt:null,user:{id:human,app:false},botActor:null,...patch};comments.push(x);return x;};
  const confirm=()=>reply(`Confirm clarification ${reference()}: all answers resolve the questions within the existing approved scope; no new permissions.`);
- return {s,w,id,e,t,api,trace,comments,labels,sends,adapter,blockers,block,reply,confirm,reference,loseSend:()=>loseSend=true,loseComment:()=>loseComment=true,loseBeforeComment:()=>loseBeforeComment=true,changeDescription:()=>description='Expanded scope',incomplete:()=>relationIncomplete=true};
+ return {s,w,id,e,t,api,trace,comments,labels,sends,adapter,blockers,block,reply,confirm,reference,closed,updates,loseSend:()=>loseSend=true,loseComment:()=>loseComment=true,loseBeforeComment:()=>loseBeforeComment=true,changeDescription:()=>description='Expanded scope',incomplete:()=>relationIncomplete=true};
 }
 test('discovery occurs before exact question publication; configured label is additive and deduplicated',async()=>{
  const f=await fixture();try{
@@ -204,6 +210,86 @@ test('permission-sensitive answers and nonanswers cannot be confirmed into scope
   await f.adapter().sync(config);f.reply(text);f.confirm();await f.adapter().sync(config);expect(f.sends).toHaveLength(1);expect(activeResolution(f.s,f.id)).toBeNull();
  }finally{f.s.close();}}
 });
+const dev66Answer='Continue DEV-66 with the legacy missing-binding regression within existing scope; report the missing binding. Leave completed DEV-43 closed because capability evidence is unavailable. No new permissions.';
+test('DEV-100: confirmed DEV-66 clarification dispatches its original worker once under standing policy, never DEV-43',async()=>{
+ for(const manual of [false,true]){const f=await fixture(':memory:',true,true);try{
+  const c:any={...config,approval:{mode:'ready-queue',id:'standing',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'}};
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']),Date.now(),manual?new Set(['issue']):new Set());
+  const closed=JSON.stringify(f.closed),plan=f.s.get(f.id).plan_hash,spec=f.s.get(f.id).spec;
+  await f.adapter().sync(c);f.reply(dev66Answer);await f.adapter().sync(c);
+  expect(activeResolution(f.s,f.id)).toBeNull();expect(f.sends).toHaveLength(0);
+  f.confirm();await Promise.all([f.adapter().sync(c),f.adapter().sync(c)]);
+  const resolution=activeResolution(f.s,f.id);expect(resolution.source).toBe('human-answer');
+  expect(standingReady(f.s,f.id)).toBe(true);expect(f.s.get(f.id).plan_hash).toBe(plan);expect(f.s.get(f.id).spec).toBe(spec);
+  // Identical preservation wording must also pass the late-correction preflight.
+  f.reply(`q1: ${dev66Answer}`);f.confirm();await f.adapter().preflight(c);
+  expect(activeResolution(f.s,f.id).at).toBe(resolution.at);
+  await f.w.tick(c);await f.w.tick(c);await f.adapter().sync(c);await f.adapter().preflight(c);
+  expect(f.sends).toHaveLength(manual?0:1);
+  if(!manual){
+   expect(f.sends[0].id).toBe('session');expect(f.sends[0].prompt).toContain(dev66Answer);
+   expect(f.w.implementation(f.id).actor).toBe('standing-policy:standing');
+  }else expect(f.s.get(f.id).state).toBe('awaiting_approval');
+  expect(JSON.stringify(f.closed)).toBe(closed);expect(f.closed.state.id).toBe('done');
+  expect(f.updates.every(v=>v.id==='issue')).toBe(true);
+  expect((f.s.db.query('SELECT count(*) AS n FROM jobs').get() as any).n).toBe(1);
+  expect((f.s.db.query('SELECT count(*) AS n FROM plan_resolutions').get() as any).n).toBe(1);
+ }finally{f.s.close();}}
+});
+test('DEV-100: preservation wording cannot hide ambiguity or expansion behind confirmation',async()=>{
+ for(const text of [
+  'Maybe continue within existing scope',
+  'Continue within existing scope unless extra permissions are needed',
+  'This cannot be within existing scope',
+  'Never within existing scope',
+  'Nor is this within existing scope',
+  'Neither regression is within existing scope',
+  'This is hardly within existing scope',
+  `${dev66Answer} Expand scope to another repository.`,
+  `${dev66Answer} Deploy production instead.`,
+ ]){const f=await fixture();try{
+  await f.adapter().sync(config);f.reply(text);f.confirm();await f.adapter().sync(config);await f.adapter().sync(config);
+  expect(activeResolution(f.s,f.id)).toBeNull();expect(f.sends).toHaveLength(1);
+  const receipt=f.adapter().status()[0];expect(receipt.state).toBe('replan');expect(receipt.reason).toContain('q1: Unresolved sensitive clause:');
+  expect(f.comments.at(-1).body).toContain(receipt.reason);expect(f.comments.at(-1).body).toContain('plan-reconcile JOB CONFIG SEQUENCE');
+ }finally{f.s.close();}}
+});
+test('DEV-100: preserved scope does not excuse stale, edited or superseded replies',async()=>{
+ for(const mode of ['stale','edited','requirements']){const f=await fixture(':memory:',true,true);try{
+  await f.adapter().sync(config);const answer=f.reply(dev66Answer,mode==='stale'?{createdAt:'2026-11-01T00:00:00Z'}:{});
+  if(mode==='edited')answer.editedAt='2026-11-02T12:00:00Z';
+  if(mode==='requirements')f.changeDescription();
+  f.confirm();await f.adapter().sync(config);expect(activeResolution(f.s,f.id)).toBeNull();expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}}
+});
+test('DEV-100: negated scope corrections invalidate a resolution before standing-policy dispatch',async()=>{
+ for(const text of [
+  'This cannot be within existing scope',
+  'Never within existing scope',
+  'Nor is this within existing scope',
+  'Neither regression is within existing scope',
+  'This is hardly within existing scope',
+ ]){const f=await fixture(':memory:',true,true);try{
+  const c:any={...config,approval:{mode:'ready-queue',id:'standing',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'}};
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']));
+  await f.adapter().sync(c);f.reply(dev66Answer);f.confirm();await f.adapter().sync(c);
+  expect(activeResolution(f.s,f.id)).not.toBeNull();
+  f.reply(`q1: ${text}`);f.confirm();await f.adapter().preflight(c);
+  expect(activeResolution(f.s,f.id)).toBeNull();
+  expect(f.adapter().status()[0].state).toBe('needs_review');
+  expect(f.adapter().status()[0].reason).toBe(`Unresolved sensitive clause: ${text}`);
+  await f.w.tick(c);await f.w.tick(c);expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}}
+});
+test('DEV-100: preserved scope retains uncertain continuation receipts without replay',async()=>{
+ const f=await fixture();try{
+  await f.adapter().sync(config);f.reply(dev66Answer);f.confirm();f.loseSend();
+  await f.adapter().sync(config);const resolution=activeResolution(f.s,f.id);
+  await f.adapter().sync(config);await f.adapter().sync(config);
+  expect(f.sends).toHaveLength(2);expect(f.w.continuation(f.id).state).toBe('delivery_uncertain');
+  expect(activeResolution(f.s,f.id).at).toBe(resolution.at);
+ }finally{f.s.close();}
+});
 test('human ownership, queued turns, revoked grants and reduced scope cannot continue',async()=>{
  for(const mutate of [
   (f:any)=>f.s.db.query("UPDATE runs SET owner='human' WHERE job=?").run(f.id),
@@ -283,6 +369,7 @@ test('shared normalization preserves confirmation-only and quote gates and escal
   f.reply(confirmation);f.reply(`\`\`\`text\nq1: listing-99\n${confirmation}\n\`\`\``);f.reply(`> q1: listing-99\n${confirmation}`);
   await f.adapter().preflight(config);expect(activeResolution(f.s,f.id)).toBeTruthy();expect(f.adapter().status()[0].state).toBe('resolved');
   f.reply(`q1: deploy production\n${confirmation}`);await f.adapter().preflight(config);expect(activeResolution(f.s,f.id)).toBeNull();
+  expect(f.adapter().status()[0].reason).toContain('Unresolved sensitive clause: deploy production');
   await expect(f.w.executeApproved(f.id)).rejects.toThrow('unresolved');expect(f.sends).toHaveLength(0);
  }finally{f.s.close();}
 });
