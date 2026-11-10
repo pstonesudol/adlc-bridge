@@ -58,6 +58,31 @@ test('DEV-95: a review blocker does not strand the existing branch synchronizati
   expect(f.loop.get(f.job).state).toBe('blocked');
  }finally{f.close();}
 });
+test('DEV-105: maintenance cadence is independent, persisted, bounded and honors provider holds',()=>{
+ const f=fixture(true);try{
+  const c={...f.c,branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}};
+  f.loop.record(f.job,{state:'blocked',reason:'PR head or description changed during custom-check collection'});
+  const review=f.w.scheduleReview(f.job,c);
+  expect(review.outcome).toBe('human_required');
+  expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.w.finishMaintenance(f.job,{reason:'Branch is current'});
+  const reopened=new Store(f.path);try{
+   const restarted=new ActionWatchdog(reopened,f.now,()=>0.5,f.root);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   f.advance();
+   const failure=readFailure('github','branch-read','HTTP/2 429\r\nRetry-After: 180\r\n\r\n',1);failure.evidence.retryAt=f.now()+180000;
+   new RecoveryObservation(f.s,f.now).failed(f.job,failure.evidence);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   expect(f.loop.list()[0].maintenance.schedule.reason).toContain('github');
+   f.advance(180001);new RecoveryObservation(f.s,f.now).clear(f.job);
+   f.s.db.query('UPDATE maintenance_schedule SET attempts=? WHERE job=?').run(WATCHDOG_LIMITS.maxAttempts,f.job);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   expect(f.loop.list()[0].maintenance.schedule.reason).toContain('budget exhausted');
+   expect(f.w.get(review.id).state).toBe('escalated');
+  }finally{reopened.close();}
+ }finally{f.close();}
+});
 // Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
 // controlled clock. A subprocess isolates the poll fence's HOME and Date.now.
 function productionScenario(f:ReturnType<typeof fixture>,scenario:string){

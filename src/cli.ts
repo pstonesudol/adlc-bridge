@@ -60,7 +60,8 @@ import {revisionStatus,latestRevision,assertCapturedRevision} from './spec-revis
 import {groups,operatorHelp,OperatorError,resolveJob,jobViews,humanJobs} from './operator-cli';
 import {modernCommand,dispatchOperator} from './operator-dispatch';
 import {projectEntries,selectProject} from './operator-discovery';
-import {ActionWatchdog,retryWatchdogObservation} from './action-watchdog';
+import {ActionWatchdog,WATCHDOG_LIMITS,retryWatchdogObservation} from './action-watchdog';
+import {maintenanceStatus} from './branch-maintenance';
 import {integrationPreview,integrationRuntime,verifyIntegrations} from './integration-capabilities';
 import {reviewerPolicyView} from './reviewer-policy';
 import {ReviewRequests,reviewProviderHoldPreview} from './coderabbit-scheduling';
@@ -131,10 +132,19 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   const blockerUpdates=blockers?await blockers.sync(c):[];if(blockerUpdates.length)io.out({linearBlockers:blockerUpdates});
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
    const watchdog=new ActionWatchdog(s);
+   let maintenanceChecks=0;
    for(const target of reviewLoop.list(c.linear.projectId) as any[]){
     try{
      reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
      if(target.state==='completed')continue;
+     if(maintenanceChecks<WATCHDOG_LIMITS.perTick&&watchdog.beginMaintenance(target.job,c)){
+      maintenanceChecks++;
+      try{
+       assertConfiguredProjectIntakeEnabled(c,s);
+       const maintenance=await reviewLoop.tick(target.job,c.branchUpdate,remediation,{project:c.linear.projectId,checks:c.prMetadataChecks??[]},c,undefined,true);
+       watchdog.finishMaintenance(target.job,maintenance);io.out({job:target.job,maintenance});
+      }catch(error){watchdog.finishMaintenance(target.job);console.error(error instanceof Error?error.message:'Maintenance tick failed');}
+     }
      watchdog.scheduleReview(target.job,c);
     }catch{console.error(`Review scheduling failed for ${target.job}; remaining targets continue`);}
    }
@@ -197,7 +207,7 @@ async function main(){
      if(!existsSync(db))return out([]);
      const store=Store.readonly(db);try{
       if(command==='approvals')return out(store.db.query("SELECT id AS job,project,plan_hash AS hash,reason FROM jobs WHERE state='awaiting_approval' AND (? IS NULL OR project=?)").all(project??null,project??null));
-       return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?(store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null) as any[]).map(t=>({...t,maintenance:store.db.query("SELECT name FROM sqlite_master WHERE name='branch_maintenance'").get()?store.db.query('SELECT * FROM branch_maintenance WHERE job=?').get(t.job):null})):[]);
+       return out(store.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?(store.db.query('SELECT t.* FROM review_targets t JOIN jobs j ON j.id=t.job WHERE (? IS NULL OR j.project=?)').all(project??null,project??null) as any[]).map(t=>({...t,maintenance:maintenanceStatus(store,t.job)})):[]);
      }finally{store.close();}
     }
    }

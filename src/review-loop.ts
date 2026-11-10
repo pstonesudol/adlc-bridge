@@ -266,12 +266,12 @@ export class ReviewLoop{
   this.s.event(job,'coderabbit_review_requested',JSON.stringify({pr,head,bodyHash,mode:requestPolicy.reviewMode}));
   return true;
  }
-   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
+   async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string},maintenanceOnly=false){
    const observations=new RecoveryObservation(this.s),release=observations.claim(`job:${job}`,60*60*1000);
    if(!release)return {state:'waiting_for_worker',send:false,reason:'Review evaluation already reserved; no duplicate reads or continuation'};
-    try{return await withObservationFence(release.assert,()=>this.tickReserved(job,branchPolicy,remediationPolicy,policy,config,action));}catch(error){if(error instanceof ObservationLeaseLost)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}finally{release();}
+    try{return await withObservationFence(release.assert,()=>this.tickReserved(job,branchPolicy,remediationPolicy,policy,config,action,maintenanceOnly));}catch(error){if(error instanceof ObservationLeaseLost)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}finally{release();}
   }
-   async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string}){
+   async tickReserved(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string},maintenanceOnly=false){
     assertObservationFence();const io=fencedIO(this.io);
     if(action){
      try{action.watchdog.assertReviewAction(action.id,job,config);}catch(error){if(error instanceof ObservationDeferred)return {state:'waiting_for_worker',send:false,reason:error.message};throw error;}
@@ -292,6 +292,12 @@ export class ReviewLoop{
    // Every write in this tick is scoped to the PR captured here; a rebound
    // target must not receive this PR's decisions.
    const record=(result:any)=>{
+    if(maintenanceOnly){
+     const current=this.get(job);
+     if(current?.pr===t.pr&&current.state==='ready_for_human'&&result.head&&result.head!==current.head)this.record(job,{state:'waiting_for_review',send:false,head:result.head,reason:'Branch head changed; fresh current-head verification and review required'},t.pr);
+     if(current?.pr===t.pr&&current.state!=='completed')this.s.db.query('INSERT INTO branch_maintenance(job,repo,pr,head,state,reason) VALUES (?,?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET repo=excluded.repo,pr=excluded.pr,head=excluded.head,state=excluded.state,reason=excluded.reason,updated=CURRENT_TIMESTAMP').run(job,t.repo,t.pr,result.head??null,result.maintenanceComplete?'completed':result.state,result.reason);
+     return result;
+    }
     const stored=this.record(job,result,t.pr);
     if(stored)return stored;
     const current=this.get(job);
@@ -324,7 +330,8 @@ export class ReviewLoop{
     let review=this.get(job);
     if(review.pr!==t.pr||review.state==='completed')return record(result);
     // Invalidate old clearance before IO, including a lost/throttled read.
-    if(review.state==='ready_for_human')record({state:'waiting_for_review',send:false,head:result.head,reason:'Branch maintenance pending; fresh current-head verification and review required'});
+    if(review.state==='ready_for_human')this.record(job,{state:'waiting_for_review',send:false,head:result.head,reason:'Branch maintenance pending; fresh current-head verification and review required'},t.pr);
+    if(maintenanceOnly)return {...result,maintenance:maintenanceStatus(this.s,job),review:{state:this.get(job).state,head:this.get(job).head,reason:this.get(job).reason}};
     try{
      const e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,[...new Set([...JSON.parse(t.required_checks),...metadataChecks])],metadataChecks));
      l.current(job);
@@ -347,6 +354,7 @@ export class ReviewLoop{
    l.recordRemediationPolicy(job,remediationPolicy);
    const recovery=worktreeReservation(this.s,job);
    if(recovery&&!recovery.branchSync){
+    if(maintenanceOnly)return record({state:'blocked',send:false,reason:'Conflict recovery retains the worktree reservation; no maintenance-only recovery dispatch'});
     if(recovery.job!==job||!config)return record({state:'blocked',send:false,reason:'Worktree has a durable conflict reservation; inspect recovery-status with its original config'});
     try{const result=await new ConflictRecovery(this.s).tick(job,config,t.repo,t.pr,remediationPolicy);if(result)return record(result);}
     catch(error){return record({state:'blocked',send:false,reason:error instanceof Error?error.message:'Conflict recovery unavailable'});}
@@ -382,7 +390,7 @@ export class ReviewLoop{
    }
    if(!config&&recovery?.branchSync)return record({state:'blocked',send:false,reason:'Pending branch synchronization requires the registered project configuration; no review dispatch'});
    let branch;
-   if(config?.conflictRecovery?.enabled===true){
+   if(!maintenanceOnly&&config?.conflictRecovery?.enabled===true){
     let snapshot;
     try{snapshot=await observation.read(job,'github',()=>io.readBranchSnapshot(t.repo,t.pr));}
     catch(error){return record(readStop(error,'Branch snapshot unavailable'));}
@@ -407,6 +415,7 @@ export class ReviewLoop{
     if(branch)return maintenance(branch);
     if(snapshot.behind===0&&local.head===snapshot.head&&maintenanceStatus(this.s,job))persistMaintenance({state:'completed',head:snapshot.head,reason:'Branch maintenance reconciled; review and verification remain independent'});
    const branchComplete=this.completed(job);if(branchComplete)return branchComplete;
+   if(maintenanceOnly)return record({state:'completed',send:false,head:snapshot.head,reason:'Branch is current and worktree synchronized; review and verification remain independent'});
   const required=[...new Set([...JSON.parse(t.required_checks),...metadataChecks])];
   let e;
    try{e=await observation.read(job,'github',()=>io.readiness(t.repo,t.pr,required,metadataChecks,reviewerInput(boundReviewerPolicy(this.s,job))));this.observeReviewers(job,e,t.pr);}

@@ -86,10 +86,34 @@ export class ActionWatchdog{
   if(s.readonly)throw Error('Watchdog evaluation requires a writable store; use actionStatus for inspection');
   s.db.exec(`CREATE TABLE IF NOT EXISTS watchdog_budgets(job TEXT PRIMARY KEY REFERENCES jobs(id),attempts INTEGER NOT NULL,max_attempts INTEGER NOT NULL);
    CREATE TABLE IF NOT EXISTS watchdog_evaluations(job TEXT PRIMARY KEY REFERENCES jobs(id),next_tick INTEGER NOT NULL,failures INTEGER NOT NULL DEFAULT 0);
+   CREATE TABLE IF NOT EXISTS maintenance_schedule(job TEXT PRIMARY KEY REFERENCES jobs(id),next_check INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS watchdog_actions(id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),project TEXT NOT NULL,binding TEXT NOT NULL,next_action TEXT NOT NULL,blocker TEXT NOT NULL,state TEXT NOT NULL,due_at INTEGER NOT NULL,attempts INTEGER NOT NULL,max_attempts INTEGER NOT NULL,failures INTEGER NOT NULL DEFAULT 0,token TEXT,lease_until INTEGER,outcome TEXT NOT NULL,reason TEXT NOT NULL,observed_at INTEGER,evidence TEXT);
    CREATE INDEX IF NOT EXISTS watchdog_due ON watchdog_actions(project,state,due_at);`);
  }
  get(id:string){return this.s.db.query('SELECT * FROM watchdog_actions WHERE id=?').get(id) as ActionRow;}
+ // Independent of review blocker classification and review backoff. This only
+ // reserves evaluation cadence; the existing evaluator retains mutation authority.
+ beginMaintenance(job:string,c:any){
+  return this.s.db.transaction(()=>{
+   this.s.db.query("INSERT OR IGNORE INTO maintenance_schedule(job,next_check,reason) VALUES (?,0,'Maintenance check pending')").run(job);
+   const schedule=row(this.s,'maintenance_schedule',job);
+   if(schedule.next_check>this.now())return false;
+   let reason='';
+   if(!c.branchUpdate?.enabled)reason='Automatic branch updates disabled';
+   else if(!eligibility(this.s,job,c,this.now()))reason='Current approval, ownership or inspect grant unavailable';
+   else if(worktreeReservation(this.s,job)&&!worktreeReservation(this.s,job)?.branchSync)reason='Conflict recovery retains the worktree reservation';
+   else if(schedule.attempts>=WATCHDOG_LIMITS.maxAttempts)reason='Automatic maintenance observation budget exhausted; inspect before supervised evaluation';
+   else if(schedule.failures>=WATCHDOG_LIMITS.maxEvaluationFailures)reason='Maintenance evaluation failures exhausted; inspect existing receipts';
+   const wait=new RecoveryObservation(this.s,this.now).wait(job);
+   if(!reason&&wait)reason=wait.reason;
+   this.s.db.query('UPDATE maintenance_schedule SET next_check=?,attempts=attempts+?,reason=? WHERE job=?').run(this.now()+WATCHDOG_LIMITS.intervalMs,reason?0:1,reason||'Maintenance evaluation reserved; existing update and synchronization guards apply',job);
+   return !reason;
+  }).immediate();
+ }
+ finishMaintenance(job:string,result?:{reason?:string}){
+  const schedule=row(this.s,'maintenance_schedule',job),failures=result?0:schedule.failures+1;
+  this.s.db.query('UPDATE maintenance_schedule SET failures=?,next_check=?,reason=? WHERE job=?').run(failures,this.now()+Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**Math.max(0,failures-1)),result?.reason??'Maintenance evaluation failed; receipts retained, bounded retry deferred',job);
+ }
  private stop(id:string,blocker:BlockerClass,outcome:string,reason:string){this.s.db.query("UPDATE watchdog_actions SET state='escalated',next_action='escalate',blocker=?,outcome=?,reason=?,token=NULL,lease_until=NULL,due_at=MAX(due_at,?) WHERE id=?").run(blocker,outcome,reason,outcome==='human_required'?this.now()+WATCHDOG_LIMITS.idleMs:0,id);}
  scheduleReview(job:string,c:any){
   return this.s.db.transaction(()=>{
