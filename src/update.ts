@@ -1,4 +1,4 @@
-import {existsSync,lstatSync,readFileSync,mkdirSync,rmSync,renameSync,unlinkSync} from 'node:fs';
+import {existsSync,lstatSync,readFileSync,mkdirSync,rmSync,renameSync,unlinkSync,readdirSync,copyFileSync,readlinkSync,realpathSync} from 'node:fs';
 import {join,dirname,isAbsolute,relative,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash,randomUUID} from 'node:crypto';
@@ -25,7 +25,7 @@ export type UpdatePolicy={
  maintenance:{blockIntakeDuringActivation:boolean};
 };
 export type Candidate={commit:string;ref:string;source:string};
-export type Staged={root:string;commit:string;version:string;files:string[]};
+export type Staged={root:string;commit:string;version:string;files:string[];sourceRoot?:string;artifact?:{lockfile:string;digest:string}};
 export type CheckEvidence={passed:boolean;names:string[];detail:string};
 export type TestEvidence={passed:boolean;skipped:boolean;detail:string};
 export type MigrationEvidence={required:boolean;compatible:boolean;rollbackSafe:boolean;detail:string};
@@ -80,8 +80,8 @@ export function classifyChanges(previous:string[],next:string[]):Classification{
  return classifyChangedFiles(changed);
 }
 export function classifyChangedFiles(changed:string[]):Classification{
- if(changed.some(file=>/migration/i.test(file)||file.startsWith('patches/')))return 'schema';
- if(changed.some(file=>file==='package.json'||file==='src/serve-orchestrator.py'||file.startsWith('scripts/')||file.startsWith('patches/')))return 'backend';
+  if(changed.some(file=>!file.startsWith('node_modules/')&&(/migration/i.test(file)||file.startsWith('patches/'))))return 'schema';
+  if(changed.some(file=>file.startsWith('node_modules/')||file==='package.json'||file==='src/serve-orchestrator.py'||file.startsWith('scripts/')||file.startsWith('patches/')))return 'backend';
  return 'hot';
 }
 export function changedFiles(previousRoot:string,nextRoot:string,previous:string[],next:string[]){
@@ -114,27 +114,80 @@ export async function resolveCandidate(policy:UpdatePolicy):Promise<Candidate>{
  if(!chosen||!/^[a-f0-9]{40,64}$/.test(chosen.sha))throw Error('Authoritative update evidence did not identify exactly one immutable commit');
  return {commit:chosen.sha,ref,source:policy.remote};
 }
-export async function stageCandidate(policy:UpdatePolicy,candidate:Candidate,state=appState()):Promise<Staged>{
+export type DependencyInstaller=(root:string,home:string)=>void;
+const installDependencies:DependencyInstaller=(root,home)=>{
+ const result=Bun.spawnSync([process.execPath,'install','--frozen-lockfile','--ignore-scripts','--linker','hoisted'],{cwd:root,timeout:300000,stdout:'pipe',stderr:'pipe',env:{PATH:Bun.env.PATH??'/usr/bin:/bin',HOME:home,TMPDIR:home,BUN_INSTALL_CACHE_DIR:join(home,'cache'),CI:'1',NO_COLOR:'1'}});
+ if(result.exitCode!==0)throw Error('Candidate dependency preparation failed; ensure the exact candidate commits a consistent bun.lock and retry preview. The running installation was not changed');
+};
+// Hash every build entry, not just the subset copied into installed snapshots.
+function artifactDigest(root:string){
+ const hash=createHash('sha256');
+ const walk=(dir:string)=>{for(const name of readdirSync(join(root,dir)).sort()){
+  const rel=join(dir,name),path=join(root,rel),st=lstatSync(path);
+  hash.update(JSON.stringify([rel,st.mode&0o777]));
+  if(st.isSymbolicLink()){
+   const target=relative(realpathSync(root),realpathSync(path));
+   if(target==='..'||target.startsWith('..'+sep)||isAbsolute(target))throw Error('Prepared artifact symlink escapes its isolated build');
+   hash.update('link:'+readlinkSync(path));
+  }else if(st.isDirectory()){hash.update('directory');walk(rel);}
+  else if(st.isFile())hash.update('file:'+digest(readFileSync(path)));
+  else throw Error('Unsupported prepared artifact entry');
+ }};walk('');return hash.digest('hex');
+}
+export async function stageCandidate(policy:UpdatePolicy,candidate:Candidate,state=appState(),prepare:DependencyInstaller=installDependencies):Promise<Staged>{
  const root=join(state,'updates','work',candidate.commit);
  const inspect=()=>{
   if(!existsSync(join(root,'.git')))throw Error('Staged update checkout is missing its pinned Git identity');
   const head=runGit(['rev-parse','HEAD'],root).trim();if(head!==candidate.commit)throw Error('Staged update checkout no longer matches the pinned candidate');
   if(runGit(['status','--porcelain','--ignored'],root).trim())throw Error(`Staged update checkout was modified; inspect and remove ${root}, then retry`);
-  const files=distributionFiles(root);return {root,commit:head,version:distributionVersion(root,files),files};
+   return head;
  };
- if(existsSync(root))return inspect();
+  if(!existsSync(root)){
  mkdirSync(dirname(root),{recursive:true,mode:0o700});
  const temp=join(state,'updates','work',`.stage-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
  try{
   runGit(['init','--quiet',temp]);
   runGit(['fetch','--quiet','--depth=1','--no-tags',policy.remote,candidate.commit],temp);
-  runGit(['checkout','--quiet','--detach','FETCH_HEAD'],temp);
+   runGit(['checkout','--quiet','--detach',candidate.commit],temp);
   const head=runGit(['rev-parse','HEAD'],temp).trim();
   if(head!==candidate.commit)throw Error('Source changed during update staging; candidate is now ambiguous');
   if(runGit(['status','--porcelain'],temp).trim())throw Error('Staged update checkout is not clean');
   renameSync(temp,root);
  }finally{rmSync(temp,{recursive:true,force:true});}
- return inspect();
+  }
+  inspect();
+  const tracked=runGit(['ls-files','-z'],root).split('\0').filter(Boolean);
+  if(!tracked.includes('bun.lock')||!tracked.includes('package.json'))throw Error('Candidate must commit root package.json and bun.lock; preview never generates or repairs a lockfile. Commit a consistent lockfile and retry');
+  for(const file of tracked){
+   if(file.startsWith('node_modules/'))throw Error('Candidate must not track node_modules');
+   let path=root;for(const part of file.split('/')){path=join(path,part);if(lstatSync(path).isSymbolicLink())throw Error('Candidate source cannot contain symlinks');}
+   if(!lstatSync(join(root,file)).isFile())throw Error('Candidate source must contain regular files');
+  }
+  const lockfile=digest(readFileSync(join(root,'bun.lock'))),build=join(state,'updates','build',candidate.commit),tree=join(build,'tree');
+  const verify=()=>{
+   for(const path of [build,tree]){const st=lstatSync(path);if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==process.getuid?.()||(st.mode&0o022))throw Error('Prepared artifact must remain in owner-controlled non-symlink directories');}
+   const receipt=readJson(join(build,'receipt.json'));
+   if(receipt.commit!==candidate.commit||receipt.lockfile!==lockfile||receipt.digest!==artifactDigest(tree))throw Error(`Prepared candidate artifact was modified; inspect and remove ${build}, then preview again`);
+   for(const file of tracked)if(!readFileSync(join(root,file)).equals(readFileSync(join(tree,file))))throw Error('Prepared candidate source differs from pinned Git source');
+   const files=distributionFiles(tree);return {root:tree,sourceRoot:root,commit:candidate.commit,version:distributionVersion(tree,files),files,artifact:{lockfile,digest:receipt.digest}};
+  };
+  if(existsSync(build))return verify();
+  mkdirSync(dirname(build),{recursive:true,mode:0o700});
+  const temporary=build+'.prepare-'+randomUUID(),home=join(temporary,'home'),output=join(temporary,'tree');
+  mkdirSync(home,{recursive:true,mode:0o700});mkdirSync(output,{mode:0o700});
+  try{
+   // Only the candidate manifests enter Bun's cwd; no checkout/user Bun config.
+   for(const file of ['package.json','bun.lock'])copyFileSync(join(root,file),join(output,file));
+   prepare(output,home);
+   for(const file of ['package.json','bun.lock'])if(!readFileSync(join(root,file)).equals(readFileSync(join(output,file))))throw Error('Dependency preparation changed candidate manifests; refusing artifact');
+    for(const file of tracked){mkdirSync(dirname(join(output,file)),{recursive:true});copyFileSync(join(root,file),join(output,file));}
+   inspect();distributionFiles(output);
+   rmSync(home,{recursive:true,force:true});
+   atomicFile(join(temporary,'receipt.json'),JSON.stringify({commit:candidate.commit,lockfile,digest:artifactDigest(output)})+'\n');
+   // rename is exclusive for a nonempty published directory; no partial reuse.
+   renameSync(temporary,build);
+  }finally{rmSync(temporary,{recursive:true,force:true});}
+  return verify();
 }
 export async function githubChecks(policy:UpdatePolicy,candidate:Candidate):Promise<CheckEvidence>{
  const result=Bun.spawnSync(['gh','api','--method','GET',`repos/${policy.repository}/commits/${candidate.commit}/check-runs?per_page=100`],{stdout:'pipe',stderr:'pipe',timeout:60000,env:{...Bun.env,GH_PROMPT_DISABLED:'1'}});
@@ -265,9 +318,9 @@ export class UpdateManager{
   let policy:UpdatePolicy|undefined,policyError:string|undefined;try{policy=readUpdatePolicy(state);}catch(error){policyError=error instanceof Error?error.message:String(error);}
   let notifications:any={};try{notifications=existsSync(join(state,'update-notifications.json'))?readJson(join(state,'update-notifications.json')):{};}catch(error){notifications={error:error instanceof Error?error.message:String(error)};}
   return {
-   source:{path:record?.source??null,commit:installed?.commit??null,commitKnown:!!installed,error:recordError},
+    source:{path:record?.source??null,commit:installed?.commit??null,commitKnown:!!installed?.commit,error:recordError},
    installed:{version:record?.version??null,cli:record?.cli??null,contentHash:record?.version??null,activatedAt:installed?.activatedAt??null},
-   running:{backend,services},
+    running:{backend,services,cli:{path:join(import.meta.dir,'cli.ts'),snapshot:/^[a-f0-9]{64}$/.test(relative(join(state,'versions'),dirname(import.meta.dir)))?relative(join(state,'versions'),dirname(import.meta.dir)):null,sourceCommit:record?.cli===join(import.meta.dir,'cli.ts')?installed?.commit??null:null}},
    policy:{configured:!!policy,mode:policy?.mode??'manual',repository:policy?.repository??null,ref:policy?.ref??null,error:policyError},
    intent:intent??null,
    lastCheck:readCheckRecord(state)??null,
@@ -281,7 +334,12 @@ export class UpdateManager{
   const result={checkedAt:new Date(this.io.now()).toISOString(),policyMode:policy.mode,candidate,installedCommit:installed?.commit??null,updateAvailable:candidate.commit!==(installed?.commit??null)};
   atomicFile(join(this.io.state(),'update-check.json'),JSON.stringify(result,null,2)+'\n');if(result.updateAvailable)this.notify('update-available',candidate.commit,{ref:candidate.ref});return result;
  }
- async preview(){
+  async preview(){
+   const plan=await this.inspectPreview();
+   if(!plan.upToDate&&plan.ready&&plan.staged.artifact)atomicFile(join(this.io.state(),'update-preview.json'),JSON.stringify({commit:plan.candidate.commit,version:plan.staged.version,artifact:plan.staged.artifact})+'\n');
+   return plan;
+  }
+  private async inspectPreview(){
   const policy=this.policy(),state=this.io.state(),candidate=await this.io.resolve(policy),current=installedVersion(state),installed=readInstalledState(state);
    const staged=await this.io.stage(policy,candidate);
    if(staged.commit!==candidate.commit)throw Error('Source changed during staging; candidate is now ambiguous');
@@ -304,13 +362,15 @@ export class UpdateManager{
   let quiescence:{session:string;reason:string}[]=[],activityUnknown:string|undefined,reattachment:{safe:boolean;detail:string}|undefined;
   if(classification!=='hot'){try{reattachment=await this.io.reattachment?.();}catch(error){reattachment={safe:false,detail:`Controller reattachment is unverified: ${error instanceof Error?error.message:String(error)}`};}reattachment??={safe:false,detail:'Controller reattachment safety is unverified; backend restart will defer'};}
   try{quiescence=await this.io.stack.blockers();}catch(error){activityUnknown=`Worker activity is unknown: ${error instanceof Error?error.message:String(error)}`;}
-   return {upToDate:false,candidate,staged:{commit:staged.commit,version:staged.version,root:staged.root},installedVersion:current.record.version,classification,policy,checks,tests,compatibility,integrations,integrationError,reattachment,migration,migrationEvidence:migration?.detail??null,quiescence,activityUnknown,blockers,ready:blockers.length===0,waitingForIdle:quiescence.length>0||!!activityUnknown,note:'Preview stages an isolated checkout; it does not install, stop or restart anything.'};
+    return {upToDate:false,candidate,staged:{commit:staged.commit,version:staged.version,root:staged.root,artifact:staged.artifact},installedVersion:current.record.version,classification,policy,checks,tests,compatibility,integrations,integrationError,reattachment,migration,migrationEvidence:migration?.detail??null,quiescence,activityUnknown,blockers,ready:blockers.length===0,waitingForIdle:quiescence.length>0||!!activityUnknown,note:'Preview prepares an isolated dependency artifact; it does not install, stop or restart anything.'};
  }
  async apply(options:{automatic?:boolean}={}){
   const policy=this.policy(),state=this.io.state();
   if(options.automatic&&policy.mode!=='automatic')throw Error('Automatic update adoption is not enabled; apply updates explicitly');
   if(options.automatic){const last=readAutoRecord(state);if(last?.attemptedAt&&this.io.now()-Date.parse(last.attemptedAt)<policy.cadenceSeconds*1000)return {skipped:true,reason:'Update cadence has not elapsed'};writeAutoAttempt(state,this.io.now());}
-  const plan=await this.preview();if(plan.upToDate)return {upToDate:true};
+   const previewPath=join(state,'update-preview.json'),saved=existsSync(previewPath)?readJson(previewPath):undefined;
+   const plan=await this.inspectPreview();if(plan.upToDate)return {upToDate:true};
+   if(saved&&(saved.commit!==plan.candidate.commit||saved.version!==plan.staged.version||JSON.stringify(saved.artifact)!==JSON.stringify(plan.staged.artifact)))throw Error('Candidate or dependency artifact changed since preview; run update-preview explicitly before applying');
   if(plan.blockers.length){
    const release=acquireLock(state);
    try{
@@ -353,7 +413,7 @@ export class UpdateManager{
     advance(state,intent,'installing');
     const confirmed=await this.io.resolve(policy);if(confirmed.commit!==plan.candidate.commit)throw Error('Authoritative candidate changed during activation; no installation attempted');
     const verified=await this.io.stage(policy,confirmed);
-     if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version)throw Error('Staged candidate changed after verification; no installation attempted');
+      if(verified.root!==plan.staged.root||verified.commit!==plan.candidate.commit||verified.version!==plan.staged.version||JSON.stringify(verified.artifact)!==JSON.stringify(plan.staged.artifact))throw Error('Staged candidate changed after verification; no installation attempted');
      if(this.io.integrations&&JSON.stringify(await this.io.integrations(verified))!==JSON.stringify(plan.integrations))throw Error('Integration configuration changed after preview; preserve config and preview again');
     installAttempted=true;
     const result=await this.io.install(true,plan.staged.root,this.io.launcher());
