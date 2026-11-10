@@ -58,6 +58,59 @@ test('DEV-95: a review blocker does not strand the existing branch synchronizati
   expect(f.loop.get(f.job).state).toBe('blocked');
  }finally{f.close();}
 });
+test('DEV-105: maintenance cadence is independent, persisted, bounded and honors provider holds',()=>{
+ const f=fixture(true);try{
+  const c={...f.c,branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}};
+  f.loop.record(f.job,{state:'blocked',reason:'PR head or description changed during custom-check collection'});
+  const review=f.w.scheduleReview(f.job,c);
+  expect(review.outcome).toBe('human_required');
+  expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.w.finishMaintenance(f.job,{reason:'Branch is current'});
+  const reopened=new Store(f.path);try{
+   const restarted=new ActionWatchdog(reopened,f.now,()=>0.5,f.root);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   f.advance();
+   const failure=readFailure('github','branch-read','HTTP/2 429\r\nRetry-After: 180\r\n\r\n',1);failure.evidence.retryAt=f.now()+180000;
+   new RecoveryObservation(f.s,f.now).failed(f.job,failure.evidence);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   expect(f.loop.list()[0].maintenance.schedule.reason).toContain('github');
+   f.advance(180001);new RecoveryObservation(f.s,f.now).clear(f.job);
+   f.s.db.query('UPDATE maintenance_schedule SET attempts=? WHERE job=?').run(WATCHDOG_LIMITS.maxAttempts,f.job);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   expect(f.loop.list()[0].maintenance.schedule.reason).toContain('budget exhausted');
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   f.advance(WATCHDOG_LIMITS.idleMs);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(true);
+   expect(f.w.get(review.id).state).toBe('escalated');
+  }finally{reopened.close();}
+ }finally{f.close();}
+});
+test('DEV-105: healthy maintenance outlives its attempt budget and failures recover only after cooldown',()=>{
+ const f=fixture();try{
+  const c={...f.c,branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}};
+  f.loop.record(f.job,{state:'blocked',reason:'Stale review evidence'});
+  for(let i=0;i<WATCHDOG_LIMITS.maxAttempts+2;i++){
+   expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+   f.w.finishMaintenance(f.job,{reason:'Branch is current'});
+   expect(f.loop.list()[0].maintenance.schedule.attempts).toBe(0);
+   f.advance();
+  }
+  for(let i=0;i<WATCHDOG_LIMITS.maxEvaluationFailures;i++){
+   expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+   f.w.finishMaintenance(f.job);
+   f.advance(WATCHDOG_LIMITS.idleMs);
+  }
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.advance(WATCHDOG_LIMITS.idleMs-1);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.advance(1);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+  f.w.finishMaintenance(f.job,{reason:'Fresh guarded evaluation completed'});
+  expect(f.loop.list()[0].maintenance.schedule).toMatchObject({attempts:0,failures:0});
+  expect(f.loop.get(f.job).state).toBe('blocked');
+ }finally{f.close();}
+});
 // Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
 // controlled clock. A subprocess isolates the poll fence's HOME and Date.now.
 function productionScenario(f:ReturnType<typeof fixture>,scenario:string){
@@ -87,6 +140,31 @@ s.close();`;
  const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');return JSON.parse(result.stdout.toString());
 }
+test('DEV-105: automatic maintenance polls select oldest due targets fairly beyond the four-target batch',()=>{
+ const f=fixture(true);try{
+  const result=productionScenario(f,`
+const {Planning}=await import(${JSON.stringify(join(import.meta.dir,'../src/planning.ts'))});
+const {Lifecycle}=await import(${JSON.stringify(join(import.meta.dir,'../src/lifecycle.ts'))});
+config.branchUpdate={enabled:true,authorizedBy:'human',maxUpdates:3};
+for(let pr=2;pr<=6;pr++){
+ const id=s.enqueue('p','issue-'+pr,'spec'),p=new Planning(s),r=p.reserve(id,'ao');p.gate(id,'ao','session-'+pr,r.branch,'/worktree-'+pr);
+ const hash=s.propose(id,'plan');s.approve(id,hash,'human');const l=new Lifecycle(s);l.grantGit(id,hash,['inspect','fetch','push-feature'],'human');l.adoptSupervised(id,{id:'session-'+pr,correlation:r.correlation,worktree:'/worktree-'+pr,controller:'running'});
+ loop.register(id,'owner/repo',pr,['CI'],['src/**'],true);
+}
+for(const target of loop.list())loop.record(target.job,{state:'blocked',head:snapshot.head,reason:'Stale review evidence'});
+let batch=[];const batches=[],originalTick=loop.tick.bind(loop);
+// Exercise real CLI selection/reservation/settlement; guarded effects have
+// separate automatic-poll integration coverage in branch-sync.test.ts.
+loop.tick=async(...args)=>{if(!args[6])return originalTick(...args);batch.push(loop.get(args[0]).pr);return {state:'completed',reason:'Branch is current'};};
+for(let cycle=0;cycle<3;cycle++){batch=[];await tick();batches.push(batch);advance(60000);}
+console.log(JSON.stringify({batches,errors,targets:loop.list().map(t=>t.state)}));`);
+  expect(result.errors).toEqual([]);
+  expect(result.batches.map((b:number[])=>b.length)).toEqual([4,4,4]);
+  expect(new Set(result.batches.flat()).size).toBe(6);
+  expect(result.batches[1].slice(0,2)).toEqual([5,6]);
+  expect(result.targets).toEqual(Array(6).fill('blocked'));
+ }finally{f.close();}
+});
 // This disk-backed subprocess executes 603 real poll ticks (303 observation /
 // ordinary-evaluation pairs), including lock and SQLite IO. CI run 42440318138
 // hit the default 5s limit at 5249.75ms; local runs take ~1.2s. Bound this one
