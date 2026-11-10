@@ -91,6 +91,13 @@ export class ActionWatchdog{
    CREATE INDEX IF NOT EXISTS watchdog_due ON watchdog_actions(project,state,due_at);`);
  }
  get(id:string){return this.s.db.query('SELECT * FROM watchdog_actions WHERE id=?').get(id) as ActionRow;}
+ maintenanceOrder<T extends {job:string}>(targets:T[]):T[]{
+  const schedules=this.s.db.query('SELECT job,next_check FROM maintenance_schedule').all() as {job:string;next_check:number}[];
+  const due=new Map(schedules.map(r=>[r.job,r.next_check]));
+  // Unobserved targets precede checked ones. Stable ties retain target order;
+  // persisted due times prevent the first batch from monopolizing later polls.
+  return [...targets].sort((a,b)=>(due.get(a.job)??0)-(due.get(b.job)??0));
+ }
  // Independent of review blocker classification and review backoff. This only
  // reserves evaluation cadence; the existing evaluator retains mutation authority.
  beginMaintenance(job:string,c:any){

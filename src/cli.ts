@@ -133,7 +133,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
   const featureUpdates=await features.tickProject(c);if(featureUpdates.length)io.out({features:featureUpdates});
    const watchdog=new ActionWatchdog(s);
    let maintenanceChecks=0;
-   for(const target of reviewLoop.list(c.linear.projectId) as any[]){
+   for(const target of watchdog.maintenanceOrder(reviewLoop.list(c.linear.projectId) as any[])){
     try{
      reviewLoop.setVerification(target.job,c.verification,c.verificationContext);
      if(target.state==='completed')continue;
