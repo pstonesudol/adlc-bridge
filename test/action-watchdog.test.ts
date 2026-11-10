@@ -79,8 +79,36 @@ test('DEV-105: maintenance cadence is independent, persisted, bounded and honors
    f.s.db.query('UPDATE maintenance_schedule SET attempts=? WHERE job=?').run(WATCHDOG_LIMITS.maxAttempts,f.job);
    expect(restarted.beginMaintenance(f.job,c)).toBe(false);
    expect(f.loop.list()[0].maintenance.schedule.reason).toContain('budget exhausted');
+   expect(restarted.beginMaintenance(f.job,c)).toBe(false);
+   f.advance(WATCHDOG_LIMITS.idleMs);
+   expect(restarted.beginMaintenance(f.job,c)).toBe(true);
    expect(f.w.get(review.id).state).toBe('escalated');
   }finally{reopened.close();}
+ }finally{f.close();}
+});
+test('DEV-105: healthy maintenance outlives its attempt budget and failures recover only after cooldown',()=>{
+ const f=fixture();try{
+  const c={...f.c,branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}};
+  f.loop.record(f.job,{state:'blocked',reason:'Stale review evidence'});
+  for(let i=0;i<WATCHDOG_LIMITS.maxAttempts+2;i++){
+   expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+   f.w.finishMaintenance(f.job,{reason:'Branch is current'});
+   expect(f.loop.list()[0].maintenance.schedule.attempts).toBe(0);
+   f.advance();
+  }
+  for(let i=0;i<WATCHDOG_LIMITS.maxEvaluationFailures;i++){
+   expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+   f.w.finishMaintenance(f.job);
+   f.advance(WATCHDOG_LIMITS.idleMs);
+  }
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.advance(WATCHDOG_LIMITS.idleMs-1);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(false);
+  f.advance(1);
+  expect(f.w.beginMaintenance(f.job,c)).toBe(true);
+  f.w.finishMaintenance(f.job,{reason:'Fresh guarded evaluation completed'});
+  expect(f.loop.list()[0].maintenance.schedule).toMatchObject({attempts:0,failures:0});
+  expect(f.loop.get(f.job).state).toBe('blocked');
  }finally{f.close();}
 });
 // Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
