@@ -47,6 +47,12 @@ test('worker receipts require an outcome and concrete evidence',()=>{
  expect(assessWorkerReceipt('<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"pr-handoff"} -->').valid).toBe(true);
  expect(assessWorkerReceipt('No receipt').valid).toBe(false);
 });
+test('host-ready is scoped to conflict resolution and rejects unresolved decisions',()=>{
+ const text=(extra:any={})=>`<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome:'host-ready',reason:'Resolved app.txt',questions:[],dependencies:[],...extra})} -->`;
+ expect(assessWorkerReceipt(text()).valid).toBe(false);
+ expect(assessWorkerReceipt(text(),true).valid).toBe(true);
+ for(const extra of [{reason:''},{questions:[{id:'q1',question:'Which behavior?',kind:'requirement'}]},{dependencies:[{ref:'DEV-9',reason:'Required'}]}])expect(assessWorkerReceipt(text(extra),true).valid).toBe(false);
+});
 test('the shared approval gate refreshes stale evidence and records explicit acknowledgement',()=>{
  const s=new Store(':memory:'),id=s.enqueue('p','i','spec');
  const hash=s.propose(id,'Legacy plan without a receipt');

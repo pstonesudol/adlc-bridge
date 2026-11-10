@@ -13,7 +13,7 @@ export type ReadinessAssessment={
   dependencies:PlanDependency[];
   risks:string[];
 };
-export type WorkerOutcome='pr-handoff'|'needs-input'|'blocked-dependency'|'failed'|'uncertain';
+export type WorkerOutcome='pr-handoff'|'host-ready'|'needs-input'|'blocked-dependency'|'failed'|'uncertain';
 export type WorkerReceipt={outcome:WorkerOutcome;reason:string;questions:PlanQuestion[];dependencies:PlanDependency[]};
 
 /** Evidence supplied by the worker after inspecting accessible context. Absence
@@ -116,17 +116,18 @@ function legacyAssessment(plan:string):ReadinessAssessment{
   };
 }
 
-export function assessWorkerReceipt(textValue:string):{valid:boolean;receipt:WorkerReceipt|null;reason:string|null}{
+export function assessWorkerReceipt(textValue:string,conflictResolution=false):{valid:boolean;receipt:WorkerReceipt|null;reason:string|null}{
   const matches=[...textValue.matchAll(/<!--\s*ADLC_WORKER_STATUS\s*(\{[\s\S]*?\})\s*-->/g)];
   if(!matches.length)return {valid:false,receipt:null,reason:'No structured worker outcome receipt'};
   const match=matches[matches.length-1];
   let parsed:any;try{parsed=JSON.parse(match[1]);}catch{return {valid:false,receipt:null,reason:'Worker outcome receipt is not valid JSON'};}
   const questionsValue=questions(parsed?.questions??[]),dependenciesValue=dependencies(parsed?.dependencies??[]);
-  if(parsed?.version!==1||typeof parsed?.outcome!=='string'||!outcomes.has(parsed.outcome))return {valid:false,receipt:null,reason:'Worker outcome receipt is malformed'};
+  if(parsed?.version!==1||typeof parsed?.outcome!=='string'||(!outcomes.has(parsed.outcome)&&!(conflictResolution&&parsed.outcome==='host-ready')))return {valid:false,receipt:null,reason:'Worker outcome receipt is malformed'};
   if(!questionsValue||!dependenciesValue)return {valid:false,receipt:null,reason:'Worker outcome receipt has malformed questions or dependencies'};
   if(parsed.outcome==='needs-input'&&questionsValue.length===0)return {valid:false,receipt:null,reason:'needs-input worker outcome requires a concrete question'};
   if(parsed.outcome==='blocked-dependency'&&dependenciesValue.length===0)return {valid:false,receipt:null,reason:'blocked-dependency worker outcome requires a dependency reference'};
   const reason=typeof parsed?.reason==='string'?parsed.reason.trim().slice(0,4000):'';
+  if(parsed.outcome==='host-ready'&&(!reason||questionsValue.length||dependenciesValue.some(d=>d.blocking!==false)))return {valid:false,receipt:null,reason:'host-ready requires a resolution summary and no unresolved questions or blocking dependencies'};
   return {valid:true,receipt:{outcome:parsed.outcome,reason,questions:questionsValue,dependencies:dependenciesValue},reason:null};
 }
 
@@ -277,6 +278,12 @@ export const WORKER_STATUS_INSTRUCTION=[
   'Before your final response, emit exactly one machine-readable outcome receipt on its own line:',
   '<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"pr-handoff|needs-input|blocked-dependency|failed|uncertain","reason":"...","questions":[{"id":"q1","question":"...","kind":"requirement|dependency|security-scope"}],"dependencies":[{"ref":"ISSUE-OR-REF","reason":"..."}]} -->',
   'Use pr-handoff only after opening or updating exactly one PR. If you must stop for a human decision or an unmet dependency, report needs-input or blocked-dependency with the exact question or reference. Never invent answers and never claim a PR that does not exist.',
+  discoveryInstruction()
+].join('\n');
+export const CONFLICT_WORKER_STATUS_INSTRUCTION=[
+  'End your response with exactly one outcome receipt on its own line:',
+  '<!-- ADLC_WORKER_STATUS {"version":1,"outcome":"host-ready|needs-input|blocked-dependency|failed|uncertain","reason":"...","questions":[],"dependencies":[]} -->',
+  'Use host-ready only after resolving every listed conflict file with no unresolved decisions. Name the resolved files in reason. Host staging, verification, commit and normal feature push remaining is expected, not uncertainty. Do not claim pr-handoff or perform host work. Use uncertain for genuine uncertainty, needs-input with concrete questions for decisions, or blocked-dependency with exact references for prerequisites. Never fabricate readiness.',
   discoveryInstruction()
 ].join('\n');
 function discoveryInstruction(){return 'Before asking, inspect the ticket, linked issues/dependencies and accessible repository context. Ask only for genuinely missing essential facts or decisions, never routine choices, information already provided or work already authorized. For a blocker include exactly one ADLC_DISCOVERY receipt, replacing the example with truthful evidence: <!-- ADLC_DISCOVERY {"checked":["ticket","linked-issues","repository"],"summary":"Specific context inspected and relevant facts already known","necessity":"Why the exact missing answer is essential and not already supplied"} -->. Never request secrets. Material scope or permission changes require replanning and applicable approval.';}
