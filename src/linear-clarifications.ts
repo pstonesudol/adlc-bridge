@@ -6,7 +6,7 @@ import {LinearBlockers,type BlockerConfig} from './linear-blockers';
 import {readLinearIssue} from './linear-api';
 import {readinessFor,resolutionBinding,recordResolution,activeResolution,clarificationDiscovery} from './readiness';
 import {ApprovalPolicyStore} from './approval-policy';
-import {inspectHumanAnswer,type ClarificationContext,type ClarificationQuestion,type HumanComment} from './clarification-answers';
+import {inspectHumanAnswer,clarificationScopeIssue,type ClarificationContext,type ClarificationQuestion,type HumanComment} from './clarification-answers';
 
 export type ClarificationConfig=WorkflowConfig&BlockerConfig&{
  linear:{projectId:string;teamId:string;readyLabelId:string;readyStateId:string};
@@ -15,7 +15,6 @@ export type ClarificationConfig=WorkflowConfig&BlockerConfig&{
 };
 type Snapshot={binding:string;questions:ClarificationQuestion[];outcome:any;discovery:{summary:string;necessity:string}|null};
 const uuid=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-const permissionSensitive=(text:string)=>/\b(?:deploy|merge|credential|password|secret|permissions?|scope|production|bypass|override|ignore|expose|expand|new requirements?)\b/i.test(text);
 export function validateClarifications(c:any){
  if(c.clarifications===undefined)return;
  if(!c.clarifications||typeof c.clarifications.enabled!=='boolean')throw Error('clarifications.enabled must be a boolean');
@@ -190,34 +189,35 @@ export class LinearClarifications{
    const latest=this.row(job,row.binding);
    if(latest.state==='resolved'){
     const answers=JSON.parse(latest.answers);
-    const correction=parsed.find(p=>p.replan||p.answers?.some((a:any)=>permissionSensitive(a.text)||answers[a.question]?.text!==a.text));
+    const correction=parsed.find(p=>p.replan||p.answers?.some((a:any)=>clarificationScopeIssue(a.text,context.questions.find(q=>q.id===a.question)!.kind)||answers[a.question]?.text!==a.text));
     if(correction){
      const active=activeResolution(this.s,job);
      if(active&&latest.continuation_binding===digest(JSON.stringify([active.binding,active.source,active.actor,active.detail,active.at])))this.s.db.query("UPDATE plan_resolutions SET state='invalidated' WHERE job=? AND binding=?").run(job,active.binding);
-     this.s.db.query("UPDATE clarification_receipts SET state='replan',reason='Human corrected or superseded the pending resolution' WHERE job=? AND binding=?").run(job,latest.binding);
+     const unsafe=correction.answers?.map((a:any)=>clarificationScopeIssue(a.text,context.questions.find(q=>q.id===a.question)!.kind)).find(Boolean);
+     this.s.db.query("UPDATE clarification_receipts SET state='replan',reason=? WHERE job=? AND binding=?").run(unsafe??'Human corrected or superseded the pending resolution',job,latest.binding);
     }
     return;
    }
    if(!['waiting','partial'].includes(latest.state))return;
-   const answers=JSON.parse(latest.answers),consumed=JSON.parse(latest.consumed);let confirmation=latest.confirmation,state=latest.state;
+   const answers=JSON.parse(latest.answers),consumed=JSON.parse(latest.consumed);let confirmation=latest.confirmation,state=latest.state,reason=latest.reason;
    for(const p of parsed){
     if(consumed[p.raw.id])continue;
-    if(p.replan){state='replan';consumed[p.raw.id]=fingerprint(p.raw);break;}
+    if(p.replan){state='replan';reason='Human requested replanning';consumed[p.raw.id]=fingerprint(p.raw);break;}
     for(const a of p.answers){
-     // Conservative escalation, never interpret permission-sensitive text as a
-     // new grant even if followed by the unchanged-scope confirmation command.
-     if(permissionSensitive(a.text)||context.questions.find(q=>q.id===a.question)?.kind==='security-scope'){state='replan';break;}
+     const scopeIssue=clarificationScopeIssue(a.text,context.questions.find(q=>q.id===a.question)!.kind);
+     if(scopeIssue){state='replan';reason=`${a.question}: ${scopeIssue}`;break;}
      if(/^(?:tbd|unknown|not sure|i don.t know|pending|later|your answer)\.?$/i.test(a.text))continue;
      const question=context.questions.find(q=>q.id===a.question)!;
      if(/^(yes|no|ok|okay)\.?$/i.test(a.text)&&!/^(may|can|should|is|are|do|does|will|would)\b/i.test(question.question))continue;
-     if(answers[a.question]&&answers[a.question].text!==a.text){state='needs_review';break;}
+     if(answers[a.question]&&answers[a.question].text!==a.text){state='needs_review';reason=`Conflicting answers for ${a.question}`;break;}
      answers[a.question]??=a;
     }
     consumed[p.raw.id]=fingerprint(p.raw);
+    if(['replan','needs_review'].includes(state))break;
     if(p.confirmation&&context.questions.every(q=>answers[q.id]))confirmation=JSON.stringify({comment:p.raw.id,actor:p.raw.user.id});
    }
    if(state!=='replan'&&state!=='needs_review')state=confirmation?'confirmed':Object.keys(answers).length?'partial':'waiting';
-   this.s.db.query('UPDATE clarification_receipts SET answers=?,consumed=?,confirmation=?,state=? WHERE job=? AND binding=?').run(JSON.stringify(answers),JSON.stringify(consumed),confirmation,state,job,row.binding);
+   this.s.db.query('UPDATE clarification_receipts SET answers=?,consumed=?,confirmation=?,state=?,reason=? WHERE job=? AND binding=?').run(JSON.stringify(answers),JSON.stringify(consumed),confirmation,state,reason,job,row.binding);
   }).immediate();
   row=this.row(job,row.binding);
   const answers=JSON.parse(row.answers),remaining=context.questions.filter(q=>!answers[q.id]);
@@ -258,8 +258,8 @@ export class LinearClarifications{
    return this.finish(job,c,row,snapshot);
   }
   if(row.state==='partial')await this.acknowledge(job,c,snapshot,row,remaining.length?`partial answer received. Still needed: ${remaining.map(q=>`${q.id}: ${q.question}`).join('; ')}`:`answers received; awaiting your completeness/scope confirmation:\n\n\`\`\`text\n${this.command(context.reference)}\n\`\`\``);
-  if(['replan','needs_review'].includes(row.state))await this.acknowledge(job,c,snapshot,row,'answer received; paused for replanning or human review. No work resumed.');
-  return {job,state:row.state,displayStatus:'Waiting for clarification',remaining:remaining.map(q=>q.id)};
+  if(['replan','needs_review'].includes(row.state))await this.acknowledge(job,c,snapshot,row,`answer received; paused for replanning or human review: ${row.reason??'Unresolved answer decision'}. No work resumed. For unchanged requirements, capture a corrected completed same-session plan and preview plan-reconcile JOB CONFIG SEQUENCE. For changed requirements or authority, update the ticket and obtain replanning and applicable approval; this confirmation cannot grant permissions.`);
+  return {job,state:row.state,displayStatus:'Waiting for clarification',reason:row.reason,remaining:remaining.map(q=>q.id)};
  }
  private async finish(job:string,c:ClarificationConfig,row:any,snapshot?:Snapshot){
   const j=this.s.get(job),stored=JSON.parse(row.context);
@@ -304,6 +304,7 @@ export class LinearClarifications{
    this.ticket(j,c,await readLinearIssue(j.issue,this.blockers.api));
    const comments=await this.blockers.comments(j.issue),consumed=JSON.parse(row.consumed);
    let valid=context.policyHash===digest(JSON.stringify([c.clarifications,c.blockerSync]))&&Object.entries(consumed).every(([id,hash])=>comments.some(x=>x.id===id&&x.user?.app===false&&x.botActor===null&&c.clarifications!.humanIds.includes(x.user.id)&&x.editedAt===null&&digest(JSON.stringify([x.id,x.body,x.createdAt,x.editedAt,x.user,x.botActor]))===hash));
+   let reason='Human answer evidence or configured identity changed before dispatch';
    const notice=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(row.job,row.binding) as any;
    const control=this.controlComment(row.job);
    const multipleRounds=(this.s.db.query('SELECT count(*) AS n FROM clarification_receipts WHERE job=?').get(row.job) as any).n>1;
@@ -311,17 +312,20 @@ export class LinearClarifications{
    else for(const raw of comments){
     if(consumed[raw.id]||control(raw)||raw.user?.app!==false||raw.botActor!==null||!c.clarifications!.humanIds.includes(raw.user.id)||raw.editedAt!==null||!Number.isFinite(Date.parse(raw.createdAt))||Date.parse(raw.createdAt)<=Date.parse(notice.created))continue;
     const normalized=this.normalizeReply(raw,context.reference,multipleRounds);if(!normalized)continue;
-    if(normalized.replan){valid=false;break;}
+    if(normalized.replan){valid=false;reason='Human requested replanning before dispatch';break;}
     if(!normalized.body.trim())continue;
     const request={...context,noticeId:notice.comment_id,publishedAt:notice.created};
     const result=await inspectHumanAnswer({current:async()=>request,authorizedHumanIds:async()=>c.clarifications!.humanIds,consumed:async()=>false},request,{...raw,issue:j.issue,body:normalized.body});
     const answers=JSON.parse(row.answers);
-    if(result.answers.some(a=>permissionSensitive(a.text)||answers[a.question]?.text!==a.text)){valid=false;break;}
+    const correction=result.answers.find(a=>clarificationScopeIssue(a.text,context.questions.find(q=>q.id===a.question)!.kind)||answers[a.question]?.text!==a.text);
+    if(correction){
+     valid=false;reason=clarificationScopeIssue(correction.text,context.questions.find(q=>q.id===correction.question)!.kind)??`Conflicting answer for ${correction.question} before dispatch`;break;
+    }
    }
    if(!valid)this.s.db.transaction(()=>{
     const active=activeResolution(this.s,row.job);
     if(active&&row.continuation_binding===digest(JSON.stringify([active.binding,active.source,active.actor,active.detail,active.at])))this.s.db.query("UPDATE plan_resolutions SET state='invalidated' WHERE job=? AND binding=?").run(row.job,active.binding);
-    this.s.db.query("UPDATE clarification_receipts SET state='needs_review',reason='Human answer evidence or configured identity changed before dispatch' WHERE job=? AND binding=?").run(row.job,row.binding);
+    this.s.db.query("UPDATE clarification_receipts SET state='needs_review',reason=? WHERE job=? AND binding=?").run(reason,row.job,row.binding);
    }).immediate();
   }
  }

@@ -13,6 +13,27 @@ export interface AnswerEvidence {
  consumed(comment:string):Promise<boolean>;
 }
 const timestamp=(s:string)=>Number.isFinite(Date.parse(s));
+/** A bounded vocabulary for preserving limits, not an interpreter or a grant.
+ * Strip only explicit preservation wording, then validate every remaining clause.
+ * Unknown sensitive wording fails closed even with the completeness confirmation. */
+export function clarificationScopeIssue(text:string,kind:ClarificationQuestion['kind']):string|null{
+ if(kind==='security-scope')return `Security/scope decision requires replanning: ${text}`;
+ const sensitive=/\b(?:deploy|merge|credentials?|password|secrets?|permissions?|scope|production|bypass|override|ignore|expose|expand|new requirements?)\b/i;
+ for(const clause of text.split(/[.;\n]|\b(?:and|but|however)\b/i).map(x=>x.trim()).filter(Boolean)){
+  if(!sensitive.test(clause))continue;
+  // Whole-clause prohibitions preserve limits; never strip a prohibition from
+  // a longer instruction ("do not deploy without ..." is not accepted here).
+  if(/^(?:do not|never) (?:merge|deploy)(?: or (?:merge|deploy))?$/i.test(clause))continue;
+  // Conditional, qualified or negated preservation claims are not assurances.
+  if(/\?|\b(?:if|unless|maybe|perhaps|probably|possibly|except|outside|beyond|not|without|no longer|or|assuming|provided|might|could)\b|\b(?:isn|aren|wasn|weren|won|can|don|doesn|didn|mustn|shouldn|wouldn)['’]t\b/i.test(clause))return `Unresolved sensitive clause: ${clause}`;
+  const remainder=clause
+   .replace(/\bwithin (?:the )?existing (?:approved )?scope$/i,'')
+   .replace(/^no (?:new|additional) permissions$/i,'')
+   .replace(/^(?:existing|approved) (?:permissions|scope) (?:remain|remains|stay|stays) unchanged$/i,'');
+  if(sensitive.test(remainder))return `Unresolved sensitive clause: ${clause}`;
+ }
+ return null;
+}
 function parseAnswers(c:ClarificationContext,comment:HumanComment):AnswerResult {
  const remaining=c.questions.map(q=>q.id);
  const ignore=(reason:string):AnswerResult=>({state:'ignored',reason,answers:[],remaining});
