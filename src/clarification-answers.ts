@@ -25,7 +25,7 @@ export function clarificationScopeIssue(text:string,kind:ClarificationQuestion['
   // a longer instruction ("do not deploy without ..." is not accepted here).
   if(/^(?:do not|never) (?:merge|deploy)(?: or (?:merge|deploy))?$/i.test(clause))continue;
   // Conditional, qualified or negated preservation claims are not assurances.
-  if(/\?|\b(?:if|unless|maybe|perhaps|probably|possibly|except|outside|beyond|not|without|no longer|or|assuming|provided|might|could)\b|\b(?:isn|aren|wasn|weren|won|can|don|doesn|didn|mustn|shouldn|wouldn)['’]t\b/i.test(clause))return `Unresolved sensitive clause: ${clause}`;
+  if(/\?|\b(?:if|unless|maybe|perhaps|probably|possibly|except|outside|beyond|not|cannot|never|nor|neither|hardly|without|no longer|or|assuming|provided|might|could)\b|\b(?:isn|aren|wasn|weren|won|can|don|doesn|didn|mustn|shouldn|wouldn)['’]t\b/i.test(clause))return `Unresolved sensitive clause: ${clause}`;
   const remainder=clause
    .replace(/\bwithin (?:the )?existing (?:approved )?scope$/i,'')
    .replace(/^no (?:new|additional) permissions$/i,'')

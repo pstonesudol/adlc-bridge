@@ -41,6 +41,7 @@ test('only explicit limit-preserving sensitive wording passes scope validation',
   'The regression is within the existing approved scope. No new permissions.',
   'Existing permissions remain unchanged; approved scope stays unchanged.',
   'Do not merge or deploy.',
+  'Never merge or deploy.',
   'Within existing scope and no new permissions.',
  ])expect(clarificationScopeIssue(text,'dependency')).toBeNull();
  for(const text of [
@@ -58,6 +59,11 @@ test('only explicit limit-preserving sensitive wording passes scope validation',
   'This is no longer within existing scope',
   "This isn't within existing scope",
   'Continue without staying within existing scope',
+  'This cannot be within existing scope',
+  'Never within existing scope',
+  'Nor is this within existing scope',
+  'Neither regression is within existing scope',
+  'This is hardly within existing scope',
  ])expect(clarificationScopeIssue(text,'requirement')).toContain('Unresolved sensitive clause:');
  expect(clarificationScopeIssue('No new permissions','security-scope')).toContain('Security/scope decision');
 });

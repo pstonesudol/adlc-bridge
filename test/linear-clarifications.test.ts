@@ -240,6 +240,11 @@ test('DEV-100: preservation wording cannot hide ambiguity or expansion behind co
  for(const text of [
   'Maybe continue within existing scope',
   'Continue within existing scope unless extra permissions are needed',
+  'This cannot be within existing scope',
+  'Never within existing scope',
+  'Nor is this within existing scope',
+  'Neither regression is within existing scope',
+  'This is hardly within existing scope',
   `${dev66Answer} Expand scope to another repository.`,
   `${dev66Answer} Deploy production instead.`,
  ]){const f=await fixture();try{
@@ -255,6 +260,25 @@ test('DEV-100: preserved scope does not excuse stale, edited or superseded repli
   if(mode==='edited')answer.editedAt='2026-11-02T12:00:00Z';
   if(mode==='requirements')f.changeDescription();
   f.confirm();await f.adapter().sync(config);expect(activeResolution(f.s,f.id)).toBeNull();expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}}
+});
+test('DEV-100: negated scope corrections invalidate a resolution before standing-policy dispatch',async()=>{
+ for(const text of [
+  'This cannot be within existing scope',
+  'Never within existing scope',
+  'Nor is this within existing scope',
+  'Neither regression is within existing scope',
+  'This is hardly within existing scope',
+ ]){const f=await fixture(':memory:',true,true);try{
+  const c:any={...config,approval:{mode:'ready-queue',id:'standing',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr'}};
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue']));
+  await f.adapter().sync(c);f.reply(dev66Answer);f.confirm();await f.adapter().sync(c);
+  expect(activeResolution(f.s,f.id)).not.toBeNull();
+  f.reply(`q1: ${text}`);f.confirm();await f.adapter().preflight(c);
+  expect(activeResolution(f.s,f.id)).toBeNull();
+  expect(f.adapter().status()[0].state).toBe('needs_review');
+  expect(f.adapter().status()[0].reason).toBe(`Unresolved sensitive clause: ${text}`);
+  await f.w.tick(c);await f.w.tick(c);expect(f.sends).toHaveLength(0);
  }finally{f.s.close();}}
 });
 test('DEV-100: preserved scope retains uncertain continuation receipts without replay',async()=>{
