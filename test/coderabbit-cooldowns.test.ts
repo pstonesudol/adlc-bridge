@@ -34,6 +34,34 @@ test('user text, quoted guidance, wrong bot/app/repository/head and malformed ev
  expect(throttleEvidence({...o,checks:[],comments:[reply(o.repo,'Review rate limited.')]},[])).toEqual([]);
  for(const text of ['<blockquote>\nReview rate limited.\n</blockquote>','   ```\nReview rate limited.\n   ```','Example provider wording:\nReview rate limited.'])expect(throttleEvidence({...o,checks:[],comments:[boundReply(o.repo,text)]},[])).toEqual([]);
 });
+for(const missing of [undefined,null])test(`missing command and receipt IDs cannot bind throttle evidence (${missing})`,()=>{
+ const o=observation(),receipts=[{head:HEAD,attempts:1,state:'accepted',requested:T,comment_id:missing}],query={episode:1,requested:T,comment_id:missing};
+ for(const commands of [[],[{id:missing,body:'@coderabbitai review',created_at:iso(T-1000)}]]){
+  expect(throttleEvidence({...o,checks:[],comments:[...commands,reply(o.repo,'Review rate limited.')]},receipts,query)).toEqual([]);
+  const independentlyBound=throttleEvidence({...o,checks:[],comments:[...commands,boundReply(o.repo,'Review rate limited.')]},receipts,query);
+  expect(independentlyBound).toHaveLength(1);expect(independentlyBound[0].request).toBeUndefined();
+ }
+});
+test('unbound bot reply cannot settle a requesting cycle or reject a marker-only accepted receipt',()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);let now=T;const requests=new ReviewRequests(s,()=>now),job=s.enqueue('p','i','spec'),o=observation();
+ const schedule={head:HEAD,signature:'config',blocker:null,incremental:false};
+ try{
+  expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);
+  requests.settle(o.repo,o.pr,HEAD,'accepted',JSON.stringify({id:41}));
+  let c=requests.cooldowns.observe(o,requests.receipts(o.repo,o.pr));requests.reconcileThrottle(o.repo,o.pr);
+  const q=requests.cooldowns.claimQuery(c);requests.cooldowns.settleQuery(q,{id:42,body:q.body,user:{id:7},created_at:iso(now)});
+  now=c.next_action+1;expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);
+  requests.settle(o.repo,o.pr,HEAD,'accepted',reviewRequestMarker(o.repo,o.pr,HEAD));
+  c=requests.cooldowns.get(o.repo,o.pr);expect(c.state).toBe('requesting');
+  const before={attempts:c.attempts,episode:c.episode,next_action:c.next_action};now+=1000;
+  const unrelated={...o,observed:now,checks:[],comments:[reply(o.repo,'Review rate limited.',{created_at:iso(now),updated_at:iso(now)})]};
+  expect(throttleEvidence(unrelated,requests.receipts(o.repo,o.pr))).toEqual([]);
+  requests.cooldowns.observe(unrelated,requests.receipts(o.repo,o.pr));requests.reconcileThrottle(o.repo,o.pr);
+  expect(requests.cooldowns.get(o.repo,o.pr)).toMatchObject({...before,state:'requesting'});
+  expect(requests.get(o.repo,o.pr,HEAD)).toMatchObject({state:'accepted',attempts:2});
+  expect(s.db.query('SELECT count(*) AS n FROM coderabbit_throttle_evidence').get()).toEqual({n:1});
+ }finally{s.close();}
+});
 test('explicit timing beats fallback with a positive buffer; edited versions never restart the relative baseline',()=>{
  const s=new Store(':memory:');let now=T;const l=new CodeRabbitCooldowns(s,()=>now,()=>0),o=observation();
  try{

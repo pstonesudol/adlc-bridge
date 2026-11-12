@@ -70,8 +70,10 @@ export function throttleEvidence(o:RabbitObservation,receipts:any[],query?:any):
    if(!text||!Number.isFinite(created)||!Number.isFinite(edited)||created>edited||edited>o.observed||!already&&!/^(?:Review rate limited\.?|Your included review limit is currently reached\b|You're currently rate limited\b)/i.test(lead))continue;
   const commands=o.comments.filter(x=>typeof x.body==='string'&&/^@coderabbitai (?:full review|review|rate limit)(?:\s|$)/.test(x.body)&&stamp(x.created_at)<=created&&x.id<c.id).sort((a,b)=>stamp(b.created_at)-stamp(a.created_at)||b.id-a.id);
   const prior=commands[0];
-  const receipt=receipts.find(r=>String(r.comment_id)===String(prior?.id)&&r.requested<=created+1000&&created-r.requested<=30*60000);
-  const queryBound=query&&String(query.comment_id)===String(prior?.id)&&query.requested<=created+1000&&created-query.requested<=24*60*60000;
+  // Missing IDs are not identities: String(undefined) must never bind a reply.
+  const hasCommand=Number.isSafeInteger(prior?.id)&&prior.id>0;
+  const receipt=hasCommand?receipts.find(r=>r.comment_id!=null&&String(r.comment_id)===String(prior.id)&&r.requested<=created+1000&&created-r.requested<=30*60000):undefined;
+  const queryBound=hasCommand&&query?.comment_id!=null&&String(query.comment_id)===String(prior.id)&&query.requested<=created+1000&&created-query.requested<=24*60*60000;
   const commits=[...text.matchAll(/https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/commit\/([a-f0-9]{40})\b/g)];
   const headBound=commits.length===1&&commits[0][1]===o.repo&&commits[0][2]===o.head;
   const runBound=runs.some(r=>stamp(r.started_at)<=edited&&stamp(r.completed_at)>=edited);
