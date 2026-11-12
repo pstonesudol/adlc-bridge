@@ -10,6 +10,7 @@ import {worktreeReservation} from './worktree-reservation';
 import {assertDeliveryTarget} from './delivery-identity';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {observeLiveness,livenessStatus} from './worker-liveness';
+import {cooldownDue} from './coderabbit-cooldowns';
 
 export type BlockerClass='ci_wait'|'reviewer_wait'|'worker_wait'|'dependency_wait'|'provider_wait'|'intake_paused'|'receipt_uncertain'|'human'|'unsupported'|'none';
 export type ActionContract=
@@ -168,7 +169,8 @@ export class ActionWatchdog{
      const live=livenessStatus(this.s,a.job),liveAge=live?Math.max(0,this.now()-live.since):0;
      const liveSteps=Math.min(4,Math.floor(Math.log2(1+liveAge/WATCHDOG_LIMITS.intervalMs)));
      const waitBackoff=result?.state==='waiting_for_ci'&&result.reason?.includes(': transient;')?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**steps):result?.state==='waiting_for_worker'&&live&&['busy','idle_no_delivery'].includes(live.classification)?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**liveSteps):WATCHDOG_LIMITS.intervalMs;
-    const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):slow?WATCHDOG_LIMITS.idleMs:waitBackoff;
+     const cooldown=result?.state==='waiting_for_coderabbit'?cooldownDue(this.s,a.job,this.now()):null;
+     const delay=failures?Math.min(WATCHDOG_LIMITS.idleMs,WATCHDOG_LIMITS.intervalMs*2**(failures-1)):cooldown!==null?cooldown-this.now():slow?WATCHDOG_LIMITS.idleMs:waitBackoff;
    this.s.db.query('UPDATE watchdog_evaluations SET failures=?,next_tick=? WHERE job=?').run(failures,this.now()+delay,a.job);
    if(failures){
     if(failures>=WATCHDOG_LIMITS.maxEvaluationFailures)this.stop(id,'unsupported','evaluation_failed','Consecutive ordinary review failures exhausted; inspect existing receipts before supervised tick-review');

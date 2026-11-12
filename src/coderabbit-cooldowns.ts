@@ -11,6 +11,18 @@ export function cycleExtensionPreview(s:Store,repo:string,pr:number){
  if(!c||c.state!=='exhausted')throw Error('Exhausted review cycle required');
  return {cycle:c,confirmation:digest(JSON.stringify(c)),mutationReplay:false};
 }
+/** Read-only scheduling hint, never approval or an effectful retry entrypoint. */
+export function cooldownDue(s:Store,job:string,now:number):number|null{
+ if(!s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_cycles'").get())return null;
+ const t=s.db.query('SELECT repo,pr,state,reason FROM review_targets WHERE job=?').get(job) as any;
+ if(t?.state!=='waiting_for_coderabbit'||!t.reason?.startsWith('CodeRabbit rate limited; next retry at '))return null;
+ const c=s.db.query('SELECT * FROM coderabbit_cycles WHERE repo=? AND pr=? ORDER BY cycle DESC LIMIT 1').get(t.repo,t.pr) as any;
+ if(!c||c.state!=='waiting')return null;
+ const shared=c.scope?(s.db.query("SELECT MAX(next_action) AS retry FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(c.scope) as any)?.retry:0;
+ const query=s.db.query('SELECT retry_after FROM coderabbit_queries WHERE repo=? AND pr=? AND cycle=? AND episode=?').get(c.repo,c.pr,c.cycle,c.episode) as any;
+ const due=Math.min(c.deadline,Math.max(c.next_action,shared??0,query?.retry_after??0));
+ return due>now?due:null;
+}
 export type CooldownPolicy={buffer:number;fallback:number;maxDelay:number;jitter:number;retryLimit:number;window:number};
 export const DEFAULT_COOLDOWN:CooldownPolicy={buffer:5*60000,fallback:60*60000,maxDelay:120*60000,jitter:0.05,retryLimit:6,window:24*60*60000};
 export function cooldownPolicy(value?:Partial<CooldownPolicy>):CooldownPolicy{

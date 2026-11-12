@@ -111,6 +111,11 @@ for(const incremental of [true,false])test(`DEV-82: durable cooldown yields one 
   f.loop.postReview=async(_repo,_pr,_marker,_spawn,selected)=>{reviews++;mode=selected;return {id:881};};
   expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
   expect(f.loop.list()[0].displayStatus).toStartWith('CodeRabbit rate limited; next retry at ');
+  const watchdog=new ActionWatchdog(f.s),config={linear:{projectId:'project'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'}};
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['inspect','commit','push-feature','open-pr'],'human');
+  const action=watchdog.scheduleReview(f.id,config);watchdog.finishReview(action.id,{state:'waiting_for_coderabbit'});
+  const evaluation=f.s.db.query('SELECT next_tick FROM watchdog_evaluations WHERE job=?').get(f.id) as any;
+  expect(evaluation.next_tick).toBe(f.loop.requests.cooldowns.get('owner/repo',1).next_action);
   await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(queries).toBe(1);expect(reviews).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
   const c=f.loop.requests.cooldowns.get('owner/repo',1);setSystemTime(new Date(c.next_action+1));
   await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);
