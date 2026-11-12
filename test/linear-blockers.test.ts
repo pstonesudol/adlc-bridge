@@ -7,6 +7,7 @@ import {ConflictRecovery} from '../src/conflict-recovery';
 import {ReviewLoop,decision} from '../src/review-loop';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
+import {Lifecycle} from '../src/lifecycle';
 test('posted observation notice is rechecked hourly without duplicates',async()=>{
  const f=fixture();try{
  f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
@@ -132,6 +133,29 @@ function fixture(){
   blockers:()=>new LinearBlockers(s,api)
  };
 }
+for(const [state,phase] of [['waiting_for_coderabbit','inventory'],['blocked','inventory'],['blocked','created']] as const)test(`CodeRabbit notice rejects a replacement approved plan during ${phase} (${state})`,async()=>{
+ const f=fixture();try{
+  f.running();const loop=new ReviewLoop(f.s),original=f.s.get(f.id),replacement='replacement approved plan',hash=digest(JSON.stringify([original.spec,replacement]));
+  f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree) VALUES (?,?,?,?,?,?)').run(f.id,'owned',original.plan_hash,'running','session','/worktree');
+  const reason=state==='blocked'?'CodeRabbit review unavailable: rate-limit retry cycle 1 exhausted; preview extend-review-cycle JOB':'CodeRabbit rate limited; next retry at 2026-11-12T12:00:00.000Z';
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',38,'["CI"]','["src/**"]',Date.now(),state,reason);
+  loop.requests.cooldowns.http('owner/repo',38,'head',1,Date.now()+3600000);
+  if(state==='blocked')f.s.db.query("UPDATE coderabbit_cycles SET state='exhausted'").run();
+  const blockers=f.blockers(),api=blockers.api;let changed=false;
+  blockers.api=async(q,v)=>{
+   const result=await api(q,v);
+   if(!changed&&(phase==='inventory'?q.includes('comments(first:100'):q.includes('commentCreate'))){
+    changed=true;f.s.db.query("UPDATE jobs SET plan=?,plan_hash=?,approved_hash=? WHERE id=?").run(replacement,hash,hash,f.id);
+    f.s.db.query('UPDATE runs SET plan_hash=? WHERE job=?').run(hash,f.id);
+    expect(new Lifecycle(f.s).current(f.id).plan_hash).toBe(hash);
+   }
+   return result;
+  };
+  await blockers.sync(f.config);expect(changed).toBe(true);
+  expect(f.creates).toBe(phase==='created'?1:0);expect(f.updates).toBe(0);expect(f.labels).not.toContain(labelId);
+  expect(f.s.db.query('SELECT repo,pr,reason FROM review_targets WHERE job=?').get(f.id)).toEqual({repo:'owner/repo',pr:38,reason});
+ }finally{f.s.close();}
+});
 test('CodeRabbit exhaustion reconciles a failed label write without reposting its delivered comment',async()=>{
  const f=fixture();try{
   f.running();const loop=new ReviewLoop(f.s),plan=f.s.get(f.id).plan_hash!;

@@ -512,7 +512,7 @@ test('an uncertain PR #30 request is reconciled before any retry',async()=>{
   expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
   expect(posts).toBe(1);
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',own:true,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
   expect(posts).toBe(1);
  }finally{f.s.close();}
@@ -536,9 +536,21 @@ test('matching marked comment reconciles uncertain request without replay or inf
   Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);
   let marker='',posts=0;f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('lost');};
   await expect(f.loop.tick(f.id)).rejects.toThrow('lost');
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',own:true,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(posts).toBe(1);
   expect(f.loop.requests.get('owner/repo',1,f.head).state).toBe('accepted');expect(f.e.clear).toBe(false);
+ }finally{f.s.close();}
+});
+for(const own of [undefined,null,false,'true',true])test(`uncertain review receipts require positive publisher ownership: ${own}`,async()=>{
+ const f=pr30LoopFixture();try{
+  let posts=0,marker='';f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('reply lost');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('reply lost');
+  f.e.requestComments=[{id:42,author:'operator',own,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  const result=await f.loop.tick(f.id);
+  expect(result.state).toBe(own===true?'waiting_for_coderabbit':'needs_reconciliation');
+  expect(f.loop.requests.get('owner/repo',1,f.head)).toMatchObject({state:own===true?'accepted':'delivery_uncertain',attempts:1});
+  expect(f.s.db.query('SELECT state FROM full_review_requests WHERE job=?').get(f.id)).toEqual({state:own===true?'accepted':'delivery_uncertain'});
+  expect(posts).toBe(1);expect(f.e.clear).toBe(false);
  }finally{f.s.close();}
 });
 test('new regular receipts reject a full-command match, while pre-mode uncertain full receipts reconcile without replay',async()=>{
@@ -551,7 +563,7 @@ test('new regular receipts reject a full-command match, while pre-mode uncertain
     f.s.db.exec('ALTER TABLE coderabbit_requests DROP COLUMN mode; ALTER TABLE coderabbit_request_attempts DROP COLUMN mode');
     f.loop=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
    }
-   const comment=(command:string)=>[{id:42,author:'operator',body:`@coderabbitai ${command}\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+   const comment=(command:string)=>[{id:42,author:'operator',own:true,body:`@coderabbitai ${command}\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
    f.e.requestComments=comment(legacy?'review':'full review');
    expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
    f.e.requestComments=comment(legacy?'full review':'review');

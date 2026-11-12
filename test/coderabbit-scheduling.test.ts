@@ -32,7 +32,7 @@ for(const header of ['retry-after','quota-reset'])test(`publication-to-ledger pr
   expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
   let error:any;try{await postCodeRabbitReview('o/r',1,'marker',spawn);}catch(e){error=e;}
   expect(error).toBeInstanceOf(ReviewRateLimit);expect(error.retryAt).toBeGreaterThanOrEqual(now+48*60*60*1000);
-  requests.settle('o/r',1,'head','rate_limited','verified HTTP 429',error.retryAt);
+   requests.settle('o/r',1,'head','rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);
   now+=24*60*60*1000+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'new-head'})).toBe(false);
   expect(requests.get('o/r',1,'head').attempts).toBe(1);
   now=error.retryAt+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);

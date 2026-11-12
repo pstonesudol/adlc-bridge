@@ -32,6 +32,10 @@ test('review-cycle CLI preview is read-only; extension requires bound confirmati
   const confirmation=JSON.parse(preview.stdout.toString()).confirmation;
   expect(run('--confirm',confirmation).exitCode).not.toBe(0);expect(run('--confirm','0'.repeat(64),'--human','Operator').exitCode).not.toBe(0);
   const applied=run('--confirm',confirmation,'--human','Operator');expect(applied.exitCode).toBe(0);expect(JSON.parse(applied.stdout.toString())).toMatchObject({state:'extended',mutationReplay:false});
-  expect(ledger.get('o/r',1)).toMatchObject({attempts:6,limit_attempts:12,state:'waiting'});expect(ledger.query(c)).toMatchObject({state:'delivery_uncertain',body:q.body});expect(ledger.reserve('o/r',1,'head')).toBe(false);expect(s.get(job).attempts).toBe(0);
+  expect(ledger.get('o/r',1)).toMatchObject({attempts:6,limit_attempts:12,state:'waiting'});expect(ledger.query(c)).toMatchObject({state:'delivery_uncertain',body:q.body});
+  const current=ledger.get('o/r',1),due=ledger.effectiveRetry(current)+1;expect(due).toBeLessThan(current.deadline);
+  ledger.now=()=>due;expect(ledger.reserve('o/r',1,'head')).toBe(false);
+  expect(ledger.settleQuery(ledger.query(c),{id:42,body:q.body,user:{id:7},created_at:new Date(q.requested).toISOString()})).toBe(true);
+  expect(ledger.reserve('o/r',1,'head')).toBe(true);expect(ledger.get('o/r',1).attempts).toBe(7);expect(s.get(job).attempts).toBe(0);
  }finally{s.close();rmSync(root,{recursive:true,force:true});}
 });

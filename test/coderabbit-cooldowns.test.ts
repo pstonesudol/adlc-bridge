@@ -100,6 +100,17 @@ test('delivered review plus fresh bound bot rejection becomes retryable without 
   expect(requests.get(o.repo,o.pr,HEAD)).toMatchObject({state:'delivery_uncertain',attempts:2,mode:'regular'});
  }finally{s.close();}
 });
+test('check-bound rejection of a plain-text accepted marker is not a global HTTP embargo',()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);const requests=new ReviewRequests(s,()=>T),job=s.enqueue('p','i','spec'),other=s.enqueue('q','other','spec'),o=observation();
+ const schedule={head:HEAD,signature:'config',blocker:null,incremental:false},marker=reviewRequestMarker(o.repo,o.pr,HEAD);
+ try{
+  expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);requests.settle(o.repo,o.pr,HEAD,'accepted',marker);
+  requests.cooldowns.observe(o,requests.receipts(o.repo,o.pr));requests.reconcileThrottle(o.repo,o.pr);
+  expect(requests.get(o.repo,o.pr,HEAD)).toMatchObject({state:'rate_limited',evidence:marker});
+  expect(requests.claim(other,'pstonesudol/honeysummer',39,{...schedule,head:OTHER})).toBe(true);
+  expect(s.db.query('SELECT state FROM coderabbit_request_attempts WHERE repo=? AND pr=?').get(o.repo,o.pr)).toEqual({state:'accepted'});
+ }finally{s.close();}
+});
 test('new heads, duplicate observations and restarts do not reset cycle or query budgets',()=>{
  const dir=mkdtempSync(join(tmpdir(),'adlc-rabbit-cycle-')),path=join(dir,'state.sqlite');let s=new Store(path),now=T;
  try{

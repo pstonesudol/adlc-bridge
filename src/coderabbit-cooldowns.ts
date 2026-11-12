@@ -11,7 +11,7 @@ export const RATE_QUERY='@coderabbitai rate limit';
  * Keep it even if the source PR's review cycle completes or the process restarts. */
 export function githubReviewTransportRetryAt(s:Store):number{
  const has=(name:string)=>s.db.query('SELECT 1 FROM sqlite_master WHERE name=?').get(name);
- const review=has('coderabbit_requests')?(s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND NOT json_valid(evidence)").get() as any)?.reset:0;
+ const review=has('coderabbit_requests')?(s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND evidence='confirmed HTTP rate-limit rejection'").get() as any)?.reset:0;
  const query=has('coderabbit_queries')?(s.db.query('SELECT MAX(retry_after) AS reset FROM coderabbit_queries').get() as any)?.reset:0;
  return Math.max(review??0,query??0);
 }

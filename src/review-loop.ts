@@ -462,7 +462,7 @@ export class ReviewLoop{
     const uncertain=this.requests.receipts(t.repo,t.pr).filter(r=>r.state==='delivery_uncertain');
     for(const receipt of uncertain){
      const marker=reviewRequestMarker(t.repo,t.pr,receipt.head);
-    const matched=e.requestComments?.filter((c:any)=>c.body===reviewRequestBody(receipt.mode,marker)&&Date.parse(c.created)+1000>=receipt.requested&&c.author&&c.id&&c.own!==false);
+     const matched=e.requestComments?.filter((c:any)=>c.body===reviewRequestBody(receipt.mode,marker)&&Date.parse(c.created)+1000>=receipt.requested&&c.author&&c.id&&c.own===true);
      if(matched?.length===1){this.requests.settle(t.repo,t.pr,receipt.head,'accepted',JSON.stringify({id:matched[0].id}));this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE pr=? AND head=? AND job IN (SELECT job FROM review_targets WHERE repo=? AND pr=?) AND state='delivery_uncertain'").run(t.pr,receipt.head,t.repo,t.pr);}
     else return record({state:'needs_reconciliation',send:false,head:e.head,reason:`CodeRabbit review unavailable: ${receipt.mode} request outcome uncertain; reconcile matching request evidence before retry`});
    }
