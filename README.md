@@ -1,5 +1,26 @@
 # ADLC Bridge
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main` using
+`macos-latest` and Bun `1.4.2`. Reproduce its checks with:
+
+```sh
+bun test
+python3 -m py_compile src/serve-orchestrator.py
+```
+
+The exact required check context for the branch ruleset is **`Bridge tests`**
+(workflow **CI**, job `test`), not `CI` or the separate `bun-test` check.
+Ruleset configuration is an operator-controlled GitHub setting; changing this
+workflow does not configure the ruleset or authorize merging.
+
+Each job is bounded to 30 minutes. New runs cancel stale runs for the same
+PR/base or push ref, without cancelling independent PRs or push validation.
+Test failures fail the job and remain visible in the Actions step output.
+CI has read-only repository permissions, does not persist checkout credentials,
+and performs no deployment, merge or auto-merge actions.
+
 ### Planning dependency observation
 
 Dependency bindings may opt into `stage: "planning"` (omitted stage retains

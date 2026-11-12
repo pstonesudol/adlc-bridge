@@ -352,6 +352,9 @@ function candidateFixture(options:{missing?:boolean;inconsistent?:boolean}={}){
  f.io.stage=(p,c)=>stageCandidate({...p,remote},c,f.state);
  return {...f,remote,commit,git};
 }
+// Real isolated preparation, repeated frozen-artifact checks, snapshot copying
+// and a --no-install import probe exceed the default 5s deadline under CI load.
+// Preserve every behavioral assertion with the bounded budget used in PR #66.
 test('fresh dependency-free preview/apply/status reuse the exact frozen artifact without lifecycle scripts',async()=>{
  const f=candidateFixture();try{
   expect(existsSync(join(f.remote,'node_modules'))).toBe(false);
@@ -367,7 +370,7 @@ test('fresh dependency-free preview/apply/status reuse the exact frozen artifact
   expect(await f.manager.status()).toMatchObject({source:{commit:f.commit,commitKnown:true},installed:{version:stage.version}});
   expect(f.services).toEqual({one:true,two:false});
  }finally{f.close();}
-});
+},30_000);
 test('missing/inconsistent candidate lockfile and failed preparation preserve the installation',async()=>{
  for(const mode of ['missing','inconsistent','failure']){
   const f=candidateFixture({missing:mode==='missing',inconsistent:mode==='inconsistent'});try{
