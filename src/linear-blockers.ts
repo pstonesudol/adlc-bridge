@@ -6,6 +6,7 @@ import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
 import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} from './spec-revisions';
 import {readinessFor,applicableResolution} from './readiness';
+import {jobBlockers,blockerText,redact} from './operator-evidence';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -23,10 +24,11 @@ export class LinearBlockers{
    applied_label_id TEXT,reason TEXT,checked TEXT,PRIMARY KEY(job,binding));`);
   const columns=s.db.query('PRAGMA table_info(blocker_notices)').all() as any[];
   if(!columns.some(column=>column.name==='applied_label_id'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN applied_label_id TEXT');
-  if(!columns.some(column=>column.name==='checked'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN checked TEXT');
+   if(!columns.some(column=>column.name==='checked'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN checked TEXT');
+   if(!columns.some(column=>column.name==='blocker_version'))s.db.exec('ALTER TABLE blocker_notices ADD COLUMN blocker_version TEXT');
  }
  binding(job:string,outcome:any,labelId?:string){
-  return digest(JSON.stringify([outcome.plan_hash,outcome.outcome,outcome.reason,outcome.questions,outcome.dependencies,labelId??null]));
+   return digest(JSON.stringify([outcome.plan_hash,outcome.outcome,outcome.reason,outcome.questions,outcome.dependencies,labelId??null,jobBlockers(this.s,job).version]));
  }
  async comments(issue:string){
   const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
@@ -45,11 +47,12 @@ export class LinearBlockers{
   if(!issue||issue.id!==j.issue||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity or label scope mismatch');
   options?.guard?.(issue);
   const questions=JSON.parse(outcome.questions),dependencies=JSON.parse(outcome.dependencies);
-  const binding=options?.binding??this.binding(job,outcome,labelId);
+   const report=jobBlockers(this.s,job);
+   const binding=options?.binding??this.binding(job,outcome,labelId);
   let row=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(job,binding) as any;
   if(!row){
    const commentId=randomUUID();
-   const body=options?.body??[
+    let body=options?.body??[
       `## ADLC: ${options?.heading??(outcome.outcome==='recovery_completed'?'conflict recovery completed':'implementation stopped')} — ${issue.identifier}`,
      `Outcome: **${outcome.outcome.replaceAll('_',' ')}**`,
      `Plan version: \`${outcome.plan_hash}\``,
@@ -57,8 +60,16 @@ export class LinearBlockers{
      questions.length?`### Questions requiring a human answer\n${questions.map((q:any)=>`- **${q.id}** (${q.kind}): ${q.question}`).join('\n')}`:null,
      dependencies.length?`### Referenced dependencies\n${dependencies.map((d:any)=>`- **${d.ref}**: ${d.reason}`).join('\n')}`:null,
       `This synchronization records an outcome only. It does not grant readiness, resolve a question, expand permissions or authorize implementation. Human PR merges remain required.`
-   ].filter(Boolean).join('\n\n');
-   this.s.db.query('INSERT OR IGNORE INTO blocker_notices(job,binding,comment_id,body,state) VALUES (?,?,?,?,?)').run(job,binding,commentId,body,'reserved');
+    ].filter(Boolean).join('\n\n');
+    if(report.blockers.length){
+     body+=`\n\n### All applicable blockers and waits\n${blockerText(report)}\n\nWorker activity is unknown unless freshly observed in jobs explain/watch. Tracking does not establish autonomy. Bridge does not control native Orchestrator board labels. Evidence refresh never grants continuation.`;
+     if(report.blockers.some(b=>b.code==='approval_required')){
+      const n=this.s.db.query("SELECT name FROM sqlite_master WHERE name='plan_approval_notices'").get()?this.s.db.query("SELECT token FROM plan_approval_notices WHERE job=? AND plan_hash=? AND state='posted' ORDER BY rowid DESC LIMIT 1").get(job,j.plan_hash) as any:null;
+      body+=n?.token&&/^[a-f0-9-]{36}$/.test(n.token)?`\n\nIf this exact plan is still current, reply on Linear with only:\n\n\`\`\`text\nApprove ADLC plan ${n.token}\n\`\`\``:'\n\nInspect the current plan approval notice for its exact fenced reply; no valid approval token is currently evidenced here. Do not invent approval wording.';
+     }
+    }
+    body=redact(body);
+    this.s.db.query('INSERT OR IGNORE INTO blocker_notices(job,binding,comment_id,body,state,blocker_version) VALUES (?,?,?,?,?,?)').run(job,binding,commentId,body,'reserved',report.version);
    row=this.s.db.query('SELECT * FROM blocker_notices WHERE job=? AND binding=?').get(job,binding) as any;
   }
   let comments=await this.comments(j.issue),posted=comments.find(x=>x.id===row.comment_id);
@@ -93,6 +104,10 @@ export class LinearBlockers{
  }
   async retract(job:string,c:BlockerConfig){
    if(c.blockerSync?.enabled!==true)return {state:'disabled'};
+   // Requirement revisions supersede old clarification/dependency labels. Their
+   // revision blocker remains visible, but must not preserve an obsolete label.
+   const independent=jobBlockers(this.s,job).blockers.filter(b=>['approval_required','stale_plan','budget_exhausted','ownership'].includes(b.code));
+   if(independent.length)return {state:'retained',reason:'Independent approval, budget or ownership blockers remain',blockers:independent.map(b=>b.code)};
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='planning_dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM planning_dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state!='resolved' AND j.state='awaiting_approval'").get(job))return {state:'retained',reason:'Planning dependency evidence remains unresolved'};
    settleDependencyWait(this.s,job);
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state NOT IN ('resumed','settled')").get(job))return {state:'retained',reason:'Dependency evidence or delivery remains unresolved'};
@@ -226,13 +241,31 @@ export class LinearBlockers{
     else results.push(await this.retract(outcome.job,c));
    }catch(error){results.push({job:outcome.job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
   }
-  const owned=this.s.db.query(`SELECT DISTINCT n.job FROM blocker_notices n JOIN jobs j ON j.id=n.job
+   const owned=this.s.db.query(`SELECT DISTINCT n.job FROM blocker_notices n JOIN jobs j ON j.id=n.job
    WHERE j.project=? AND n.state='posted' AND n.label_applied=1`).all(c.linear.projectId) as any[];
-  for(const {job} of owned){
+   for(const {job} of owned){
    if(handled.has(job))continue;
    try{results.push({job,...await this.retract(job,c)});}
    catch(error){results.push({job,state:'blocked',reason:error instanceof Error?error.message:'Linear blocker synchronization failed'});}
-  }
+   }
+   // Publish combined evidence even when specialized views cannot select a job
+   // (for example, requirements invalidated plus a failed provider read). This
+   // is comment-only: never change readiness/state/labels for this projection.
+   for(const j of this.s.list().filter(j=>j.project===c.linear.projectId&&j.state!=='done')){
+    const report=jobBlockers(this.s,j.id);if(report.blockers.length<2)continue;
+    if(this.s.db.query("SELECT 1 FROM blocker_notices WHERE job=? AND blocker_version=? AND state='posted'").get(j.id,report.version))continue;
+    // Superseded targets/invalid approval are inspection evidence, not a new
+    // publication grant. Only a valid current plan or a real revision plus a
+    // provider-read stop can enter this additional comment-only path.
+    const revision=latestRevision(this.s,j.id);
+    if(j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))&&!(revision&&report.blockers.some(b=>b.code==='observation')))continue;
+    if(report.blockers.some(b=>b.code==='approval_required')&&j.state!=='awaiting_approval'&&!(revision&&report.blockers.some(b=>b.code==='observation')))continue;
+    const outcome={plan_hash:j.plan_hash,outcome:'needs_reconciliation',reason:'Multiple independent blockers/waits remain; resolving one does not resolve the others.',questions:'[]',dependencies:'[]'};
+    const binding=`operator:${report.version}`;
+    if(this.s.db.query("SELECT 1 FROM blocker_notices WHERE job=? AND binding=? AND state='posted'").get(j.id,binding))continue;
+    try{results.push(await this.leave(j.id,outcome,c,{binding:`operator:${report.version}`,applyLabel:false,heading:'all current blockers',guard:()=>{if(jobBlockers(this.s,j.id).version!==report.version)throw Error('Blocker evidence changed; refresh before publishing');}}));}
+    catch{results.push({job:j.id,state:'blocked',reason:'Combined blocker notice uncertain or evidence changed; no blind replay'});}
+   }
   return results;
  }
 }

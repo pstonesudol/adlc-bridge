@@ -20,6 +20,7 @@ type LegacyBudgetEvidence={attempts:number;lastHead:string|null;lastFindingsHash
  * worker runtime is validated. This store must never be writable by that runtime. */
 export class Lifecycle {
   constructor(public s:Store) {
+    if(s.readonly)return;
     s.db.exec(`CREATE TABLE IF NOT EXISTS git_grants (
       job TEXT PRIMARY KEY REFERENCES jobs(id), plan_hash TEXT NOT NULL,
       operations TEXT NOT NULL, actor TEXT NOT NULL);

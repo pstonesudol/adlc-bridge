@@ -8,7 +8,7 @@ import {readDefinition} from './project-services';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {acquireProcessLock} from './process-lock';
 
-type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number};
+type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number;launcher?:string;launcherVerified?:boolean};
 export type StackOps={
  projects():Promise<{project:string}[]>;
   // A start result must confirm the running poll's PID-bound startup receipt.
@@ -124,7 +124,12 @@ export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,
    if(action==='stop'&&persistent){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
    return result;
   },
-  backend:async()=>{const s=await inspect();return {loaded:await loaded(config.target,run),ready:s.ready,managed:s.ready?s.executablePath===config.executable&&trustedDaemon(s.executablePath):true,...(s.ready?{pid:s.pid}:{})};},
+  backend:async()=>{const s=await inspect();let launcherVerified=false;
+   if(s.ready&&Number.isSafeInteger(s.pid)&&s.pid>0){
+    const parent=await run(['/bin/ps','-p',String(s.pid),'-o','ppid=']);const ppid=parent.stdout.trim();
+    if(parent.code===0&&/^[1-9][0-9]*$/.test(ppid)){const args=await run(['/bin/ps','-p',ppid,'-o','command=']);launcherVerified=args.code===0&&args.stdout.trim()===`/usr/bin/python3 ${config.launcher}`;}
+   }
+   return {loaded:await loaded(config.target,run),ready:s.ready,managed:s.ready?s.executablePath===config.executable&&trustedDaemon(s.executablePath):true,launcher:config.launcher,launcherVerified,...(s.ready?{pid:s.pid}:{})};},
   backendStart:async()=>{
    const s=await inspect();if(s.ready&&s.executablePath!==config.executable)throw Error('Another Orchestrator backend is running; preserved');
    const enabled=await run(['/bin/launchctl','enable',config.target]);if(enabled.code!==0)throw Error('Could not enable Orchestrator service');
