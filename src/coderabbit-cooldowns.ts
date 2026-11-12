@@ -6,6 +6,15 @@ import {BOT_IDENTITIES} from './reviewer-policy';
 // closed until reviewed. https://api.github.com/apps/coderabbitai
 export const CODERABBIT_APP_ID=347564;
 export const RATE_QUERY='@coderabbitai rate limit';
+/** Shared GitHub comment transport cooldown, not CodeRabbit review quota.
+ * Query retry_after is recorded only for protocol-confirmed HTTP rejection.
+ * Keep it even if the source PR's review cycle completes or the process restarts. */
+export function githubReviewTransportRetryAt(s:Store):number{
+ const has=(name:string)=>s.db.query('SELECT 1 FROM sqlite_master WHERE name=?').get(name);
+ const review=has('coderabbit_requests')?(s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND NOT json_valid(evidence)").get() as any)?.reset:0;
+ const query=has('coderabbit_queries')?(s.db.query('SELECT MAX(retry_after) AS reset FROM coderabbit_queries').get() as any)?.reset:0;
+ return Math.max(review??0,query??0);
+}
 export function cycleExtensionPreview(s:Store,repo:string,pr:number){
  const c=s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_cycles'").get()?s.db.query('SELECT * FROM coderabbit_cycles WHERE repo=? AND pr=? ORDER BY cycle DESC LIMIT 1').get(repo,pr) as any:null;
  if(!c||c.state!=='exhausted')throw Error('Exhausted review cycle required');
@@ -19,8 +28,7 @@ export function cooldownDue(s:Store,job:string,now:number):number|null{
  const c=s.db.query('SELECT * FROM coderabbit_cycles WHERE repo=? AND pr=? ORDER BY cycle DESC LIMIT 1').get(t.repo,t.pr) as any;
  if(!c||c.state!=='waiting')return null;
  const shared=c.scope?(s.db.query("SELECT MAX(next_action) AS retry FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(c.scope) as any)?.retry:0;
- const query=s.db.query('SELECT retry_after FROM coderabbit_queries WHERE repo=? AND pr=? AND cycle=? AND episode=?').get(c.repo,c.pr,c.cycle,c.episode) as any;
- const due=Math.min(c.deadline,Math.max(c.next_action,shared??0,query?.retry_after??0));
+ const due=Math.min(c.deadline,Math.max(c.next_action,shared??0,githubReviewTransportRetryAt(s)));
  return due>now?due:null;
 }
 export type CooldownPolicy={buffer:number;fallback:number;maxDelay:number;jitter:number;retryLimit:number;window:number};
@@ -150,7 +158,7 @@ export class CodeRabbitCooldowns{
  }
  effectiveRetry(c:any){
   const shared=c.scope?(this.s.db.query("SELECT MAX(next_action) AS retry FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(c.scope) as any)?.retry:0;
-  return Math.max(c.next_action,shared??0,this.query(c)?.retry_after??0);
+  return Math.max(c.next_action,shared??0,githubReviewTransportRetryAt(this.s));
  }
  http(repo:string,pr:number,head:string,attempt:number,retryAt?:number,config?:Partial<CooldownPolicy>){
   assertObservationFence();const p=cooldownPolicy(config);this.s.db.transaction(()=>{
@@ -166,6 +174,7 @@ export class CodeRabbitCooldowns{
  claimQuery(c:any){
   assertObservationFence();return this.s.db.transaction(()=>{
    if(this.s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_provider_holds'").get()&&this.s.db.query("SELECT 1 FROM coderabbit_provider_holds WHERE provider='coderabbit'").get())return null;
+   if(githubReviewTransportRetryAt(this.s)>this.now())return null;
    const fresh=this.get(c.repo,c.pr);
   if(!fresh||fresh.cycle!==c.cycle||fresh.episode!==c.episode||fresh.state!=='waiting'||fresh.reliable||this.now()>=fresh.deadline)return null;
   const body=`${RATE_QUERY}\n\n<!-- adlc-coderabbit-availability:${digest(JSON.stringify([c.repo,c.pr,c.cycle,c.episode]))} -->`;

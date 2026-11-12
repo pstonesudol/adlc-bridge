@@ -183,6 +183,20 @@ test('DEV-82: uncertain availability query survives polls without blind resend o
   await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
  }finally{f.s.close();}
 });
+test('DEV-82: availability HTTP throttle is a shared transport hold, not a review attempt',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now(),reset=at+4*60*60000;
+  f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:921,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw new ReviewRateLimit(reset);};
+  const waiting=await f.loop.tick(f.id);expect(waiting).toMatchObject({state:'waiting_for_coderabbit',send:false});expect(waiting.reason).toContain(new Date(reset).toISOString());
+  const other=f.s.enqueue('other-project','other-issue','spec');
+  expect(f.loop.requests.claim(other,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(false);
+  expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_request_attempts').get()).toEqual({n:0});
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).attempts).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(queries).toBe(1);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
 test('DEV-82: provider-wide inspection hold blocks availability publication on another PR',async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});

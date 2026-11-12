@@ -1,7 +1,7 @@
 import {digest,Store} from './core';
 import {assertObservationFence} from './observation-fence';
 import {randomUUID} from 'node:crypto';
-import {CodeRabbitCooldowns,type CooldownPolicy} from './coderabbit-cooldowns';
+import {CodeRabbitCooldowns,githubReviewTransportRetryAt,type CooldownPolicy} from './coderabbit-cooldowns';
 
 export const REVIEW_GRACE_MS=5*60*1000, REVIEW_TIMEOUT_MS=30*60*1000;
 export type ReviewMode='regular'|'full';
@@ -214,8 +214,7 @@ export class ReviewRequests{
    // request for this PR. This embargo shares the existing durable ledger.
     // Legacy HTTP evidence is plain text. Bot-rejected deliveries retain their
     // JSON comment receipt; they must not embargo unrelated developer quotas.
-    const embargo=this.s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND NOT json_valid(evidence)").get() as any;
-    if(embargo?.reset>this.now())return false;
+     if(githubReviewTransportRetryAt(this.s)>this.now())return false;
     if(schedule.quotaIdentity){const shared=this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any;if(shared?.reset>this.now())return false;}
    if(this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND state='delivery_uncertain'").get(repo,pr))return false;
    // Existing metadata-review receipts also consume this head's accepted/uncertain

@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {CodeRabbitCooldowns,throttleEvidence,cooldownPolicy,CODERABBIT_APP_ID,DEFAULT_COOLDOWN} from '../src/coderabbit-cooldowns';
+import {CodeRabbitCooldowns,throttleEvidence,cooldownPolicy,cooldownDue,CODERABBIT_APP_ID,DEFAULT_COOLDOWN} from '../src/coderabbit-cooldowns';
 import {ReviewLoop} from '../src/review-loop';
 import {ReviewRequests,reviewRequestBody,reviewRequestMarker} from '../src/coderabbit-scheduling';
 import {BOT_IDENTITIES,reviewerPolicy} from '../src/reviewer-policy';
@@ -203,6 +203,33 @@ test('chat HTTP cooldown is persisted separately without a review attempt or rep
  try{const c=l.observe(o,[]),q=l.claimQuery(c);l.chatThrottle(q,T+4*60*60000);
   expect(l.effectiveRetry(c)).toBe(T+4*60*60000);expect(l.get(o.repo,o.pr).attempts).toBe(0);expect(l.claimQuery(c)).toBeNull();
  }finally{s.close();}
+});
+test('availability-query HTTP reset blocks other PR reviews and queries across projects and restarts without charging review attempts',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-query-transport-')),path=join(root,'state.sqlite');let s=new Store(path),now=T;
+ try{
+  new ReviewLoop(s);let requests=new ReviewRequests(s,()=>now);const job=s.enqueue('p','one','spec'),other=s.enqueue('q','two','spec'),o=observation();
+  const first=requests.cooldowns.observe(o,[]),query=requests.cooldowns.claimQuery(first),reset=T+4*60*60000;
+  requests.cooldowns.chatThrottle(query,reset);
+  const schedule={head:OTHER,signature:'config',blocker:null,incremental:false};
+  expect(requests.claim(other,'pstonesudol/honeysummer',39,schedule)).toBe(false);
+  expect(s.db.query('SELECT count(*) AS n FROM coderabbit_requests').get()).toEqual({n:0});
+  const second=requests.cooldowns.observe(observation('pstonesudol/honeysummer',{pr:39,head:OTHER,checks:[run({id:124,head_sha:OTHER})]}),[]);
+  expect(requests.cooldowns.effectiveRetry(second)).toBe(reset);expect(requests.cooldowns.claimQuery(second)).toBeNull();
+  s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(other,second.repo,second.pr,'["CI"]','["src/**"]',now,'waiting_for_coderabbit','CodeRabbit rate limited; next retry at '+iso(reset));
+  expect(cooldownDue(s,other,now)).toBe(reset);
+  // Finishing the query's PR must not clear a transport reset for the token.
+  requests.cooldowns.complete(o.repo,o.pr,HEAD);
+  expect(requests.cooldowns.get(o.repo,o.pr).attempts).toBe(0);expect(s.get(job).attempts).toBe(0);
+  s.close();s=new Store(path);requests=new ReviewRequests(s,()=>now);
+  now=reset-1;
+  expect(requests.claim(other,'pstonesudol/honeysummer',39,schedule)).toBe(false);
+  expect(requests.cooldowns.claimQuery(second)).toBeNull();expect(s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:1});
+  expect(requests.cooldowns.get(second.repo,second.pr)).toMatchObject({attempts:0,deadline:second.deadline});
+  now=reset+1;const next=requests.cooldowns.claimQuery(second);expect(next).not.toBeNull();
+  requests.cooldowns.settleQuery(next,{id:125,body:next.body,user:{id:7},created_at:iso(now)});
+  expect(requests.claim(other,'pstonesudol/honeysummer',39,schedule)).toBe(true);
+  expect(requests.cooldowns.get(o.repo,o.pr).attempts).toBe(0);expect(s.get(other).attempts).toBe(0);
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
 });
 test('an authenticated already-reviewed refusal blocks futile regular requests in the same cycle',()=>{
  const s=new Store(':memory:');let now=T;const l=new CodeRabbitCooldowns(s,()=>now,()=>0),o=observation();
