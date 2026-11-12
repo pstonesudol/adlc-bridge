@@ -2304,6 +2304,122 @@ DEV-35/DEV-55 integrations are optional; this core command does not require them
 
 # Everyday operator CLI
 
+## Detailed job operations and troubleshooting (DEV-35)
+
+Use the same existing worker and reservation throughout recovery. These commands
+never imply merge/deployment authority or modify readiness labels.
+
+```sh
+adlc jobs list --project PROJECT --state uncertain_delivery --json
+adlc jobs show DEV-35 --project PROJECT --json
+adlc jobs explain DEV-35 --project PROJECT
+adlc jobs show-plan DEV-35 --project PROJECT
+adlc jobs watch DEV-35 --project PROJECT --json
+adlc jobs logs DEV-35 --project PROJECT --follow --json
+adlc jobs budget DEV-35 --project PROJECT --json
+adlc jobs reconcile DEV-35 --project PROJECT --json
+adlc diagnostics export --project PROJECT --json
+```
+
+**Is it working?** Explain/watch correlate the reserved session's current worker
+activity and native turns with persisted job, review and delivery evidence.
+`running`, `queued`, `idle`, `exited`, and `unknown` are activity observations,
+not execution authorization. A running worker and uncertain host delivery may
+coexist. A ready controller, tracking, or “Needs human review” does not establish
+autonomy. Worker reads are bounded to ten seconds; failures remain explicit
+unknowns rather than claims of inactivity. CI/review evidence remains explicitly
+persisted-only; these commands never request a review or run a model turn.
+
+**Why is it waiting?** Every job has additive `blockers`, deterministic `primary`,
+`version`, `phase`, and specialized-view coverage (`views`) fields alongside the
+existing schemaVersion 1 fields. Primary reasons do not replace secondary gates.
+Blockers include requirement revisions, stale/missing approval, dependency waits,
+budget stops, observations, receipts, recovery and review outcomes, and ownership.
+Each gives an evidence timestamp (or unknown) and a next supported action.
+The legacy `state` field remains compatible. List filters additionally accept
+`requirements_changed`, `uncertain_delivery`, `budget_exhausted`, `queued`,
+`tracked_activity_unknown`, and `observation_wait`. Persisted working status does
+not assert an active worker. Missing review targets/dependency records are not
+proof of completion or admission. Native Orchestrator board labels are not
+controlled by this Bridge projection.
+
+Watch/log follow stop after at most 180 polls (one-second initial interval,
+unchanged-output exponential backoff capped at ten seconds); Ctrl-C cancels after
+an in-flight bounded read settles. Unchanged observations are not printed.
+Scoped logs expose up to 200 event metadata records per snapshot, omitting raw
+event payloads because those may contain private source, transcripts or secrets.
+Inspection uses read-only database connections and never initializes engines.
+
+**How do I recover?** Preview first, inspect the exact job/project and effect,
+then explicitly apply with the returned confirmation. Reconcile refreshes worker
+evidence only, or delegates applicable configured planning dependencies to the
+existing DEV-55 engine. It does not dispatch implementation or implicitly resume
+work. Unavailable dependency bindings report no supported dependency mutation.
+Continuation is a separate existing-engine action with its own guards:
+
+```sh
+adlc jobs reconcile DEV-35 --project PROJECT
+adlc jobs reconcile DEV-35 --project PROJECT --apply --confirm HASH
+adlc jobs resume DEV-35 --project PROJECT
+adlc jobs resume DEV-35 --project PROJECT --apply --confirm HASH
+adlc jobs recover-delivery DEV-35 --project PROJECT
+adlc jobs recover-delivery DEV-35 --project PROJECT --apply --confirm HASH
+adlc jobs extend-budget DEV-35 --project PROJECT --human NAME --additional 2 --head SHA
+adlc jobs extend-budget DEV-35 --project PROJECT --human NAME --additional 2 --head SHA --apply --confirm HASH
+```
+
+Registered project configuration is used, or supply an explicit CONFIG after the
+ticket for resume/recover-delivery/extend-budget. Budget extension requires the
+engine's exact preview hash, current head and operator identity, preserving
+consumed attempts and audit history. Budget previews run that same engine on an
+in-memory database snapshot; they cannot initialize/migrate the live database.
+Recovery preserves the original reservation and uses DEV-31 identity validation;
+uncertain deliveries are never blindly replayed. Existing `jobs recover` retains
+its older review-maintenance meaning; `recover-delivery` exposes recover-handoff.
+Existing flat commands remain available with their original interfaces.
+
+All grouped mutations require explicit flags, never interactive inference.
+Exit codes remain 0 success (including a successful preview), 1 operational
+failure/incomplete evidence or rejected apply, 2 usage, 3 not found, 4 ambiguous.
+Inspect a response's preview/continued/capability fields: success is not proof
+that continuation occurred. Unknown evidence never grants approval or scope.
+
+Diagnostic export previews categories and the exact output under the fixed
+application-controlled `ADLC Bridge/diagnostics` directory. Add `--apply` to write
+the project-hash-named JSON bundle (replacing that project's previous export).
+Files are owner-only (0600), directories 0700; exports refuse unsafe/symlink
+locations, exceed neither 1 MiB nor 1000 jobs, and never upload automatically.
+They include version, an allowlisted configuration-scope summary, persisted state,
+blocker codes, timestamps, unknowns and event metadata. Raw configuration, source,
+credentials/auth stores, transcripts, event payloads and PR bodies are excluded.
+
+### Saved guarded restart preview
+
+```sh
+adlc restart --all
+adlc restart --all --apply
+adlc status --all --json
+adlc update-status
+```
+
+A validated preview is saved locally for ten minutes, bound to exact action,
+scope/options, backend identity and installation/launcher records. Apply checks
+that proof again under lifecycle guards before stopping services, and rechecks
+worker ownership/activity and queued turns. Missing/stale/mismatched proof stops
+before changing services and prints the exact preview command to rerun. An
+incomplete inspection is not a saved valid proof. Scripts can still use
+`adlc restart --all --apply --confirm HASH` after previewing. Explicit --preview
+does not change services; a valid restart preview saves only its local proof.
+
+After restart, backend readiness, managed executable, intended launcher parent
+and project service load state must be verified before `pending.restart` clears.
+A failed or unverifiable result preserves the pending update flag, even if a
+launcher switch occurred. A verified restart also clears a stale pending flag
+without resetting update history. `status --all` includes the historical verified
+restart result alongside independently observed current backend/service state;
+historical success alone does not establish current health. Interrupted recovery
+retains its existing exact-receipt and unchanged-authorization guards.
+
 Grouped commands coexist with all existing flat commands. No migration or
 installation activation is needed to use the source CLI:
 
