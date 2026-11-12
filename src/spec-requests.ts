@@ -6,6 +6,7 @@ import {latestRevision,revisionStatus} from './spec-revisions';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {LinearApprovals} from './linear-approvals';
 import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
+import {PlanningCapacityReached} from './planning-capacity';
 
 export type ReplanningPolicy={automatic:boolean};
 export function parseReplanReply(body:unknown){
@@ -129,7 +130,7 @@ export class SpecRequests{
   for(const j of jobs){
    const revision=latestRevision(this.s,j.id)?.id;
    try{results.push({job:j.id,...await this.syncOne(j.id,c)});}catch(e){
-    const reason=e instanceof Error?e.message:'Replanning blocked',state=latestRevision(this.s,j.id)?.id!==revision?'superseded':/busy|quiescence/.test(reason)?'waiting_for_worker':'blocked';
+    const reason=e instanceof Error?e.message:'Replanning blocked',state=latestRevision(this.s,j.id)?.id!==revision?'superseded':e instanceof PlanningCapacityReached?'waiting_for_planning_capacity':/busy|quiescence/.test(reason)?'waiting_for_worker':'blocked';
     this.s.db.query('UPDATE spec_requests SET state=?,reason=? WHERE revision=?').run(state,reason,revision??'');
     results.push({job:j.id,revision,state,reason,nextAction:revisionStatus(this.s,j.id)?.nextAction});
    }

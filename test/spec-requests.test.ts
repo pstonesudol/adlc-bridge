@@ -17,6 +17,7 @@ import {planningPRFixture} from './planning-pr-fixture';
 import {featureGit} from '../src/approval-policy';
 import {ReviewLoop} from '../src/review-loop';
 import {Lifecycle} from '../src/lifecycle';
+import {activePlanning,PlanningCapacityReached} from '../src/planning-capacity';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const human='11111111-1111-4111-8111-111111111111';
@@ -45,6 +46,73 @@ function fixture(path=':memory:'){
  const complete=(paths=['src/update.ts'])=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.session.activity.state='idle';e.transcript.turns.at(-1).state='completed';e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:d.client_id,sequence:e.transcript.entries.length+1,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nRevised plan\n<!-- ADLC_PLAN_SCOPE ${JSON.stringify({version:1,paths})} -->\n${ready}`});};
  return {get s(){return s;},get w(){return w;},get requests(){return requests;},get recovery(){return recovery;},c,job,e,sends,comments,api,edit,row,reply,complete,snapshot,creates:()=>creates,lose:()=>lose=true,reopen:()=>{s.close();s=new Store(path);wire();}};
 }
+function capacityPeer(f:ReturnType<typeof fixture>,state='planning',project='p'){
+ const job=f.s.enqueue(project,`capacity-${state}-${project}`,JSON.stringify({identifier:'CAP-1',title:'Other planner',description:'Original'}));
+ f.s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(job,digest(f.s.get(job).spec),state,'other-owner',null,`capacity-${job}`);
+ return job;
+}
+for(const automatic of [true,false])test(`capacity wait retains ${automatic?'automatic':'authenticated human'} intent and dispatches once after a slot is free`,async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=1;f.c.replanning={automatic};f.edit('revised');
+  if(!automatic){await f.requests.sync(f.c);f.reply();}
+  const peer=capacityPeer(f);let routed=0;
+  f.c.routing={enabled:true};f.w.router.choose=async()=>{routed++;throw Error('Capacity must be checked before routing');};
+  expect((await f.requests.sync(f.c)).find(r=>r.job===f.job)).toMatchObject({state:'waiting_for_planning_capacity',nextAction:expect.stringContaining('Wait for configured planning capacity')});
+  expect(f.row()).toMatchObject({source:automatic?'automatic':'human',state:'waiting_for_planning_capacity'});
+  expect(routed).toBe(0);expect(f.sends).toHaveLength(0);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();
+  f.s.db.query("UPDATE planning_dispatch SET state='planning_finished' WHERE job=?").run(peer);delete f.c.routing;
+  await f.requests.sync(f.c);await f.requests.sync(f.c);expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+for(const state of ['dispatch_uncertain','needs_reconciliation','restore_reserved','restore_setup_consumed'])test(`capacity includes another job's ${state} reservation`,async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=1;f.c.replanning={automatic:true};f.edit('revised');
+  const peer=capacityPeer(f,state.startsWith('restore_')?'planning_finished':state);
+  if(state.startsWith('restore_'))f.s.db.query('INSERT INTO planning_restores VALUES (?,?,?,?,NULL)').run(peer,`restore-${state}`,state.slice('restore_'.length),'{}');
+  expect((await f.requests.sync(f.c)).find(r=>r.job===f.job)?.state).toBe('waiting_for_planning_capacity');expect(f.sends).toHaveLength(0);
+ }finally{f.s.close();}
+});
+test('new replan replaces its settled owner slot and does not consume another project capacity',async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=1;f.c.replanning={automatic:true};f.edit('revised');
+  f.s.db.query("UPDATE planning_dispatch SET state='planning' WHERE job=?").run(f.job);capacityPeer(f,'planning','other-project');
+  await f.requests.sync(f.c);expect(f.sends).toHaveLength(1);
+  expect(f.s.db.query(`SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project='p' AND ${activePlanning}`).get()).toEqual({n:1});
+ }finally{f.s.close();}
+});
+test('already-dispatched uncertain replan still reconciles and captures when capacity is full',async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=1;f.c.replanning={automatic:true};f.edit('revised');f.lose();await f.requests.sync(f.c);capacityPeer(f);
+  expect((await f.requests.sync(f.c)).find(r=>r.job===f.job)?.state).toBe('actively_replanning');expect(f.sends).toHaveLength(1);
+  f.complete();expect(await f.w.reconcilePlanning(f.job,f.c)).toMatchObject({state:'awaiting_approval'});expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+for(const change of ['new-reservation','lower-limit'])test(`direct reconciliation rechecks capacity atomically after ${change} during authorization`,async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=change==='lower-limit'?2:1;f.edit('revised');if(change==='lower-limit')capacityPeer(f);
+  const preview=await f.recovery.preview(f.job,f.c);
+  await expect(f.recovery.reconcile(f.job,f.c,preview.confirmation,async()=>{
+   if(change==='lower-limit')f.c.automation.maxPlanning=1;else capacityPeer(f);
+  })).rejects.toBeInstanceOf(PlanningCapacityReached);
+  expect(f.sends).toHaveLength(0);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();
+ }finally{f.s.close();}
+});
+test('overlapping revised tickets share one project slot rather than all dispatching in the poll',async()=>{
+ const f=fixture();try{
+  f.c.automation.maxPlanning=1;f.c.replanning={automatic:true};f.edit('first revision');
+  const second=capacityPeer(f,'awaiting_approval'),p=new Planning(f.s),run=p.reserve(second,'dev110-test');p.gate(second,'dev110-test','other-owner',run.branch,'/other-worktree');
+  f.s.propose(second,'Original plan\n'+ready);f.s.enqueue('p',f.s.get(second).issue,JSON.stringify({identifier:'CAP-1',title:'Other planner',description:'Second revision'}));
+  new ApprovalPolicyStore(f.s).snapshot('p',new Set(['issue',f.s.get(second).issue]));
+  const e=structuredClone(f.e);e.session.id='other-owner';e.session.branch=run.branch;
+  const w=new Workflow(f.s,{...f.w.t,evidence:async()=>e,worktree:async()=>({branch:run.branch,head:'a'.repeat(40),tree:'/other-worktree'}),sendImplementation:async(session,text,clientId,mode)=>{f.sends.push({session,text,clientId,mode});e.transcript.controller='busy';}});
+  const issue=()=>({id:f.s.get(second).issue,...JSON.parse(f.s.get(second).spec),project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}});
+  const requests=new SpecRequests(f.s,w,async()=>({issue:issue()}),new SpecRecovery(f.s,w,async()=>issue(),async op=>op()));
+  const results=await Promise.allSettled([f.requests.syncOne(f.job,f.c),requests.syncOne(second,f.c)]);
+  expect(results.filter(r=>r.status==='fulfilled')).toHaveLength(1);expect(results.filter(r=>r.status==='rejected'&&r.reason instanceof PlanningCapacityReached)).toHaveLength(1);
+  expect(f.sends).toHaveLength(1);expect(f.s.db.query('SELECT count(*) AS n FROM spec_replans').get()).toEqual({n:1});
+  expect(f.s.db.query(`SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project='p' AND ${activePlanning}`).get()).toEqual({n:1});
+ }finally{f.s.close();}
+});
 test('DEV-106: obsolete clarification, second edit, bad replies, busy handoff, restart during dispatch, exact fresh grant',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'dev110-')),f=fixture(join(dir,'state.db'));
  try{

@@ -10,6 +10,7 @@ import {readBranchSnapshot} from './branch-updates';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
 import {readPlanningPRs} from './planning-prs';
+import {assertPlanningCapacity} from './planning-capacity';
 
 export async function assertCurrentPlanningRequirements(s:Store,job:string,c:WorkflowConfig,read=readLinearIssue){
  const j=s.get(job),issue=await read(j.issue),lc=c as any;
@@ -132,7 +133,8 @@ export class SpecRecovery{
    if(!preview.proof||preview.confirmation!==confirmation)throw Error('Preview changed or delivery already reserved; refresh evidence, never replay');
    // Receipt-only reconciliation above remains available while paused. A new
    // replanning turn must honor the project pause before routing/reservation.
-   assertProjectReferenceIntakeEnabled(this.s.get(job).project,this.s);assertConfiguredProjectIntakeEnabled(c,this.s);
+    assertProjectReferenceIntakeEnabled(this.s.get(job).project,this.s);assertConfiguredProjectIntakeEnabled(c,this.s);
+    assertPlanningCapacity(this.s,c,job);
    const proof=preview.proof,priorRow=this.s.db.query('SELECT client_id FROM spec_replans WHERE revision=?').get(preview.revision) as any;
    // Attempts for one revision replace the row, so the job-wide count never grows.
    // Derive the next suffix from this revision's recorded client ID.
@@ -143,7 +145,8 @@ export class SpecRecovery{
     if(authorize)await authorize();
    this.s.db.transaction(()=>{
     if(latestRevision(this.s,job)?.id!==proof.revision||digest(this.s.get(job).spec)!==proof.spec||this.s.get(job).state!=='awaiting_plan')throw Error('Requirements changed before reservation');
-    assertWorktreeAvailable(this.s,job);
+     assertWorktreeAvailable(this.s,job);
+     assertPlanningCapacity(this.s,c,job);
      this.s.db.query("INSERT INTO spec_replans VALUES (?,?,?,?,?,'delivery_uncertain',?,NULL) ON CONFLICT(revision) DO UPDATE SET client_id=excluded.client_id,session=excluded.session,binding=excluded.binding,state=excluded.state,proof=excluded.proof,reason=NULL").run(proof.revision,job,clientId,proof.session,confirmation,JSON.stringify({...proof,attemptedAt:Date.now()}));
      this.s.db.query("UPDATE planning_dispatch SET state='revision_pending' WHERE job=?").run(job);
    }).immediate();

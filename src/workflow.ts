@@ -23,11 +23,10 @@ import {assertRequiredIntegrations} from './integration-capabilities';
 import {RoutePreflightFailure} from './routing-session';
 import {ensureDispatchRoutes,recordDispatchRoute} from './dispatch-route';
 import type {PlanningPRInventory} from './planning-prs';
+import {activePlanning,assertPlanningCapacity} from './planning-capacity';
 
 export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
-// Uncertain and reconciliation-blocked reservations always consume capacity.
-// Completed planning dispatches release their slot even if manually proposed.
-export const activePlanning="(EXISTS (SELECT 1 FROM planning_restores restore WHERE restore.job=d.job AND restore.state IN ('reserved','setup_consumed')) OR d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
+export {activePlanning} from './planning-capacity';
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
@@ -82,7 +81,6 @@ export class Workflow{
   private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
    assertRequiredIntegrations(c);
    assertWorktreeAvailable(this.s,job);
-   const {maxPlanning}=effectiveSettings(c);
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
   if(this.planning(job))return this.reconcilePlanning(job,c);
   const specification=this.s.get(job).spec;
@@ -93,8 +91,7 @@ export class Workflow{
    const j=this.s.get(job);if(j.project!==c.linear.projectId||j.state!=='awaiting_plan')throw Error('Eligible project job required');
    if(this.planning(job))return null;
    if(route&&this.router.get(job,'planning')?.binding!==digest(j.spec))throw Error('Specification changed during route selection');
-   const active=this.s.db.query(`SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND ${activePlanning}`).get(c.linear.projectId) as any;
-   if(active.n>=maxPlanning)throw Error('Planning concurrency limit reached');
+    assertPlanningCapacity(this.s,c);
    const p=new Planning(this.s),r=p.reserve(job,c.automation!.orchestratorProject);
    this.s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,client_id) VALUES (?,?,?,?)').run(job,digest(j.spec),'dispatch_uncertain',`adlc-plan-${r.correlation}`);
    const args=p.request(job,false,c.approval);return {r,args,clientId:`adlc-plan-${r.correlation}`};
