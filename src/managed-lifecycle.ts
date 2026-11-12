@@ -11,6 +11,7 @@ import {sessionEvidence} from './session-evidence';
 import {OperatorError} from './operator-cli';
 import {turnBarrier,TurnSubmissionBlocked,projectIntakePaused,setProjectIntakePaused,type TurnBarrier} from './turn-submission';
 import {recoverRegisteredProjects,assertRecoveryAvailable} from './recovery-runtime';
+import {saveRestartProof,loadRestartProof,recordVerifiedRestart,restartResult,restartIdentity,restartPreviewCommand} from './restart-proof';
 
 export type LifecycleAction='start'|'stop'|'restart'|'status';
 export type LifecycleOptions={project?:string;all?:boolean;mode?:'pause'|'drain'|'workers';timeout:number;persistent?:boolean;preview?:boolean;apply?:boolean;confirm?:string};
@@ -34,11 +35,16 @@ export function lifecycleConfirmation(action:LifecycleAction,o:LifecycleOptions,
   // Activity may finish naturally after preview. Identity/ownership must not change.
   workers:inventory.workers.map(w=>[w.session,w.project,w.branch,w.worktree,w.owned,includeTurns?[...(w.turns??[])].sort():null]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))}));
 }
-export async function controlManagedLifecycle(action:LifecycleAction,o:LifecycleOptions,ops:LifecycleOps,deadline=ops.now()+o.timeout*1000){
+export async function controlManagedLifecycle(action:LifecycleAction,o:LifecycleOptions,ops:LifecycleOps,deadline=ops.now()+o.timeout*1000,state?:string){
  const entries=await ops.projects(),ids=o.all?entries.map(x=>x.project):o.project?[o.project]:entries.length===1?[entries[0].project]:[];
  if(!ids.length&&!o.all)throw new OperatorError('Specify a registered project or --all; no project was selected',entries.length?4:3);
  if(ids.some(id=>!entries.some(e=>e.project===id)))throw new OperatorError('Unknown project; use adlc projects',3);
- const persistent=o.persistent??!!o.all;
+  const persistent=o.persistent??!!o.all;
+  const proofBinding={action,all:!!o.all,projects:[...ids].sort(),mode:o.mode??null,persistent,timeout:o.timeout};
+  const savedRestart=action==='restart'&&o.all&&!!state;
+  const rerun=restartPreviewCommand(proofBinding);
+  if(savedRestart&&o.apply&&!o.confirm)o={...o,confirm:loadRestartProof(state!,{...proofBinding,backend:await ops.backend()},ops.now())};
+  const initialIdentity=savedRestart?restartIdentity(state!):null;
   const result:any={scope:o.all?'all':'project',projects:ids,action,mode:o.mode??(action==='start'?'start':action==='restart'?'restart':o.all?'shutdown':'pause'),persistent,globalIntakePaused:ops.turns.isPaused(),services:[],workers:null,children:null,inventoryComplete:false,errors:[],resume:'Existing sessions and worktrees are preserved; startup recovery requires exact receipts and unchanged current authorization. Ambiguous jobs remain blocked.'};
  const tracked=new Map<string,ProcessIdentity>();
  const scoped=(i:Inventory)=>i.workers.filter(w=>w.owned&&ids.includes(w.project));
@@ -47,12 +53,17 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   for(const id of ids)try{result.services.push(await ops.project('service-status',id,persistent));}catch(e){result.errors.push({project:id,message:message(e)});}
   try{result.backend=await ops.backend();}catch(e){result.errors.push({resource:'backend',message:message(e)});}
   try{await observe();}catch(e){result.inventoryComplete=false;result.errors.push({resource:'workers/processes',message:message(e)});}
-  result.complete=!result.errors.length&&result.inventoryComplete===true;return result;
+   if(state)try{result.restartVerification=restartResult(state);result.restartVerificationNote='Historical verified result; current backend/services above are independently observed.';}catch{result.errors.push({resource:'restart',message:'Saved restart verification unavailable'});}
+   result.complete=!result.errors.length&&result.inventoryComplete===true;return result;
  }
  const disruptive=action==='restart'||action==='stop'&&o.mode!=='pause'&&(!!o.all||!!o.mode);
  if(o.preview||disruptive&&!o.apply){
   const i=disruptive?await observe():{workers:[],children:[],complete:true,externalProcesses:'Not inspected'};
-  result.preview=true;result.confirm=lifecycleConfirmation(action,o,ids,i);result.note=disruptive?'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.':'Preview only. Re-run without --preview to start or pause coordination; no worker interruption is performed.';return result;
+   result.preview=true;result.confirm=lifecycleConfirmation(action,o,ids,i);
+   if(savedRestart){
+    if(i.complete){const backend=await ops.backend();if(backend.managed&&backend.ready){saveRestartProof(state!,{...proofBinding,backend},result.confirm,ops.now());result.savedPreview=true;}}
+   }
+   result.note=savedRestart?(result.savedPreview?'Preview saved for ten minutes. Re-run the same options with --apply; --apply --confirm HASH remains supported.':'Incomplete preview was not saved. Resolve unknown evidence and run adlc restart --all again before --apply.'):'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.';return result;
  }
  return ops.turns.run(async()=>{
   const time=()=>{if(ops.now()>=deadline)throw Error('Lifecycle timeout; remaining resources are reported. No force escalation was attempted');};
@@ -61,7 +72,14 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   const wait=async(test:()=>Promise<boolean>)=>{for(;;){time();if(await test())return;await ops.sleep(Math.min(200,Math.max(1,deadline-ops.now())));}};
   try{
    time();
-   if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error('Confirmation missing or stale; preview the exact action again');confirmed=lifecycleConfirmation(action,o,ids,i,false);for(const w of i.workers)allowedTurns.set(w.session,new Set(w.turns??[]));}
+    if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error(savedRestart?`Confirmation missing or stale; run ${rerun}`:'Confirmation missing or stale; preview the exact selected action again');
+     if(savedRestart){if(initialIdentity!==restartIdentity(state!))throw Error(`Restart identity changed; run ${rerun}`);
+      if(!o.apply||!o.confirm)throw Error('Restart apply confirmation missing');
+      // The wrapper's initial read is not enough: revalidate backend identity
+      // again under the shared lifecycle/submission lock before any service stop.
+      if(!o.confirm||o.confirm!==loadRestartProof(state!,{...proofBinding,backend:await ops.backend()},ops.now()))throw Error(`Restart proof changed; run ${rerun}`);
+      if(o.mode!=='workers'&&o.mode!=='drain'&&i.workers.some(w=>ids.includes(w.project)&&w.busy))throw Error(`Worker became busy; after work is idle run ${rerun}`);}
+     confirmed=lifecycleConfirmation(action,o,ids,i,false);for(const w of i.workers)allowedTurns.set(w.session,new Set(w.turns??[]));}
    const start=async()=>{
     time();
     let releaseGlobal=false;
@@ -118,9 +136,13 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
      if(result.backend.loaded||result.backend.ready||remaining.length)throw Error('Shutdown incomplete; managed backend or observed child processes remain');
     }else await ops.checkpoint();
    }else await ops.checkpoint();
-   if(action==='restart'){
+    if(action==='restart'){
     result.shutdown={backend:result.backend,remainingObservedChildren:result.children};
-    await start();result.children=null;result.childrenAfterRestart='Not re-inventoried; use services status. The new backend and intake are running.';
+     await start();result.children=null;result.childrenAfterRestart='Not re-inventoried; use services status. The new backend and intake are running.';
+     if(savedRestart){
+      const services=[];for(const id of ids)services.push(await ops.project('service-status',id,persistent));
+      result.restartVerification=recordVerifiedRestart(state!,{backend:await ops.backend(),services:services.filter(s=>!s.intakePaused),observedAt:ops.now()});
+     }
    }
     result.globalIntakePaused=ops.turns.isPaused();result.complete=true;result.note=action==='restart'?'Selected coordination restarted; see startup recovery outcomes. Original submissions are never replayed.':o.all&&o.mode!=='pause'?'Managed stack shutdown verified for observed processes. Unrelated apps/windows and detached external processes are not controlled.':'Selected coordination stopped; unrelated services and workers are preserved.';return result;
   }catch(e){result.globalIntakePaused=ops.turns.isPaused();result.complete=false;result.errors.push({message:message(e)});throw new LifecycleFailure(message(e),result);}
@@ -250,7 +272,7 @@ export function liveLifecycleOps(o:LifecycleOptions,path=registryPath(),state=ap
 export async function managedLifecycle(action:LifecycleAction,o:LifecycleOptions,path=registryPath(),state=appState()){
  if(process.platform!=='darwin')throw Error('Managed lifecycle controls require macOS');
  const deadline=Date.now()+o.timeout*1000;
-  const run=()=>{if(action==='start'||action==='restart')assertRecoveryAvailable(state);return controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline),deadline);};
+   const run=()=>{if(action==='start'||action==='restart')assertRecoveryAvailable(state);return controlManagedLifecycle(action,o,liveLifecycleOps(o,path,state,deadline),deadline,state);};
  if(action==='status'||o.preview||!o.apply&&(action==='restart'||action==='stop'&&o.mode!=='pause'&&(o.all||o.mode)))return run();
   // A busy tick is not interrupted. Only proved-dead lock generations may be
   // reclaimed; delivery receipts remain uncertain until separately reconciled.

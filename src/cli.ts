@@ -10,7 +10,7 @@ import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {Store} from './core';
 import {PlanningRestore} from './planning-restore';
-import {recoverProject} from './recovery-runtime';
+import {recoverProject,assertRecoveryAvailable} from './recovery-runtime';
 import {ApprovalPolicyStore} from './approval-policy';
 import {serviceControl,registeredProjects} from './service-control';
 import {lifecycleCLI} from './lifecycle-cli';
@@ -533,6 +533,7 @@ Registered approved review targets can request bounded in-scope fixes from their
       const job=req(a[0],'Job');
       if(s.get(job).project!==c!.linear.projectId)throw Error('Job project does not match configured project');
       const result=await runPollTick(async()=>{
+       assertRecoveryAvailable();
        assertConfiguredProjectIntakeEnabled(c!,s);
        await poll(c!,s,linearToken());
        const stage=await workflow.resume(job,c!);

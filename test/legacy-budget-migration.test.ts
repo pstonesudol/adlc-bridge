@@ -2,7 +2,7 @@ import {test,expect} from 'bun:test';
 import {Store,digest} from '../src/core';
 import {Lifecycle} from '../src/lifecycle';
 import {ReviewLoop} from '../src/review-loop';
-import {mkdtempSync,rmSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
@@ -43,6 +43,18 @@ function legacyFixture(path=':memory:'){
 }
 
 const options=(f:ReturnType<typeof legacyFixture>)=>({actor:'Patrick Stone-Sudol',additional:2,head:f.head,policy,reason:'reviewed legacy receipts'});
+
+test('grouped budget preview runs real engine on snapshot; apply preserves consumed history',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'operator-budget-')),path=join(dir,'state.sqlite'),config=join(dir,'config.json');
+ try{
+  const project='00000000-0000-0000-0000-000000000001',f=legacyFixture(path);f.s.db.query('UPDATE jobs SET project=? WHERE id=?').run(project,f.id);f.s.close();writeFileSync(config,JSON.stringify({version:1,name:'Fixture',repo:dir,requiredChecks:['CI'],linear:{projectId:project,teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'}}));
+  const args=['jobs','extend-budget','DEV-15',config,'--project',project,'--human','Human','--additional','2','--head',f.head,'--json'];
+  const run=(extra:string[]=[])=>Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),...args,...extra],{env:{ADLC_DB:path,HOME:dir,PATH:process.env.PATH??'/usr/bin:/bin'}});
+  const before=readFileSync(path),p=run();expect(p.exitCode,p.stderr.toString()).toBe(0);const preview=JSON.parse(p.stdout.toString()).data;expect(preview.preview).toBe(true);expect(preview.budget.consumed).toBe(5);expect(readFileSync(path)).toEqual(before);expect(run().stdout.toString()).toBe(p.stdout.toString());
+  const apply=run(['--apply','--confirm',preview.confirmHash]);expect(apply.exitCode).toBe(0);expect(JSON.parse(apply.stdout.toString()).data).toMatchObject({preview:false,budget:{consumed:5,extensions:2}});
+  const s=Store.readonly(path);try{expect(s.get(f.id).attempts).toBe(5);expect((s.db.query('SELECT count(*) AS n FROM remediation_budget_extensions').get() as any).n).toBe(1);}finally{s.close();}
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
 
 test('legacy pre-budget exhaustion migrates once and extend-budget recovers without resetting attempts',()=>{
   const f=legacyFixture();
