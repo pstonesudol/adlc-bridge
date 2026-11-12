@@ -49,12 +49,16 @@ export class LinearApprovals{
    return paths;
   }
   async comments(issue:string){
-  const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
+   const result:any[]=[];let after:string|null=null;const seen=new Set<string>(),ids=new Set<string>();
   do{
    const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body createdAt editedAt user{id app} botActor{id}}pageInfo{hasNextPage endCursor}}}}',{id:issue,after});
    const page=b.issue?.comments;
    if(b.issue?.id!==issue||!Array.isArray(page?.nodes)||typeof page.pageInfo?.hasNextPage!=='boolean')throw Error('Incomplete approval comment inventory');
-   result.push(...page.nodes);if(result.length>1000)throw Error('Approval comment inventory exceeds safe bound');
+    for(const comment of page.nodes){
+     if(typeof comment?.id!=='string'||!comment.id||ids.has(comment.id))throw Error('Ambiguous approval comment identity; complete unique inventory required');
+     ids.add(comment.id);result.push(comment);
+    }
+    if(result.length>1000)throw Error('Approval comment inventory exceeds safe bound');
    if(!page.pageInfo.hasNextPage)return result;
    after=page.pageInfo.endCursor;if(!after||seen.has(after))throw Error('Invalid approval comment cursor');seen.add(after);
   }while(true);

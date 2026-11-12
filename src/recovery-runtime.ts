@@ -19,6 +19,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {disableNativeFeedback} from './ao-policy';
 import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {createLinearAPI,readLinearIssue} from './linear-api';
+import {readPlanningPRs} from './planning-prs';
 
 type RecoveryIODependencies={spawn?:typeof Bun.spawn;send?:typeof fetch;now?:()=>number;trust?:typeof trustedDaemon;registry?:typeof restoreRegistry;token?:typeof linearToken};
 // Scope all recovery I/O to one absolute deadline, not a fresh allowance for
@@ -40,7 +41,8 @@ export function createRecoveryIO(s:Store,deadline:number,submit=withTurnSubmissi
  transport.preflightRoute=route=>preflightRoute(route,api);
  transport.configureRoute=(id,route)=>configureSessionRoute(id,route,api);
  transport.worktree=job=>worktreeIdentity(s,job,run);
- transport.branchSnapshot=(repo,pr)=>readBranchSnapshot(repo,pr,async args=>JSON.parse(await run(['gh',...args])));
+  transport.branchSnapshot=(repo,pr)=>readBranchSnapshot(repo,pr,async args=>JSON.parse(await run(['gh',...args])));
+  transport.planningPRs=(repo,branch)=>readPlanningPRs(repo,branch,async args=>JSON.parse(await run(['gh',...args])));
  const linear=createLinearAPI(send,deps.token??linearToken);
  return {remaining,spawn,send,run,api,transport,
   inspect:(store:Store,job:string,c:any)=>restoreRepository(store,job,c,run,deps.registry??restoreRegistry),

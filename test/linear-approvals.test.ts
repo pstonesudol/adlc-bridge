@@ -10,6 +10,7 @@ import {latestRevision} from '../src/spec-revisions';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {planningPRFixture} from './planning-pr-fixture';
 function fixture(path=':memory:'){
  const s=new Store(path),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
@@ -94,6 +95,7 @@ test('restored spec and plan hashes publish a revision-specific notice and rejec
   f.c.automation.planningEnabled=true;
   const p=new Planning(f.s).get(f.id),e:any={session:{id:'worker',projectId:'ao',branch:p.branch,isTerminated:false,prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[],turns:[{id:'initial-plan',state:'completed'}]}};
   f.w.t.evidence=async()=>e;f.w.t.worktree=async()=>({branch:p.branch,head:'a'.repeat(40),tree:'/worktree'});
+  f.w.t.planningPRs=planningPRFixture(()=>e);
   f.w.t.sendImplementation=async(_session,_text,clientId)=>{
    e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:1});
    e.transcript.turns.push({id:clientId,state:'completed'});

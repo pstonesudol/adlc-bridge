@@ -2279,6 +2279,28 @@ not an unrelated clarification loop. Merges remain human-only; deployment and
 other existing restrictions are unchanged. Existing sessions and PRs are retained;
 when no PR exists, the first may be opened only during later authorized implementation.
 
+Replanning now queries every GitHub PR state for the exact configured repository
+and owned branch with bounded, complete pagination. A fresh verified empty result
+is explicit **no-PR context**, not a request to supply a PR number. The planner
+must stay in the same worker/worktree and defer first PR creation to later current
+plan approval and scoped Git authorization. A verified existing open PR must
+match the native attachment, worktree HEAD and recorded review target. Closed PRs,
+partial/failed lookup, duplicate or multiple identities, or attachment/head
+conflicts stop dispatch with an evidence-reconciliation action; none can be
+interpreted as “no PR.” The preview binding is rechecked before reservation.
+
+Linear comment inventories reject duplicate IDs before admission and again before
+dispatch. Enabling automatic policy supersedes stale **undispatched** human intent;
+it never replaces an in-flight delivery. Explicit negative notice acknowledgements
+can retry using the same durable ID. Transport/GraphQL errors remain uncertain
+because they can partially succeed: polling reconciles an existing notice by ID,
+or the operator uses the reported `spec-reconcile JOB CONFIG` preview/confirmation
+to request planning without blindly reposting. A missing or malformed revised-plan
+scope receipt is rejected by direct CLI approval as well as standing/Linear gates.
+For the same verified existing PR, fresh revised authorization can reconcile its
+review-target paths atomically with the exact new job grant and resets stale review
+evidence; ordinary review registration still cannot widen scope.
+
 Use `adlc spec-reconcile JOB CONFIG` for a read-only preview. It refreshes Linear,
 owner, worktree and attached PR evidence. `--confirm HASH` authorizes **only a
 planning turn in the existing owner** when that exact evidence remains valid.

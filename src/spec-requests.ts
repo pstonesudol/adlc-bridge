@@ -65,7 +65,7 @@ export class SpecRequests{
    this.s.db.query('UPDATE spec_requests SET state=?,reason=NULL WHERE revision=?').run(state,r.id);return {state,revision:r.id};
   }
   if(c.replanning?.automatic===true){
-   this.s.db.query("UPDATE spec_requests SET source='automatic',state='accepted',reason=NULL WHERE revision=? AND source IS NULL").run(r.id);
+   this.s.db.query("UPDATE spec_requests SET source='automatic',state='accepted',reply=NULL,reason=NULL WHERE revision=? AND (source IS NULL OR source='human') AND NOT EXISTS (SELECT 1 FROM spec_replans WHERE revision=?)").run(r.id,r.id);
   }else{
    // Revoking automatic policy also revokes undispatched automatic intent.
    this.s.db.query("UPDATE spec_requests SET source=NULL WHERE revision=? AND source='automatic'").run(r.id);
@@ -87,8 +87,14 @@ export class SpecRequests{
    }else{
     await this.guard(job,c,r.id,binding);
     const claim=this.s.db.query("UPDATE spec_requests SET notice_state='delivery_uncertain' WHERE revision=? AND notice_state='reserved'").run(r.id);
-    if(!claim.changes)throw Error('Notice delivery uncertain or missing; inspect before retrying, never repost blindly');
+    if(!claim.changes)throw Error(`Notice delivery uncertain or missing. Inspect Linear comment ${n.comment_id}; normal polling reconciles it if present. If absence cannot be authoritatively established, use spec-reconcile ${job} CONFIG preview/confirmation to request planning without reposting the notice`);
     const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}}),posted=b.commentCreate?.comment;
+    if(b.commentCreate?.success===false&&!posted){
+     // Only an explicit negative mutation acknowledgement is definite failure.
+     // Transport/GraphQL errors can be partial successes and retain uncertainty.
+     this.s.db.query("UPDATE spec_requests SET notice_state='reserved' WHERE revision=? AND notice_state='delivery_uncertain'").run(r.id);
+     throw Error('Linear rejected notice creation; normal polling can retry the same durable comment ID');
+    }
     if(!b.commentCreate?.success||posted?.id!==n.comment_id||posted.body!==n.body||!Number.isFinite(Date.parse(posted.createdAt)))throw Error('Replan notice delivery uncertain; inspect without replay');
     this.s.db.query("UPDATE spec_requests SET notice_state='posted',state='awaiting_replan_confirmation',created=? WHERE revision=?").run(posted.createdAt,r.id);
     return {state:'awaiting_replan_confirmation',revision:r.id};

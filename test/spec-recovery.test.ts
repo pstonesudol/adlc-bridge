@@ -19,6 +19,7 @@ import {jobViews,humanJobs} from '../src/operator-cli';
 import {routingConfig,settings} from './routing-fixture';
 import {RoutePreflightFailure} from '../src/routing-session';
 import {StartupRecovery} from '../src/startup-recovery';
+import {planningPRFixture} from './planning-pr-fixture';
 
 const ready='<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -126,6 +127,7 @@ async function fixture(database=':memory:'){
  const s=new Store(database),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
  let e:any,sends:any[]=[];
  const transport:any={evidence:async()=>e,worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40),tree:'/worktree'}),disableFeedback:async()=>{},branchSnapshot:async()=>({branch:e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),sendImplementation:async(session:string,text:string,clientId:string,mode?:string)=>{sends.push({session,text,clientId,mode});e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:e.transcript.entries.length+1});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';}};
+ transport.planningPRs=planningPRFixture(()=>e);
  const w=new Workflow(s,transport),p=new Planning(s),r=p.reserve(job,'project');p.gate(job,'project','owner',r.branch,'/worktree');
  s.db.query("INSERT INTO planning_dispatch VALUES (?,?, 'awaiting_approval', 'owner',NULL,'initial')").run(job,digest(s.get(job).spec));
  const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(job);
