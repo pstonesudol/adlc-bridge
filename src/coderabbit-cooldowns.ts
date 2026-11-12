@@ -41,7 +41,7 @@ function providerText(body:any):string|null{
  if(/^ {0,3}(?:`{3}|~{3})/m.test(text)||/<(?:blockquote|pre|code)\b/i.test(text))return null;
  return text.split('\n').filter(line=>!/^\s*>/.test(line)).join('\n');
 }
-export type ThrottleEvidence={id:string;version:string;at:number;head:string;request?:string;reset:number|null;timing:string;guidance?:string;scope?:string;kind?:'already-reviewed'};
+export type ThrottleEvidence={id:string;version:string;at:number;started?:number;head:string;request?:string;reset:number|null;timing:string;guidance?:string;scope?:string;kind?:'already-reviewed'};
 const guidance=(text:string)=>text.split(/\n|(?<=[.!?])\s+/).filter(s=>/available (?:in|at|after)|retry (?:after|in|at)|try again in/i.test(s)).map(s=>s.trim()).join('\n');
 const resultLead=(text:string)=>text.replace(/^(?:<details>\s*|<summary>Action not completed<\/summary>\s*|<dl>\s*|<dd>\s*|<br\s*\/?>\s*)*/i,'').trim().replace(/^#{1,6}\s+/,'');
 export type RabbitObservation={repo:string;pr:number;head:string;comments:any[];checks:any[];author?:{id:number;login:string};observed:number};
@@ -61,7 +61,7 @@ export function throttleEvidence(o:RabbitObservation,receipts:any[],query?:any):
   const text=providerText([c.output?.title,c.output?.summary,c.output?.text].filter(Boolean).join('\n')),at=stamp(c.completed_at??c.started_at);
    if(!text||!/^(?:Review rate limited|Rate limit (?:exceeded|reached))\b/i.test(c.output?.title??'')||!Number.isFinite(at)||at>o.observed)continue;
   const request=receipts.filter(r=>r.head===o.head&&stamp(c.started_at)+1000>=r.requested&&at+1000>=r.requested).sort((a,b)=>b.requested-a.requested)[0];
-  result.push({id:`check:${c.id}`,version:digest(JSON.stringify([c.completed_at,c.output])),at,head:o.head,request:request?`${request.head}:${request.attempts}`:undefined,reset:resetTime(text,at),timing:text,guidance:guidance(text)});
+  result.push({id:`check:${c.id}`,version:digest(JSON.stringify([c.completed_at,c.output])),at,started:stamp(c.started_at),head:o.head,request:request?`${request.head}:${request.attempts}`:undefined,reset:resetTime(text,at),timing:text,guidance:guidance(text)});
  }
  for(const c of o.comments){
   if(!trustedRabbit(c)||!Number.isSafeInteger(c.id)||c.issue_url!==`https://api.github.com/repos/${o.repo}/issues/${o.pr}`)continue;
@@ -104,12 +104,17 @@ export class CodeRabbitCooldowns{
   assertObservationFence();const p=cooldownPolicy(config);
   return this.s.db.transaction(()=>{
    let c=this.get(o.repo,o.pr);const evidence=throttleEvidence(o,receipts,c?this.query(c):null);
+   // Freeze the history boundary before processing a batch. Initializing the
+   // ledger during this poll must not discard other provider events that also
+   // occurred before the poll, especially a newer throttle after a review.
+   const earliest=c?(this.s.db.query('SELECT MIN(at) AS at FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND cycle=?').get(o.repo,o.pr,c.cycle) as any).at:null;
+   const historyAfter=c?(c.state==='completed'?c.next_action:earliest??c.started):null;
    for(const e of evidence){
     if(this.s.db.query('SELECT 1 FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND id=? AND version=?').get(o.repo,o.pr,e.id,e.version))continue;
     // Historical evidence cannot open or mutate a later cycle. A cooldown is
     // conservative evidence, never a license to replay an unbound request.
-    const prior=this.s.db.query('SELECT * FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND id=? ORDER BY observed LIMIT 1').get(o.repo,o.pr,e.id) as any;
-    if(c&&e.at+1000<c.started&&!prior||this.now()-e.at>24*60*60000)continue;
+    const prior=this.s.db.query('SELECT * FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND id=? ORDER BY observed DESC,rowid DESC LIMIT 1').get(o.repo,o.pr,e.id) as any;
+    if(historyAfter!==null&&e.at+1000<historyAfter&&!prior||this.now()-e.at>24*60*60000)continue;
     if(!c||c.state==='completed'){
      if(e.kind==='already-reviewed')continue;
      if(c&&e.at<=c.next_action)continue;
@@ -124,7 +129,10 @@ export class CodeRabbitCooldowns{
     // throttle outcomes after an actual reserved retry start the next episode.
     const fresh=!prior;
     const latest=receipts.filter(r=>['accepted','delivery_uncertain'].includes(r.state)).sort((a,b)=>b.requested-a.requested)[0];
-    const outcomeBound=!latest||e.request===`${latest.head}:${latest.attempts}`;
+    // A fresh authenticated automatic run on the latest pushed head can
+    // supersede an older delivered request, never an uncertain delivery.
+    const supersedingThrottle=latest?.state==='accepted'&&latest.head!==o.head&&e.head===o.head&&e.id.startsWith('check:')&&Number.isFinite(e.started)&&e.started!<=e.at&&e.started!+1000>=latest.requested;
+    const outcomeBound=!latest||e.request===`${latest.head}:${latest.attempts}`||supersedingThrottle;
     if(e.kind==='already-reviewed'&&outcomeBound)this.s.db.query("UPDATE coderabbit_cycles SET state='already_reviewed' WHERE repo=? AND pr=? AND cycle=?").run(o.repo,o.pr,c.cycle);
     else if(c.state==='requesting'&&fresh&&outcomeBound)this.s.db.query("UPDATE coderabbit_cycles SET state='waiting',episode=episode+1,reliable=0 WHERE repo=? AND pr=? AND cycle=?").run(o.repo,o.pr,c.cycle);
     const keepReliable=c.reliable&&c.next_action>this.now()&&fresh&&c.state!=='requesting'&&!reliable;
@@ -157,7 +165,8 @@ export class CodeRabbitCooldowns{
  reason(c:any){return c.state==='already_reviewed'?`CodeRabbit review unavailable: provider already reviewed head ${c.head}; no repeated regular requests. Inspect the existing review and metadata gates; whole-PR reassessment requires explicit operator full review.`:c.state==='exhausted'?`CodeRabbit review unavailable: rate-limit retry cycle ${c.cycle} exhausted (${c.attempts}/${c.limit_attempts} retries; deadline ${new Date(c.deadline).toISOString()}). Preview extend-review-cycle JOB, then confirm with a named human; receipts, cooldown and uncertainty remain intact.`:`CodeRabbit rate limited; next retry at ${new Date(this.effectiveRetry(c)).toISOString()}`;}
  claimQuery(c:any){
   assertObservationFence();return this.s.db.transaction(()=>{
-  const fresh=this.get(c.repo,c.pr);
+   if(this.s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_provider_holds'").get()&&this.s.db.query("SELECT 1 FROM coderabbit_provider_holds WHERE provider='coderabbit'").get())return null;
+   const fresh=this.get(c.repo,c.pr);
   if(!fresh||fresh.cycle!==c.cycle||fresh.episode!==c.episode||fresh.state!=='waiting'||fresh.reliable||this.now()>=fresh.deadline)return null;
   const body=`${RATE_QUERY}\n\n<!-- adlc-coderabbit-availability:${digest(JSON.stringify([c.repo,c.pr,c.cycle,c.episode]))} -->`;
    const changed=this.s.db.query("INSERT OR IGNORE INTO coderabbit_queries(repo,pr,cycle,episode,state,requested,body) VALUES (?,?,?,?,'delivery_uncertain',?,?)").run(c.repo,c.pr,c.cycle,c.episode,this.now(),body).changes;

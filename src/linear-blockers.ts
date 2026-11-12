@@ -201,7 +201,9 @@ export class LinearBlockers{
      if(rows.some(r=>r.job===wait.job&&blockerOutcome(r.outcome)))continue;
       const exhausted=wait.state==='blocked',binding=digest(JSON.stringify(['coderabbit-cooldown',wait.plan_hash,wait.repo,wait.pr,wait.cycle,wait.episode,wait.reason]));
       if(exhausted){handled.add(wait.job);const prior=rows.findIndex(r=>r.job===wait.job);if(prior>=0)rows.splice(prior,1);}
-     if(this.s.db.query("SELECT 1 FROM blocker_notices WHERE job=? AND binding=? AND state='posted'").get(wait.job,binding))continue;
+     // Comment delivery and blocker-label reconciliation are separate effects.
+     // leave() deduplicates the posted comment while verifying/retrying labels.
+     if(!exhausted&&this.s.db.query("SELECT 1 FROM blocker_notices WHERE job=? AND binding=? AND state='posted'").get(wait.job,binding))continue;
      try{results.push(await this.leave(wait.job,{plan_hash:wait.plan_hash,outcome:exhausted?'failed':'waiting',reason:wait.reason,questions:'[]',dependencies:'[]'},c,{binding,applyLabel:exhausted,heading:exhausted?'CodeRabbit retry budget exhausted':'CodeRabbit cooldown',guard:()=>{new Lifecycle(this.s).current(wait.job);const t=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(wait.job) as any;if(t?.repo!==wait.repo||t?.pr!==wait.pr||t?.reason!==wait.reason)throw Error('CodeRabbit wait changed before notice');}}));}
      catch{results.push({job:wait.job,state:'needs_reconciliation',reason:'CodeRabbit cooldown notice requires reconciliation; no blind resend'});}
     }

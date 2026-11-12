@@ -16,7 +16,7 @@ import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import
 import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
-import {ReviewRateLimit} from '../src/coderabbit-scheduling';
+import {ReviewRateLimit,ReviewRequests} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
 import {CODERABBIT_APP_ID} from '../src/coderabbit-cooldowns';
 import {ActionWatchdog} from '../src/action-watchdog';
@@ -99,6 +99,56 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+function cooldownChronologyFixture(){
+ const f=templateFixture(),at=Date.now(),stamp=(ms:number)=>new Date(at+ms).toISOString();
+ f.loop.configureMetadataChecks('project',[]);
+ const throttle={id:910,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,status:'completed',conclusion:'success',started_at:stamp(-121000),completed_at:stamp(-120000),output:{title:'Review rate limited'}};
+ const completed={...throttle,id:911,started_at:stamp(-90000),completed_at:stamp(-30000),output:{title:'Review completed'}};
+ const review={id:912,user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},commit_id:f.head,state:'APPROVED',submitted_at:stamp(-60000)};
+ const observation={repo:'owner/repo',pr:1,head:f.head,comments:[],checks:[throttle,completed],reviews:[review],observed:at};
+ Object.assign(f.e,{clear:true,reasons:[],findings:[],failedChecks:[],prOpen:true,coderabbitObservation:observation});
+ f.e.reviewSchedule={head:f.head,signature:'config',blocker:null,incremental:false,evidence:{classification:'current-review',recoverable:false}};
+ return {...f,at,stamp,observation,review,completed};
+}
+for(const state of ['APPROVED','CHANGES_REQUESTED','COMMENTED'])test(`DEV-82 chronology: ${state} after throttle/request but before first poll completes the cycle`,()=>{
+ const f=cooldownChronologyFixture();try{
+  f.review.state=state;f.e.clear=state==='APPROVED';
+  const requests=new ReviewRequests(f.s,()=>f.at-100000);
+  expect(requests.claim(f.id,'owner/repo',1,{head:f.head,signature:'config',blocker:null,incremental:false})).toBe(true);
+  requests.settle('owner/repo',1,f.head,'accepted',JSON.stringify({id:909}));
+  expect(f.loop.observeCooldown(f.id,f.e).state).toBe('completed');
+  // Completion is not approval, and a restart must not revive old throttling.
+  expect(f.e.clear).toBe(state==='APPROVED');
+  const restarted=new ReviewLoop(f.s,async()=>{throw Error('No review expected');},f.loop.io);
+  expect(restarted.observeCooldown(f.id,f.e)).toMatchObject({state:'completed',attempts:0});
+ }finally{f.s.close();}
+});
+test('DEV-82 chronology: approval completed before observation reaches the existing ready-for-human gate',async()=>{
+ const f=cooldownChronologyFixture();try{
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('No query expected');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'ready_for_human',send:false});
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).state).toBe('completed');
+  expect(f.reviews()).toBe(0);expect(queries).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+for(const scenario of ['before-throttle','before-request','before-later-throttle','wrong-head','untrusted','pending','commented-without-run','run-before-throttle','future'])test(`DEV-82 chronology still requires current completed review evidence: ${scenario}`,()=>{
+ const f=cooldownChronologyFixture();try{
+  if(scenario==='before-throttle')f.review.submitted_at=f.stamp(-180000);
+  if(scenario==='before-request'){
+   expect(f.loop.requests.claim(f.id,'owner/repo',1,{head:f.head,signature:'config',blocker:null,incremental:false})).toBe(true);
+   f.loop.requests.settle('owner/repo',1,f.head,'accepted',JSON.stringify({id:909}));
+  }
+  if(scenario==='before-later-throttle')f.observation.checks.push({...f.observation.checks[0],id:913,started_at:f.stamp(-31000),completed_at:f.stamp(-30000)});
+  if(scenario==='wrong-head')f.review.commit_id='b'.repeat(40);
+  if(scenario==='untrusted')f.review.user.id=7;
+  if(scenario==='pending')f.e.coderabbitPending=true;
+  if(scenario==='commented-without-run'){f.review.state='COMMENTED';f.observation.checks.splice(1);}
+  if(scenario==='run-before-throttle'){f.review.state='COMMENTED';f.completed.started_at=f.stamp(-180000);}
+  if(scenario==='future')f.review.submitted_at=f.stamp(60000);
+  expect(f.loop.observeCooldown(f.id,f.e).state).toBe('waiting');
+  if(scenario==='before-later-throttle')expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_throttle_evidence').get()).toEqual({n:2});
+ }finally{f.s.close();}
+});
 for(const incremental of [true,false])test(`DEV-82: durable cooldown yields one regular retry (incremental=${incremental}) without code budget`,async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);
@@ -131,6 +181,20 @@ test('DEV-82: uncertain availability query survives polls without blind resend o
   let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('lost reply');};
   expect(await f.loop.tick(f.id)).toMatchObject({state:'needs_reconciliation',send:false});
   await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+test('DEV-82: provider-wide inspection hold blocks availability publication on another PR',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const holder=f.s.enqueue('project','other-issue','spec');
+  expect(f.loop.requests.claim(holder,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(true);
+  const hold=f.loop.requests.holdForInspection(holder,'other/repo',2,'other'),at=Date.now();
+  f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:920,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;return null;};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.loop.get(f.id).reason).toContain('provider-wide inspection hold');
+  expect(queries).toBe(0);expect(f.reviews()).toBe(0);expect(f.loop.requests.providerHold().id).toBe(hold.id);
+  expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:0});
  }finally{f.s.close();}
 });
 for(const blocked of ['paused','already-reviewed','closed','request-disabled'])test(`DEV-82: ${blocked} never sends a retry or availability query`,async()=>{

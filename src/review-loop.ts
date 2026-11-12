@@ -238,8 +238,13 @@ export class ReviewLoop{
     this.requests.reconcileThrottle(t.repo,t.pr);
     const c=this.requests.cooldowns.get(t.repo,t.pr);
     const latest=c?(this.s.db.query('SELECT MAX(at) AS at FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND cycle=?').get(t.repo,t.pr,c.cycle) as any).at:0;
-    const completed=(r:any)=>['APPROVED','CHANGES_REQUESTED'].includes(r.state)||r.state==='COMMENTED'&&o.checks?.some((check:any)=>check.app?.id===CODERABBIT_APP_ID&&check.head_sha===e.head&&check.status==='completed'&&check.conclusion==='success'&&!/rate[ _-]?limit|skip|paus/i.test(check.output?.title??'')&&Date.parse(check.started_at)>=c.started&&Date.parse(check.completed_at)>=Date.parse(r.submitted_at));
-    if(c&&o.reviews?.some((r:any)=>trustedRabbit(r)&&r.commit_id===e.head&&completed(r)&&Date.parse(r.submitted_at)>Math.max(c.started,latest??0))&&!e.coderabbitPending)this.requests.cooldowns.complete(t.repo,t.pr,e.head);
+    const request=c?this.requests.get(t.repo,t.pr,e.head):null;
+    // Ledger initialization is observation time, not provider chronology: a
+    // throttle and its completed review can both predate our very first poll.
+    // Legacy cycles without provider evidence retain their known wait origin.
+    const after=Math.max(latest??c?.started??0,request?.requested??0);
+    const completed=(r:any)=>['APPROVED','CHANGES_REQUESTED'].includes(r.state)||r.state==='COMMENTED'&&o.checks?.some((check:any)=>check.app?.id===CODERABBIT_APP_ID&&check.head_sha===e.head&&check.status==='completed'&&check.conclusion==='success'&&!/rate[ _-]?limit|skip|paus/i.test(check.output?.title??'')&&Date.parse(check.started_at)>=after&&Date.parse(check.started_at)<=Date.parse(r.submitted_at)&&Date.parse(check.completed_at)>=Date.parse(r.submitted_at)&&Date.parse(check.completed_at)<=o.observed);
+    if(c&&o.reviews?.some((r:any)=>trustedRabbit(r)&&r.commit_id===e.head&&Date.parse(r.submitted_at)>after&&Date.parse(r.submitted_at)<=o.observed&&completed(r))&&!e.coderabbitPending)this.requests.cooldowns.complete(t.repo,t.pr,e.head);
    }
    return this.requests.cooldowns.get(t.repo,t.pr);
   }
@@ -536,8 +541,10 @@ export class ReviewLoop{
    if(activeCycle){
     // Throttle checks never prove completed review or spend remediation budget.
     e.clear=false;
-    if(idle&&!e.customCheckBlocker){
-     if(['exhausted','already_reviewed'].includes(activeCycle.state))return record({state:'blocked',send:false,head:e.head,reason:this.requests.cooldowns.reason(activeCycle)});
+     if(idle&&!e.customCheckBlocker){
+      const hold=this.requests.providerHold();
+      if(hold)return record({state:'blocked',send:false,head:e.head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; preview reconcile-review-provider ${hold.job} before any new request`});
+      if(['exhausted','already_reviewed'].includes(activeCycle.state))return record({state:'blocked',send:false,head:e.head,reason:this.requests.cooldowns.reason(activeCycle)});
      const requestPolicy=boundReviewerPolicy(this.s,job).find(r=>r.id==='coderabbit')!;
      let q=this.requests.cooldowns.query(activeCycle);
      if(q?.state==='delivery_uncertain'){

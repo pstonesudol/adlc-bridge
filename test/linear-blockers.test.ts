@@ -80,7 +80,7 @@ function fixture(){
  const id=s.enqueue('p','issue',spec);
  const planHash=digest(JSON.stringify([spec,'plan']));
  s.db.query("UPDATE jobs SET state='approved',plan='plan',plan_hash=?,approved_hash=?,actor='human' WHERE id=?").run(planHash,planHash,id);
- let labels=['ready','team'],comments:any[]=[],updates=0,creates=0,calls=0,lostCreate=false,lostReplyAfterCreate=false,failLabelVerification=false,badIdentity=false,injectHumanLabelBeforeUpdate=false;
+ let labels=['ready','team'],comments:any[]=[],updates=0,creates=0,calls=0,lostCreate=false,lostReplyAfterCreate=false,failLabelVerification=false,badIdentity=false,injectHumanLabelBeforeUpdate=false,failLabelWrite=false;
  const issue=()=>({id:'issue',...JSON.parse(spec),project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:labels.map(id=>({id})),pageInfo:{hasNextPage:false}}});
  const api=async(q:string,v:any)=>{
   calls++;
@@ -95,6 +95,7 @@ function fixture(){
   }
   if(q.includes('issueUpdate')){
    updates++;
+   if(failLabelWrite){failLabelWrite=false;throw Error('Transient label update failure');}
    if(injectHumanLabelBeforeUpdate){injectHumanLabelBeforeUpdate=false;if(!labels.includes('human-concurrent'))labels.push('human-concurrent');}
    if(q.includes('labelIds:$added'))labels=[...v.added];
    if(q.includes('addedLabelIds:$added'))labels=[...new Set([...labels,...v.added])];
@@ -120,7 +121,8 @@ function fixture(){
   get labels(){return [...labels];},get comments(){return [...comments];},get creates(){return creates;},get updates(){return updates;},get calls(){return calls;},
   loseCreate(){lostCreate=true;},
   loseReplyAfterCreate(){lostReplyAfterCreate=true;},
-  failLabel(){failLabelVerification=true;},
+   failLabel(){failLabelVerification=true;},
+   failNextLabelWrite(){failLabelWrite=true;},
   badIdentity(){badIdentity=true;},
   injectHumanLabel(){injectHumanLabelBeforeUpdate=true;},
   running(){s.db.query("UPDATE worker_outcomes SET outcome='running',reason='Continuation accepted' WHERE job=?").run(id);},
@@ -130,6 +132,19 @@ function fixture(){
   blockers:()=>new LinearBlockers(s,api)
  };
 }
+test('CodeRabbit exhaustion reconciles a failed label write without reposting its delivered comment',async()=>{
+ const f=fixture();try{
+  f.running();const loop=new ReviewLoop(f.s),plan=f.s.get(f.id).plan_hash!;
+  f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree) VALUES (?,?,?,?,?,?)').run(f.id,'owned',plan,'running','session','/worktree');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',38,'["CI"]','["src/**"]',Date.now(),'blocked','CodeRabbit review unavailable: rate-limit retry cycle 1 exhausted; preview extend-review-cycle JOB');
+  loop.requests.cooldowns.http('owner/repo',38,'head',1,Date.now()+3600000);f.s.db.query("UPDATE coderabbit_cycles SET state='exhausted'").run();
+  const blockers=f.blockers();f.failNextLabelWrite();await blockers.sync(f.config);
+  expect(f.creates).toBe(1);expect(f.labels).not.toContain(labelId);expect(f.updates).toBe(1);
+  expect(f.s.db.query('SELECT state FROM blocker_notices WHERE job=?').get(f.id)).toEqual({state:'posted'});
+  await blockers.sync(f.config);expect(f.creates).toBe(1);expect(f.updates).toBe(2);expect(f.labels).toContain(labelId);
+  await blockers.sync(f.config);expect(f.creates).toBe(1);expect(f.updates).toBe(2);
+ }finally{f.s.close();}
+});
 test('stale worker outcomes from an earlier revision never reach the generic publisher',async()=>{
  const f=fixture();try{
   const j=f.s.get(f.id),dispatch='current-dispatch';

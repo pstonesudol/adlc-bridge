@@ -158,8 +158,44 @@ test('changed edited relative guidance falls back, unrelated edits retain timing
   let c=l.observe({...o,checks:[],comments:[response]},[]);expect(c.next_action).toBe(T+7*60000);
   now+=60000;response={...response,updated_at:iso(now),body:response.body.replace('2 minutes','30 minutes')};
   c=l.observe({...o,observed:now,checks:[],comments:[response]},[]);expect(c.reliable).toBe(0);expect(c.next_action).toBe(now+60*60000);
+  const fallback=c.next_action;
+  for(const note of ['An unrelated note.','Another unrelated note.']){
+   now+=60000;response={...response,updated_at:iso(now),body:response.body+'\n'+note};
+   c=l.observe({...o,observed:now,checks:[],comments:[response]},[]);expect(c.next_action).toBe(fallback);
+  }
   const absolute=boundReply(o.repo,`Review rate limited. Retry at ${iso(now+120*60000)}`,{id:100,created_at:iso(now),updated_at:iso(now+1)});
-  now++;c=l.observe({...o,observed:now,checks:[],comments:[absolute]},[]);expect(c.reliable).toBe(1);expect(c.next_action).toBe(T+126*60000);
+  const absoluteReset=now+125*60000;
+  now++;c=l.observe({...o,observed:now,checks:[],comments:[absolute]},[]);expect(c.reliable).toBe(1);expect(c.next_action).toBe(absoluteReset);
+ }finally{s.close();}
+});
+for(const scenario of ['accepted','uncertain','stale-run','future-run'])test(`new-head authenticated throttle coalesces only a known delivered request: ${scenario}`,()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);let now=T;const requests=new ReviewRequests(s,()=>now),job=s.enqueue('p','i','spec'),o=observation();
+ const schedule={head:HEAD,signature:'config',blocker:null,incremental:true};
+ try{
+  expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);requests.settle(o.repo,o.pr,HEAD,'accepted',JSON.stringify({id:41}));
+  let c=requests.cooldowns.observe(o,requests.receipts(o.repo,o.pr));requests.reconcileThrottle(o.repo,o.pr);
+  const deadline=c.deadline,q=requests.cooldowns.claimQuery(c);requests.cooldowns.settleQuery(q,{id:42,body:q.body,user:{id:7},created_at:iso(now)});
+  now=c.next_action+1;expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);
+  if(scenario!=='uncertain')requests.settle(o.repo,o.pr,HEAD,'accepted',JSON.stringify({id:43}));
+  const requested=now;now+=1000;
+  const pushed={...o,head:OTHER,observed:now,checks:[run({id:124,head_sha:OTHER,started_at:iso(scenario==='stale-run'?requested-10000:scenario==='future-run'?now+60000:now),completed_at:iso(now)})]};
+  c=requests.cooldowns.observe(pushed,requests.receipts(o.repo,o.pr));
+  expect(c).toMatchObject({head:OTHER,attempts:1,deadline,state:scenario==='accepted'?'waiting':'requesting'});
+  if(scenario==='accepted'){
+   expect(c.episode).toBe(2);const nextQuery=requests.cooldowns.claimQuery(c);requests.cooldowns.settleQuery(nextQuery,{id:44,body:nextQuery.body,user:{id:7},created_at:iso(now)});
+   now=c.next_action+1;expect(requests.claim(job,o.repo,o.pr,{...schedule,head:OTHER})).toBe(true);
+   expect(requests.cooldowns.get(o.repo,o.pr)).toMatchObject({attempts:2,deadline});
+   expect(requests.get(o.repo,o.pr,HEAD).state).toBe('accepted');
+  }else expect(requests.claim(job,o.repo,o.pr,{...schedule,head:OTHER})).toBe(false);
+ }finally{s.close();}
+});
+test('provider inspection hold prevents even reserving an availability query',()=>{
+ const s=new Store(':memory:');const loop=new ReviewLoop(s),requests=loop.requests,holder=s.enqueue('p','i','spec');
+ try{
+  expect(requests.claim(holder,'holder/repo',1,{head:HEAD,signature:'config',blocker:null,incremental:false})).toBe(true);
+  const hold=requests.holdForInspection(holder,'holder/repo',1,HEAD),at=Date.now(),o=observation(undefined,{observed:at,checks:[run({completed_at:iso(at)})]});
+  const c=requests.cooldowns.observe(o,[]);expect(requests.cooldowns.claimQuery(c)).toBeNull();
+  expect(requests.providerHold().id).toBe(hold.id);expect(s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:0});
  }finally{s.close();}
 });
 test('chat HTTP cooldown is persisted separately without a review attempt or repeat query',()=>{
