@@ -61,6 +61,20 @@ test('permanent read failures publish one secret-safe operator notice without la
 const labelId='11111111-1111-1111-1111-111111111111';
 const config={linear:{projectId:'p',teamId:'t'},blockerSync:{enabled:true,labelId}};
 const spec=JSON.stringify({identifier:'DEV-6',title:'Preview',description:'Repository-only preview'});
+test('CodeRabbit cooldown notices deduplicate and do not apply a blocker label while waiting',async()=>{
+ const f=fixture();try{
+  f.running();const loop=new ReviewLoop(f.s),plan=f.s.get(f.id).plan_hash!;
+  f.s.db.query('INSERT INTO runs(job,correlation,plan_hash,state,session_id,worktree) VALUES (?,?,?,?,?,?)').run(f.id,'owned',plan,'running','session','/worktree');
+  f.s.db.query('INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since,state,reason) VALUES (?,?,?,?,?,?,?,?)').run(f.id,'owner/repo',38,'["CI"]','["src/**"]',Date.now(),'waiting_for_coderabbit','CodeRabbit rate limited; next retry at 2026-11-12T12:00:00.000Z');
+  loop.requests.cooldowns.http('owner/repo',38,'head',1,Date.now()+3600000);
+  const blockers=f.blockers();await blockers.sync(f.config);await blockers.sync(f.config);
+  expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.comments[0].body).toContain('CodeRabbit rate limited; next retry at');
+  f.s.db.query("UPDATE coderabbit_cycles SET state='exhausted'").run();
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason='CodeRabbit review unavailable: rate-limit retry cycle 1 exhausted; preview extend-review-cycle JOB'").run();
+  await blockers.sync(f.config);await blockers.sync(f.config);
+  expect(f.creates).toBe(2);expect(f.comments[1].body).toContain('retry budget exhausted');expect(f.labels).toContain(labelId);
+ }finally{f.s.close();}
+});
 function fixture(){
  const s=new Store(':memory:');new Workflow(s,{} as any);
  const id=s.enqueue('p','issue',spec);

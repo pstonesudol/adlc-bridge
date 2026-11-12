@@ -1,6 +1,7 @@
 import {digest,Store} from './core';
 import {assertObservationFence} from './observation-fence';
 import {randomUUID} from 'node:crypto';
+import {CodeRabbitCooldowns,type CooldownPolicy} from './coderabbit-cooldowns';
 
 export const REVIEW_GRACE_MS=5*60*1000, REVIEW_TIMEOUT_MS=30*60*1000;
 export type ReviewMode='regular'|'full';
@@ -20,7 +21,7 @@ export type ReviewEvidence={
  pauseThreshold:number;
  incremental:boolean;
 };
-export type ReviewSchedule={head:string;signature:string;blocker:string|null;incremental:boolean;evidence?:ReviewEvidence;requestPolicy?:{requestReview:boolean;reviewMode:ReviewMode;cooldown:number;retryLimit:number}};
+export type ReviewSchedule={head:string;signature:string;blocker:string|null;incremental:boolean;quotaIdentity?:string;evidence?:ReviewEvidence;requestPolicy?:{requestReview:boolean;reviewMode:ReviewMode;cooldown:number;retryLimit:number;rateLimit?:Partial<CooldownPolicy>}};
 class ScheduleGap extends Error{}
 const gap=(message:string)=>{throw new ScheduleGap(message);};
 const object=(v:any)=>v&&typeof v==='object'&&!Array.isArray(v)?v:gap('configuration must be a mapping');
@@ -68,7 +69,7 @@ export function deriveReviewSchedule(input:{head:string;headText:string;baseText
  const runs=checks.filter(c=>c.app?.slug==='coderabbitai'&&c.head_sha===head);
  const output=runs.map(c=>`${c.output?.title??''} ${c.output?.summary??''} ${c.output?.text??''}`).join('\n');
  let incremental=false;
- const result=(blocker:string|null,classification:ReviewClassification,recoverable:boolean):ReviewSchedule=>({head,signature,blocker,incremental,evidence:{...evidence,classification,recoverable,incremental}});
+  const result=(blocker:string|null,classification:ReviewClassification,recoverable:boolean):ReviewSchedule=>({head,signature,blocker,incremental,quotaIdentity:Number.isSafeInteger(pr.user?.id)?`github-user:${pr.user.id}`:undefined,evidence:{...evidence,classification,recoverable,incremental}});
  const fail=(message:string,classification:ReviewClassification)=>result(`CodeRabbit review unavailable: ${message}`,classification,false);
  try{
   const c=parseReviewConfig(headText);parseReviewConfig(baseText);incremental=c.incremental;
@@ -139,6 +140,7 @@ export function reviewProviderHoldPreview(s:Store,job:string){
  return {state:'inspection_required',hold,confirmation:digest(JSON.stringify([hold,j.id,j.plan_hash,j.approved_hash,j.state])),mutationReplay:false};
 }
 export class ReviewRequests{
+ cooldowns:CodeRabbitCooldowns;
  constructor(public s:Store,public now=Date.now){s.db.exec(`CREATE TABLE IF NOT EXISTS coderabbit_requests(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,job TEXT NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL,requested INTEGER NOT NULL,next_attempt INTEGER NOT NULL,evidence TEXT,PRIMARY KEY(repo,pr,head));
  CREATE TABLE IF NOT EXISTS coderabbit_waits(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,signature TEXT NOT NULL,started INTEGER NOT NULL,PRIMARY KEY(repo,pr,head));
    CREATE TABLE IF NOT EXISTS coderabbit_request_attempts(repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,attempt INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,requested INTEGER NOT NULL,evidence TEXT,next_attempt INTEGER NOT NULL,PRIMARY KEY(repo,pr,head,attempt));
@@ -150,7 +152,33 @@ export class ReviewRequests{
     const columns=s.db.query(`PRAGMA table_info(${table})`).all() as any[];
     if(!columns.some(c=>c.name==='mode'))s.db.exec(`ALTER TABLE ${table} ADD COLUMN mode TEXT NOT NULL DEFAULT 'full' CHECK(mode IN ('regular','full'))`);
    }
-  }).immediate();}
+   }).immediate();this.cooldowns=new CodeRabbitCooldowns(s,now);
+   // Upgrade known legacy throttle episodes conservatively. Existing accepted
+   // and uncertain receipts remain non-replayable, and old retries are not free.
+   s.db.transaction(()=>{
+    for(const key of s.db.query("SELECT DISTINCT repo,pr FROM coderabbit_requests WHERE state='rate_limited'").all() as any[]){
+     if(this.cooldowns.get(key.repo,key.pr))continue;
+     const rows=s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC').all(key.repo,key.pr) as any[];
+     const audit=s.db.query("SELECT MIN(requested) AS started FROM coderabbit_request_attempts WHERE repo=? AND pr=? AND state='rate_limited'").get(key.repo,key.pr) as any;
+     const started=Math.min(now(),audit?.started??Math.min(...rows.map(r=>r.requested))),attempts=rows.reduce((n,r)=>n+Math.max(0,r.attempts-1),0),deadline=started+24*60*60000;
+     const reset=Math.max(...rows.filter(r=>r.state==='rate_limited').map(r=>r.next_attempt)),next=reset>0?reset+5*60000:started+60*60000;
+     s.db.query('INSERT INTO coderabbit_cycles(repo,pr,cycle,head,started,deadline,attempts,limit_attempts,state,next_action,reliable) VALUES (?,?,1,?,?,?,?,6,?,?,?)').run(key.repo,key.pr,rows[0].head,started,deadline,attempts,now()>=deadline||attempts>=6?'exhausted':'waiting',next,Number(reset>0));
+    }
+   }).immediate();}
+ receipts(repo:string,pr:number){return (this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=?').all(repo,pr) as any[]).map(r=>{let delivered:any;try{delivered=JSON.parse(r.evidence??'null');}catch{}return {...r,comment_id:delivered?.id};});}
+ reconcileThrottle(repo:string,pr:number){
+  assertObservationFence();this.s.db.transaction(()=>{
+   const c=this.cooldowns.get(repo,pr);if(!c||c.state==='completed')return;
+   const evidence=this.s.db.query('SELECT * FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND cycle=?').all(repo,pr,c.cycle) as any[];
+   for(const row of evidence){const e=JSON.parse(row.evidence);if(!e.request||e.request.startsWith('query:')||e.kind==='already-reviewed')continue;
+    const r=this.get(repo,pr,e.head);if(!r||e.request!==`${r.head}:${r.attempts}`||!['accepted','rate_limited'].includes(r.state)||e.at+1000<r.requested)continue;
+    this.s.db.query("UPDATE coderabbit_requests SET state='rate_limited',next_attempt=? WHERE repo=? AND pr=? AND head=? AND state IN ('accepted','rate_limited')").run(c.next_action,repo,pr,e.head);
+    // Delivery remains accepted in the attempt audit; provider rejection is
+    // additional evidence, never a rewrite of the successful delivery receipt.
+    this.s.db.query("UPDATE full_review_requests SET state='rate_limited' WHERE pr=? AND head=? AND job IN (SELECT job FROM review_targets WHERE repo=? AND pr=?) AND state='accepted'").run(pr,e.head,repo,pr);
+   }
+  }).immediate();
+ }
   get(repo:string,pr:number,head:string):any{return this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? AND head=?').get(repo,pr,head);}
   providerHold(){return reviewProviderHold(this.s);}
   holdForInspection(job:string,repo:string,pr:number,head:string){
@@ -184,15 +212,21 @@ export class ReviewRequests{
    if(this.providerHold())return false;
    // A new head/PR cannot evade a verified provider reset or an uncertain
    // request for this PR. This embargo shares the existing durable ledger.
-   const embargo=this.s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited'").get() as any;
-   if(embargo?.reset>this.now())return false;
+    // Legacy HTTP evidence is plain text. Bot-rejected deliveries retain their
+    // JSON comment receipt; they must not embargo unrelated developer quotas.
+    const embargo=this.s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND NOT json_valid(evidence)").get() as any;
+    if(embargo?.reset>this.now())return false;
+    if(schedule.quotaIdentity){const shared=this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any;if(shared?.reset>this.now())return false;}
    if(this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND state='delivery_uncertain'").get(repo,pr))return false;
    // Existing metadata-review receipts also consume this head's accepted/uncertain
    // request budget. This upgrade must not replay requests from old databases.
    const legacy=this.s.db.query("SELECT r.state FROM full_review_requests r JOIN review_targets t ON t.job=r.job AND t.pr=r.pr WHERE t.repo=? AND r.pr=? AND r.head=? AND r.state IN ('accepted','delivery_uncertain') LIMIT 1").get(repo,pr,schedule.head);
    if(legacy)return false;
-   const p=schedule.requestPolicy,mode=p?.reviewMode??'regular',limit=Math.min(3,p?.retryLimit??3),cooldown=Math.max(60000,p?.cooldown??60000);
-   const prior=this.get(repo,pr,schedule.head);if(prior&&(prior.attempts>=limit||this.now()<Math.max(prior.next_attempt,prior.requested+cooldown)))return false;
+    const cycle=this.cooldowns.get(repo,pr);
+    const p=schedule.requestPolicy,mode=cycle&&cycle.state!=='completed'?'regular':p?.reviewMode??'regular',limit=cycle&&cycle.state!=='completed'?Number.MAX_SAFE_INTEGER:Math.min(3,p?.retryLimit??3),cooldown=Math.max(60000,p?.cooldown??60000);
+    const prior=this.get(repo,pr,schedule.head);if(prior&&(prior.attempts>=limit||this.now()<Math.max(prior.next_attempt,prior.requested+cooldown)))return false;
+    if(prior&&prior.state!=='rate_limited')return false;
+    if(!this.cooldowns.reserve(repo,pr,schedule.head))return false;
    const changed=!!this.s.db.query(`INSERT INTO coderabbit_requests(repo,pr,head,job,signature,state,attempts,requested,next_attempt,evidence,mode) VALUES (?,?,?,?,?,'delivery_uncertain',1,?,0,NULL,?) ON CONFLICT(repo,pr,head) DO UPDATE SET state='delivery_uncertain',signature=excluded.signature,attempts=attempts+1,requested=excluded.requested,evidence=NULL,mode=excluded.mode WHERE state='rate_limited' AND next_attempt<=? AND attempts<?`).run(repo,pr,schedule.head,job,schedule.signature,this.now(),mode,this.now(),limit).changes;
    if(changed){const r=this.get(repo,pr,schedule.head);this.s.db.query('INSERT INTO coderabbit_request_attempts(repo,pr,head,attempt,signature,state,requested,evidence,next_attempt,mode) VALUES (?,?,?,?,?,?,?,?,?,?)').run(repo,pr,schedule.head,r.attempts,schedule.signature,r.state,r.requested,null,0,r.mode);}
    return changed;

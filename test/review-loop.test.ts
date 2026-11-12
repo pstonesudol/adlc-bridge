@@ -18,6 +18,7 @@ import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
 import {ReviewRateLimit} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
+import {CODERABBIT_APP_ID} from '../src/coderabbit-cooldowns';
 import {ActionWatchdog} from '../src/action-watchdog';
 import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES,MAX_REVIEW_BODY_BYTES,MAX_REMEDIATION_PROMPT_BYTES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
@@ -98,6 +99,46 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+for(const incremental of [true,false])test(`DEV-82: durable cooldown yields one regular retry (incremental=${incremental}) without code budget`,async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);
+  Object.assign(f.e,{clear:true,findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  f.e.reviewSchedule={head:f.head,signature:'config',blocker:null,incremental,evidence:{classification:'rate-limited',recoverable:true}};
+  const at=Date.now(),run={id:882,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,status:'completed',conclusion:'success',started_at:new Date(at-1000).toISOString(),completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}};
+  Object.defineProperty(f.e,'coderabbitObservation',{get:()=>({repo:'owner/repo',pr:1,head:f.e.head,comments:[],checks:[run],observed:Date.now()})});
+  let queries=0,reviews=0,mode:any;
+  f.loop.io.postAvailability=async(_repo,_pr,body)=>{queries++;return {id:880,body,user:{id:7},created_at:new Date().toISOString()};};
+  f.loop.postReview=async(_repo,_pr,_marker,_spawn,selected)=>{reviews++;mode=selected;return {id:881};};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(f.loop.list()[0].displayStatus).toStartWith('CodeRabbit rate limited; next retry at ');
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(queries).toBe(1);expect(reviews).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  const c=f.loop.requests.cooldowns.get('owner/repo',1);setSystemTime(new Date(c.next_action+1));
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);
+  expect(reviews).toBe(1);expect(mode).toBe('regular');expect(f.loop.requests.get('owner/repo',1,f.head).mode).toBe('regular');
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).attempts).toBe(1);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.loop.get(f.id).state).not.toBe('ready_for_human');
+ }finally{setSystemTime();f.s.close();}
+});
+test('DEV-82: uncertain availability query survives polls without blind resend or review',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now();f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:900,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('lost reply');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'needs_reconciliation',send:false});
+  await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+for(const blocked of ['paused','already-reviewed','closed','request-disabled'])test(`DEV-82: ${blocked} never sends a retry or availability query`,async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:blocked!=='closed'});
+  const at=Date.now();f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:902,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  if(blocked==='paused')f.e.reviewSchedule.blocker='CodeRabbit review unavailable: intentional pause';
+  if(blocked==='already-reviewed')f.e.reviewSchedule.evidence={classification:'current-review',recoverable:false};
+  if(blocked==='request-disabled')bindReviewerPolicy(f.s,f.id,[{id:'coderabbit',requestReview:false}]);
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('must not send');};
+  await f.loop.tick(f.id);expect(queries).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
 test('DEV-97: early blockers refresh head and edited evidence bindings without resetting budgets',async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);
@@ -252,7 +293,7 @@ test('missing current-head review gets one request after grace, retries only con
   f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   let calls=0;f.loop.postReview=async()=>{if(++calls===1)throw new ReviewRateLimit(Date.now()+60000);};
   await f.loop.tick(f.id);await f.loop.tick(f.id);expect(calls).toBe(1);
-  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0,requested=?').run(Date.now()-60001);await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
+  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0,requested=?').run(Date.now()-60001);f.s.db.query('UPDATE coderabbit_cycles SET next_action=0').run();await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
   await f.loop.tick(f.id);expect(calls).toBe(2);
   f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
   const escalated=await f.loop.tick(f.id);

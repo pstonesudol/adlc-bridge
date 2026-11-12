@@ -2,13 +2,14 @@ import {Store,digest} from './core';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {providerEvidence} from './provider-read';
 import {transient} from './recovery-observation';
+import {cooldownPolicy,type CooldownPolicy} from './coderabbit-cooldowns';
 
 export type Severity='info'|'low'|'medium'|'high'|'critical';
 export type ReviewerIdentity={userId:number;type:'Bot'|'User';login?:string};
 export type ReviewerConfig={id:string;adapter:'github-review'|'coderabbit';identity?:ReviewerIdentity;
  membership?:{kind:'collaborators'}|{kind:'team';organization:string;slug:string};
  enabled?:boolean;remediate?:boolean;approvalRequired?:boolean;minimumSeverity?:Severity;
- includePaths?:string[];excludePaths?:string[];requestReview?:boolean;reviewMode?:'regular'|'full';cooldown?:number;retryLimit?:number};
+ includePaths?:string[];excludePaths?:string[];requestReview?:boolean;reviewMode?:'regular'|'full';cooldown?:number;retryLimit?:number;rateLimit?:Partial<CooldownPolicy>};
 export type Reviewer=ReviewerConfig&{enabled:boolean;remediate:boolean;approvalRequired:boolean;requestReview:boolean;reviewMode:'regular'|'full';cooldown:number;retryLimit:number};
 export const BOT_IDENTITIES={coderabbit:{userId:136622811,type:'Bot' as const,login:'coderabbitai[bot]'},codex:{userId:199175422,type:'Bot' as const,login:'chatgpt-codex-connector[bot]'}};
 const levels:Severity[]=['info','low','medium','high','critical'];
@@ -40,7 +41,7 @@ export function reviewerPolicy(value:unknown):Reviewer[]{
  const merged=[...defaults.map(d=>({...d,...declared.find(r=>r.id===d.id)})),...declared.filter(r=>!defaults.some(d=>d.id===r.id))];
  return merged.map((r:any):Reviewer=>{
   const id=r.id;
-  const keys=['id','adapter','identity','membership','enabled','remediate','approvalRequired','minimumSeverity','includePaths','excludePaths','requestReview','reviewMode','cooldown','retryLimit'];
+   const keys=['id','adapter','identity','membership','enabled','remediate','approvalRequired','minimumSeverity','includePaths','excludePaths','requestReview','reviewMode','cooldown','retryLimit','rateLimit'];
   if(Object.keys(r).some(k=>!keys.includes(k)))fail(id,'unsupported option');
   if(!['github-review','coderabbit'].includes(r.adapter))fail(id,`unsupported adapter ${r.adapter}; custom Graphite/Claude APIs are not supported`);
   for(const k of ['enabled','remediate','approvalRequired','requestReview'])if(r[k]!==undefined&&typeof r[k]!=='boolean')fail(id,`${k} must be boolean`);
@@ -52,7 +53,8 @@ export function reviewerPolicy(value:unknown):Reviewer[]{
   const p={...r,enabled:r.enabled??true,remediate:r.remediate??true,approvalRequired:r.approvalRequired??false,requestReview:r.requestReview??false,reviewMode:r.reviewMode??'regular',cooldown:r.cooldown??60000,retryLimit:r.retryLimit??3,includePaths:paths(r.includePaths,id),excludePaths:paths(r.excludePaths,id)} as Reviewer;
   if(!p.enabled&&p.approvalRequired)fail(id,'enabled=false with approvalRequired=true would bypass clearance; reviewed policy change required');
   if(p.minimumSeverity!==undefined&&!levels.includes(p.minimumSeverity))fail(id,'unsupported minimumSeverity');
-  if(!['regular','full'].includes(p.reviewMode))fail(id,'reviewMode must be regular or full');
+   if(!['regular','full'].includes(p.reviewMode))fail(id,'reviewMode must be regular or full');
+   if(r.rateLimit!==undefined){if(p.adapter!=='coderabbit'||!object(r.rateLimit))fail(id,'rateLimit requires CodeRabbit options');cooldownPolicy(r.rateLimit);}
   if(!Number.isSafeInteger(p.cooldown)||p.cooldown<60000||p.cooldown>86400000)fail(id,'cooldown must be milliseconds from 60000 to 86400000');
   if(!Number.isSafeInteger(p.retryLimit)||p.retryLimit<1||p.retryLimit>3)fail(id,'retryLimit must be from 1 to 3; cannot increase shared budget');
   if(p.adapter!=='coderabbit'&&(p.requestReview||r.reviewMode!==undefined||r.cooldown!==undefined||r.retryLimit!==undefined))fail(id,'requestReview/reviewMode/cooldown/retryLimit require the CodeRabbit request adapter');

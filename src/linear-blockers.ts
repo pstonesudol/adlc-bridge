@@ -180,7 +180,8 @@ export class LinearBlockers{
   // attestation. Reuse the existing publisher/receipts for the concrete blocker.
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()){
    const reviews=this.s.db.query("SELECT t.job,t.reason,j.plan_hash FROM review_targets t JOIN jobs j ON j.id=t.job JOIN runs r ON r.job=j.id WHERE j.project=? AND t.state IN ('blocked','needs_reconciliation') AND (t.reason LIKE 'CodeRabbit custom-check%' OR t.reason LIKE 'CodeRabbit review unavailable:%' OR t.reason LIKE 'Reviewer %' OR t.reason LIKE 'Unresolved review threads%' OR t.reason='Review findings require concrete approved paths before automatic remediation') AND j.state='approved' AND j.approved_hash=j.plan_hash AND r.plan_hash=j.plan_hash AND r.owner='orchestrator'").all(c.linear.projectId) as any[];
-   for(const review of reviews){
+    for(const review of reviews){
+     if(review.reason.startsWith('CodeRabbit review unavailable: rate-limit retry cycle'))continue;
     // Match ReviewLoop's execution gate, including the recomputed plan/spec
     // hash and standing-policy eligibility. Old targets survive specification
     // resets for audit purposes; they cannot label a new planning cycle.
@@ -192,8 +193,20 @@ export class LinearBlockers{
      const reason=review.reason+(maintenance?`\nIndependent branch maintenance: ${maintenance.state} — ${maintenance.reason}. This does not clear review or authorize merging.`:'');
      rows.push({job:review.job,plan_hash:review.plan_hash,outcome:'failed',reason,questions:JSON.stringify([{id:'custom-check-evidence',kind:'requirement',question:`Resolve this evidence prerequisite before autonomous remediation can proceed: ${review.reason}. Do not post secrets or infer approval from a green check.`}]),dependencies:'[]'});
    }
-  }
-   const observations=new RecoveryObservation(this.s);
+   }
+   if(this.s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_cycles'").get()){
+    const waits=this.s.db.query("SELECT t.job,t.repo,t.pr,t.state,t.reason,j.plan_hash,c.cycle,c.episode,c.next_action FROM review_targets t JOIN jobs j ON j.id=t.job JOIN runs r ON r.job=j.id JOIN coderabbit_cycles c ON c.repo=t.repo AND c.pr=t.pr WHERE j.project=? AND j.state='approved' AND r.owner='orchestrator' AND r.plan_hash=j.plan_hash AND (t.reason LIKE 'CodeRabbit rate limited; next retry at %' OR t.reason LIKE 'CodeRabbit review unavailable: rate-limit retry cycle%') AND c.cycle=(SELECT MAX(x.cycle) FROM coderabbit_cycles x WHERE x.repo=t.repo AND x.pr=t.pr)").all(c.linear.projectId) as any[];
+    for(const wait of waits){
+     try{new Lifecycle(this.s).current(wait.job);}catch{continue;}
+     if(rows.some(r=>r.job===wait.job&&blockerOutcome(r.outcome)))continue;
+      const exhausted=wait.state==='blocked',binding=digest(JSON.stringify(['coderabbit-cooldown',wait.plan_hash,wait.repo,wait.pr,wait.cycle,wait.episode,wait.reason]));
+      if(exhausted){handled.add(wait.job);const prior=rows.findIndex(r=>r.job===wait.job);if(prior>=0)rows.splice(prior,1);}
+     if(this.s.db.query("SELECT 1 FROM blocker_notices WHERE job=? AND binding=? AND state='posted'").get(wait.job,binding))continue;
+     try{results.push(await this.leave(wait.job,{plan_hash:wait.plan_hash,outcome:exhausted?'failed':'waiting',reason:wait.reason,questions:'[]',dependencies:'[]'},c,{binding,applyLabel:exhausted,heading:exhausted?'CodeRabbit retry budget exhausted':'CodeRabbit cooldown',guard:()=>{new Lifecycle(this.s).current(wait.job);const t=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(wait.job) as any;if(t?.repo!==wait.repo||t?.pr!==wait.pr||t?.reason!==wait.reason)throw Error('CodeRabbit wait changed before notice');}}));}
+     catch{results.push({job:wait.job,state:'needs_reconciliation',reason:'CodeRabbit cooldown notice requires reconciliation; no blind resend'});}
+    }
+   }
+    const observations=new RecoveryObservation(this.s);
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='startup_recovery_results'").get()){
     for(const recovery of this.s.db.query("SELECT r.* FROM startup_recovery_results r JOIN jobs j ON j.id=r.job WHERE j.project=? AND j.state!='done' AND r.outcome='blocked'").all(c.linear.projectId) as any[]){
      const j=this.s.get(recovery.job);if(j.plan_hash!==recovery.plan_hash||digest(j.spec)!==recovery.spec_hash)continue;
