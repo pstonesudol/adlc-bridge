@@ -4,12 +4,14 @@ import {classifyCIFailure,readCIFailure,ciFinding} from '../src/ci-failures';
 import {boundedLogCommand} from '../src/gh-logs';
 import {incident} from './incidents/harness';
 import {ReviewLoop} from '../src/review-loop';
+import {dev115Timeouts} from './incidents/dev115-ci-timeouts';
 
 function stream(text:string|Uint8Array,chunk=1024){const bytes=typeof text==='string'?new TextEncoder().encode(text):text;let offset=0;return new ReadableStream<Uint8Array>({pull(c){if(offset===bytes.length)return c.close();c.enqueue(bytes.slice(offset,offset+=Math.min(chunk,bytes.length-offset)));}});}
 const failure='test/action-watchdog.test.ts:\nerror: Test exceeded 5000ms\n(fail) idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget\n';
 const check={id:1,sha:'92e39323b857538df0cc96486766ba510d9459a5',name:'Bridge tests',conclusion:'failure',url:'https://github.com/fixture/repo/actions/runs/42440318138/job/128607949593'};
-const job={id:128607949593,run_id:42440318138,head_sha:check.sha,name:check.name,status:'completed',conclusion:'failure',check_run_url:'https://api.github.com/repos/fixture/repo/check-runs/1',run_attempt:2,steps:[{number:3,status:'completed',conclusion:'failure'}]};
-async function evidence(text:string,change=false){const excerpt=await extractCILog(stream(text));let reads=0;return readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,run_attempt:change&&++reads>1?3:2}));}
+const job={id:128607949593,run_id:42440318138,head_sha:check.sha,name:check.name,status:'completed',conclusion:'failure',check_run_url:'https://api.github.com/repos/fixture/repo/check-runs/1',run_attempt:2,steps:[{number:3,name:'Run bun test',status:'completed',conclusion:'failure',started_at:'2026-11-12T03:46:12Z',completed_at:'2026-11-12T03:50:55Z'}]};
+const timestamp=(text:string)=>text.replace(/^(?=.+)/gm,'2026-11-12T03:48:20.5007190Z ');
+async function evidence(text:string,change=false){const excerpt=await extractCILog(stream(timestamp(text)));let reads=0;return readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,run_attempt:change&&++reads>1?3:2}));}
 
 for(const position of ['early','late'])test(`PR42 231911-byte reproduction: failure ${position}, not tail-only`,async()=>{
  const padding='passing fixture Error is expected\n'.repeat(8000);
@@ -37,8 +39,8 @@ test('multiple failures retain both paths; attempt change during collection reje
  expect(classifyCIFailure(await evidence(failure,true),['test/**']).reason).toContain('attempt changed');
 });
 test('all failed step identities are preserved; passing steps and unavailable logs cannot authorize repair',async()=>{
- const excerpt=await extractCILog(stream(failure));
- const steps=[...job.steps,{number:4,status:'completed',conclusion:'failure'},{number:5,status:'completed',conclusion:'success'}];
+ const excerpt=await extractCILog(stream(timestamp(failure)));
+ const steps=[...job.steps,{number:4,name:'Run scanner',status:'completed',conclusion:'failure',started_at:'2026-11-12T03:51:00Z',completed_at:'2026-11-12T03:52:00Z'},{number:5,status:'completed',conclusion:'success',started_at:'2026-11-12T03:52:00Z',completed_at:'2026-11-12T03:53:00Z'}];
  const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
  expect(classifyCIFailure(result,['test/**']).evidence?.provenance.steps).toEqual([3,4]);
  for(const change of [{run_attempt:undefined},{steps:[]},{steps:[{number:1,status:'completed',conclusion:'success'}]}]){
@@ -75,5 +77,123 @@ test('extracted large-log evidence dispatches once across repeated polls and loo
   await restarted.tick(f.id);
   expect(f.calls.filter(x=>x.kind==='send')).toHaveLength(1);expect(f.s.get(f.id).attempts).toBe(1);
   expect(JSON.stringify(f.s.db.query('SELECT * FROM events').all())).not.toContain('Test exceeded');
+ }finally{f.s.close();}
+});
+
+test('DEV-115 passing synthetic CVE does not mask the failed test step timeouts',async()=>{
+ const extracted=await evidence(dev115Timeouts);
+ const diagnosis=classifyCIFailure(extracted,['test/**']);
+ expect(diagnosis).toMatchObject({classification:'repairable',paths:['test/action-watchdog.test.ts','test/update.test.ts']});
+ expect(diagnosis.reason).toContain('step 3: deterministic in-scope failure');
+ expect(diagnosis.evidence?.decisions?.[0]).toMatchObject({step:3,classification:'repairable',basis:'test-timeout'});
+ const f=incident();try{
+  if(!extracted||typeof extracted==='string'||'unavailable' in extracted)throw Error('fixture unavailable');
+  extracted.provenance.head=f.evidence.head;
+  Object.assign(f.evidence,{clear:false,reasons:['Required CI failed'],failedChecks:[{...check,sha:f.evidence.head}]});
+  f.s.db.query('UPDATE review_targets SET allowed_paths=? WHERE job=?').run(JSON.stringify(['test/**']),f.id);
+  f.loop.io.readCIFailure=async()=>extracted;f.io.readCIFailure=async()=>extracted;
+  await f.loop.tick(f.id);await f.loop.tick(f.id);
+  expect(f.calls.filter(x=>x.kind==='send')).toHaveLength(1);
+  expect(f.s.get(f.id).attempts).toBe(1);
+  expect(JSON.stringify(f.s.db.query('SELECT * FROM events').all())).not.toContain('CVE-2026-123');
+  expect(f.calls.every(c=>c.kind==='send')).toBe(true);
+  expect(f.loop.get(f.id).required_checks).toBe(JSON.stringify(['CI']));
+ }finally{f.s.close();}
+});
+
+for(const [index,security] of ['vulnerabilities found: 1\nCVE-2026-9999\n','(pass) vulnerabilities found: 1\n','CVE-2026-9999\n','{"results":[{"ruleId":"unsafe-input","level":"error"}]}\n'].entries())test(`DEV-115 mixed test/security output requires inspection, case ${index}`,async()=>{
+ expect(classifyCIFailure(await evidence(dev115Timeouts+security),['test/**']).classification).toBe('out_of_scope');
+});
+
+test('DEV-115 missing/overlapping step timings and partial streams cannot authorize repair',async()=>{
+ const excerpt=await extractCILog(stream(timestamp(dev115Timeouts)));
+ for(const steps of [[{...job.steps[0],started_at:undefined}],[job.steps[0],{...job.steps[0],number:4}]]){
+  const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+  expect(classifyCIFailure(result,['test/**']).classification).toBe('unknown');
+ }
+ expect(classifyCIFailure(await evidence(dev115Timeouts+'(fail) truncated'),['test/**']).classification).toBe('unknown');
+});
+
+test('DEV-115 a failed scanner step cannot be hidden by a repairable test step',async()=>{
+ const raw=timestamp(dev115Timeouts)+'2026-11-12T03:51:10Z vulnerabilities found: 1\n2026-11-12T03:51:11Z CVE-2026-9999\n';
+ const excerpt=await extractCILog(stream(raw));
+ const steps=[...job.steps,{number:4,name:'Run dependency audit',status:'completed',conclusion:'failure',started_at:'2026-11-12T03:51:00Z',completed_at:'2026-11-12T03:52:00Z'}];
+ const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+ const diagnosis=classifyCIFailure(result,['test/**']);
+ expect(diagnosis.classification).toBe('out_of_scope');
+ expect(diagnosis.reason).toContain('step 4: security finding requires human inspection');
+ expect(diagnosis.evidence?.decisions?.map(d=>d.classification)).toEqual(['repairable','out_of_scope']);
+});
+
+test('DEV-115 scanner identity keeps structured findings without a CVE human-only',async()=>{
+ const raw=timestamp(failure)+'2026-11-12T03:51:10Z {"runs":[{"results":[{"ruleId":"unsafe-input","level":"error","message":{"text":"FAIL src/example.ts"}}]}]}\n';
+ const excerpt=await extractCILog(stream(raw));
+ const steps=[...job.steps,{number:4,name:'Run CodeQL analysis',status:'completed',conclusion:'failure',started_at:'2026-11-12T03:51:00Z',completed_at:'2026-11-12T03:52:00Z'}];
+ const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+ expect(classifyCIFailure(result,['src/**','test/**'])).toMatchObject({classification:'out_of_scope',reason:expect.stringContaining('step 4: security finding')});
+});
+
+test('DEV-115 passing-step paths and cached file headers cannot authorize a later failed step',async()=>{
+ const raw='2026-11-12T03:45:10Z test/passing.test.ts:\n2026-11-12T03:45:11Z (pass) earlier test\n2026-11-12T03:48:20Z (fail) unattributed later failure\n';
+ const excerpt=await extractCILog(stream(raw));
+ const steps=[{number:2,name:'Run earlier tests',status:'completed',conclusion:'success',started_at:'2026-11-12T03:45:00Z',completed_at:'2026-11-12T03:46:00Z'},...job.steps];
+ const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+ expect(classifyCIFailure(result,['test/**']).classification).toBe('unknown');
+});
+
+const boundaryStep={...job.steps[0],started_at:'2026-11-12T03:00:00Z',completed_at:'2026-11-12T03:00:10Z'};
+const postStep={number:4,name:'Post checkout',status:'completed',conclusion:'success',started_at:'2026-11-12T03:00:10Z',completed_at:'2026-11-12T03:00:20Z'};
+async function boundaryEvidence(raw:string,steps=[boundaryStep]){
+ const excerpt=await extractCILog(stream(raw));
+ return readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+}
+const earlyFailure='2026-11-12T03:00:09.1000000Z FAIL test/early.test.ts\n';
+
+test('completion second retains the complete failure path set including subsecond diagnostics',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.9999999Z FAIL other/outside.test.ts\n');
+ expect(classifyCIFailure(result,['test/**']).classification).toBe('out_of_scope');
+ expect(classifyCIFailure(result,['test/**','other/**'])).toMatchObject({classification:'repairable',paths:['other/outside.test.ts','test/early.test.ts']});
+ const onlyFinal=await boundaryEvidence('2026-11-12T03:00:10.9999999Z FAIL test/final.test.ts\n');
+ expect(classifyCIFailure(onlyFinal,['test/**'])).toMatchObject({classification:'repairable',paths:['test/final.test.ts']});
+});
+
+test('completion second includes the test-file context origin as well as its failure',async()=>{
+ const result=await boundaryEvidence('2026-11-12T03:00:10.1000000Z test/final.test.ts:\n2026-11-12T03:00:10.9000000Z (fail) final test\n');
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'repairable',paths:['test/final.test.ts']});
+});
+
+test('attributable final-second permission diagnostic blocks an earlier repairable failure',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.0000000Z Permission denied\n');
+ expect(classifyCIFailure(result,['test/**']).classification).toBe('unauthorized');
+});
+
+for(const [index,diagnostic] of ['Permission denied','HTTP 503','token expired','runner disconnected','FAIL other/outside.test.ts','##[error] Process completed with exit code 1','AssertionError: incomplete failure context'].entries())test(`shared-second blocking diagnostic fails closed, case ${index}`,async()=>{
+ const result=await boundaryEvidence(earlyFailure+`2026-11-12T03:00:10.5000000Z ${diagnostic}\n`,[boundaryStep,postStep]);
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'unknown',reason:expect.stringContaining('outside an unambiguous failed step')});
+});
+
+test('blocking diagnostics with no timing owner or only a successful-step owner fail closed',async()=>{
+ for(const steps of [[boundaryStep],[boundaryStep,postStep]]){
+  const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:11.5000000Z Permission denied\n',steps);
+  expect(classifyCIFailure(result,['test/**']).classification).toBe('unknown');
+ }
+});
+
+test('ambiguous test-file context cannot be discarded while retaining earlier repairable evidence',async()=>{
+ const raw='2026-11-12T03:00:10.5000000Z test/late.test.ts:\n2026-11-12T03:00:11.5000000Z (fail) late failure\n';
+ const laterFailure={...postStep,name:'Run bun test',conclusion:'failure'};
+ const result=await boundaryEvidence(earlyFailure+raw,[boundaryStep,laterFailure]);
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'unknown',reason:expect.stringContaining('failure path context')});
+});
+
+test('shared-second ambiguity never dispatches a worker or spends an attempt',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.5000000Z Permission denied SECRET_SENTINEL\n',[boundaryStep,postStep]);
+ const f=incident();try{
+  Object.assign(f.evidence,{clear:false,reasons:['Required CI failed'],failedChecks:[{...check,sha:f.evidence.head}]});
+  f.s.db.query('UPDATE review_targets SET allowed_paths=? WHERE job=?').run(JSON.stringify(['test/**']),f.id);
+  f.loop.io.readCIFailure=async()=>result;f.io.readCIFailure=async()=>result;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.calls).toEqual([]);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(JSON.stringify(f.s.db.query('SELECT * FROM events').all())).not.toContain('SECRET_SENTINEL');
  }finally{f.s.close();}
 });

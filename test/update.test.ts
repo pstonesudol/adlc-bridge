@@ -352,10 +352,14 @@ function candidateFixture(options:{missing?:boolean;inconsistent?:boolean}={}){
  f.io.stage=(p,c)=>stageCandidate({...p,remote},c,f.state);
  return {...f,remote,commit,git};
 }
+// Real isolated preparation, repeated frozen-artifact checks, snapshot copying
+// and a --no-install import probe exceed the default 5s deadline under CI load.
+// Preserve every assertion and the upstream bounded budget on each phase.
+const FROZEN_ARTIFACT_TIMEOUT_MS=30_000;
 describe('fresh dependency-free preview/apply/status reuse the exact frozen artifact without lifecycle scripts',()=>{
  let f:ReturnType<typeof candidateFixture>,stage:Awaited<ReturnType<typeof stageCandidate>>;
  // Real frozen preparation is an integration setup step, not repeated work
- // charged to a single 5s test. Each preview/apply/status phase keeps its checks.
+ // charged to a single test. Each preview/apply/status phase keeps its checks.
  beforeAll(async()=>{
   f=candidateFixture();
   expect(existsSync(join(f.remote,'node_modules'))).toBe(false);
@@ -363,23 +367,23 @@ describe('fresh dependency-free preview/apply/status reuse the exact frozen arti
   stage=await f.io.stage(f.policy,{commit:f.commit,ref:'refs/heads/main',source:f.remote});
   expect(stage.artifact?.lockfile).toHaveLength(64);expect(stage.files.some(p=>p.startsWith('node_modules/@opencode/client/'))).toBe(true);
   expect(existsSync(join(stage.root,'lifecycle-ran'))).toBe(false);
- });
+ },FROZEN_ARTIFACT_TIMEOUT_MS);
  afterAll(()=>f?.close());
  test('repeated preview reuses the pinned frozen artifact and preserves clean source',async()=>{
   const preview=await f.manager.preview();
   const repeated=await f.manager.preview();expect(repeated.staged).toEqual(preview.staged);
   expect(Bun.spawnSync(['git','status','--porcelain','--ignored'],{cwd:stage.sourceRoot,stdout:'pipe'}).stdout.toString()).toBe('');
   expect(existsSync(join(f.remote,'node_modules'))).toBe(false);expect(f.installs).toEqual([]);
- });
+ },FROZEN_ARTIFACT_TIMEOUT_MS);
  test('apply activates the exact prepared snapshot without running lifecycle scripts',async()=>{
   f.io.install=async(_apply,root)=>{const built=snapshot(root,join(f.state,'versions'));writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:root,version:built.version,cli:built.cli,launcher:join(f.root,'adlc')}),{mode:0o600});return built;};
   expect(await f.manager.apply()).toMatchObject({activated:true,version:stage.version});
   expect(existsSync(join(stage.root,'lifecycle-ran'))).toBe(false);
- });
+ },FROZEN_ARTIFACT_TIMEOUT_MS);
  test('status retains the exact committed source, version and prior service selection',async()=>{
   expect(await f.manager.status()).toMatchObject({source:{commit:f.commit,commitKnown:true},installed:{version:stage.version}});
   expect(f.services).toEqual({one:true,two:false});
- });
+ },FROZEN_ARTIFACT_TIMEOUT_MS);
 });
 test('missing/inconsistent candidate lockfile and failed preparation preserve the installation',async()=>{
  for(const mode of ['missing','inconsistent','failure']){

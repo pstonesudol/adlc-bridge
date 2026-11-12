@@ -113,6 +113,7 @@ test('DEV-105: healthy maintenance outlives its attempt budget and failures reco
 });
 // Exercise the real CLI scheduler and ReviewLoop with an offline provider and a
 // controlled clock. A subprocess isolates the poll fence's HOME and Date.now.
+const POLL_SCENARIO_TIMEOUT_MS=30_000;
 function productionScenario(f:ReturnType<typeof fixture>,scenario:string){
  const script=`
 import {createCLIPollTick} from ${JSON.stringify(join(import.meta.dir,'../src/cli.ts'))};
@@ -137,7 +138,7 @@ const status=()=>actionStatus(s,job,now),advance=(ms=WATCHDOG_LIMITS.intervalMs)
 s.db.query('UPDATE review_targets SET head=?,head_since=? WHERE job=?').run(snapshot.head,now,job);
 ${scenario}
 s.close();`;
- const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe'});
+ const result=Bun.spawnSync([process.execPath,'-e',script],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root},stdout:'pipe',stderr:'pipe',timeout:POLL_SCENARIO_TIMEOUT_MS});
  expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');return JSON.parse(result.stdout.toString());
 }
 test('DEV-105: automatic maintenance polls select oldest due targets fairly beyond the four-target batch',()=>{
@@ -165,8 +166,12 @@ console.log(JSON.stringify({batches,errors,targets:loop.list().map(t=>t.state)})
   expect(result.targets).toEqual(Array(6).fill('blocked'));
  }finally{f.close();}
 });
-// Keep all 603 disk-backed ticks and their assertions. This scheduling test
-// does not simulate power failure: WAL NORMAL avoids fsync on every tiny write
+// This disk-backed subprocess executes 603 real poll ticks (303 observation /
+// ordinary-evaluation pairs), including lock and SQLite IO. Hosted CI run
+// 43154974882 exceeded the previous 10s outer deadline and killed the child.
+// Keep every cycle/assertion; bound the child at 30s and allow cleanup headroom.
+// This scheduling test does not simulate power failure: WAL NORMAL avoids fsync
+// on every tiny write
 // while keeping real SQLite, locks, persisted reads and subprocess isolation.
 test('idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget',()=>{
  const f=fixture(true);try{
@@ -182,7 +187,7 @@ console.log(JSON.stringify({first,idleTicks,idleStatus,current:status(),target:l
   expect(r.first).toBe(1);expect(r.idleTicks).toBe(301);expect(r.idleStatus).toMatchObject({state:'pending',attempts:0,evaluation:{failures:0}});
   expect(r.target).toBe('waiting_for_ci');expect(r.current).toMatchObject({state:'pending',attempts:1});expect(r.ordinary).toBe(303);expect(r.actions).toBe(303);expect(r.errors).toEqual([]);
  }finally{f.close();}
-},10_000);
+},POLL_SCENARIO_TIMEOUT_MS+5_000);
 test('human-required target sees a worker push through bounded ordinary polling and resumes observation',()=>{
  const f=fixture(true);try{
   const r=productionScenario(f,`
