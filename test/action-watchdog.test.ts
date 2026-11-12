@@ -165,13 +165,13 @@ console.log(JSON.stringify({batches,errors,targets:loop.list().map(t=>t.state)})
   expect(result.targets).toEqual(Array(6).fill('blocked'));
  }finally{f.close();}
 });
-// This disk-backed subprocess executes 603 real poll ticks (303 observation /
-// ordinary-evaluation pairs), including lock and SQLite IO. CI run 42440318138
-// hit the default 5s limit at 5249.75ms; local runs take ~1.2s. Bound this one
-// integration workload at 10s without reducing its 300 cycles or assertions.
+// Keep all 603 disk-backed ticks and their assertions. This scheduling test
+// does not simulate power failure: WAL NORMAL avoids fsync on every tiny write
+// while keeping real SQLite, locks, persisted reads and subprocess isolation.
 test('idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget',()=>{
  const f=fixture(true);try{
   const r=productionScenario(f,`
+s.db.exec('PRAGMA synchronous=NORMAL');
 clear=true;s.db.query("UPDATE review_targets SET state='ready_for_human' WHERE job=?").run(job);
 await tick();const first=ordinary;
 for(let i=0;i<300;i++){await tick();advance(WATCHDOG_LIMITS.idleMs);await tick();}
