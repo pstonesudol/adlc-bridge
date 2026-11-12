@@ -1,5 +1,5 @@
 import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from './approval-policy';
-import {validScopes} from './file-scope';
+import {validScopes,planPaths,scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
@@ -23,7 +23,7 @@ import {assertRequiredIntegrations} from './integration-capabilities';
 import {RoutePreflightFailure} from './routing-session';
 import {ensureDispatchRoutes,recordDispatchRoute} from './dispatch-route';
 
-export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
+export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 // Uncertain and reconciliation-blocked reservations always consume capacity.
 // Completed planning dispatches release their slot even if manually proposed.
 export const activePlanning="(EXISTS (SELECT 1 FROM planning_restores restore WHERE restore.job=d.job AND restore.state IN ('reserved','setup_consumed')) OR d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
@@ -255,6 +255,8 @@ export class Workflow{
      this.s.db.query('DELETE FROM policy_authorizations WHERE job=?').run(job);
     }
    assertApprovalReadiness(this.s,job,actor,!!acknowledge?.readiness,!!standing);
+   const proposed=j.plan?.includes('<!-- ADLC_REVISED_PLAN:')?planPaths(j.plan):null;
+   if(proposed?.some(path=>!scopeAllows(path,paths)))throw Error('Fresh grant must include every proposed revised-plan path');
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);

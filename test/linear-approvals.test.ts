@@ -97,7 +97,7 @@ test('restored spec and plan hashes publish a revision-specific notice and rejec
   f.w.t.sendImplementation=async(_session,_text,clientId)=>{
    e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:1});
    e.transcript.turns.push({id:clientId,state:'completed'});
-   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
+   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
   };
   const recovery=new SpecRecovery(f.s,f.w,async()=>f.issue,async fn=>fn());
   await recovery.reconcile(f.id,f.c,(await recovery.preview(f.id,f.c)).confirmation);await recovery.capture(f.id,f.c);

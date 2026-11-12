@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
 import {Workflow,type WorkflowConfig} from './workflow';
 import {ApprovalPolicyStore,featureGit} from './approval-policy';
-import {validScopes} from './file-scope';
+import {validScopes,planPaths,scopeAllows} from './file-scope';
 import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
 import {latestRevision} from './spec-revisions';
 import {readinessFor,applicableResolution} from './readiness';
@@ -32,16 +32,23 @@ export class LinearApprovals{
  async current(job:string,c:ApprovalConfig){
   const j=this.s.get(job),p=new ApprovalPolicyStore(this.s),q=this.s.db.query('SELECT * FROM queue_eligibility WHERE job=?').get(job) as any;
   if(j.state!=='awaiting_approval'||!j.plan||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!q?.ready||q.project!==c.linear.projectId||q.spec_hash!==digest(j.spec)||Date.now()-q.observed>120000||q.observed>Date.now()+5000)throw Error('Fresh eligible captured plan required');
-  if(c.approval?.mode==='ready-queue'&&!p.requiresManual(job))throw Error('Ticket no longer requires manual approval');
+  const added=j.plan?.includes('<!-- ADLC_REVISED_PLAN:')&&this.grantScope(job,c).some(path=>!scopeAllows(path,c.approval?.scope??[]));
+  if(c.approval?.mode==='ready-queue'&&!p.requiresManual(job)&&!added)throw Error('Ticket no longer requires manual approval');
   const readiness=readinessFor(this.s,job);
   if((!readiness?.valid||readiness.plan_hash!==j.plan_hash||readiness.spec_hash!==digest(j.spec))&&!applicableResolution(this.s,job))throw Error(`Plan evidence requires reconciliation before approval: ${readiness?.reason??'missing or stale readiness'}. Preview plan-reconcile for corrected completed same-session evidence.`);
   const issue=await readLinearIssue(j.issue,this.api);
    if(issue?.id!==j.issue||issue.team?.id!==c.linear.teamId||issue.project?.id!==c.linear.projectId||issue.labels?.pageInfo?.hasNextPage!==false||!issue.labels.nodes.some((x:any)=>x.id===c.linear.readyLabelId)||!issue.state?.id||![c.linear.readyStateId,c.statusSync?.inProgress,c.statusSync?.inReview].includes(issue.state.id))throw Error('Ticket is no longer eligible for plan approval');
   if(j.spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Ticket requirements changed; approval refused');
-  if(c.approval?.mode==='ready-queue'&&!issue.labels.nodes.some((l:any)=>l.name?.trim().toLowerCase()==='plan-approval-required'))throw Error('Approval label removed; refresh intake before proceeding');
+   if(c.approval?.mode==='ready-queue'&&!added&&!issue.labels.nodes.some((l:any)=>l.name?.trim().toLowerCase()==='plan-approval-required'))throw Error('Approval label removed; refresh intake before proceeding');
   return {j,issue};
  }
- async comments(issue:string){
+  grantScope(job:string,c:ApprovalConfig){
+   const j=this.s.get(job);
+   if(!j.plan?.includes('<!-- ADLC_REVISED_PLAN:'))return c.planApproval!.scope;
+   const paths=planPaths(j.plan);if(!paths)throw Error('Revised plan scope receipt missing or malformed; inspect spec-reconcile, not clarification');
+   return paths;
+  }
+  async comments(issue:string){
   const result:any[]=[];let after:string|null=null;const seen=new Set<string>();
   do{
    const b=await this.api('query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body createdAt editedAt user{id app} botActor{id}}pageInfo{hasNextPage endCursor}}}}',{id:issue,after});
@@ -59,7 +66,7 @@ export class LinearApprovals{
    const token=randomUUID(),commentId=randomUUID();
    const ctx=new ApprovalPolicyStore(this.s).context(job,c.approval);
    const body=[`## ADLC: awaiting your plan approval — ${issue.identifier}`,`Ticket eligibility verified from current Linear state and readiness label. Gate: ${ctx.authorization.gate}`,`Plan version: \`${j.plan_hash}\``,j.plan,
-    `### Approve this exact plan`,`Review the plan above. To authorize implementation, verification, feature-branch commit/push, and PR creation within \`${c.planApproval!.scope.join(', ')}\`, post a **new comment** containing only:`,
+     `### Approve this exact plan`,`Review the plan above. To authorize implementation, verification, feature-branch commit/push, and PR creation within \`${this.grantScope(job,c).join(', ')}\`, post a **new comment** containing only:`,
      ['```text',`Approve ADLC plan ${token}`,'```'].join('\n'),`Copy only the command above into a new comment on this issue or a reply in this notice's thread. Plain text, one inline-code wrapper, or one fenced block (no tag or text) are accepted. Outer spaces, tabs, newlines and non-breaking spaces are ignored; internal command spaces and token must remain exact. CRLF newlines are supported. Do not add prose, quotes or edit an existing comment; submit a new reply instead.`, `Only configured human approvers can release this gate. The reply applies only to this plan version. PR merges and deployment are not authorized. Requirements or plan changes invalidate it. Do not send the approval to the coding worker; reply on this Linear ticket.`].join('\n\n');
    this.s.db.query('INSERT OR IGNORE INTO plan_approval_notices(job,binding,plan_hash,comment_id,token,body,state) VALUES (?,?,?,?,?,?,?)').run(job,binding,j.plan_hash,commentId,token,body,'reserved');
    n=this.s.db.query('SELECT * FROM plan_approval_notices WHERE job=? AND binding=?').get(job,binding) as any;
@@ -94,7 +101,7 @@ export class LinearApprovals{
   return this.s.db.transaction(()=>{
    const row=this.s.db.query('SELECT state FROM plan_approval_notices WHERE job=? AND binding=?').get(job,binding) as any;
    if(row.state!=='posted')return {state:'already_processed'};
-   this.workflow.approve(job,j.plan_hash,`Linear user ${approval.user.id}`,c.planApproval!.scope,'supervised-host',featureGit);
+    this.workflow.approve(job,j.plan_hash,`Linear user ${approval.user.id}`,this.grantScope(job,c),'supervised-host',featureGit);
    this.s.db.query("UPDATE plan_approval_notices SET state='approved',approval_comment=?,reason=NULL WHERE job=? AND binding=?").run(approval.id,job,binding);
    this.s.event(job,'linear_human_plan_approval',JSON.stringify({hash:j.plan_hash,comment:approval.id,user:approval.user.id}));
    return {state:'approved',issue:issue.identifier,implementation:'queued_for_next_poll'};
