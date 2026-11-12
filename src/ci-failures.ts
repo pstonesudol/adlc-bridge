@@ -1,7 +1,7 @@
 import {digest} from './core';
 import {scopeAllows} from './file-scope';
 import {ciLogReader} from './gh-logs';
-import {CI_SECURITY_SIGNAL,type LogExcerpt,type LogRecord} from './ci-log-evidence';
+import {blockingCILogLine,CI_SECURITY_SIGNAL,CI_PERMISSION_SIGNAL,CI_TRANSIENT_SIGNAL,type LogExcerpt,type LogRecord} from './ci-log-evidence';
 
 export type FailedCheck={id:number;sha:string;name:string;conclusion:string;url:string};
 export type CIClass='repairable'|'transient'|'out_of_scope'|'unauthorized'|'unknown';
@@ -51,8 +51,8 @@ export function classifyCIFailure(input:string|CIEvidence|CIReadFailure|null,pat
  if(!raw||raw.length>MAX_LOG)return result('unknown','failure evidence unavailable or exceeds bound');
  const text=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'');
   if(CI_SECURITY_SIGNAL.test(text))return result('out_of_scope','security finding requires human inspection');
- if(/bad credentials|permission denied|resource not accessible|(?:token.{0,30}expired|expired.{0,30}token)|(?:missing|unable to locate|invalid).{0,30}credentials?|credentials? (?:missing|unavailable)|unauthorized|HTTP\s*(?:401|403)/i.test(text))return result('unauthorized','credentials or permission unavailable');
- if(/runner.{0,40}(?:lost|disconnect)|ECONNRESET|ENOTFOUND|ETIMEDOUT|rate limit|HTTP\s*5\d\d|service unavailable|connection timed out|network (?:error|unreachable)/i.test(text))return result('transient','infrastructure failure; human inspection and bounded CI backoff');
+ if(CI_PERMISSION_SIGNAL.test(text))return result('unauthorized','credentials or permission unavailable');
+ if(CI_TRANSIENT_SIGNAL.test(text))return result('transient','infrastructure failure; human inspection and bounded CI backoff');
   const lines=text.split('\n'),diagnostic=/(?:error TS\d+|AssertionError|expect\(.+\)|FAIL\s|FAILED\s|(?:lint|build|syntax|type)\s*error|\berror\s+.{1,80}\b(?:eslint|no-[\w-]+))/i;
   const attributed=lines.filter((line,i)=>diagnostic.test(line)||diagnostic.test(lines[i+1]??'')).join('\n');
   const found=[...new Set([...attributed.matchAll(/(?:^|[\s("'])(\/?(?:[\w@.-]+\/)*[\w@.-]+\.(?:[cm]?[jt]sx?|py|rs|go|java|json|yml|yaml|css|scss|vue|svelte))(?=[:(\s"']|$)/gm)].map(m=>m[1]))].sort();
@@ -92,18 +92,21 @@ export async function readCIFailure(repo:string,c:FailedCheck,read=ciLogReader()
     // multiline reporter titles; otherwise a repeated continuation loses its title.
     const records:LogRecord[]=[...new Map<string,LogRecord>(excerpt.records.map((r:LogRecord)=>[`${r.line}:${'contextAt' in r}`,r])).values()].sort((a,b)=>a.line-b.line||Number('contextAt' in b)-Number('contextAt' in a));
     if(records.some(r=>!Number.isSafeInteger(r.line)||r.line<1))return unavailable('source line identity missing');
+    // Provider completion times are truncated to seconds. Include that entire
+    // second, but never choose between adjacent steps sharing it.
+    const inWindow=(time:number,step:any)=>time>=step.start&&time<step.end+1000;
     for(const record of records){
      const time=record.at?Date.parse(record.at):NaN;
-     const owners=windows.filter((s:any)=>time>=s.start&&time<s.end);
+     const owners=windows.filter((s:any)=>inWindow(time,s));
      const owner=owners.length===1?diagnostics.find(d=>d.step===owners[0].number):undefined;
      if('contextAt' in record){
       const context=record.contextAt?Date.parse(record.contextAt):NaN;
-      const origins=windows.filter((s:any)=>context>=s.start&&context<s.end);
-      if(origins.length!==1||owners.length!==1||origins[0].number!==owners[0].number)continue;
+      const origins=windows.filter((s:any)=>inWindow(context,s));
+      if(origins.length!==1||owners.length!==1||origins[0].number!==owners[0].number)return unavailable('failure path context outside an unambiguous failed step');
      }
      if(owner)owner.text+=record.text+'\n';
-     // Unattributed or nonfailed-step security signals cannot be silently dropped.
-     else if(CI_SECURITY_SIGNAL.test(record.text))return unavailable('security evidence outside an unambiguous failed step');
+     // No blocker may be discarded while authorizing from the remaining subset.
+     else if(blockingCILogLine(record.text))return unavailable('blocking diagnostic outside an unambiguous failed step');
     }
    }
    return {excerpt,...(diagnostics?{diagnostics}:{}),provenance:{repo,run:Number(match[1]),job:Number(match[2]),check:c.id,head:c.sha,attempt:job.run_attempt,steps:steps.map((s:any)=>s.number)}};

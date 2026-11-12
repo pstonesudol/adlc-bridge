@@ -140,3 +140,60 @@ test('DEV-115 passing-step paths and cached file headers cannot authorize a late
  const result=await readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
  expect(classifyCIFailure(result,['test/**']).classification).toBe('unknown');
 });
+
+const boundaryStep={...job.steps[0],started_at:'2026-11-12T03:00:00Z',completed_at:'2026-11-12T03:00:10Z'};
+const postStep={number:4,name:'Post checkout',status:'completed',conclusion:'success',started_at:'2026-11-12T03:00:10Z',completed_at:'2026-11-12T03:00:20Z'};
+async function boundaryEvidence(raw:string,steps=[boundaryStep]){
+ const excerpt=await extractCILog(stream(raw));
+ return readCIFailure('fixture/repo',check,async path=>path.endsWith('/logs')?JSON.stringify({ciLogExcerpt:1,...excerpt}):JSON.stringify({...job,steps}));
+}
+const earlyFailure='2026-11-12T03:00:09.1000000Z FAIL test/early.test.ts\n';
+
+test('completion second retains the complete failure path set including subsecond diagnostics',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.9999999Z FAIL other/outside.test.ts\n');
+ expect(classifyCIFailure(result,['test/**']).classification).toBe('out_of_scope');
+ expect(classifyCIFailure(result,['test/**','other/**'])).toMatchObject({classification:'repairable',paths:['other/outside.test.ts','test/early.test.ts']});
+ const onlyFinal=await boundaryEvidence('2026-11-12T03:00:10.9999999Z FAIL test/final.test.ts\n');
+ expect(classifyCIFailure(onlyFinal,['test/**'])).toMatchObject({classification:'repairable',paths:['test/final.test.ts']});
+});
+
+test('completion second includes the test-file context origin as well as its failure',async()=>{
+ const result=await boundaryEvidence('2026-11-12T03:00:10.1000000Z test/final.test.ts:\n2026-11-12T03:00:10.9000000Z (fail) final test\n');
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'repairable',paths:['test/final.test.ts']});
+});
+
+test('attributable final-second permission diagnostic blocks an earlier repairable failure',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.0000000Z Permission denied\n');
+ expect(classifyCIFailure(result,['test/**']).classification).toBe('unauthorized');
+});
+
+for(const [index,diagnostic] of ['Permission denied','HTTP 503','token expired','runner disconnected','FAIL other/outside.test.ts','##[error] Process completed with exit code 1','AssertionError: incomplete failure context'].entries())test(`shared-second blocking diagnostic fails closed, case ${index}`,async()=>{
+ const result=await boundaryEvidence(earlyFailure+`2026-11-12T03:00:10.5000000Z ${diagnostic}\n`,[boundaryStep,postStep]);
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'unknown',reason:expect.stringContaining('outside an unambiguous failed step')});
+});
+
+test('blocking diagnostics with no timing owner or only a successful-step owner fail closed',async()=>{
+ for(const steps of [[boundaryStep],[boundaryStep,postStep]]){
+  const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:11.5000000Z Permission denied\n',steps);
+  expect(classifyCIFailure(result,['test/**']).classification).toBe('unknown');
+ }
+});
+
+test('ambiguous test-file context cannot be discarded while retaining earlier repairable evidence',async()=>{
+ const raw='2026-11-12T03:00:10.5000000Z test/late.test.ts:\n2026-11-12T03:00:11.5000000Z (fail) late failure\n';
+ const laterFailure={...postStep,name:'Run bun test',conclusion:'failure'};
+ const result=await boundaryEvidence(earlyFailure+raw,[boundaryStep,laterFailure]);
+ expect(classifyCIFailure(result,['test/**'])).toMatchObject({classification:'unknown',reason:expect.stringContaining('failure path context')});
+});
+
+test('shared-second ambiguity never dispatches a worker or spends an attempt',async()=>{
+ const result=await boundaryEvidence(earlyFailure+'2026-11-12T03:00:10.5000000Z Permission denied SECRET_SENTINEL\n',[boundaryStep,postStep]);
+ const f=incident();try{
+  Object.assign(f.evidence,{clear:false,reasons:['Required CI failed'],failedChecks:[{...check,sha:f.evidence.head}]});
+  f.s.db.query('UPDATE review_targets SET allowed_paths=? WHERE job=?').run(JSON.stringify(['test/**']),f.id);
+  f.loop.io.readCIFailure=async()=>result;f.io.readCIFailure=async()=>result;
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.calls).toEqual([]);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(JSON.stringify(f.s.db.query('SELECT * FROM events').all())).not.toContain('SECRET_SENTINEL');
+ }finally{f.s.close();}
+});
