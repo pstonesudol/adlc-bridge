@@ -1950,6 +1950,27 @@ they identify the recovery and stage without publishing raw Git/hook diagnostics
 Detailed failure text remains local in `recovery-status`.
 Completion notices report the new SHA but do not grant readiness or merge approval.
 
+#### Required-check policy drift
+
+Startup registration and review polling fail closed if configured `requiredChecks`
+differs from the existing target. To add checks without editing state directly:
+
+```sh
+adlc reconcile-review-checks JOB CONFIG HUMAN
+adlc reconcile-review-checks JOB CONFIG HUMAN --confirm EXACT_PREVIEW_HASH
+```
+
+Preview is read-only. Confirmation requires current unchanged owned handoff
+authorization, an idle review-evaluation lease and the exact preview proof. It
+stores the configured list only if **every existing check is retained**, clears
+the old decision signature, and moves stale readiness or this policy-drift blocker
+to `waiting_for_review` with no stale ready reason. Unrelated review/delivery
+blockers, worktree reservations and retry budgets are preserved. The operation
+records an audit event and makes no provider requests, Git mutations or worker
+deliveries. Fresh polling evaluates the added checks; this is not review or merge
+approval. Check removal is deliberately unsupported and requires a separately
+approved policy change, not direct edits to the live database.
+
 Installation/activation is a separate reviewed operator step. Human-only PR
 merging remains mandatory.
 

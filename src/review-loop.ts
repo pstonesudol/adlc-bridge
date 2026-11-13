@@ -308,7 +308,7 @@ export class ReviewLoop{
     if(config?.requiredChecks!==undefined&&t.required_checks!==JSON.stringify(config.requiredChecks)){
      // Startup may report a policy mismatch without stopping all polling. Never
      // evaluate readiness with the historical list, even in maintenance mode.
-     return this.record(job,{state:'blocked',send:false,head:t.head,reason:'Required-check policy changed; explicit review-target reconciliation required'},t.pr);
+     return this.record(job,{state:'blocked',send:false,head:t.head,reason:`Required-check policy changed; preview reconcile-review-checks ${job} CONFIG HUMAN (additions only; existing checks cannot be removed)`},t.pr);
     }
     if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
     // A durable handoff marker survives later remediation states, so failed or
