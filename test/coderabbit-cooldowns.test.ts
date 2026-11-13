@@ -157,6 +157,21 @@ test('shared quota requires explicit provider identity evidence; same credential
   const separate=l.observe({...o,pr:39,observed:now},[]);expect(separate.scope).toBeNull();expect(l.effectiveRetry(separate)).toBe(separate.next_action);
  }finally{s.close();}
 });
+for(const arrival of ['same-poll','later-poll','edited-comment'])test(`verified quota scope persists independently of reliable timing: ${arrival}`,()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);let now=T;const requests=new ReviewRequests(s,()=>now),o=observation(),author={id:7,login:'alice'};
+ const check=run({output:{title:'Review rate limited',summary:'Retry after 60 minutes.'}});
+ let comment=boundReply(o.repo,'Review rate limited.');
+ try{
+  if(arrival!=='same-poll')requests.cooldowns.observe({...o,author,checks:[check],comments:arrival==='edited-comment'?[comment]:[]},[]);
+  if(arrival!=='same-poll')now+=60000;
+  comment={...comment,body:comment.body+'\nDeveloper @alice.',updated_at:iso(now)};
+  const c=requests.cooldowns.observe({...o,author,observed:now,checks:[check],comments:[comment]},[]);
+  expect(c).toMatchObject({scope:'github-user:7',next_action:T+65*60000,reliable:1,attempts:0});
+  const job=s.enqueue('p','other','spec'),schedule={head:OTHER,signature:'config',blocker:null,incremental:false};
+  expect(requests.claim(job,'other/repo',2,{...schedule,quotaIdentity:'github-user:7'})).toBe(false);
+  expect(requests.claim(job,'unrelated/repo',3,{...schedule,quotaIdentity:'github-user:8'})).toBe(true);
+ }finally{s.close();}
+});
 for(const named of ['alice','ALICE','alice-ops','alice2'])test(`shared quota requires a complete login: ${named}`,()=>{
  const s=new Store(':memory:');new ReviewLoop(s);const requests=new ReviewRequests(s,()=>T),o=observation(),author={id:7,login:'alice'};
  try{

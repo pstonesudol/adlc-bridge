@@ -216,15 +216,18 @@ test('DEV-82: rejected availability query retains inspection hold, not fictitiou
   expect(queries).toBe(1);expect(f.reviews()).toBe(1);expect(ledger.get('owner/repo',1).attempts).toBe(1);
  }finally{setSystemTime();f.s.close();}
 });
-test('DEV-82: shared quota waits suspend timeout and permit a first request after reset',async()=>{
+for(const kind of ['developer-quota','query-transport'])test(`DEV-82: shared ${kind} waits suspend timeout and permit a first request after reset`,async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
-  f.e.reviewSchedule.quotaIdentity='github-user:7';
+  if(kind==='developer-quota')f.e.reviewSchedule.quotaIdentity='github-user:7';
   const at=Date.now(),reset=at+60*60000;
-  f.loop.requests.cooldowns.http('source/repo',2,'source',1,reset-5*60000);
-  f.s.db.query("UPDATE coderabbit_cycles SET scope='github-user:7'").run();
+  const ledger=f.loop.requests.cooldowns;
+  ledger.http('source/repo',2,'source',1,kind==='developer-quota'?reset-5*60000:undefined);
+  if(kind==='developer-quota')f.s.db.query("UPDATE coderabbit_cycles SET scope='github-user:7'").run();
+  else{const query=ledger.claimQuery(ledger.get('source/repo',2));ledger.chatThrottle(query,reset);}
   const waiting=await f.loop.tick(f.id);expect(waiting.state).toBe('waiting_for_coderabbit');expect(waiting.reason).toContain(new Date(reset).toISOString());
   expect(cooldownDue(f.s,f.id,at)).toBe(reset);expect(f.reviews()).toBe(0);
+  expect(f.s.db.query('SELECT started FROM coderabbit_waits WHERE repo=? AND pr=?').get('owner/repo',1)).toEqual({started:reset});
   expect(f.loop.requests.cooldowns.get('owner/repo',1)).toBeNull();
   // Reconstruct the scheduler to ensure the timeout baseline is durable.
   f.loop.requests=new ReviewRequests(f.s);
@@ -267,7 +270,11 @@ for(const blocked of ['paused','already-reviewed','closed','request-disabled'])t
   if(blocked==='already-reviewed')f.e.reviewSchedule.evidence={classification:'current-review',recoverable:false};
   if(blocked==='request-disabled')bindReviewerPolicy(f.s,f.id,[{id:'coderabbit',requestReview:false}]);
   let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('must not send');};
-  await f.loop.tick(f.id);expect(queries).toBe(0);expect(f.reviews()).toBe(0);
+   const result=await f.loop.tick(f.id);expect(queries).toBe(0);expect(f.reviews()).toBe(0);
+   expect(f.loop.requests.cooldowns.get('owner/repo',1)).toMatchObject({state:'waiting',head:f.head,attempts:0});
+   expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:0});
+   expect(result).toMatchObject({state:blocked==='paused'?'blocked':'waiting_for_coderabbit',send:false});
+   expect(result.reason).toStartWith(blocked==='paused'?'CodeRabbit review unavailable: intentional pause':'CodeRabbit rate limited; next retry at ');
  }finally{f.s.close();}
 });
 test('DEV-97: early blockers refresh head and edited evidence bindings without resetting budgets',async()=>{

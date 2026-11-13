@@ -149,7 +149,10 @@ export class CodeRabbitCooldowns{
     if(e.kind==='already-reviewed'&&outcomeBound)this.s.db.query("UPDATE coderabbit_cycles SET state='already_reviewed' WHERE repo=? AND pr=? AND cycle=?").run(o.repo,o.pr,c.cycle);
     else if(c.state==='requesting'&&fresh&&outcomeBound)this.s.db.query("UPDATE coderabbit_cycles SET state='waiting',episode=episode+1,reliable=0 WHERE repo=? AND pr=? AND cycle=?").run(o.repo,o.pr,c.cycle);
     const keepReliable=c.reliable&&c.next_action>this.now()&&fresh&&c.state!=='requesting'&&!reliable;
-    if((fresh||!sameTiming)&&!keepReliable)this.s.db.query("UPDATE coderabbit_cycles SET next_action=?,reliable=?,scope=COALESCE(?,scope) WHERE repo=? AND pr=? AND cycle=?").run(reliable&&!c.reliable?retry:Math.max(c.next_action,retry),Number(reliable),e.scope??null,o.repo,o.pr,c.cycle);
+    if((fresh||!sameTiming)&&!keepReliable)this.s.db.query("UPDATE coderabbit_cycles SET next_action=?,reliable=? WHERE repo=? AND pr=? AND cycle=?").run(reliable&&!c.reliable?retry:Math.max(c.next_action,retry),Number(reliable),o.repo,o.pr,c.cycle);
+    // Identity evidence is independent of timing: retaining a reliable reset or
+    // unchanged edited guidance must not discard a newly verified quota scope.
+    if(e.scope)this.s.db.query('UPDATE coderabbit_cycles SET scope=? WHERE repo=? AND pr=? AND cycle=?').run(e.scope,o.repo,o.pr,c.cycle);
     c=this.get(o.repo,o.pr);
    }
    if(c&&c.state!=='completed'){

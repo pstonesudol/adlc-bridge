@@ -210,10 +210,16 @@ export class ReviewRequests{
    const shared=this.sharedRetryAt(schedule);
    // A verified wait is not time spent awaiting a delivered review. Persist
    // its end so a poll/restart after reset cannot immediately time out.
-   if(shared>this.now())this.s.db.query('UPDATE coderabbit_waits SET started=MAX(started,?) WHERE repo=? AND pr=? AND head=?').run(shared,repo,pr,head);
+   // A local active cycle already owns its timeout/deadline. Do not add a new
+   // stable-head grace period after that cycle's own buffered transport reset.
+   const cycle=this.cooldowns.get(repo,pr);
+   if(shared>this.now()&&(!cycle||cycle.state==='completed'))this.s.db.query('UPDATE coderabbit_waits SET started=MAX(started,?) WHERE repo=? AND pr=? AND head=?').run(shared,repo,pr,head);
   return this.s.db.query('SELECT started FROM coderabbit_waits WHERE repo=? AND pr=? AND head=?').get(repo,pr,head) as {started:number};
   }
-  sharedRetryAt(schedule:ReviewSchedule):number{return schedule.quotaIdentity?(this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any)?.reset??0:0;}
+  sharedRetryAt(schedule:ReviewSchedule):number{
+   const quota=schedule.quotaIdentity?(this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any)?.reset??0:0;
+   return Math.max(quota,githubReviewTransportRetryAt(this.s));
+  }
  claim(job:string,repo:string,pr:number,schedule:ReviewSchedule){
    assertObservationFence();if(schedule.blocker||schedule.evidence?.recoverable===false||schedule.requestPolicy?.requestReview===false)return false;
    return this.s.db.transaction(()=>{
