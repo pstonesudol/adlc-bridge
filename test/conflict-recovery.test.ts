@@ -4,7 +4,9 @@ import {readFailure} from '../src/provider-read';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,realpathSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {Store} from '../src/core';
+import {Store,digest} from '../src/core';
+import {StartupRecovery} from '../src/startup-recovery';
+import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {Planning} from '../src/planning';
 import {Workflow} from '../src/workflow';
 import {Lifecycle} from '../src/lifecycle';
@@ -13,7 +15,7 @@ import {ConflictRecovery,recoveryCommand,verificationCommand,type RecoveryComman
 import {validateConflictPolicy} from '../src/conflict-policy';
 import {BranchUpdates} from '../src/branch-updates';
 import {sendPilotRemediation} from '../src/pilot';
-import {assertWorktreeAvailable,worktreeReservation} from '../src/worktree-reservation';
+import {assertWorktreeAvailable,worktreeReservation,conflictRecoveryStatus} from '../src/worktree-reservation';
 import {DeliveryRecovery} from '../src/delivery-recovery';
 import {maintenance} from '../src/maintenance';
 
@@ -37,10 +39,11 @@ async function fixture(filename='app.txt'){
  s.db.exec(`CREATE TABLE review_targets(job TEXT PRIMARY KEY,head TEXT,head_since INTEGER,state TEXT,reason TEXT,last_signature TEXT,repo TEXT DEFAULT 'owner/repo',pr INTEGER DEFAULT 1);`);
  s.db.query('INSERT INTO review_targets(job,head,head_since,state,reason,last_signature) VALUES (?,?,?,?,?,?)').run(job,null,0,'ready_for_human',null,'old');
  const config={repo:source,githubRepo:'owner/repo',linear:{projectId:'project'},conflictRecovery:{version:1 as const,enabled:true,authorizedBy:'human',baseBranch:'main',maxRecoveries:3,verification:[[process.execPath,'-e',`if(require('fs').readFileSync(${JSON.stringify(filename)},'utf8')!=='feature=new\\nsafety=new\\n')process.exit(1)`]]}};
- const e:any={session:{id:'worker',branch:reserved.branch,isTerminated:false,activity:{state:'idle'},prs:[{number:1,url:'https://github.com/owner/repo/pull/1',state:'open'}]},transcript:{controller:'ready',entries:[],turns:[]}};
+  const e:any={session:{id:'worker',kind:'worker',projectId:'ao',branch:reserved.branch,isTerminated:false,activity:{state:'idle'},prs:[{number:1,url:'https://github.com/owner/repo/pull/1',state:'open'}]},transcript:{controller:'ready',entries:[],turns:[]}};
  let sends=0,owners=['worker'],idle=true,lost=false;
- const snapshot=async()=>({head:await git(remote,'rev-parse',`refs/heads/${reserved.branch}`),base:await git(remote,'rev-parse','refs/heads/main'),branch:reserved.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:false,behind:1});
- const io={command,snapshot,evidence:async()=>e,submit:async<T>(fn:()=>Promise<T>)=>fn(),send:async(_s:string,_p:string,id:string)=>{sends++;if(lost)throw Error('Lost receipt');e.transcript.entries=[{clientMessageId:id,turnId:'resolution'}];e.transcript.turns=[{id:'resolution',state:'running'}];},facts:async()=>{const b=await snapshot();return {session:'worker',project:'ao',reserved:reserved.branch,worktree:tree,branch:await git(tree,'branch','--show-current'),head:await git(tree,'rev-parse','HEAD'),anchor:await git(tree,'rev-parse',reserved.branch),clean:!(await git(tree,'status','--porcelain')),isolated:true,lineage:true,idle,completed:true,owners,candidates:[{repo:'owner/repo',pr:1,url:'https://github.com/owner/repo/pull/1',branch:reserved.branch,head:b.head,baseBranch:'main',defaultBranch:'main',fork:false,state:'open',draft:false}]};}};
+  const initialHead=await git(remote,'rev-parse',`refs/heads/${reserved.branch}`);
+  const snapshot=async()=>{const head=await git(remote,'rev-parse',`refs/heads/${reserved.branch}`);return {head,base:await git(remote,'rev-parse','refs/heads/main'),branch:reserved.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:head===initialHead?false:true,behind:head===initialHead?1:0};};
+  const io={command,snapshot,evidence:async()=>({...e,receiptObservation:{complete:true,observed:Date.now()}}),submit:async<T>(fn:()=>Promise<T>)=>fn(),send:async(_s:string,_p:string,id:string)=>{sends++;if(lost)throw Error('Lost receipt');e.transcript.entries=[{clientMessageId:id,turnId:'resolution'}];e.transcript.turns=[{id:'resolution',state:'running'}];},facts:async()=>{const b=await snapshot();return {session:'worker',project:'ao',reserved:reserved.branch,worktree:tree,branch:await git(tree,'branch','--show-current'),head:await git(tree,'rev-parse','HEAD'),anchor:await git(tree,'rev-parse',reserved.branch),clean:!(await git(tree,'status','--porcelain')),isolated:true,lineage:true,idle,completed:true,owners,candidates:[{repo:'owner/repo',pr:1,url:'https://github.com/owner/repo/pull/1',branch:reserved.branch,head:b.head,baseBranch:'main',defaultBranch:'main',fork:false,state:'open',draft:false}]};}};
  const recovery=new ConflictRecovery(s,io as any);
   return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'resolution',text:`<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome:'host-ready',reason:`Resolved ${filename}; host staging, verification and publication remain`,questions:[],dependencies:[]})} -->`});},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
 }
@@ -121,6 +124,151 @@ async function reservedWithReadFailure(f:any){
  return snapshot;
 }
 const mutating=(commands:string[][])=>commands.filter(a=>a[0]==='git'&&['fetch','merge','update-ref','commit','push'].includes(a[1]));
+async function publishedReservation(f:Awaited<ReturnType<typeof fixture>>){
+ await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+ const io={...f.io,command:async(args:string[],cwd:string)=>{const result=await f.io.command(args,cwd);if(args[0]==='git'&&args[1]==='push')throw Error('Reboot after publication');return result;}};
+ await new ConflictRecovery(f.s,io as any).tick(f.job,f.config,'owner/repo',1);
+ const active=f.recovery.row(f.job);
+ // Reproduce a later-created completed historical receipt masking an older
+ // reservation. Its older result is deliberately not evidence for today's SHA.
+ f.s.db.query("INSERT INTO conflict_recoveries SELECT ?,job,plan,worktree,session,repo,pr,branch,base_branch,head,base,policy,'completed',?,attempt,?,NULL,created+1 FROM conflict_recoveries WHERE id=?").run(`history-${active.id}`,`history-${active.client_id}`,JSON.stringify({...JSON.parse(active.detail),result:active.head}),active.id);
+ f.s.db.exec('CREATE TABLE branch_maintenance(job TEXT PRIMARY KEY,repo TEXT,pr INTEGER,head TEXT,state TEXT,reason TEXT)');
+ f.s.db.query("INSERT INTO branch_maintenance VALUES (?,'owner/repo',1,?,'completed','Current published branch is maintained')").run(f.job,JSON.parse(active.detail).result);
+ return active;
+}
+for(const incident of ['DEV-82','DEV-110'])test(`${incident}: reboot settles exact published reservation despite newer completed history, once`,async()=>{
+ const f=await fixture();let reopened:Store|undefined;
+ try{
+  const active=await publishedReservation(f),head=JSON.parse(active.detail).result;
+  expect(f.recovery.row(f.job).id).toBe(active.id);
+  const ledger=new ReceiptReconciliation(f.s);
+  ledger.reserve({job:f.job,plan:f.plan,spec:digest(f.s.get(f.job).spec),session:'worker',client:'original',attempt:'implementation:1'});ledger.accepted('original');
+  f.e.session.projectId='ao';f.e.session.kind='worker';
+  f.e.transcript.entries.unshift({clientMessageId:'original',turnId:'implementation'});f.e.transcript.turns.unshift({id:'implementation',state:'completed'});
+  // DEV-110 shape includes an interrupted, terminal historical native turn;
+  // neither that turn nor any other implementation turn may be replayed.
+  if(incident==='DEV-110')f.e.transcript.turns.push({id:'historical-maintenance',state:'interrupted'});
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason=?").run(`Conflict recovery ${active.id} retains reservation`);
+  const budget=JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all()),attempts=f.s.get(f.job).attempts,mark=f.commands.length;
+  reopened=new Store(join(f.dir,'state.sqlite'));
+  const c={...f.config,automation:{planningEnabled:true,orchestratorProject:'ao'}},registrations:any[]=[];
+  const w=new Workflow(reopened,{...f.io,worktree:async()=>({tree:f.tree,branch:f.branch,head}),branchSnapshot:f.io.snapshot} as any);
+  const startup=new StartupRecovery(reopened,w,{inventory:async()=>[f.e.session],requirements:async()=>{},inspect:async()=>({tree:f.tree,branch:f.branch,prs:[{url:'https://github.com/owner/repo/pull/1'}]}) as any,conflict:f.io as any,register:(...args)=>registrations.push(args)});
+  for(let n=0;n<3;n++)expect(await startup.pass(c,true)).toMatchObject({blocked:0,reattached:1});
+  expect(worktreeReservation(reopened,f.job)).toBeUndefined();
+  expect(reopened.db.query("SELECT count(*) AS n FROM events WHERE kind='conflict_reservation_settled'").get()).toEqual({n:1});
+  expect(registrations).toHaveLength(0); // The existing review target is retained.
+  expect(reopened.db.query('SELECT head,state FROM review_targets').get()).toMatchObject({head,state:'waiting_for_ci'});
+  expect(f.sends()).toBe(1);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+  expect(f.s.get(f.job).attempts).toBe(attempts);expect(JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all())).toBe(budget);
+ }finally{reopened?.close();f.close();}
+},60000);
+test('settlement preserves unrelated review and budget gates and is idempotent',async()=>{
+ const f=await fixture();try{
+  await publishedReservation(f);
+  f.s.db.query("UPDATE review_targets SET state='needs_reconciliation',reason='CodeRabbit delivery uncertain'").run();
+  f.s.db.query("INSERT INTO remediation_budget(job,stop_reason) VALUES (?,'budget_exhausted') ON CONFLICT(job) DO UPDATE SET stop_reason='budget_exhausted'").run(f.job);
+  const budget=f.s.db.query('SELECT * FROM remediation_budget').all();
+  expect(await f.recovery.reconcileSettled(f.job,f.config)).toMatchObject({state:'completed'});
+  const target=f.s.db.query('SELECT * FROM review_targets').get();
+  expect(target).toMatchObject({state:'needs_reconciliation',reason:'CodeRabbit delivery uncertain'});
+  expect(await f.recovery.reconcileSettled(f.job,f.config)).toBeNull();
+  expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.s.db.query('SELECT * FROM remediation_budget').all()).toEqual(budget);
+ }finally{f.close();}
+},60000);
+test('concurrent settlement observers commit one release and one review transition',async()=>{
+ const f=await fixture();try{
+  await publishedReservation(f);const mark=f.commands.length;
+  await Promise.allSettled([f.recovery.reconcileSettled(f.job,f.config),new ConflictRecovery(f.s,f.io as any).reconcileSettled(f.job,f.config)]);
+  expect(worktreeReservation(f.s,f.job)).toBeUndefined();
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='conflict_reservation_settled'").get()).toEqual({n:1});
+  const target=f.s.db.query('SELECT * FROM review_targets').get();
+  expect(await f.recovery.reconcileSettled(f.job,f.config)).toBeNull();expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);
+  expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+ }finally{f.close();}
+},60000);
+test('operator preview can verify a published result whose automatic verification proof is incomplete',async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),d=JSON.parse(r.detail);d.verification=[];
+  f.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=?').run(JSON.stringify(d),r.id);
+  const mark=f.commands.length,preview=await f.recovery.manualPreview(f.job,f.config);
+  expect(preview).toMatchObject({id:r.id,action:'verify-published-merge',automaticSettlementBlocker:expect.stringContaining('verification proof missing')});
+  expect(await f.recovery.manualConfirm(f.job,f.config,preview.confirmation,'human')).toMatchObject({state:'completed'});
+  expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+ }finally{f.close();}
+},60000);
+for(const fault of ['none','unattributed','uncertain','older-head'])test(`stale reservation requires attributable confirmed publication evidence: ${fault}`,async()=>{
+ const f=await fixture();try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Previously authorized operator repair');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','human');
+  await f.recovery.publishedConfirm(f.job,f.config,'merge','human',preview.confirmation);
+  const r=f.recovery.row(f.job),p=JSON.parse((f.s.db.query('SELECT detail FROM publication_reconciliations WHERE id=?').get(preview.confirmation) as any).detail);
+  if(fault==='unattributed')p.proof.active.id='another-reservation';
+  if(fault==='uncertain')p.proof.message='uncertain';
+  if(fault==='older-head')p.proof.head=r.head;
+  f.s.db.query('UPDATE publication_reconciliations SET detail=? WHERE id=?').run(JSON.stringify(p),preview.confirmation);
+  f.s.db.query("UPDATE conflict_recoveries SET state='resolving',reason='Stale reservation after restart' WHERE id=?").run(r.id);
+  const mark=f.commands.length;
+  if(fault==='none')expect(await f.recovery.reconcileSettled(f.job,f.config)).toMatchObject({state:'completed'});
+  else{await expect(f.recovery.reconcileSettled(f.job,f.config)).rejects.toThrow();expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);}
+  expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+ }finally{f.close();}
+},60000);
+for(const fault of ['authority','target'])test(`settlement rechecks ${fault} after the final asynchronous proof`,async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f);let proofs=0;
+  const io={...f.io,command:async(args:string[],cwd:string)=>{
+   const result=await f.io.command(args,cwd);
+   if(args.includes('--format=%P')&&++proofs===2){
+    if(fault==='authority')f.s.db.query('UPDATE jobs SET approved_hash=NULL WHERE id=?').run(f.job);
+    else f.s.db.query("UPDATE review_targets SET reason='Independent security hold',state='blocked'").run();
+   }
+   return result;
+  }};
+  await expect(new ConflictRecovery(f.s,io as any).reconcileSettled(f.job,f.config)).rejects.toThrow();
+  expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);expect(f.recovery.row(f.job).state).toBe('pushing');
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='conflict_reservation_settled'").get()).toEqual({n:0});
+ }finally{f.close();}
+},60000);
+test('startup proof failure appears in read-only status with the exact reservation and recovery command',async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),j=f.s.get(f.job);
+  f.s.db.exec('CREATE TABLE startup_recovery_results(job TEXT PRIMARY KEY,outcome TEXT,next_action TEXT,plan_hash TEXT,spec_hash TEXT)');
+  const missing=`Reservation ${r.id}: exact merge tree/parents and successful configured verification proof missing; preview reconcile-conflict ${f.job} CONFIG`;
+  f.s.db.query("INSERT INTO startup_recovery_results VALUES (?,'blocked',?,?,?)").run(f.job,missing,j.plan_hash,digest(j.spec));
+  const before=f.s.db.query('SELECT * FROM conflict_recoveries').all();
+  const status=conflictRecoveryStatus(f.s).find(s=>s.id===r.id);
+  expect(status.missingProof).toBe(missing);expect(status.nextAction).toContain(`reconcile-conflict ${f.job} CONFIG`);
+  expect(f.s.db.query('SELECT * FROM conflict_recoveries').all()).toEqual(before);
+ }finally{f.close();}
+},60000);
+for(const fault of ['owner','human','approval','session','worktree','older-head','missing-result','verification','receipt','inventory','busy','dirty','base','conflict'])test(`settlement retains reservation with ${fault} proof failure`,async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),d=JSON.parse(r.detail);let io:any=f.io;
+  if(fault==='owner')f.setOwners(['another']);
+  if(fault==='human'){f.s.db.exec('CREATE TABLE ownership(session_id TEXT PRIMARY KEY,owner TEXT)');f.s.db.query("INSERT INTO ownership VALUES ('worker','human')").run();}
+  if(fault==='approval')f.s.db.query('UPDATE jobs SET approved_hash=NULL WHERE id=?').run(f.job);
+  if(fault==='session')f.s.db.query("UPDATE conflict_recoveries SET session='different' WHERE id=?").run(r.id);
+  if(fault==='worktree')f.s.db.query('UPDATE conflict_recoveries SET worktree=? WHERE id=?').run(f.source,r.id);
+  if(fault==='older-head')d.result=r.head;
+  if(fault==='missing-result')delete d.result;
+  if(fault==='verification')d.verification[0].code=1;
+  if(fault==='receipt')f.e.transcript.entries=[];
+  if(fault==='inventory')io={...f.io,evidence:async()=>({...f.e,receiptObservation:{complete:false,observed:Date.now()}})};
+  if(fault==='busy')f.e.transcript.turns.push({id:'active',state:'running'});
+  if(fault==='dirty')writeFileSync(join(f.tree,'operator-work'),'preserve me');
+  if(fault==='base')io={...f.io,snapshot:async()=>({...await f.io.snapshot(),base:'f'.repeat(40)})};
+  if(fault==='conflict')io={...f.io,snapshot:async()=>({...await f.io.snapshot(),mergeable:false})};
+  f.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=?').run(JSON.stringify(d),r.id);
+  const before=f.recovery.row(f.job),target=f.s.db.query('SELECT * FROM review_targets').get(),mark=f.commands.length;
+  await expect(new ConflictRecovery(f.s,io).reconcileSettled(f.job,f.config)).rejects.toThrow();
+  expect(f.recovery.row(f.job)).toEqual(before);expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);
+  expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.sends()).toBe(1);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
+  const status=conflictRecoveryStatus(f.s).find(s=>s.id===r.id);
+  expect(status).toMatchObject({reserved:true,missingProof:expect.any(String),nextAction:expect.stringContaining(`reconcile-conflict ${f.job} CONFIG`)});
+ }finally{f.close();}
+},60000);
 test('DEV-103/DEV-67 host-ready text-only handoff publishes once across repeated polls',async()=>{
  const f=await fixture();try{
   let prompt='';const io={...f.io,send:async(s:string,p:string,id:string)=>{prompt=p;return f.io.send(s,p,id);}};

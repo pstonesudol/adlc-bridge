@@ -50,7 +50,7 @@ import {assertConfiguredProjectIntakeEnabled,assertProjectReferenceIntakeEnabled
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
-import {recoveryRows,branchSyncRows} from './worktree-reservation';
+import {conflictRecoveryStatus,branchSyncRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
@@ -473,7 +473,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='recovery-status'||command==='recovery-preview'){
      const store=new Store(db,true);
      try{
-      if(command==='recovery-status')return out([...recoveryRows(store),...branchSyncRows(store)]);
+       if(command==='recovery-status')return out([...conflictRecoveryStatus(store),...branchSyncRows(store)]);
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       const job=req(a[0],'Job'),target=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
       if(!target)throw Error('Existing review target required');

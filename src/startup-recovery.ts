@@ -4,7 +4,8 @@ import {DeliveryRecovery} from './delivery-recovery';
 import {ApprovalPolicyStore,featureGit} from './approval-policy';
 import {ReceiptReconciliation,RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {restoreRepository,restoreConfig} from './planning-restore';
-import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation';
+import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
+import {ConflictRecovery,type ConflictIO} from './conflict-recovery';
 import {assertConfiguredProjectIntakeEnabled} from './project-services';
 import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {WORKER_STATUS_INSTRUCTION} from './readiness';
@@ -62,7 +63,7 @@ export function consumeStartupRestore(s:Store,job:string,c:WorkflowConfig,sessio
 }
 
 export class StartupRecovery{
- constructor(public s:Store,public w:Workflow,public io:{inventory():Promise<any[]>;inspect?:typeof restoreRepository;requirements?:typeof assertCurrentPlanningRequirements;register?:(job:string,result:any,c:WorkflowConfig)=>void;now?:()=>number;check?:()=>void}){ensureStartupRecovery(s);}
+  constructor(public s:Store,public w:Workflow,public io:{inventory():Promise<any[]>;inspect?:typeof restoreRepository;requirements?:typeof assertCurrentPlanningRequirements;conflict?:Partial<ConflictIO>;register?:(job:string,result:any,c:WorkflowConfig)=>void;now?:()=>number;check?:()=>void}){ensureStartupRecovery(s);}
  async pass(c:WorkflowConfig,force=false):Promise<RecoverySummary>{
   const summary:RecoverySummary={complete:true,admit:true,results:[],reattached:0,resumed:0,waiting:0,blocked:0};
   const now=this.io.now??Date.now;
@@ -102,8 +103,18 @@ export class StartupRecovery{
   if(!session)throw Error('Recorded worker missing from authoritative inventory; never replace it');
   let e=await this.w.t.evidence(d.session_id);retained(e);
   if(e.session?.id!==d.session_id||e.session.projectId!==p?.project||e.session.branch!==p?.branch||e.session.kind!=='worker'||typeof e.session.isTerminated!=='boolean')throw Error('Exact recorded native worker/project/branch identity required');
-  const busy=e.transcript.turns.some((t:any)=>!terminal.has(t.state));
-  if(busy)return {job,outcome:'waiting',nextAction:'Existing active/queued or disconnected turn preserved; wait for authoritative terminal evidence'};
+   const busy=e.transcript.turns.some((t:any)=>!terminal.has(t.state));
+   if(busy)return {job,outcome:'waiting',nextAction:'Existing active/queued or disconnected turn preserved; wait for authoritative terminal evidence'};
+   // A stale branch reservation must be reconciled before startupAuthorization
+   // reaches the fence. This path observes only; it cannot replay recovery Git,
+   // restore a provider or deliver another implementation turn.
+   const reservation=worktreeReservation(this.s,job);
+   if(reservation&&!reservation.branchSync&&!reservation.planningRestore&&!reservation.specRevision&&!reservation.dependency){
+    if(reservation.job!==job)throw Error(`Reservation ${reservation.id} belongs to another job; inspect recovery-status`);
+    await (this.io.requirements??assertCurrentPlanningRequirements)(this.s,job,c);
+    try{await new ConflictRecovery(this.s,this.io.conflict).reconcileSettled(job,c);}
+    catch(error){throw Error(`Reservation ${reservation.id} (${reservation.state}): ${error instanceof Error?error.message:'settlement proof missing'}; preview reconcile-conflict ${job} CONFIG or reconcile-publication ${job} CONFIG SOURCE HUMAN; never replay or discard work`);}
+   }
    const ledger=new ReceiptReconciliation(this.s),cont=currentDispatchContinuation(this.s,job,d),client=cont?cont.client_id:d.client_id,binding=ledger.get(client);
   if(!binding){
    if(d.state==='approved_pending')return {job,outcome:'waiting',nextAction:'Original dispatch unattempted; normal current-authority workflow will deliver it'};
@@ -164,7 +175,10 @@ export class StartupRecovery{
   if(e.session.isTerminated!==false||e.session.activity?.state!=='idle'||e.transcript.controller!=='ready'||e.transcript.turns.some((t:any)=>!terminal.has(t.state)))throw Error('Worker not authoritatively idle; preserve existing turns');
   if(!interrupted){
    const result=await this.w.executionStatus(job,e,c);
-   if(result?.state==='pr_handoff')this.io.register?.(job,result,c);
+    if(result?.state==='pr_handoff'){
+     const target=row(this.s,'review_targets',job);
+     if(!target||target.repo!==c.githubRepo||target.pr!==result.pr?.number)this.io.register?.(job,result,c);
+    }
    return {job,outcome:reattached?'reattached':result?.state==='pr_handoff'?'reattached':['needs_input','blocked_dependency','failed','blocked','needs_reconciliation'].includes(result?.state)?'blocked':'waiting',state:result?.state,nextAction:result?.state==='pr_handoff'?'Published PR returned to ordinary CI/review polling':result?.reason??'Completed delivery reconciled; no implementation resend'};
   }
   if(cont||this.s.db.query('SELECT 1 FROM startup_continuations WHERE job=? AND dispatch=?').get(job,d.client_id))throw Error('Recovery/guarded continuation already exists; reconcile it rather than issuing another');
