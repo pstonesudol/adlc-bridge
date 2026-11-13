@@ -12,6 +12,7 @@ import {Store} from './core';
 import {PlanningRestore} from './planning-restore';
 import {recoverProject,assertRecoveryAvailable} from './recovery-runtime';
 import {ApprovalPolicyStore} from './approval-policy';
+import {SpecRequests} from './spec-requests';
 import {serviceControl,registeredProjects} from './service-control';
 import {lifecycleCLI} from './lifecycle-cli';
 import {LifecycleFailure,type LifecycleAction} from './managed-lifecycle';
@@ -103,7 +104,7 @@ export async function runCLIReviewTick<T>(operation:()=>Promise<T>):Promise<T>{
   if(interrupted)process.exitCode=interrupted==='SIGINT'?130:143;
  }
 }
-export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;recovery?:(c:any)=>Promise<any>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}},run=runPollTick){
+export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:Store;reviewLoop:Pick<ReviewLoop,'configureMetadataChecks'|'register'|'list'|'tick'|'setVerification'>;workflow:Pick<Workflow,'tick'|'implementation'>;linearApprovals:Pick<LinearApprovals,'sync'>;linearLifecycle:Pick<LinearLifecycle,'sync'>;features:Pick<FeaturePlanning,'tickProject'>;specRequests?:Pick<SpecRequests,'sync'>;recovery?:(c:any)=>Promise<any>;blockers?:Pick<LinearBlockers,'sync'|'retract'>;clarifications?:Pick<LinearClarifications,'sync'>&Partial<Pick<LinearClarifications,'preflight'>>;io?:{poll:typeof poll;linearToken:typeof linearToken;out:typeof out}},run=runPollTick){
  const {config:startup,loadConfig,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,io={poll,linearToken,out}}=context;
  const identity=(c:any)=>JSON.stringify([realpathSync(c.repo),c.linear.projectId,c.linear.teamId,c.automation?.orchestratorProject,c.githubRepo]);
   const initialIdentity=loadConfig?identity(startup):undefined;
@@ -121,6 +122,7 @@ export function createCLIPollTick(context:{config:any;loadConfig?:()=>any;store:
    if(context.recovery){const recovery=await context.recovery(c);io.out({startupRecovery:recovery});if(!recovery.admit)throw Error(recovery.reason??'Startup recovery incomplete; new work remains fenced');}
   await clarifications?.preflight?.(c);
   const stages=await workflow.tick(c);if(stages.length)io.out({workflow:stages});
+  if(context.specRequests)io.out({replanning:await context.specRequests.sync(c)});
   if(blockers&&(workflow as Workflow).planningDependencies)io.out({planningDependencyNotices:await (workflow as Workflow).planningDependencies.notices(c,blockers as LinearBlockers)});
   if(c.dependencyRecovery?.enabled){const dependencies=new DependencyRecovery(s,workflow as Workflow);io.out({dependencies:await dependencies.sync(c)});if(blockers)io.out({dependencyNotices:await dependencies.notices(c,blockers as LinearBlockers)});}
   const clarificationUpdates=clarifications?await clarifications.sync(c):[];if(clarificationUpdates.length)io.out({clarifications:clarificationUpdates});
@@ -634,7 +636,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     }
     if(command==='rebind-review-target')return out(reviewLoop.rebind(req(a[0],'Job'),req(a[1],'Repository'),Number(req(a[2],'Pull request'))));
     if(command==='prepare')return out(bridge.prepare(req(a[0],'Job'),req(a[1],'Orchestrator project')));
-     const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,recovery:config=>recoverProject(s,workflow,reviewLoop,config)});
+     const tick=createCLIPollTick({config:c,loadConfig:command==='serve'?()=>projectConfiguration(req(a[0],'Config')):undefined,store:s,reviewLoop,workflow,linearApprovals,linearLifecycle,features,blockers,clarifications,specRequests:new SpecRequests(s,workflow),recovery:config=>recoverProject(s,workflow,reviewLoop,config)});
     const finished=await acknowledgePoll(req(a[0],'Config'),join(import.meta.dir,'cli.ts'));
     try{
     if(command==='poll')return await tick();

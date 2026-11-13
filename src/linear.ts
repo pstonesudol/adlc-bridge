@@ -10,6 +10,7 @@ import {effectiveSettings} from './project-settings';
 import {validateDependencies,type DependencyPolicy} from './dependency-policy';
 import {validateIntegrationPolicy,type IntegrationPolicy} from './integration-capabilities';
 import {reviewerPolicy,type ReviewerConfig} from './reviewer-policy';
+import {validateReplanning,type ReplanningPolicy} from './spec-requests';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -17,6 +18,7 @@ export type ProjectConfig = {
   approval?:ApprovalPolicy;
   reviewers?:ReviewerConfig[];
   verification?:Verification;
+  replanning?:ReplanningPolicy;
   pollingIntervalSeconds?:number;
   automation?:{planningEnabled?:boolean;orchestratorProject?:string;maxPlanning?:number};
   linear: { projectId: string; teamId: string; readyStateId: string; readyLabelId: string };
@@ -45,6 +47,7 @@ export function metadataCheckNames(value:unknown):string[]{
 export function validate(c: any): asserts c is ProjectConfig {
   if(c?.verification!==undefined)validateVerification(c.verification);
   effectiveSettings(c??{});
+  validateReplanning(c??{});
   reviewerPolicy(c?.reviewers);
   validateIntegrationPolicy(c);
   if (c?.version !== 1 || typeof c.name !== 'string' || !c.name.trim() || typeof c.repo !== 'string' || !c.repo.startsWith('/')) throw Error('Invalid project configuration');

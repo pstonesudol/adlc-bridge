@@ -201,10 +201,26 @@ export function capturedRevision(s:Store,job:string,plan:string|null,session?:st
 export function assertCapturedRevision(s:Store,job:string,plan:string|null,session?:string|null){
  if(!capturedRevision(s,job,plan,session).captured)throw Error('Exact captured replan for the current requirement revision required');
 }
+/** Called only inside the fresh revised-plan approval transaction. Ordinary
+ * review registration still rejects all scope/identity changes. */
+export function reconcileAuthorizedReviewScope(s:Store,job:string,paths:string[]){
+ if(!s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get())return;
+ const target=s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
+ if(!target||target.allowed_paths===JSON.stringify(paths))return;
+ const j=s.get(job),r=latestRevision(s,job),d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
+ const replan=r&&s.db.query('SELECT * FROM spec_replans WHERE revision=?').get(r.id) as any,proof=replan&&JSON.parse(replan.proof);
+ const grant=s.db.query('SELECT * FROM git_grants WHERE job=?').get(job) as any;
+ const evidence=r&&s.db.query('SELECT snapshot FROM spec_revision_evidence WHERE revision=?').get(r.id) as any;
+ const old=evidence&&JSON.parse(evidence.snapshot).review_targets;
+ if(!r||r.state!=='authorized'||j.state!=='approved'||j.approved_hash!==j.plan_hash||!d||d.plan_hash!==j.plan_hash||d.actor!==j.actor||d.paths!==JSON.stringify(paths)||!grant||grant.plan_hash!==j.plan_hash||grant.actor!==j.actor||!['inspect','commit','push-feature','open-pr'].every(op=>JSON.parse(grant.operations).includes(op))||!capturedRevision(s,job,j.plan_hash,d.session_id).captured||proof.spec!==digest(j.spec)||proof.prs?.length!==1||proof.prs[0].number!==target.pr||proof.prs[0].url!==`https://github.com/${target.repo}/pull/${target.pr}`||proof.prEvidence?.headRepo!==target.repo||proof.prEvidence.baseRepo!==target.repo||proof.prEvidence.state!=='open'||!Array.isArray(old)||old.length!==1||old[0].repo!==target.repo||old[0].pr!==target.pr||old[0].allowed_paths!==target.allowed_paths)throw Error('Revised review scope needs exact same-job/PR authorization and captured identity; explicit reconciliation required');
+ s.db.query("UPDATE review_targets SET allowed_paths=?,state='waiting_for_review',head=NULL,last_signature=NULL,reason='Fresh revised scope authorized; collect current-head evidence',head_since=?,updated=CURRENT_TIMESTAMP WHERE job=?").run(JSON.stringify(paths),Date.now(),job);
+ s.event(job,'revised_review_scope_authorized',JSON.stringify({revision:r.id,plan:j.plan_hash,session:d.session_id,repo:target.repo,pr:target.pr,previous:target.allowed_paths,paths,actor:j.actor}));
+}
 export function revisionStatus(s:Store,job:string){
  const r=latestRevision(s,job);if(!r)return null;
  const p=s.db.query('SELECT state,reason FROM spec_replans WHERE revision=?').get(r.id) as any;
- const j=s.get(job),settled=r.state==='authorized'||r.state==='preplanning';
- return {revision:r.id,oldHash:r.old_hash,newHash:r.new_hash,summary:r.summary,state:r.state,delivery:p??null,blocking:!settled,
-  nextAction:r.state==='authorized'?'Continue only under the fresh current grant':r.state==='preplanning'?'No recovery needed: the first captured plan binds these requirements.':j.state==='awaiting_approval'?'Await current-plan approval':`Preview spec-reconcile ${job} CONFIG; confirm only after the existing owner is idle. For an archived terminated owner, preview spec-restore ${job} CONFIG first; confirm only the exact planning-only restore. No replacement worker or PR.`};
+  const j=s.get(job),settled=r.state==='authorized'||r.state==='preplanning';
+  const request=s.db.query("SELECT name FROM sqlite_master WHERE name='spec_requests'").get()?s.db.query('SELECT source,state,reason,comment_id,reply FROM spec_requests WHERE revision=?').get(r.id) as any:null;
+  return {revision:r.id,oldHash:r.old_hash,newHash:r.new_hash,summary:r.summary,state:r.state,delivery:p??null,request,blocking:!settled,
+  nextAction:r.state==='authorized'?'Continue only under the fresh current grant':r.state==='preplanning'?'No recovery needed: the first captured plan binds these requirements.':j.state==='awaiting_approval'?'Await current-plan approval':request?.state==='awaiting_replan_confirmation'?`Reply with the exact standalone command from Linear notice ${request.comment_id}; this requests planning only, not clarification or plan approval.`:request?.state==='waiting_for_planning_capacity'?'Wait for configured planning capacity; normal polling rechecks the latest revision and current limit before dispatch. Existing planning turns and uncertain deliveries retain their slots.':request?.state==='waiting_for_worker'?'Wait for the existing worker to become safely idle; normal polling rechecks the latest revision and policy. Do not interrupt it.':['dispatched','actively_replanning','delivery_uncertain'].includes(request?.state)?'Await exact owned planning delivery evidence; never resend. Inspect spec-reconcile if receipt recovery is required.':`Preview spec-reconcile ${job} CONFIG; confirm only after the existing owner is idle. For an archived terminated owner, preview spec-restore ${job} CONFIG first; confirm only the exact planning-only restore. No replacement worker or PR.`};
 }

@@ -2338,6 +2338,71 @@ remain blocked. It never resends or restores stale approval. Afterwards use the
 normal `spec-reconcile` path below. See [receipt reconciliation](docs/deterministic-watchdog.md#original-remediation-receipts-dev-84--dev-69)
 for refusals, audit guarantees and persisted-only receipt status.
 
+### Revised-ticket planning requests (DEV-110)
+
+Trusted per-project configuration may explicitly opt in with
+`"replanning": {"automatic": true}`. An absent setting (or `false`) requires
+operator confirmation. This controls **planning only**, not implementation or
+scope approval. The example configuration keeps it disabled; installing this
+code does not edit live project configuration.
+
+Normal polling coalesces edits to the latest revision and requests a read-only
+planning turn in the same ADLC-owned worker only after fresh eligible Linear
+requirements, ownership, reservation, idle-worker and settled-delivery checks.
+Project pauses remain effective. Busy workers wait for a safe handoff. A later
+edit makes the active plan historical; its completed delivery must settle before
+the newest revision can dispatch. Unknown/failed deliveries are never replayed.
+
+In manual mode Linear receives one notice per revision, with an exact standalone
+`Replan ADLC requirements TOKEN` command in a copyable fenced block. Only new,
+unedited comments by configured clarification operators (`clarifications.humanIds`
+when enabled), or otherwise configured plan approvers (`planApproval.approverIds`
+when enabled), are accepted. Bots, quotes, extra prose, old tokens and commands
+on other issues cannot confirm a request. Plain text, one inline-code wrapper,
+or one fenced block (no tag or `text`) is accepted. This command is neither
+`Confirm clarification ...` nor `Approve ADLC plan ...`. If no operator policy
+is configured, use explicit CLI preview/confirmation instead.
+
+Automatic and human requests share durable per-revision intent and the existing
+`spec_replans` delivery reservation. Status includes accepted intent, waiting for
+worker, dispatched, actively replanning, uncertain delivery, captured, superseded
+or blocked evidence, with a concrete next action. Retired attempts require a new
+explicit CLI preview/confirmation, not replaying a consumed reply.
+
+Revised plans declare all concrete affected files in exactly one receipt:
+`<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/update.ts","bun.lock"]} -->`.
+This declaration is a proposal, never authority. Actionable in-scope plans can
+receive a **fresh** authorization under current standing policy. Plans proposing
+additional files require the configured human plan approver's fresh, exact
+job-specific grant via the ordinary plan-approval notice; its file list is shown
+in the notice. Neither project-wide allowlist is widened. Missing/malformed scope
+evidence blocks automatic approval and requires explicit plan/evidence inspection,
+not an unrelated clarification loop. Merges remain human-only; deployment and
+other existing restrictions are unchanged. Existing sessions and PRs are retained;
+when no PR exists, the first may be opened only during later authorized implementation.
+
+Replanning now queries every GitHub PR state for the exact configured repository
+and owned branch with bounded, complete pagination. A fresh verified empty result
+is explicit **no-PR context**, not a request to supply a PR number. The planner
+must stay in the same worker/worktree and defer first PR creation to later current
+plan approval and scoped Git authorization. A verified existing open PR must
+match the native attachment, worktree HEAD and recorded review target. Closed PRs,
+partial/failed lookup, duplicate or multiple identities, or attachment/head
+conflicts stop dispatch with an evidence-reconciliation action; none can be
+interpreted as “no PR.” The preview binding is rechecked before reservation.
+
+Linear comment inventories reject duplicate IDs before admission and again before
+dispatch. Enabling automatic policy supersedes stale **undispatched** human intent;
+it never replaces an in-flight delivery. Explicit negative notice acknowledgements
+can retry using the same durable ID. Transport/GraphQL errors remain uncertain
+because they can partially succeed: polling reconciles an existing notice by ID,
+or the operator uses the reported `spec-reconcile JOB CONFIG` preview/confirmation
+to request planning without blindly reposting. A missing or malformed revised-plan
+scope receipt is rejected by direct CLI approval as well as standing/Linear gates.
+For the same verified existing PR, fresh revised authorization can reconcile its
+review-target paths atomically with the exact new job grant and resets stale review
+evidence; ordinary review registration still cannot widen scope.
+
 Use `adlc spec-reconcile JOB CONFIG` for a read-only preview. It refreshes Linear,
 owner, worktree and attached PR evidence. `--confirm HASH` authorizes **only a
 planning turn in the existing owner** when that exact evidence remains valid.

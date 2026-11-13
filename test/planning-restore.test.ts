@@ -13,8 +13,9 @@ import {featureGit} from '../src/approval-policy';
 import {PreSendFailure} from '../src/pre-send';
 import {worktreeReservation} from '../src/worktree-reservation';
 import {createWorkflowTransport} from '../src/workflow-transport';
+import {planningPRFixture} from './planning-pr-fixture';
 
-const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
+const ready='<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
 function fixture(path=':memory:'){
  const s=new Store(path),spec=(description:string)=>JSON.stringify({identifier:'DEV-91',title:'Task',description}),job=s.enqueue('p','issue',spec('v1'));
@@ -27,6 +28,7 @@ function fixture(path=':memory:'){
  const e:any={session:{id:'owner',projectId:'project',branch:p.branch,isTerminated:true,activity:{state:'exited'},prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'stopped',turns:[{id:'plan',state:'completed'}],entries:[{kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:1,turnId:'plan',text:`<!-- ADLC_PLAN_READY:${p.correlation} -->\nOld plan`}]}};
  const issue:any={id:'issue',...JSON.parse(s.get(job).spec),project:{id:'p'},team:{id:'t'},state:{id:'todo'},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}}};
  const recovery=new SpecRecovery(s,w,async()=>issue,async fn=>fn());
+ t.planningPRs=planningPRFixture(()=>e);
  const repository:any={tree:'/worktree',branch:p.branch,head:'a'.repeat(40),source:'/repo',common:'/repo/.git',repo:'owner/repo',prs:[],dirty:digest('dirty preserved')};
  const inspect:any=async()=>repository;
  const restore=new PlanningRestore(s,w,recovery,inspect,async fn=>fn());

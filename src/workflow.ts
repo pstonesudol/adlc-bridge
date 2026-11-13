@@ -1,5 +1,5 @@
 import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from './approval-policy';
-import {validScopes} from './file-scope';
+import {validScopes,planPaths,scopeAllows} from './file-scope';
 import {Store,digest} from './core';
 import {ReceiptReconciliation} from './receipt-reconciliation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
@@ -15,18 +15,18 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
-import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision,revisedExecution,currentDispatchContinuation,implementationRecoveryContinuation,implementationCompletion,type HandoffProof} from './spec-revisions';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision,revisedExecution,currentDispatchContinuation,implementationRecoveryContinuation,implementationCompletion,reconcileAuthorizedReviewScope,type HandoffProof} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 import {ensurePlanningRestores} from './planning-restore';
 import {PlanningDependencies} from './planning-dependencies';
 import {assertRequiredIntegrations} from './integration-capabilities';
 import {RoutePreflightFailure} from './routing-session';
 import {ensureDispatchRoutes,recordDispatchRoute} from './dispatch-route';
+import type {PlanningPRInventory} from './planning-prs';
+import {activePlanning,assertPlanningCapacity} from './planning-capacity';
 
-export type WorkflowConfig={repo:string;linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
-// Uncertain and reconciliation-blocked reservations always consume capacity.
-// Completed planning dispatches release their slot even if manually proposed.
-export const activePlanning="(EXISTS (SELECT 1 FROM planning_restores restore WHERE restore.job=d.job AND restore.state IN ('reserved','setup_consumed')) OR d.state IN ('dispatch_uncertain','needs_reconciliation') OR (d.state NOT IN ('awaiting_approval','planning_finished') AND j.state NOT IN ('awaiting_approval','approved','done')))";
+export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
+export {activePlanning} from './planning-capacity';
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
  startPlan(request:{project:string;branch:string;name:string;prompt:string;clientId:string;route?:Route}):Promise<{id:string}>;
@@ -38,6 +38,7 @@ export interface WorkflowTransport{
   configureRoute?(session:string,route:Route):Promise<unknown>;
   worktree?(job:string):Promise<{branch:string;head:string;tree?:string;worktree?:string}>;
   branchSnapshot?(repo:string,pr:number):Promise<any>;
+  planningPRs?(repo:string,branch:string):Promise<PlanningPRInventory>;
   restorePlan?(session:string,project:string):Promise<void>;
 }
 export class Workflow{
@@ -80,7 +81,6 @@ export class Workflow{
   private async startPlanningWithinBarrier(job:string,c:WorkflowConfig){
    assertRequiredIntegrations(c);
    assertWorktreeAvailable(this.s,job);
-   const {maxPlanning}=effectiveSettings(c);
   if(!c.automation?.planningEnabled)throw Error('Project planning is not enabled');
   if(this.planning(job))return this.reconcilePlanning(job,c);
   const specification=this.s.get(job).spec;
@@ -91,8 +91,7 @@ export class Workflow{
    const j=this.s.get(job);if(j.project!==c.linear.projectId||j.state!=='awaiting_plan')throw Error('Eligible project job required');
    if(this.planning(job))return null;
    if(route&&this.router.get(job,'planning')?.binding!==digest(j.spec))throw Error('Specification changed during route selection');
-   const active=this.s.db.query(`SELECT count(*) AS n FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND ${activePlanning}`).get(c.linear.projectId) as any;
-   if(active.n>=maxPlanning)throw Error('Planning concurrency limit reached');
+    assertPlanningCapacity(this.s,c);
    const p=new Planning(this.s),r=p.reserve(job,c.automation!.orchestratorProject);
    this.s.db.query('INSERT INTO planning_dispatch(job,spec_hash,state,client_id) VALUES (?,?,?,?)').run(job,digest(j.spec),'dispatch_uncertain',`adlc-plan-${r.correlation}`);
    const args=p.request(job,false,c.approval);return {r,args,clientId:`adlc-plan-${r.correlation}`};
@@ -255,6 +254,10 @@ export class Workflow{
      this.s.db.query('DELETE FROM policy_authorizations WHERE job=?').run(job);
     }
    assertApprovalReadiness(this.s,job,actor,!!acknowledge?.readiness,!!standing);
+   const revisedPlan=!!revision&&revision.state!=='preplanning'||!!j.plan?.includes('<!-- ADLC_REVISED_PLAN:');
+   const proposed=revisedPlan?planPaths(j.plan!):null;
+   if(revisedPlan&&!proposed)throw Error('Revised plan requires exactly one valid ADLC_PLAN_SCOPE receipt; inspect spec-reconcile, not clarification');
+   if(proposed?.some(path=>!scopeAllows(path,paths)))throw Error('Fresh grant must include every proposed revised-plan path');
    if(standing){const check=new ApprovalPolicyStore(this.s).evaluate(job,standing.project,standing.policy);if(!check.allowed||check.actor!==actor||JSON.stringify(check.paths)!==JSON.stringify(paths)||operations.some(op=>!featureGit.includes(op)))throw Error('Invalid standing policy proof');}
    this.s.approve(job,hash,actor,standing?'standing-policy':'human');new Lifecycle(this.s).grantGit(job,hash,operations,actor);this.router.approve(job,hash);
    if(standing)new ApprovalPolicyStore(this.s).record(job,standing.project,standing.policy);
@@ -263,6 +266,7 @@ export class Workflow{
     if(revised){
      this.s.db.query("UPDATE spec_revisions SET state='authorized' WHERE id=?").run(revision.id);
      if(run)this.s.db.query("UPDATE runs SET plan_hash=?,state='running',reason='Fresh revised-plan authorization; previous evidence is historical' WHERE job=?").run(hash,job);
+     reconcileAuthorizedReviewScope(this.s,job,paths);
     }
    this.s.event(job,'plan_and_git_scope_approved',JSON.stringify({hash,paths,runtime,operations,actor}));
    return {job,state:'approved_pending',runtime,paths,mergeEnabled:false};

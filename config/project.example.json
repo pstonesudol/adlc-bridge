@@ -1,5 +1,8 @@
 {
   "version": 1,
+  "replanning": {
+    "automatic": false
+  },
   "dependencyRecovery": {
     "enabled": false,
     "baseBranch": "main",
