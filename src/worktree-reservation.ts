@@ -1,11 +1,22 @@
 import {realpathSync} from 'node:fs';
 import {resolve} from 'node:path';
-import {Store} from './core';
+import {Store,digest} from './core';
 
 export const canonicalWorktree=(path:string)=>{try{return realpathSync(path);}catch{return resolve(path);}};
 export function recoveryRows(s:Store):any[]{
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='conflict_recoveries'").get())return [];
  return s.db.query('SELECT * FROM conflict_recoveries ORDER BY created,id').all() as any[];
+}
+/** Persisted diagnostics only. A completed historical row never releases a
+ * different reservation, and this read-only projection cannot certify live IO. */
+export function conflictRecoveryStatus(s:Store):any[]{
+ return recoveryRows(s).map(r=>{
+  const d=JSON.parse(r.detail),active=r.state!=='completed';
+  const startup=s.db.query("SELECT name FROM sqlite_master WHERE name='startup_recovery_results'").get()?s.db.query("SELECT * FROM startup_recovery_results WHERE job=? AND outcome='blocked'").get(r.job) as any:null;
+  const startupBlocker=startup?.plan_hash===r.plan&&startup.spec_hash===digest(s.get(r.job).spec)&&startup.next_action.includes(r.id)?startup.next_action:null;
+  return {...r,reserved:active,missingProof:active?(startupBlocker??r.reason??(!d.result?'Exact current published result SHA and attributable recovery/publication evidence missing':'Fresh exact owned session, current authorization, idle clean worktree and current-head publication/verification proof required')):null,
+   nextAction:active?`Preview reconcile-conflict ${r.job} CONFIG. If the recorded merge proof is unavailable or publication differs, preview reconcile-publication ${r.job} CONFIG SOURCE HUMAN; inspect the missing proof before explicit confirmation. Never replay delivery or bypass the reservation.`:'Historical completed recovery only; collect fresh current-head CI/review evidence. Any other unfinished reservation remains independent.'};
+ });
 }
 export function branchSyncRows(s:Store):any[]{
  if(!s.db.query("SELECT name FROM sqlite_master WHERE name='branch_syncs'").get())return [];

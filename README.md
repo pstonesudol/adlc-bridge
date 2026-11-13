@@ -1913,8 +1913,18 @@ rejected push, decision blockers, and unprovable results preserve work and stop
 for operator reconciliation rather than replaying a mutation. These conservative
 stops are intentional, not automatic reset/retry opportunities.
 
+Startup recovery and ordinary review ticks can settle an interrupted reservation
+without replay when its exact current published result has attributable successful
+verification and recovery/publication evidence. They recheck the exact owned idle
+session, clean worktree, current authorization, PR head and reservation before the
+transactional release. Completed historical rows cannot hide an unfinished
+reservation, and older-head receipts or a completed branch-maintenance status
+alone are not settlement authority. Release preserves independent review/delivery
+gates and retry budgets; current-head CI and review remain required.
+
 Inspect `recovery-status` for the exact stage, conflict paths, input SHAs,
-verification evidence and reason. After separately authorized manual repair and
+verification evidence and reason. Unfinished rows also show `missingProof` and a
+`nextAction` preview command; status itself performs no release. After separately authorized manual repair and
 normal publication of the exact two-parent merge, an operator can preview and
 confirm its completion:
 
@@ -1923,7 +1933,9 @@ adlc reconcile-conflict JOB CONFIG
 adlc reconcile-conflict JOB CONFIG --confirm HASH --human NAME
 ```
 
-Confirmation verifies the same approval/policy/scope/ownership, exact original
+When the preview action is `settle-published-reservation`, confirmation rechecks
+the existing exact-head settlement proof without rerunning verification or Git
+mutations. Otherwise, confirmation verifies the same approval/policy/scope/ownership, exact original
 parents, clean published tree, retained non-conflict content and a terminal
 worker receipt, then reruns configured verification and releases only that proven
 completed reservation. Completion rechecks current approval and grants inside its
@@ -1937,6 +1949,27 @@ alone does not resume a conflict worker. DEV-17 blocker notices are deduplicated
 they identify the recovery and stage without publishing raw Git/hook diagnostics.
 Detailed failure text remains local in `recovery-status`.
 Completion notices report the new SHA but do not grant readiness or merge approval.
+
+#### Required-check policy drift
+
+Startup registration and review polling fail closed if configured `requiredChecks`
+differs from the existing target. To add checks without editing state directly:
+
+```sh
+adlc reconcile-review-checks JOB CONFIG HUMAN
+adlc reconcile-review-checks JOB CONFIG HUMAN --confirm EXACT_PREVIEW_HASH
+```
+
+Preview is read-only. Confirmation requires current unchanged owned handoff
+authorization, an idle review-evaluation lease and the exact preview proof. It
+stores the configured list only if **every existing check is retained**, clears
+the old decision signature, and moves stale readiness or this policy-drift blocker
+to `waiting_for_review` with no stale ready reason. Unrelated review/delivery
+blockers, worktree reservations and retry budgets are preserved. The operation
+records an audit event and makes no provider requests, Git mutations or worker
+deliveries. Fresh polling evaluates the added checks; this is not review or merge
+approval. Check removal is deliberately unsupported and requires a separately
+approved policy change, not direct edits to the live database.
 
 Installation/activation is a separate reviewed operator step. Human-only PR
 merging remains mandatory.

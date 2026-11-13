@@ -11,7 +11,8 @@ import {appState} from './install-state';
 import {projectIntakePaused,withRecoverySubmission,withTurnSubmission} from './turn-submission';
 import {poll} from './linear';
 import {linearToken} from './credential';
-import {createProcessRunner,worktreeIdentity} from './delivery-evidence';
+import {createProcessRunner,worktreeIdentity,recoveryTransport} from './delivery-evidence';
+import {recoveryCommand} from './conflict-recovery';
 import {restoreRepository,restoreRegistry} from './planning-restore';
 import {readBranchSnapshot} from './branch-updates';
 import {preflightRoute,configureSessionRoute} from './routing-session';
@@ -69,7 +70,8 @@ export async function recoverProject(s:Store,w:Workflow,loop:ReviewLoop,c:any,op
  const check=()=>{assertRecoveryAvailable(state);io.remaining();};
  check();
  const scopedWorkflow=new Workflow(s,io.transport,w.router,true);
- const recovery=new StartupRecovery(s,scopedWorkflow,{inventory:options.inventory??(()=>authoritativeSessions(io.api)),check,inspect:io.inspect,requirements:io.requirements,
+  const recovery=new StartupRecovery(s,scopedWorkflow,{inventory:options.inventory??(()=>authoritativeSessions(io.api)),check,inspect:io.inspect,requirements:io.requirements,
+   conflict:{submit:io.transport.submit,evidence:io.transport.evidence,snapshot:io.transport.branchSnapshot!,facts:recoveryTransport(s,io.run,io.transport.evidence,true).inspect,command:(args,cwd)=>recoveryCommand(args,cwd,io.spawn)},
   register:(job,result,config)=>{
    const pr=result.pr??s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
    if(!pr||!(pr.number??pr.pr))throw Error('Published PR target unavailable; reconcile before review');

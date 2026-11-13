@@ -5,7 +5,7 @@ import {RecoveryObservation,ObservationDeferred} from './recovery-observation';
 import {ProviderReadError} from './provider-read';
 import {resolve} from 'node:path';
 import {Store,digest} from './core';
-import {ReceiptReconciliation} from './receipt-reconciliation';
+import {ReceiptReconciliation,RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {Lifecycle} from './lifecycle';
 import {DeliveryRecovery,type DeliveryFacts} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
@@ -17,14 +17,14 @@ import {withTurnSubmission} from './turn-submission';
 import {scopeAllows} from './file-scope';
 import {CONFLICT_WORKER_STATUS_INSTRUCTION as WORKER_STATUS_INSTRUCTION,assessWorkerReceipt} from './readiness';
 import {validateConflictPolicy} from './conflict-policy';
-import {assertWorktreeAvailable,canonicalWorktree,recoveryRows} from './worktree-reservation';
+import {assertWorktreeAvailable,canonicalWorktree,recoveryRows,worktreeReservation} from './worktree-reservation';
 import {type RemediationPolicy,DEFAULT_REMEDIATION_POLICY} from './remediation';
 
 export type RecoveryCommand=(args:string[],cwd:string)=>Promise<{code:number;out:string;err:string}>;
-export const recoveryCommand:RecoveryCommand=async(args,cwd)=>{
+export const recoveryCommand=async(args:string[],cwd:string,spawn=Bun.spawn)=>{
  const env={...process.env};
  for(const key of Object.keys(env))if(key.startsWith('GIT_')&&!['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM'].includes(key))delete env[key];
- const p=Bun.spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
+ const p=spawn(args,{cwd,env,stdout:'pipe',stderr:'pipe',timeout:600000});
  const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
 };
 // Verification executes worker-edited code. Never select its environment by
@@ -57,17 +57,93 @@ export class ConflictRecovery{
  head TEXT NOT NULL,base TEXT NOT NULL,policy TEXT NOT NULL,state TEXT NOT NULL,client_id TEXT NOT NULL UNIQUE,
  attempt INTEGER NOT NULL,detail TEXT NOT NULL,reason TEXT,created INTEGER NOT NULL);
  CREATE UNIQUE INDEX IF NOT EXISTS active_conflict_worktree ON conflict_recoveries(worktree) WHERE state!='completed';`);}
- row(job:string){return recoveryRows(this.s).filter(r=>r.job===job).at(-1);}
+  row(job:string){
+   const rows=recoveryRows(this.s).filter(r=>r.job===job),active=rows.filter(r=>r.state!=='completed');
+   if(active.length>1)throw Error('Multiple conflict reservations for this job; inspect recovery-status and reconcile each exact worktree');
+   return active[0]??rows.at(-1);
+  }
+  /** Observe only: completed maintenance/status or an old-head receipt is not a
+   * publication proof for this reservation. Never fetch or replay a Git stage. */
+  async settledPreview(job:string,c:any){
+   const r=this.row(job);if(!r||r.state==='completed')return null;
+   const held=worktreeReservation(this.s,job);
+   if(held?.id!==r.id||held.job!==job)throw Error(`Reservation ${r.id}: another recovery owns the worktree; inspect recovery-status`);
+   const d=JSON.parse(r.detail);
+   const dispatch=this.s.db.query('SELECT state FROM implementation_dispatch WHERE job=?').get(job) as any;
+   if(dispatch?.state!=='pr_handoff')throw Error(`Reservation ${r.id}: current implementation handoff required; preserve independent worker gates`);
+   let publication:any=null;
+   if(d.publication&&this.s.db.query("SELECT name FROM sqlite_master WHERE name='publication_reconciliations'").get()){
+    const saved=this.s.db.query('SELECT detail FROM publication_reconciliations WHERE id=? AND job=?').get(d.publication,job) as any;
+    if(saved)publication=JSON.parse(saved.detail);
+   }
+   if(!sha(d.result??''))throw Error(`Reservation ${r.id}: missing exact published result SHA; preview reconcile-publication ${job} CONFIG SOURCE HUMAN`);
+   const x=await this.guard(r,c,d.result,publication?.proof?.base??r.base);
+   if(x.e.session.projectId!==x.auth.project||x.e.session.kind!=='worker')throw Error(`Reservation ${r.id}: exact native worker/project identity missing`);
+   const age=Date.now()-x.e.receiptObservation?.observed;
+   if(x.e.receiptObservation?.complete!==true||!Number.isFinite(age)||age<0||age>RECEIPT_FRESHNESS_MS||!Array.isArray(x.e.transcript.entries)||new Set(x.e.transcript.turns.map((t:any)=>t.id)).size!==x.e.transcript.turns.length)throw Error(`Reservation ${r.id}: fresh complete authoritative delivery inventory missing`);
+   if(x.b.mergeable!==true||!x.facts.clean||x.facts.head!==d.result||x.facts.candidates[0].head!==d.result)throw Error(`Reservation ${r.id}: clean conflict-free current published head proof missing`);
+   await this.noOperation(r.worktree);
+   const tree=await this.git(r.worktree,'rev-parse',`${d.result}^{tree}`);
+   const verified=(v:any)=>Array.isArray(v)&&v.length===c.conflictRecovery.verification.length&&v.every((item:any,i:number)=>item.code===0&&JSON.stringify(item.argv)===JSON.stringify(c.conflictRecovery.verification[i]));
+   if(publication){
+    const p=publication.proof;
+    if(p?.active?.id!==r.id||p.head!==d.result||p.base!==x.b.base||p.target?.repo!==r.repo||p.target?.pr!==r.pr||p.worktree!==x.facts.worktree||p.branch!==r.branch||JSON.stringify(p.auth)!==JSON.stringify(x.auth)||JSON.stringify(p.policy)!==r.policy||p.message==='uncertain'||!verified(publication.verification))throw Error(`Reservation ${r.id}: attributable current publication/verification or terminal delivery proof missing`);
+   }else{
+    if(d.tree!==tree||!verified(d.verification)||await this.git(r.worktree,'show','-s','--format=%P',d.result)!==`${r.head} ${r.base}`)throw Error(`Reservation ${r.id}: exact merge tree/parents and successful configured verification proof missing`);
+    if(!Array.isArray(d.conflicts))throw Error(`Reservation ${r.id}: recorded conflict set missing`);
+    if(d.conflicts.length){
+     if(x.e.transcript.entries.filter((e:any)=>e.clientMessageId===r.client_id).length!==1)throw Error(`Reservation ${r.id}: unique resolution delivery binding missing`);
+     const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
+     const terminal=x.e.transcript.entries.filter((e:any)=>e.turnId===turn?.id&&e.kind==='message'&&e.role==='assistant'&&e.origin==='provider'&&!e.streaming).at(-1);
+     const report=assessWorkerReceipt(terminal?.text??'',true);
+     if(turn?.state!=='completed'||!report.valid||report.receipt?.outcome!=='host-ready'||[...(terminal?.text??'').matchAll(/<!--\s*ADLC_WORKER_STATUS\b/g)].length!==1)throw Error(`Reservation ${r.id}: authoritative completed host-ready resolution receipt missing; never resend`);
+    }
+   }
+   const ledger=new ReceiptReconciliation(this.s),resolutionReceipt=ledger.get(r.client_id);
+   if(d.conflicts?.length||publication?.proof?.message==='completed'||resolutionReceipt){
+    const receipt=ledger.inspect({job:r.job,plan:r.plan,spec:x.auth.spec,session:r.session,client:r.client_id,attempt:`remediation:${r.attempt}`},x.e,false);
+    if(receipt.state!=='completed')throw Error(`Reservation ${r.id}: resolution delivery ${receipt.code}: ${receipt.reason}; reservation retained, never resend`);
+   }
+   const target=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
+   if(!target||target.repo!==r.repo||target.pr!==r.pr||target.state==='completed')throw Error(`Reservation ${r.id}: current open review target proof missing`);
+   const final=await this.inspect(job,c,r.repo,r.pr);
+   const identity=(e:any)=>[e.session.id,e.session.projectId,e.session.kind,e.session.branch,e.session.isTerminated,e.session.activity?.state,e.session.prs,e.transcript.controller,e.transcript.entries,e.transcript.turns];
+   if(JSON.stringify(final.auth)!==JSON.stringify(x.auth)||JSON.stringify(final.b)!==JSON.stringify(x.b)||JSON.stringify(final.facts)!==JSON.stringify(x.facts)||JSON.stringify(identity(final.e))!==JSON.stringify(identity(x.e))||final.e.receiptObservation?.complete!==true)throw Error(`Reservation ${r.id}: session, worktree or publication changed during settlement proof`);
+   if(JSON.stringify(ledger.get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed during settlement proof`);
+   return {job,id:r.id,head:d.result,tree,action:'settle-published-reservation',confirmation:digest(JSON.stringify([r,x.auth,x.b,target,tree,publication,resolutionReceipt])),reservation:r,auth:x.auth,target,detail:d,resolutionReceipt};
+  }
+  async reconcileSettled(job:string,c:any,confirmation?:string){return this.io.submit(async()=>{
+   const first=await this.settledPreview(job,c);if(!first)return null;
+   if(confirmation&&first.confirmation!==confirmation)throw Error(`Reservation ${first.id}: confirmed settlement proof changed; preview again`);
+   const fresh=await this.settledPreview(job,c);
+   if(!fresh||fresh.confirmation!==first.confirmation)throw Error(`Reservation ${first.id}: settlement proof changed; preserve reservation`);
+   return this.s.db.transaction(()=>{
+    assertObservationFence();
+    if(JSON.stringify(this.auth(job,c))!==JSON.stringify(fresh.auth)||JSON.stringify(this.row(job))!==JSON.stringify(fresh.reservation)||JSON.stringify(this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job))!==JSON.stringify(fresh.target)||worktreeReservation(this.s,job)?.id!==fresh.id)throw Error(`Reservation ${fresh.id}: authority, target or reservation changed before settlement`);
+    if(JSON.stringify(new ReceiptReconciliation(this.s).get(fresh.reservation.client_id))!==JSON.stringify(fresh.resolutionReceipt))throw Error(`Reservation ${fresh.id}: persisted resolution receipt changed before settlement`);
+    this.set(fresh.reservation,'completed',fresh.detail);
+    this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state IN ('reserved','delivery_uncertain')").run(job,fresh.reservation.attempt);
+    // Preserve independent review gates, including blocked/uncertain reviewer
+    // delivery. Only a positively identified branch-recovery wait is released.
+    const t=fresh.target,branchWait=/^(Conflict recovery |Feature branch has conflicts with base|Earlier branch update outcome uncertain|Base merged;|Published Git update reconciled;)/.test(t.reason??'');
+    const preserve=['blocked','needs_reconciliation'].includes(t.state)&&!branchWait;
+    this.s.db.query('UPDATE review_targets SET head=?,head_since=?,state=?,reason=?,last_signature=NULL WHERE job=?').run(fresh.head,t.head===fresh.head?t.head_since:Date.now(),preserve?t.state:'waiting_for_ci',preserve?t.reason:'Base merged; fresh latest-SHA CI and CodeRabbit required',job);
+    this.s.event(job,'conflict_reservation_settled',JSON.stringify({id:fresh.id,head:fresh.head,tree:fresh.tree}));
+    return {job,id:fresh.id,head:fresh.head,state:'completed',send:false,mergePR:false};
+   }).immediate();
+  });}
  async git(tree:string,...args:string[]){const r=await this.io.command(['git',...args],tree);if(r.code!==0)throw Error(`Git ${args[0]} failed (${r.code}); preserve work and inspect: ${r.err.slice(0,2000)}`);return r.out.trim();}
  auth(job:string,c:any){
   assertObservationFence();
   validateConflictPolicy(c.conflictRecovery);if(c.conflictRecovery?.enabled!==true)throw Error('Conflict recovery is not explicitly enabled');
-  const a=new DeliveryRecovery(this.s,{} as any).authorization(job,c);
+   const a=new DeliveryRecovery(this.s,{} as any).authorization(job,c);
+   const owner=this.s.db.query("SELECT name FROM sqlite_master WHERE name='ownership'").get()?this.s.db.query('SELECT owner FROM ownership WHERE session_id=?').get(a.session) as any:null;
+   if(owner&&owner.owner!=='orchestrator')throw Error('Worker is human-owned; explicit handback required');
   if(!['inspect','fetch','branch','commit','push-feature','merge-base-feature'].every(op=>JSON.parse(a.grant).includes(op)))throw Error('Explicit current merge-base-feature and feature Git grants required; no retroactive grant migration');
   return a;
  }
  async noOperation(tree:string,allowMerge=false){
-  for(const name of ['rebase-merge','rebase-apply','sequencer','CHERRY_PICK_HEAD','REVERT_HEAD',...allowMerge?[]:['MERGE_HEAD']]){
+   for(const name of ['rebase-merge','rebase-apply','sequencer','CHERRY_PICK_HEAD','REVERT_HEAD','index.lock',...allowMerge?[]:['MERGE_HEAD']]){
    const path=await this.git(tree,'rev-parse','--git-path',name);
    if(existsSync(resolve(tree,path)))throw Error(`Pre-existing/in-progress ${name}; preserve work for explicit operator reconciliation`);
   }
@@ -92,24 +168,34 @@ export class ConflictRecovery{
   if(!facts.idle||e.transcript?.controller!=='ready'||!Array.isArray(e.transcript.turns)||e.transcript.turns.some((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state)))throw Error('Worker is not idle with no queued work; wait');
   return {auth,facts,b,e};
  }
- async manualPreview(job:string,c:any){
-  const r=this.row(job);if(!r||r.state==='completed')throw Error('Outstanding conflict recovery required');
+  async manualPreview(job:string,c:any){
+   const r=this.row(job);if(!r||r.state==='completed')throw Error('Outstanding conflict recovery required');
+   let automaticSettlementBlocker:string|undefined;
+   if(JSON.parse(r.detail).result){
+    try{const settled=await this.settledPreview(job,c);if(settled)return {...settled,preview:true};}
+    catch(error){if(error instanceof ObservationLeaseLost)throw error;automaticSettlementBlocker=error instanceof Error?error.message:'Automatic settlement proof unavailable';}
+   }
   const b=await this.io.snapshot(r.repo,r.pr),x=await this.guard(r,c,b.head),d=JSON.parse(r.detail);
   if(!x.facts.clean||x.facts.head!==b.head||!d.index||!Array.isArray(d.conflicts))throw Error('Clean published merge and recorded conflict index required; preserve evidence for operator inspection');
   await this.noOperation(r.worktree);
   if(await this.git(r.worktree,'show','-s','--format=%P',b.head)!==`${r.head} ${r.base}`)throw Error('Operator reconciliation requires exact original two-parent merge; never rewrite history to satisfy this check');
   await this.assertResolved(r,d);
-  if(d.conflicts.length){
-   const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
-   if(!turn||!['completed','failed','cancelled','interrupted'].includes(turn.state))throw Error('Resolution delivery must have an authoritative terminal receipt before manual release');
-  }
+   const ledger=new ReceiptReconciliation(this.s),resolutionReceipt=ledger.get(r.client_id);
+   if(d.conflicts.length){
+    const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
+    if(!turn||!['completed','failed','cancelled','interrupted'].includes(turn.state))throw Error('Resolution delivery must have an authoritative terminal receipt before manual release');
+    const receipt=ledger.inspect({job:r.job,plan:r.plan,spec:x.auth.spec,session:r.session,client:r.client_id,attempt:`remediation:${r.attempt}`},x.e,false);
+    if(!['completed','failed','cancelled'].includes(receipt.state))throw Error(`Reservation ${r.id}: resolution delivery ${receipt.code}: ${receipt.reason}; preserve conflicting receipt evidence`);
+   }
   const tree=await this.git(r.worktree,'rev-parse',`${b.head}^{tree}`);
-  return {job,id:r.id,head:b.head,base:r.base,tree,stage:r.state,reason:r.reason,confirmation:digest(JSON.stringify([r,b.head,tree])),preview:true,action:'verify-published-merge',note:'Confirmation runs configured verification and releases only this proven completed reservation; no send, commit, push, reset or scope expansion'};
+   if(JSON.stringify(ledger.get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed during manual preview`);
+   return {job,id:r.id,head:b.head,base:r.base,tree,stage:r.state,reason:r.reason,automaticSettlementBlocker,resolutionReceipt,confirmation:digest(JSON.stringify([r,b.head,tree,resolutionReceipt])),preview:true,action:'verify-published-merge',note:'Confirmation runs configured verification and releases only this proven completed reservation; no send, commit, push, reset or scope expansion'};
  }
  async manualConfirm(job:string,c:any,hash:string,human:string){
   if(!human?.trim())throw Error('Explicit human operator required');
   return this.io.submit(async()=>{
-   const proof=await this.manualPreview(job,c);if(proof.confirmation!==hash)throw Error('Recovery proposal changed; preview again');
+    const proof=await this.manualPreview(job,c);if(proof.confirmation!==hash)throw Error('Recovery proposal changed; preview again');
+     if(proof.action==='settle-published-reservation')return this.reconcileSettled(job,c,hash);
    const r=this.row(job),d=JSON.parse(r.detail);d.result=proof.head;d.tree=proof.tree;d.verification=[];
    this.set(r,'manual_verifying',d);
    try{
@@ -119,7 +205,7 @@ export class ConflictRecovery{
     }
     const x=await this.guard(r,c,proof.head);await this.noOperation(r.worktree);await this.assertResolved(r,d);
     if(!x.facts.clean||x.facts.head!==proof.head||await this.git(r.worktree,'write-tree')!==proof.tree)throw Error('Verification changed worktree or published evidence');
-    this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d,c);
+     this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d,c,proof.resolutionReceipt);
     return {...proof,preview:false,state:'completed',mergePR:false};
    }catch(e){this.set(r,'manual_verifying',d,e instanceof Error?e.message:'Verification uncertain');throw e;}
   });
@@ -255,7 +341,11 @@ export class ConflictRecovery{
    }
    if(r.repo!==repo||r.pr!==pr)throw Error('Recovery target mismatch');
    if(r.state==='reserved'){const wait=new RecoveryObservation(this.s).wait(job);if(wait)return {...wait,recovery:r.id,stage:r.state};}
-   if(r.reason&&!['resolving','pushing'].includes(r.state))return this.result(r);
+    if(JSON.parse(r.detail).result){
+     try{await this.reconcileSettled(job,c);return null;}
+     catch(error){if(error instanceof ObservationLeaseLost)throw error;this.set(r,r.state,JSON.parse(r.detail),`${error instanceof Error?error.message:'Settlement proof unavailable'}; preview reconcile-conflict ${job} CONFIG or reconcile-publication ${job} CONFIG SOURCE HUMAN; reservation retained`);return this.result(r);}
+    }
+    if(r.reason&&!['resolving','pushing'].includes(r.state))return this.result(r);
    if(r.state==='resolving'){
     const e=await this.io.evidence(r.session),entry=e.transcript?.entries?.find((e:any)=>e.clientMessageId===r.client_id);
     const active=e.transcript?.turns?.filter((t:any)=>!['completed','failed','cancelled','interrupted'].includes(t.state));
@@ -276,10 +366,10 @@ export class ConflictRecovery{
    }
   });
  }
- async guard(r:any,c:any,expectedRemote=r.head){
+  async guard(r:any,c:any,expectedRemote=r.head,expectedBase=r.base){
   const observations=r.state==='reserved'&&!this.s.readonly?new RecoveryObservation(this.s):undefined;
   const x=await this.inspect(r.job,c,r.repo,r.pr,observations);
-  if(x.auth.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy||JSON.stringify(JSON.parse(x.auth.paths))!==JSON.stringify(JSON.parse(r.detail).paths)||x.b.head!==expectedRemote||x.b.base!==r.base||x.b.branch!==r.branch||x.b.baseBranch!==r.base_branch)throw Error('Approval, policy, scope, remote head/base or ownership changed; preserve recovery evidence');
+   if(x.auth.session!==r.session||canonicalWorktree(x.auth.worktree)!==canonicalWorktree(r.worktree)||x.auth.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy||JSON.stringify(JSON.parse(x.auth.paths))!==JSON.stringify(JSON.parse(r.detail).paths)||x.b.head!==expectedRemote||x.b.base!==expectedBase||x.b.branch!==r.branch||x.b.baseBranch!==r.base_branch)throw Error('Approval, policy, scope, remote head/base or ownership changed; preserve recovery evidence');
   await this.noOperation(r.worktree,true);return x;
  }
  async index(r:any){return (await this.git(r.worktree,'ls-files','--stage','-z')).split('\0').filter(Boolean);}
@@ -390,12 +480,13 @@ export class ConflictRecovery{
   if(observed.head!==d.result)throw Error(`Normal push rejected or uncertain (${pushed.code}): ${pushed.err.slice(0,2000)}; remote ${observed.head}; preserve commit ${d.result}`);
   await this.guard(r,c,d.result);this.complete(r,d,c);return null;
  }
- complete(r:any,d:any,c:any){this.s.db.transaction(()=>{
+  complete(r:any,d:any,c:any,resolutionReceipt?:any){this.s.db.transaction(()=>{
   // Approval, scope or grants can be revoked during the final asynchronous Git
   // checks. Recheck inside this transaction and leave the reservation untouched
   // on failure; never release it under stale authorization.
   const a=this.auth(r.job,c);
-  if(a.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy)throw Error('Current approval, policy or scope changed before completion; reservation retained for reconciliation');
+   if(a.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy)throw Error('Current approval, policy or scope changed before completion; reservation retained for reconciliation');
+   if(resolutionReceipt!==undefined&&JSON.stringify(new ReceiptReconciliation(this.s).get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed before completion`);
   this.set(r,'completed',d);
   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(r.job,r.attempt);
   this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state='waiting_for_ci',reason='Base merged; fresh latest-SHA CI and CodeRabbit required',last_signature=NULL WHERE job=?").run(d.result,Date.now(),r.job);
