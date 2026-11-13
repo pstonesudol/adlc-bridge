@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {controlStack,activityBlockers,turnBlockers,workerBlockers,daemonStatus,type StackOps} from '../src/stack-control';
-import {inspectManagedBackend} from '../src/stack-control';
+import {inspectManagedBackend,liveStackOps} from '../src/stack-control';
 import {bundledAO} from '../src/daemon-runtime';
 function fixture(){
  const calls:string[]=[];let on=true;let blocks:{session:string;reason:string}[]=[];
@@ -55,6 +55,21 @@ test('desktop-first bundled daemon is diagnosed, not adopted as managed',async()
  expect(b.managed).toBe(false);expect(b.checks?.find(c=>c.check==='managed-executable')).toMatchObject({passed:false});
  expect(b.checks?.find(c=>c.check==='managed-executable')?.nextAction).toContain('Desktop-first');
  expect(f.calls.every(a=>a[0]==='/bin/ps'||a[1]==='print')).toBe(true);
+});
+test('live backendStart rejects a ready unmanaged daemon before enabling or bootstrapping its service',async()=>{
+ const calls:string[][]=[];
+ const run=async(args:string[])=>{
+  calls.push(args);
+  if(args[1]==='status')return {stdout:JSON.stringify({state:'ready',port:3001,pid:34,executablePath:bundledAO}),stderr:'',code:0};
+  if(args[0]==='/bin/ps')return {stdout:args.includes('ppid=')?'12':'desktop parent',stderr:'',code:0};
+  if(args[0]==='/bin/launchctl'&&args[1]==='print')return {stdout:'Could not find service',stderr:'',code:1};
+  throw Error('Unexpected process operation: '+args.join(' '));
+ };
+ const ops=liveStackOps(true,fixture().ops.turns,true,run,()=>30000,{...managedConfig,domain:'gui/fixture',plist:'/fixture/runtime.plist'});
+ await expect(ops.backendStart()).rejects.toThrow('Another Orchestrator backend is running; preserved');
+ expect(calls.some(args=>args[1]==='status')).toBe(true);
+ expect(calls.some(args=>args[0]==='/bin/launchctl'&&['enable','bootstrap'].includes(args[1]))).toBe(false);
+ expect(calls.every(args=>args[1]==='status'||args[0]==='/bin/ps'||args[0]==='/bin/launchctl'&&args[1]==='print')).toBe(true);
 });
 test('service-first verifies launcher independently of the daemon executable and provides conditional desktop relaunch guidance',async()=>{
  const b=await backendFixture().read();expect(b.managed).toBe(true);expect(b.launcherVerified).toBe(true);expect(b.checks?.every(c=>c.passed)).toBe(true);

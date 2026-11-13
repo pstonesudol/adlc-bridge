@@ -131,8 +131,7 @@ export async function workerBlockers(executable:string,inspect=probe,read=get){
  const ids=new Set(snapshot.sessions.map((x:any)=>x.id));for(const x of latest.sessions)if(!ids.has(x.id)&&!x.isTerminated)blocked.push({session:x.id,reason:'new session during stop'});
  return blocked;
 }
-export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,run=command,remaining=()=>30000):StackOps{
- const config=managedServiceDefinition();
+export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,run=command,remaining=()=>30000,config=managedServiceDefinition()):StackOps{
  const inspect=async()=>daemonStatus(await run([AO,'status','--json']));
  return {
   turns,
