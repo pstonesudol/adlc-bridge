@@ -50,7 +50,8 @@ import {assertConfiguredProjectIntakeEnabled,assertProjectReferenceIntakeEnabled
 import {DeliveryRecovery} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
 import {ConflictRecovery} from './conflict-recovery';
-import {recoveryRows,branchSyncRows} from './worktree-reservation';
+import {previewReviewChecks,confirmReviewChecks} from './review-check-policy';
+import {conflictRecoveryStatus,branchSyncRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
@@ -352,6 +353,7 @@ receipt-reconcile JOB CONFIG ATTEMPT [--confirm HASH] settle an original complet
   rebind-review-target JOB REPO PR     reconcile a revised handoff recorded on another PR
   review-status                        show CI/review waits, blockers and remediation budget
   reconcile-review-provider JOB [--confirm HASH --human NAME] inspect/clear a provider request hold; no replay
+  reconcile-review-checks JOB CONFIG HUMAN [--confirm HASH] preview/confirm added required checks; never remove checks
   tick-review JOB CONFIG               same identity and branch policy as periodic review
   extend-budget JOB CONFIG HUMAN ADDITIONAL HEAD [--confirm HASH] [--reason TEXT]
                                        preview or apply an audited exhausted-budget extension
@@ -459,7 +461,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-    if(!['approvals','review-status','extend-review-cycle','reconcile-review-query','reconcile-review-provider','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+    if(!['approvals','review-status','extend-review-cycle','reconcile-review-query','reconcile-review-provider','reconcile-review-checks','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
@@ -475,7 +477,7 @@ Registered approved review targets can request bounded in-scope fixes from their
     if(command==='recovery-status'||command==='recovery-preview'){
      const store=new Store(db,true);
      try{
-      if(command==='recovery-status')return out([...recoveryRows(store),...branchSyncRows(store)]);
+       if(command==='recovery-status')return out([...conflictRecoveryStatus(store),...branchSyncRows(store)]);
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
       const job=req(a[0],'Job'),target=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
       if(!target)throw Error('Existing review target required');
@@ -514,7 +516,14 @@ Registered approved review targets can request bounded in-scope fixes from their
       store.event(a[0],'coderabbit_query_reconciled',JSON.stringify({comment:comment.id,mutationReplay:false}));return out({state:'delivered',mutationReplay:false});
      }finally{store.close();}
     }
-    if(command==='reconcile-review-provider'){
+     if(command==='reconcile-review-checks'){
+      if(a.length!==3&&!(a.length===5&&a[3]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[4])))throw Error('Use reconcile-review-checks JOB CONFIG HUMAN [--confirm HASH]');
+      const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);
+      if(!existsSync(db))throw Error('Existing state database required');
+      const store=new Store(db,a.length===3);
+      try{return out(a.length===3?previewReviewChecks(store,a[0],config,a[2]):confirmReviewChecks(store,a[0],config,a[2],a[4]));}finally{store.close();}
+     }
+     if(command==='reconcile-review-provider'){
      if(a.length!==1&&!(a.length===5&&a[1]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[2])&&a[3]==='--human'&&a[4].trim()))throw Error('Use reconcile-review-provider JOB [--confirm HASH --human NAME]');
      if(!existsSync(db))throw Error('Existing state database required');
      const store=new Store(db,a.length===1);try{if(a.length===1)return out(reviewProviderHoldPreview(store,a[0]));new Lifecycle(store).current(a[0]);return out(new ReviewRequests(store).reconcileProviderHold(a[0],a[2],a[4]));}finally{store.close();}

@@ -80,6 +80,28 @@ for(const [name,stopped,terminated] of [['wake',false,false],['daemon restart',t
 test('published PR returns to review polling without an implementation resend',async()=>{
  const f=await fixture();try{f.complete();const result=await f.recovery.pass(f.c);expect(result.reattached).toBe(1);expect(f.loop.list(f.c.linear.projectId)).toHaveLength(1);expect(f.sends).toHaveLength(1);expect(f.restores).toHaveLength(0);}finally{f.close();}
 });
+test('repeated published handoffs revalidate policy without duplicating review targets or resetting gates',async()=>{
+ const f=await fixture();try{
+  f.complete();expect((await f.recovery.pass(f.c,true)).reattached).toBe(1);
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason='Independent reviewer gate' WHERE job=?").run(f.job);
+  const target=f.loop.get(f.job),attempts=f.s.get(f.job).attempts;
+  for(let n=0;n<2;n++)expect((await f.recovery.pass(f.c,true)).reattached).toBe(1);
+  expect(f.registrations).toHaveLength(3);expect(f.loop.get(f.job)).toEqual(target);
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='review_target_registered'").get()).toEqual({n:1});
+  expect(f.sends).toHaveLength(1);expect(f.restores).toHaveLength(0);expect(f.s.get(f.job).attempts).toBe(attempts);
+ }finally{f.close();}
+});
+for(const change of ['add','remove'])test(`published handoff fails closed when required-check policy changes: ${change}`,async()=>{
+ const f=await fixture();try{
+  if(change==='remove')f.c.requiredChecks=['CI','Security'];
+  f.complete();expect((await f.recovery.pass(f.c,true)).reattached).toBe(1);
+  const target=f.loop.get(f.job),attempts=f.s.get(f.job).attempts;
+  f.c.requiredChecks=change==='add'?['CI','Security']:['CI'];
+  const result=await f.recovery.pass(f.c,true);
+  expect(result).toMatchObject({blocked:1,reattached:0});expect(result.results[0].nextAction).toContain('Target changed; explicit reconciliation required');
+  expect(f.loop.get(f.job)).toEqual(target);expect(f.sends).toHaveLength(1);expect(f.restores).toHaveLength(0);expect(f.s.get(f.job).attempts).toBe(attempts);
+ }finally{f.close();}
+});
 test('uncertain recovery send is reconciled and never replayed after restart',async()=>{
  const f=await fixture();try{f.interrupt();f.flags({lostSend:true});expect((await f.recovery.pass(f.c)).blocked).toBe(1);f.advance();expect((await f.recovery.pass(f.c)).waiting).toBe(1);expect(f.sends).toHaveLength(2);f.complete();await f.recovery.pass(f.c,true);expect(f.registrations).toHaveLength(1);}finally{f.close();}
 });
