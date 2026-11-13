@@ -472,9 +472,59 @@ function pr30LoopFixture(){
  f.loop.configureMetadataChecks('project',[]);
  const schedule=pr30Schedule(f.head);f.e.reviewSchedule=schedule;
  Object.assign(f.e,{findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,coderabbitPresent:true,customCheckBlocker:null,clear:false,reasons:['CodeRabbit check not clear','Explicit latest-SHA CodeRabbit approval missing'],botReviewSubmittedAt:Date.now()-10000});
- f.loop.requests.wait('owner/repo',1,schedule);f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
+  f.loop.requests.wait('owner/repo',1,schedule);f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
  return f;
 }
+function pausedCIFixture(){
+ const f=pr30LoopFixture();
+ f.e.reviewSchedule.blocker='CodeRabbit review unavailable: auto-pause threshold reached (2 reviewed commits >= auto_pause_after_reviewed_commits=2)';
+ Object.assign(f.e.reviewSchedule.evidence,{classification:'intentional-pause',recoverable:false,reviewedCommits:2});
+ f.e.failedChecks=[{id:120,sha:f.head,name:'CI',conclusion:'failure',url:'https://github.com/owner/repo/actions/runs/12/job/120'}];
+ f.e.reasons=['Required CI failed',f.e.reviewSchedule.blocker];
+ new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['commit','push-feature'],'human');
+ f.loop.setVerification(f.id,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});
+ let diagnoses=0;
+ const readCIFailure=async()=>{diagnoses++;return 'src/fix.ts:12 AssertionError: expected true';};
+ f.loop.io.readCIFailure=readCIFailure;f.io.readCIFailure=readCIFailure;
+ return {...f,diagnoses:()=>diagnoses};
+}
+test('DEV-120: paused CodeRabbit permits required-CI remediation once across concurrent polls and restart',async()=>{
+ const f=pausedCIFixture();try{
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'remediation_pending',send:true});
+  expect(f.diagnoses()).toBeGreaterThan(0);expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  const restarted=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
+  await Promise.all([restarted.tick(f.id),f.loop.tick(f.id)]);
+  expect(f.sends()).toBe(1);expect(f.s.get(f.id).attempts).toBe(1);
+  f.session.transcript.turns[0].state='completed';
+  expect(await restarted.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:expect.stringContaining('without a new commit')});
+  expect(f.sends()).toBe(1);expect(f.reviews()).toBe(0);
+  expect(f.s.db.query('SELECT * FROM coderabbit_requests').all()).toEqual([]);
+  expect(f.s.db.query('SELECT * FROM coderabbit_queries').all()).toEqual([]);
+ }finally{f.s.close();}
+});
+test('DEV-120: paused CodeRabbit with green CI retains the pause without diagnosis, dispatch or clearance',async()=>{
+ const f=pausedCIFixture();try{
+  f.e.failedChecks=[];
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false,reason:f.e.reviewSchedule.blocker});
+  expect(f.diagnoses()).toBe(0);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+for(const scenario of ['unknown','stale','out-of-scope','unauthorized','changed-check'])test(`DEV-120: paused review surfaces the specific CI blocker: ${scenario}`,async()=>{
+ const f=pausedCIFixture();try{
+  if(scenario==='unknown')f.loop.io.readCIFailure=async()=>null;
+  if(scenario==='stale')f.e.failedChecks[0].sha='b'.repeat(40);
+  if(scenario==='out-of-scope')f.loop.io.readCIFailure=async()=> 'outside/fix.ts:12 AssertionError: expected true';
+  if(scenario==='unauthorized')new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['open-pr'],'human');
+  if(scenario==='changed-check')f.loop.io.readCIFailure=async()=>{f.e.failedChecks=[{...f.e.failedChecks[0],id:121}];return 'src/fix.ts:12 AssertionError: expected true';};
+  const reason=scenario==='unauthorized'?'unauthorized':scenario==='out-of-scope'?'out_of_scope':'unknown';
+  const result=await f.loop.tick(f.id);
+  expect(result).toMatchObject({state:'blocked',send:false});expect(result.reason).toContain('Required CI CI');expect(result.reason).toContain(reason);
+  expect(result.reason).not.toBe(f.e.reviewSchedule.blocker);
+  if(scenario==='changed-check')expect(result.reason).toContain('failure identity changed during diagnosis');
+  if(scenario==='stale')expect(f.diagnoses()).toBe(0);
+  expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
 for(const current of [false,true])test(`CodeRabbit ${current?'current':'stale'} change request preserves bounded scheduling guard`,async()=>{
  const f=pr30LoopFixture();try{
   const blockers=['Reviewer coderabbit: explicit current-head approval required','Reviewer coderabbit: changes requested (5810360982)'];
