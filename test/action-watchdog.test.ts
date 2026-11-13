@@ -170,9 +170,13 @@ console.log(JSON.stringify({batches,errors,targets:loop.list().map(t=>t.state)})
 // ordinary-evaluation pairs), including lock and SQLite IO. Hosted CI run
 // 43154974882 exceeded the previous 10s outer deadline and killed the child.
 // Keep every cycle/assertion; bound the child at 30s and allow cleanup headroom.
+// This scheduling test does not simulate power failure: WAL NORMAL avoids fsync
+// on every tiny write
+// while keeping real SQLite, locks, persisted reads and subprocess isolation.
 test('idle ready-for-human targets receive ordinary polls past 240 observations without charging retry budget',()=>{
  const f=fixture(true);try{
   const r=productionScenario(f,`
+s.db.exec('PRAGMA synchronous=NORMAL');
 clear=true;s.db.query("UPDATE review_targets SET state='ready_for_human' WHERE job=?").run(job);
 await tick();const first=ordinary;
 for(let i=0;i<300;i++){await tick();advance(WATCHDOG_LIMITS.idleMs);await tick();}

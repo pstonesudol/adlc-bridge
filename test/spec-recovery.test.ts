@@ -19,8 +19,9 @@ import {jobViews,humanJobs} from '../src/operator-cli';
 import {routingConfig,settings} from './routing-fixture';
 import {RoutePreflightFailure} from '../src/routing-session';
 import {StartupRecovery} from '../src/startup-recovery';
+import {planningPRFixture} from './planning-pr-fixture';
 
-const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
+const ready='<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
 async function receiptFixture(legacy=false,changed=true,database=':memory:'){
  const f=await fixture(database),l=new Lifecycle(f.s),ledger=new ReceiptReconciliation(f.s);
@@ -126,6 +127,7 @@ async function fixture(database=':memory:'){
  const s=new Store(database),job=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-57',title:'Task',description:'Original'}));
  let e:any,sends:any[]=[];
  const transport:any={evidence:async()=>e,worktree:async()=>({branch:e.session.branch,head:'a'.repeat(40),tree:'/worktree'}),disableFeedback:async()=>{},branchSnapshot:async()=>({branch:e.session.branch,head:'a'.repeat(40),state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',defaultBranch:'main',baseBranch:'main'}),sendImplementation:async(session:string,text:string,clientId:string,mode?:string)=>{sends.push({session,text,clientId,mode});e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:e.transcript.entries.length+1});e.transcript.turns.push({id:clientId,state:'running'});e.transcript.controller='busy';}};
+ transport.planningPRs=planningPRFixture(()=>e);
  const w=new Workflow(s,transport),p=new Planning(s),r=p.reserve(job,'project');p.gate(job,'project','owner',r.branch,'/worktree');
  s.db.query("INSERT INTO planning_dispatch VALUES (?,?, 'awaiting_approval', 'owner',NULL,'initial')").run(job,digest(s.get(job).spec));
  const hash=s.propose(job,'Original plan\n'+ready);recordReadiness(s,job,s.get(job).plan,hash,digest(s.get(job).spec));s.db.query("UPDATE planning_runs SET state='plan_captured' WHERE job=?").run(job);
@@ -138,6 +140,17 @@ async function fixture(database=':memory:'){
  const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
+for(const duplicate of ['completed','failed','cancelled','interrupted'])test(`prior completed delivery refuses duplicate ${duplicate} turn identity before replanning`,async()=>{
+ const f=await fixture();try{
+  f.edit('Revised requirements');const original=f.e.transcript.turns.at(-1);
+  f.e.transcript.turns.push({...original,state:duplicate});
+  const before={job:f.s.get(f.job),planning:f.w.planning(f.job),events:f.s.db.query('SELECT * FROM events').all()};
+  await expect(f.recovery.preview(f.job,config)).rejects.toThrow('unique owned turn');
+  expect(f.s.get(f.job)).toEqual(before.job);expect(f.w.planning(f.job)).toEqual(before.planning);expect(f.s.db.query('SELECT * FROM events').all()).toEqual(before.events);
+  expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();expect(f.sends).toHaveLength(1);
+  f.e.transcript.turns.pop();expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
+ }finally{f.s.close();}
+});
 test('DEV-67 unavailable pinned model on a revised plan retains dispatch and historical session/PR/delivery evidence',async()=>{
  const f=await fixture();try{
   new ReviewLoop(f.s).register(f.job,'owner/repo',17,['CI'],['src/**']);

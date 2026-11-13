@@ -1,5 +1,5 @@
 import {Store,digest} from './core';
-import {validScopes} from './file-scope';
+import {validScopes,planPaths,scopeAllows} from './file-scope';
 import {standingReady} from './readiness';
 export const featureGit=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
 export type ApprovalPolicy={mode:'manual'|'ready-queue';id?:string;authorizedBy?:string;scope?:string[];gitScope?:'feature-pr'};
@@ -23,6 +23,12 @@ export class ApprovalPolicyStore{
   if(j.project!==project||!e||e.project!==project||!e.ready||e.spec_hash!==digest(j.spec)||e.observed>now+5000||now-e.observed>120000)return {allowed:false,reason:'Fresh complete Todo + agent-ready snapshot required'};
   if(!['awaiting_approval','approved'].includes(j.state)||!j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))return {allowed:false,reason:'Current captured plan required'};
   if(requireReadiness&&!standingReady(this.s,job))return {allowed:false,reason:'Actionable plan required; resolve outstanding questions or dependencies before standing authorization'};
+  if(j.plan?.includes('<!-- ADLC_REVISED_PLAN:')){
+   const paths=planPaths(j.plan);
+   if(!paths)return {allowed:false,reason:'Revised plan requires exactly one ADLC_PLAN_SCOPE receipt listing concrete affected files; inspect spec-reconcile, not clarification'};
+   const added=paths.filter(path=>!scopeAllows(path,p.scope!));
+   if(added.length)return {allowed:false,reason:`Fresh job-specific plan approval required for additional paths: ${added.join(', ')}`};
+  }
   return {allowed:true,reason:'Authorized by user standing ready-queue policy',policyHash:this.hash(p),actor:`standing-policy:${p.id}`,paths:[...p.scope]};
  }
  record(job:string,project:string,p:ApprovalPolicy){

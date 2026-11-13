@@ -10,6 +10,7 @@ import {latestRevision} from '../src/spec-revisions';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {planningPRFixture} from './planning-pr-fixture';
 function fixture(path=':memory:'){
  const s=new Store(path),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
@@ -94,10 +95,11 @@ test('restored spec and plan hashes publish a revision-specific notice and rejec
   f.c.automation.planningEnabled=true;
   const p=new Planning(f.s).get(f.id),e:any={session:{id:'worker',projectId:'ao',branch:p.branch,isTerminated:false,prs:[]},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[],turns:[{id:'initial-plan',state:'completed'}]}};
   f.w.t.evidence=async()=>e;f.w.t.worktree=async()=>({branch:p.branch,head:'a'.repeat(40),tree:'/worktree'});
+  f.w.t.planningPRs=planningPRFixture(()=>e);
   f.w.t.sendImplementation=async(_session,_text,clientId)=>{
    e.transcript.entries.push({clientMessageId:clientId,turnId:clientId,sequence:1});
    e.transcript.turns.push({id:clientId,state:'completed'});
-   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
+   e.transcript.entries.push({sequence:2,turnId:clientId,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`<!-- ADLC_REVISED_PLAN:${latestRevision(f.s,f.id).id} -->\nCurrent revised plan\n<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->`});
   };
   const recovery=new SpecRecovery(f.s,f.w,async()=>f.issue,async fn=>fn());
   await recovery.reconcile(f.id,f.c,(await recovery.preview(f.id,f.c)).confirmation);await recovery.capture(f.id,f.c);
