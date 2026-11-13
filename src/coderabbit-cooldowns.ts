@@ -11,9 +11,13 @@ export const RATE_QUERY='@coderabbitai rate limit';
  * Keep it even if the source PR's review cycle completes or the process restarts. */
 export function githubReviewTransportRetryAt(s:Store):number{
  const has=(name:string)=>s.db.query('SELECT 1 FROM sqlite_master WHERE name=?').get(name);
- const review=has('coderabbit_requests')?(s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_requests WHERE state='rate_limited' AND evidence='confirmed HTTP rate-limit rejection'").get() as any)?.reset:0;
+ // Attempt receipts keep the transport deadline immutable when reconciliation
+ // updates the current request's aggregate provider-quota deadline.
+ const audit=has('coderabbit_request_attempts');
+ const attempts=audit?(s.db.query("SELECT MAX(next_attempt) AS reset FROM coderabbit_request_attempts WHERE state='rate_limited' AND evidence='confirmed HTTP rate-limit rejection'").get() as any)?.reset:0;
+ const review=has('coderabbit_requests')?(s.db.query(`SELECT MAX(r.next_attempt) AS reset FROM coderabbit_requests r WHERE r.state='rate_limited' AND r.evidence='confirmed HTTP rate-limit rejection' ${audit?"AND NOT EXISTS (SELECT 1 FROM coderabbit_request_attempts a WHERE a.repo=r.repo AND a.pr=r.pr AND a.head=r.head AND a.attempt=r.attempts AND a.evidence='confirmed HTTP rate-limit rejection')":''}`).get() as any)?.reset:0;
  const query=has('coderabbit_queries')?(s.db.query('SELECT MAX(retry_after) AS reset FROM coderabbit_queries').get() as any)?.reset:0;
- return Math.max(review??0,query??0);
+ return Math.max(attempts??0,review??0,query??0);
 }
 export function cycleExtensionPreview(s:Store,repo:string,pr:number){
  const c=s.db.query("SELECT 1 FROM sqlite_master WHERE name='coderabbit_cycles'").get()?s.db.query('SELECT * FROM coderabbit_cycles WHERE repo=? AND pr=? ORDER BY cycle DESC LIMIT 1').get(repo,pr) as any:null;
@@ -26,7 +30,8 @@ export function cooldownDue(s:Store,job:string,now:number):number|null{
  const t=s.db.query('SELECT repo,pr,state,reason FROM review_targets WHERE job=?').get(job) as any;
  if(t?.state!=='waiting_for_coderabbit'||!t.reason?.startsWith('CodeRabbit rate limited; next retry at '))return null;
  const c=s.db.query('SELECT * FROM coderabbit_cycles WHERE repo=? AND pr=? ORDER BY cycle DESC LIMIT 1').get(t.repo,t.pr) as any;
- if(!c||c.state!=='waiting')return null;
+ if(!c){const wait=s.db.query('SELECT started FROM coderabbit_waits WHERE repo=? AND pr=? AND head=(SELECT head FROM review_targets WHERE job=?)').get(t.repo,t.pr,job) as any;return wait?.started>now?wait.started:null;}
+ if(c.state!=='waiting')return null;
  const shared=c.scope?(s.db.query("SELECT MAX(next_action) AS retry FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(c.scope) as any)?.retry:0;
  const due=Math.min(c.deadline,Math.max(c.next_action,shared??0,githubReviewTransportRetryAt(s)));
  return due>now?due:null;
@@ -91,7 +96,7 @@ export function throttleEvidence(o:RabbitObservation,receipts:any[],query?:any):
   const reset=created===edited||!/available in|retry (?:after|in)|try again in/i.test(text)?resetTime(text,created):null;
   // Quota is per developer. Widen scope only when the authenticated provider
   // explicitly names the PR author and the GitHub immutable author ID is known.
-   const scope=o.author&&Number.isSafeInteger(o.author.id)&&o.author.id>0&&typeof o.author.login==='string'&&new RegExp(`\\b(?:developer|account) @${o.author.login.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\b`,'i').test(text)?`github-user:${o.author.id}`:undefined;
+   const scope=o.author&&Number.isSafeInteger(o.author.id)&&o.author.id>0&&typeof o.author.login==='string'&&new RegExp(`\\b(?:developer|account) @${o.author.login.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?![a-z0-9-])`,'i').test(text)?`github-user:${o.author.id}`:undefined;
   result.push({id:`comment:${c.id}`,version:digest(JSON.stringify([c.updated_at,c.body])),at:created,head:receipt?.head??o.head,request:receipt?`${receipt.head}:${receipt.attempts}`:queryBound?`query:${query.episode}`:undefined,reset,timing:text,guidance:guidance(text),scope,kind:already?'already-reviewed':undefined});
  }
  return result;
@@ -161,13 +166,14 @@ export class CodeRabbitCooldowns{
   return Math.max(c.next_action,shared??0,githubReviewTransportRetryAt(this.s));
  }
  http(repo:string,pr:number,head:string,attempt:number,retryAt?:number,config?:Partial<CooldownPolicy>){
-  assertObservationFence();const p=cooldownPolicy(config);this.s.db.transaction(()=>{
+  assertObservationFence();const p=cooldownPolicy(config);return this.s.db.transaction(()=>{
    let c=this.get(repo,pr);
    if(!c||c.state==='completed'){this.s.db.query("INSERT INTO coderabbit_cycles(repo,pr,cycle,head,started,deadline,limit_attempts,state,next_action) VALUES (?,?,?,?,?,?,?,'waiting',?)").run(repo,pr,(c?.cycle??0)+1,head,this.now(),this.now()+p.window,p.retryLimit,this.now());c=this.get(repo,pr);}
     const next=retryAt&&Number.isSafeInteger(retryAt)?Math.max(this.now(),retryAt)+p.buffer:this.now()+Math.ceil(Math.min(p.maxDelay,p.fallback*2**Math.min(c.attempts,1)*(1+p.jitter*this.random())));
    const id=`http:${head}:${attempt}`;
    const changed=this.s.db.query('INSERT OR IGNORE INTO coderabbit_throttle_evidence VALUES (?,?,?,?,?,?,?,?,?)').run(repo,pr,id,id,c.cycle,this.now(),this.now(),next,JSON.stringify({id,head,request:`${head}:${attempt}`,transport:'github',reset:retryAt??null})).changes;
-   if(changed)this.s.db.query("UPDATE coderabbit_cycles SET head=?,state='waiting',episode=episode+?,reliable=?,next_action=MAX(next_action,?) WHERE repo=? AND pr=? AND cycle=?").run(head,c.state==='requesting'?1:0,Number(!!retryAt),next,repo,pr,c.cycle);
+    if(changed)this.s.db.query("UPDATE coderabbit_cycles SET head=?,state='waiting',episode=episode+?,reliable=?,next_action=MAX(next_action,?) WHERE repo=? AND pr=? AND cycle=?").run(head,c.state==='requesting'?1:0,Number(!!retryAt),next,repo,pr,c.cycle);
+   return next;
   }).immediate();
  }
  reason(c:any){return c.state==='already_reviewed'?`CodeRabbit review unavailable: provider already reviewed head ${c.head}; no repeated regular requests. Inspect the existing review and metadata gates; whole-PR reassessment requires explicit operator full review.`:c.state==='exhausted'?`CodeRabbit review unavailable: rate-limit retry cycle ${c.cycle} exhausted (${c.attempts}/${c.limit_attempts} retries; deadline ${new Date(c.deadline).toISOString()}). Preview extend-review-cycle JOB, then confirm with a named human; receipts, cooldown and uncertainty remain intact.`:`CodeRabbit rate limited; next retry at ${new Date(this.effectiveRetry(c)).toISOString()}`;}

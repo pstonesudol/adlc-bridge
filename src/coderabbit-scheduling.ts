@@ -181,9 +181,12 @@ export class ReviewRequests{
  }
   get(repo:string,pr:number,head:string):any{return this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? AND head=?').get(repo,pr,head);}
   providerHold(){return reviewProviderHold(this.s);}
-  holdForInspection(job:string,repo:string,pr:number,head:string){
+  holdForInspection(job:string,repo:string,pr:number,head:string,query?:any){
    assertObservationFence();return this.s.db.transaction(()=>{
-    if(!this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND head=? AND job=? AND state='delivery_uncertain'").get(repo,pr,head,job))throw Error('Original uncertain request required for provider hold');
+    if(query){
+     const target=this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any;
+     if(target?.repo!==repo||target?.pr!==pr||query.repo!==repo||query.pr!==pr||!this.s.db.query("UPDATE coderabbit_queries SET state='inspection_rejected' WHERE repo=? AND pr=? AND cycle=? AND episode=? AND state='delivery_uncertain'").run(repo,pr,query.cycle,query.episode).changes)throw Error('Original uncertain query required for provider hold');
+    }else if(!this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND head=? AND job=? AND state='delivery_uncertain'").get(repo,pr,head,job))throw Error('Original uncertain request required for provider hold');
     const changed=this.s.db.query('INSERT OR IGNORE INTO coderabbit_provider_holds VALUES (?,?,?,?,?,?,?,?)').run('coderabbit',randomUUID(),job,repo,pr,head,'Provider rate-limit reset cannot be safely represented; operator inspection required',this.now()).changes;
     if(changed)this.s.event(job,'coderabbit_provider_hold_recorded',JSON.stringify(this.providerHold()));
     return this.providerHold();
@@ -201,11 +204,16 @@ export class ReviewRequests{
     return {state:'provider_hold_cleared',provider:'coderabbit',mutationReplay:false,originalRequest:'retained; uncertain receipts and budgets unchanged'};
    }).immediate();
   }
- wait(repo:string,pr:number,schedule:ReviewSchedule){
+  wait(repo:string,pr:number,schedule:ReviewSchedule){
   assertObservationFence();const {head,signature}=schedule;
-  this.s.db.query('INSERT INTO coderabbit_waits VALUES (?,?,?,?,?) ON CONFLICT(repo,pr,head) DO UPDATE SET signature=excluded.signature,started=excluded.started WHERE signature!=excluded.signature').run(repo,pr,head,signature,this.now());
+   this.s.db.query('INSERT INTO coderabbit_waits VALUES (?,?,?,?,?) ON CONFLICT(repo,pr,head) DO UPDATE SET signature=excluded.signature,started=excluded.started WHERE signature!=excluded.signature').run(repo,pr,head,signature,this.now());
+   const shared=this.sharedRetryAt(schedule);
+   // A verified wait is not time spent awaiting a delivered review. Persist
+   // its end so a poll/restart after reset cannot immediately time out.
+   if(shared>this.now())this.s.db.query('UPDATE coderabbit_waits SET started=MAX(started,?) WHERE repo=? AND pr=? AND head=?').run(shared,repo,pr,head);
   return this.s.db.query('SELECT started FROM coderabbit_waits WHERE repo=? AND pr=? AND head=?').get(repo,pr,head) as {started:number};
- }
+  }
+  sharedRetryAt(schedule:ReviewSchedule):number{return schedule.quotaIdentity?(this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any)?.reset??0:0;}
  claim(job:string,repo:string,pr:number,schedule:ReviewSchedule){
    assertObservationFence();if(schedule.blocker||schedule.evidence?.recoverable===false||schedule.requestPolicy?.requestReview===false)return false;
    return this.s.db.transaction(()=>{
@@ -215,7 +223,7 @@ export class ReviewRequests{
     // Legacy HTTP evidence is plain text. Bot-rejected deliveries retain their
     // JSON comment receipt; they must not embargo unrelated developer quotas.
      if(githubReviewTransportRetryAt(this.s)>this.now())return false;
-    if(schedule.quotaIdentity){const shared=this.s.db.query("SELECT MAX(next_action) AS reset FROM coderabbit_cycles WHERE scope=? AND state!='completed'").get(schedule.quotaIdentity) as any;if(shared?.reset>this.now())return false;}
+    if(this.sharedRetryAt(schedule)>this.now())return false;
    if(this.s.db.query("SELECT 1 FROM coderabbit_requests WHERE repo=? AND pr=? AND state='delivery_uncertain'").get(repo,pr))return false;
    // Existing metadata-review receipts also consume this head's accepted/uncertain
    // request budget. This upgrade must not replay requests from old databases.

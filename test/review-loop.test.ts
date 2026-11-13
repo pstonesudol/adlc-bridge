@@ -16,9 +16,9 @@ import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import
 import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
-import {ReviewRateLimit,ReviewRequests} from '../src/coderabbit-scheduling';
+import {ReviewRateLimit,ReviewRequests,ReviewResetUnrepresentable,reviewProviderHoldPreview} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
-import {CODERABBIT_APP_ID} from '../src/coderabbit-cooldowns';
+import {CODERABBIT_APP_ID,cooldownDue,githubReviewTransportRetryAt} from '../src/coderabbit-cooldowns';
 import {ActionWatchdog} from '../src/action-watchdog';
 import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES,MAX_REVIEW_BODY_BYTES,MAX_REMEDIATION_PROMPT_BYTES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
@@ -195,6 +195,54 @@ test('DEV-82: availability HTTP throttle is a shared transport hold, not a revie
   expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_request_attempts').get()).toEqual({n:0});
   expect(f.loop.requests.cooldowns.get('owner/repo',1).attempts).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
   expect(queries).toBe(1);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
+test('DEV-82: rejected availability query retains inspection hold, not fictitious delivery uncertainty',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now();Object.defineProperty(f.e,'coderabbitObservation',{get:()=>({repo:'owner/repo',pr:1,head:f.head,comments:[],observed:Date.now(),checks:[{id:922,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]})});
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw new ReviewResetUnrepresentable();};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.loop.get(f.id).reason).toContain('provider-wide inspection hold');
+  const ledger=f.loop.requests.cooldowns,c=ledger.get('owner/repo',1);
+  expect(ledger.query(c).state).toBe('inspection_rejected');expect(c.attempts).toBe(0);
+  const restarted=new ReviewRequests(f.s),other=f.s.enqueue('other','other','spec');
+  expect(restarted.providerHold().job).toBe(f.id);
+  expect(restarted.claim(other,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(false);
+  await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);
+  const preview=reviewProviderHoldPreview(f.s,f.id);restarted.reconcileProviderHold(f.id,preview.confirmation,'Operator');
+  setSystemTime(new Date(c.next_action+1));
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(queries).toBe(1);expect(f.reviews()).toBe(1);expect(ledger.get('owner/repo',1).attempts).toBe(1);
+ }finally{setSystemTime();f.s.close();}
+});
+test('DEV-82: shared quota waits suspend timeout and permit a first request after reset',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  f.e.reviewSchedule.quotaIdentity='github-user:7';
+  const at=Date.now(),reset=at+60*60000;
+  f.loop.requests.cooldowns.http('source/repo',2,'source',1,reset-5*60000);
+  f.s.db.query("UPDATE coderabbit_cycles SET scope='github-user:7'").run();
+  const waiting=await f.loop.tick(f.id);expect(waiting.state).toBe('waiting_for_coderabbit');expect(waiting.reason).toContain(new Date(reset).toISOString());
+  expect(cooldownDue(f.s,f.id,at)).toBe(reset);expect(f.reviews()).toBe(0);
+  expect(f.loop.requests.cooldowns.get('owner/repo',1)).toBeNull();
+  // Reconstruct the scheduler to ensure the timeout baseline is durable.
+  f.loop.requests=new ReviewRequests(f.s);
+  setSystemTime(new Date(at+66*60000));
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(f.reviews()).toBe(1);expect(f.loop.requests.get('owner/repo',1,f.head).attempts).toBe(1);
+  expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
+test('DEV-82: HTTP response deadline stays separate from an already longer provider wait',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now(),ledger=f.loop.requests.cooldowns;
+  // Provider evidence can arrive after reservation but before HTTP settlement.
+  const reset=at+60000;f.loop.postReview=async()=>{ledger.http('owner/repo',1,f.head,99,at+120*60000);throw new ReviewRateLimit(reset);};
+  expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).toBe(false);
+  expect(githubReviewTransportRetryAt(f.s)).toBe(reset+5*60000);
+  expect(ledger.get('owner/repo',1).next_action).toBeGreaterThan(githubReviewTransportRetryAt(f.s));
  }finally{f.s.close();}
 });
 test('DEV-82: provider-wide inspection hold blocks availability publication on another PR',async()=>{
@@ -376,7 +424,7 @@ test('missing current-head review gets one request after grace, retries only con
   f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   let calls=0;f.loop.postReview=async()=>{if(++calls===1)throw new ReviewRateLimit(Date.now()+60000);};
   await f.loop.tick(f.id);await f.loop.tick(f.id);expect(calls).toBe(1);
-  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0,requested=?').run(Date.now()-60001);f.s.db.query('UPDATE coderabbit_cycles SET next_action=0').run();await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
+  setSystemTime(new Date(f.loop.requests.cooldowns.get('owner/repo',1).next_action+1));await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
   await f.loop.tick(f.id);expect(calls).toBe(2);
   f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
   const escalated=await f.loop.tick(f.id);
@@ -385,7 +433,7 @@ test('missing current-head review gets one request after grace, retries only con
   expect(escalated.reason).toContain('requested mode regular');
   expect(escalated.reason).toContain('never automatic escalation');
   expect(escalated.reason).not.toContain('ambiguous');
- }finally{f.s.close();}
+ }finally{setSystemTime();f.s.close();}
 });
 for(const extra of ['missing-coderabbit','required-human','advisory-trust-failure'])test(`automatic requests distinguish missing approval from other reviewer obligations: ${extra}`,async()=>{
  const f=templateFixture();try{

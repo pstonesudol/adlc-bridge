@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {CodeRabbitCooldowns,throttleEvidence,cooldownPolicy,cooldownDue,CODERABBIT_APP_ID,DEFAULT_COOLDOWN} from '../src/coderabbit-cooldowns';
+import {CodeRabbitCooldowns,throttleEvidence,cooldownPolicy,cooldownDue,githubReviewTransportRetryAt,CODERABBIT_APP_ID,DEFAULT_COOLDOWN} from '../src/coderabbit-cooldowns';
 import {ReviewLoop} from '../src/review-loop';
 import {ReviewRequests,reviewRequestBody,reviewRequestMarker} from '../src/coderabbit-scheduling';
 import {BOT_IDENTITIES,reviewerPolicy} from '../src/reviewer-policy';
@@ -156,6 +156,35 @@ test('shared quota requires explicit provider identity evidence; same credential
   expect(l.effectiveRetry(a)).toBe(b.next_action);
   const separate=l.observe({...o,pr:39,observed:now},[]);expect(separate.scope).toBeNull();expect(l.effectiveRetry(separate)).toBe(separate.next_action);
  }finally{s.close();}
+});
+for(const named of ['alice','ALICE','alice-ops','alice2'])test(`shared quota requires a complete login: ${named}`,()=>{
+ const s=new Store(':memory:');new ReviewLoop(s);const requests=new ReviewRequests(s,()=>T),o=observation(),author={id:7,login:'alice'};
+ try{
+  const c=requests.cooldowns.observe({...o,author,checks:[],comments:[boundReply(o.repo,`Review rate limited. Developer @${named}. Retry after 60 minutes.`)]},[]);
+  const exact=named.toLowerCase()==='alice';expect(c.scope).toBe(exact?'github-user:7':null);
+  const job=s.enqueue('p','other','spec'),schedule={head:OTHER,signature:'config',blocker:null,incremental:false};
+  expect(requests.claim(job,'other/repo',2,{...schedule,quotaIdentity:'github-user:7'})).toBe(!exact);
+  expect(requests.claim(job,'unrelated/repo',3,{...schedule,quotaIdentity:'github-user:8'})).toBe(true);
+ }finally{s.close();}
+});
+test('provider quota reconciliation cannot extend immutable HTTP transport evidence across restarts',()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-transport-deadline-')),path=join(root,'state.sqlite');let s=new Store(path),now=T;
+ try{
+  new ReviewLoop(s);let requests=new ReviewRequests(s,()=>now);const o=observation(),job=s.enqueue('p','i','spec'),schedule={head:HEAD,signature:'config',blocker:null,incremental:false};
+  expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(true);
+  const transport=requests.cooldowns.http(o.repo,o.pr,HEAD,1,T+60000);
+  requests.settle(o.repo,o.pr,HEAD,'rate_limited','confirmed HTTP rate-limit rejection',transport);
+  now+=1000;
+  requests.cooldowns.observe({...o,observed:now,checks:[run({started_at:iso(now),completed_at:iso(now),output:{title:'Review rate limited',summary:'Retry after 120 minutes.'}})]},requests.receipts(o.repo,o.pr));
+  requests.reconcileThrottle(o.repo,o.pr);
+  expect(requests.get(o.repo,o.pr,HEAD).next_attempt).toBeGreaterThan(transport);
+  expect(githubReviewTransportRetryAt(s)).toBe(transport);
+  s.close();s=new Store(path);requests=new ReviewRequests(s,()=>now);
+  expect(githubReviewTransportRetryAt(s)).toBe(transport);
+  now=T+10*60000;
+  expect(requests.claim(job,'unrelated/repo',2,{...schedule,head:OTHER,quotaIdentity:'github-user:8'})).toBe(true);
+  expect(requests.claim(job,o.repo,o.pr,schedule)).toBe(false);
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
 });
 test('cooldown configuration is bounded and opt-in to preserve existing approved policy bindings',()=>{
  expect(reviewerPolicy(undefined)[0].rateLimit).toBeUndefined();expect(cooldownPolicy({fallback:30*60000}).fallback).toBe(30*60000);

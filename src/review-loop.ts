@@ -289,7 +289,7 @@ export class ReviewLoop{
      }
    catch(error){assertObservationFence();
      if(error instanceof ReviewResetUnrepresentable){const hold=this.requests.holdForInspection(job,t.repo,pr,head);this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; request remains reserved; preview reconcile-review-provider ${hold.job}`},pr);throw error;}
-      if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{this.requests.cooldowns.http(t.repo,pr,head,this.requests.get(t.repo,pr,head).attempts,error.retryAt,requestPolicy.rateLimit);this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',this.requests.cooldowns.get(t.repo,pr).next_action);this.s.db.query("UPDATE full_review_requests SET state='rate_limited' WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
+      if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{const transportRetry=this.requests.cooldowns.http(t.repo,pr,head,this.requests.get(t.repo,pr,head).attempts,error.retryAt,requestPolicy.rateLimit);this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',transportRetry);this.s.db.query("UPDATE full_review_requests SET state='rate_limited' WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
     this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: ${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
   assertObservationFence();
    this.s.db.transaction(()=>{this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
@@ -557,7 +557,7 @@ export class ReviewLoop{
       q=this.requests.cooldowns.claimQuery(activeCycle);
       if(q){
        try{l.current(job);const comment=await io.postAvailability(t.repo,t.pr,q.body);assertObservationFence();this.requests.cooldowns.settleQuery(q,comment);}
-       catch(error){if(error instanceof ObservationLeaseLost)throw error;if(error instanceof ReviewRateLimit)this.requests.cooldowns.chatThrottle(q,error.retryAt);}
+       catch(error){assertObservationFence();if(error instanceof ObservationLeaseLost)throw error;if(error instanceof ReviewResetUnrepresentable){const hold=this.requests.holdForInspection(job,t.repo,t.pr,e.head,q);return record({state:'blocked',send:false,head:e.head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; query rejected; preview reconcile-review-provider ${hold.job} before any new request`});}if(error instanceof ReviewRateLimit)this.requests.cooldowns.chatThrottle(q,error.retryAt);}
        q=this.requests.cooldowns.query(activeCycle);
       }
      }
@@ -570,6 +570,8 @@ export class ReviewLoop{
     }
    }
   if(schedule&&idle&&!e.clear&&!waiting&&!e.customCheckBlocker){
+   const sharedRetry=this.requests.sharedRetryAt(schedule);
+   if(!activeCycle&&sharedRetry>this.now())return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:`CodeRabbit rate limited; next retry at ${new Date(sharedRetry).toISOString()}`});
    const request=this.requests.get(t.repo,t.pr,e.head),age=Date.now()-(request?.state==='accepted'?request.requested:scheduleWait!.started);
     if(!activeCycle&&request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt,mode:request.mode})});
     if(!activeCycle&&schedule.evidence?.classification==='rate-limited'&&!request)return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:0,requestState:'none'})});
