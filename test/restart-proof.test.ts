@@ -43,3 +43,26 @@ test('post-restart failure names the launcher check and next action without clea
   expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
  }finally{f.close();}
 });
+test('stale prior launcher recovery is disclosed and only a verified replacement clears pending restart',async()=>{
+ for(const replacementVerified of [true,false]){const f=fixture();try{
+  const original=f.ops.backend,start=f.ops.backendStart;let restarted=false;
+  f.ops.backend=async()=>({...await original(),launcherVerified:restarted&&replacementVerified});
+  f.ops.backendStart=async()=>{await start();restarted=true;};
+  const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state);
+  expect(p.backend.launcherVerified).toBe(false);expect(p.savedPreview).toBe(true);expect(f.calls).toEqual([]);
+  expect(p.note).toContain('may replace a prior launcher');expect(p.note).toContain('not verification of the current launcher');expect(p.note).toContain('Post-restart');
+  const apply=()=>controlManagedLifecycle('restart',{all:true,timeout:30,apply:true},f.ops,30000,f.state);
+  if(replacementVerified)expect((await apply()).restartVerification.verified).toBe(true);
+  else await expect(apply()).rejects.toThrow('managed-launcher');
+  expect(f.calls).toContain('backend:stop');expect(f.calls).toContain('backend:start');
+  expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(!replacementVerified);
+ }finally{f.close();}}
+});
+test('stale launcher recovery still refuses newly busy work before mutation',async()=>{
+ const f=fixture();try{
+  const original=f.ops.backend;f.ops.backend=async()=>({...await original(),launcherVerified:false});
+  await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state);f.busy();
+  await expect(controlManagedLifecycle('restart',{all:true,timeout:30,apply:true},f.ops,30000,f.state)).rejects.toThrow('Worker became busy');
+  expect(f.calls).toEqual([]);expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
+ }finally{f.close();}
+});

@@ -355,6 +355,13 @@ integration work; never disable executable verification to make projects visible
   the daemon normally use different executable paths. An unverified launcher must
   not count as a verified restart; inspect the PID/parent command and registered
   launcher, then obtain a fresh `adlc restart --all` preview before applying.
+  A guarded restart can replace a stale/unverified prior launcher: installation
+  updates the registered launcher before the running parent changes. The trusted
+  registered executable, service definition and worker ownership/activity guards
+  still apply before disruption. Saving a preview does not verify the current
+  launcher. Only post-restart verification of the intended launcher (alongside
+  backend readiness/identity and project services) records success and clears a
+  pending restart; failure preserves pending state.
 * After managed takeover: if the desktop retains its bundled executable expectation,
   inspect and finish active/queued work before any app exit or ownership transition;
   preserve sessions/worktrees, fully quit and relaunch the desktop app, and check that
