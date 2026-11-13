@@ -1,8 +1,9 @@
-import {test,expect} from 'bun:test';
+import {test,expect,spyOn} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,existsSync,readFileSync,rmSync} from 'node:fs';
 import {join,dirname} from 'node:path';
 import {tmpdir} from 'node:os';
 import {turnBarrier} from '../src/turn-submission';
+import {lockIdentity} from '../src/process-lock';
 import {UpdateManager,validateUpdatePolicy,classifyChanges,classifyChangedFiles,changedFiles,repositoryFromRemote,stageCandidate,candidateCompatibility,evaluateCheckRuns,writeUpdatePolicy,type UpdateIO,type UpdatePolicy} from '../src/update';
 import {installBridge,installIO,snapshot,distributionVersion} from '../src/install';
 import {liveUpdateIO} from '../src/update';
@@ -392,12 +393,23 @@ test('tampered staged build, lockfile and source fail closed instead of being re
  }
 },30000);
 test('artifact tampering during activation is caught by the final stage verification',async()=>{
- const f=candidateFixture();try{
+ // Exercise real filesystem locks without depending on OS identity subprocesses
+ // during frozen-artifact preparation. Native identity safety has its own tests.
+ const boot=spyOn(lockIdentity,'boot').mockReturnValue('artifact-test-boot');
+ const started=spyOn(lockIdentity,'started').mockImplementation(pid=>pid===process.pid?'artifact-test-process':null);
+ let f:ReturnType<typeof candidateFixture>|undefined;
+ try{
+  f=candidateFixture();
   const preview=await f.manager.preview(),stop=f.io.stack.project;
   f.io.stack.project=async(action,id)=>{const result=await stop(action,id);if(action==='stop')writeFileSync(join(preview.staged.root,'src/cli.ts'),'changed during activation');return result;};
   await expect(f.manager.apply()).rejects.toThrow('artifact was modified');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);expect(f.manager.turns.isPaused()).toBe(false);
- }finally{f.close();}
-});
+  expect(readFileSync(join(preview.staged.root,'src/cli.ts'),'utf8')).toBe('changed during activation');
+  expect(boot).toHaveBeenCalled();expect(started).toHaveBeenCalledWith(process.pid);
+  expect(existsSync(join(f.state,'turn-submission.lock'))).toBe(false);
+ }finally{started.mockRestore();boot.mockRestore();f?.close();}
+ // Like the adjacent artifact tests, isolated preparation needs a bounded CI
+ // budget beyond Bun's default 5s; the tampering assertion remains unchanged.
+},30_000);
 test('a changed authoritative candidate after a saved preview requires a fresh explicit preview',async()=>{
  const f=fixture();try{
   f.io.stage=async(_p,c)=>({root:join(f.root,'stage'),commit:c.commit,version:'v2',files:['src/cli.ts'],artifact:{lockfile:'lock',digest:'artifact'}});

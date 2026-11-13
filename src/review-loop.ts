@@ -305,7 +305,12 @@ export class ReviewLoop{
      ?{state:'blocked',send:false,head:result.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'}
      :{state:'completed',send:false,head:current?.head??result.head,reason:current?.reason??'Review target completed during collection'};
    };
-   if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
+    if(config?.requiredChecks!==undefined&&t.required_checks!==JSON.stringify(config.requiredChecks)){
+     // Startup may report a policy mismatch without stopping all polling. Never
+     // evaluate readiness with the historical list, even in maintenance mode.
+     return this.record(job,{state:'blocked',send:false,head:t.head,reason:`Required-check policy changed; preview reconcile-review-checks ${job} CONFIG HUMAN (additions only; existing checks cannot be removed)`},t.pr);
+    }
+    if(revisedExecution(this.s,job)&&!revisedHandoff(this.s,job)){
     // A durable handoff marker survives later remediation states, so failed or
     // uncertain remediation after a revised handoff still reaches reconciliation.
     return record({state:'waiting_for_revised_handoff',send:false,reason:'Previous PR evidence is historical; await revised implementation handoff'});
