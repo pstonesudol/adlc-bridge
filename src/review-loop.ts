@@ -537,7 +537,10 @@ export class ReviewLoop{
   // idle PR. Pending CI and actionable findings must be handled first.
   const waitStart=Math.max(waiting?.started??0,deliveryWait?.started??0);
   const schedule:ReviewSchedule|undefined=e.reviewSchedule;
-   if(schedule?.blocker&&!e.findings.length)return record({state:'blocked',send:false,head:e.head,reason:schedule.blocker});
+    // Review scheduling cannot veto independent required-CI diagnosis. Failed
+    // checks still pass the scoped authorization, provenance and delivery gates
+    // below; the schedule blocker continues to prohibit review requests.
+    if(schedule?.blocker&&!e.findings.length&&!e.failedChecks.length)return record({state:'blocked',send:false,head:e.head,reason:schedule.blocker});
   const scheduleWait=schedule?this.requests.wait(t.repo,t.pr,schedule):null;
   if(schedule&&session.transcript.controller!=='ready')this.s.db.query('UPDATE coderabbit_waits SET started=? WHERE repo=? AND pr=? AND head=?').run(Date.now(),t.repo,t.pr,e.head);
    const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
