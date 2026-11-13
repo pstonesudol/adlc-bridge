@@ -31,7 +31,8 @@ export function loadRestartProof(state:string,binding:unknown,now:number){
 // Only a caller holding the lifecycle fence and freshly verifying backend,
 // intended launcher and every prior poller may reconcile this existing record.
 export function recordVerifiedRestart(state:string,evidence:{backend:any;services:any[];observedAt:number}){
- if(!evidence.backend?.ready||!evidence.backend?.managed||evidence.backend?.launcherVerified!==true||evidence.services.some(s=>s.loaded!==true))throw Error('Restart verification incomplete; pending restart preserved');
+ const failed=[!evidence.backend?.ready?'daemon-readiness':null,!evidence.backend?.managed?'managed-executable':null,evidence.backend?.launcherVerified!==true?'managed-launcher':null,evidence.services.some(s=>s.loaded!==true)?'project-services':null].filter(Boolean);
+ if(failed.length)throw Error(`Restart verification incomplete (${failed.join(', ')}); pending restart preserved. Inspect services status --all and the exact registered launcher, then run a fresh restart preview. Do not bypass identity verification.`);
  privateDirectory(state);
  const path=join(state,'update-state.json');
  if(existsSync(path)){const prior=privateJSON(path);if(prior.version!==1||typeof prior.restartRequired!=='boolean')throw Error('Update record invalid; pending restart preserved');atomicFile(path,JSON.stringify({...prior,restartRequired:false,restartVerification:evidence})+'\n');}

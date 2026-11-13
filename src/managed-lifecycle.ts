@@ -57,11 +57,13 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
    result.complete=!result.errors.length&&result.inventoryComplete===true;return result;
  }
  const disruptive=action==='restart'||action==='stop'&&o.mode!=='pause'&&(!!o.all||!!o.mode);
- if(o.preview||disruptive&&!o.apply){
-  const i=disruptive?await observe():{workers:[],children:[],complete:true,externalProcesses:'Not inspected'};
+  if(o.preview||disruptive&&!o.apply){
+   if(o.all)try{result.backend=await ops.backend();}catch{result.errors.push({resource:'backend',message:'Backend evidence unavailable; inspect runtime registration and service definition. Backend preserved.'});}
+   let i:Inventory={workers:[],children:[],complete:true,externalProcesses:'Not inspected'};
+   if(disruptive)try{i=await observe();}catch{ i={workers:[],children:[],complete:false,externalProcesses:'Inventory unavailable; backend preserved'};result.errors.push({resource:'workers/processes',message:'Worker/process inventory unavailable; preserve existing sessions and inspect daemon identity and activity before retrying.'}); }
    result.preview=true;result.confirm=lifecycleConfirmation(action,o,ids,i);
    if(savedRestart){
-    if(i.complete){const backend=await ops.backend();if(backend.managed&&backend.ready){saveRestartProof(state!,{...proofBinding,backend},result.confirm,ops.now());result.savedPreview=true;}}
+    if(i.complete){const backend=result.backend;if(backend?.managed&&backend.ready){saveRestartProof(state!,{...proofBinding,backend},result.confirm,ops.now());result.savedPreview=true;}}
    }
    result.note=savedRestart?(result.savedPreview?'Preview saved for ten minutes. Re-run the same options with --apply; --apply --confirm HASH remains supported.':'Incomplete preview was not saved. Resolve unknown evidence and run adlc restart --all again before --apply.'):'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.';return result;
  }
@@ -72,6 +74,7 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   const wait=async(test:()=>Promise<boolean>)=>{for(;;){time();if(await test())return;await ops.sleep(Math.min(200,Math.max(1,deadline-ops.now())));}};
   try{
    time();
+    if(action==='restart'&&o.all){result.backend=await ops.backend();if(!result.backend.ready||!result.backend.managed)throw Error('Restart backend identity/readiness check failed; backend and workers preserved. Inspect the failed backend checks in a fresh restart preview.');}
     if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error(savedRestart?`Confirmation missing or stale; run ${rerun}`:'Confirmation missing or stale; preview the exact selected action again');
      if(savedRestart){if(initialIdentity!==restartIdentity(state!))throw Error(`Restart identity changed; run ${rerun}`);
       if(!o.apply||!o.confirm)throw Error('Restart apply confirmation missing');

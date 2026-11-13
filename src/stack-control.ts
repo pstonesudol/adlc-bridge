@@ -2,13 +2,34 @@ import {existsSync,lstatSync,readFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {AO} from './orchestrator';
-import {trustedDaemon} from './daemon-runtime';
+import {trustedDaemon,bundledAO} from './daemon-runtime';
 import {registeredProjects,serviceControl} from './service-control';
 import {readDefinition} from './project-services';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {acquireProcessLock} from './process-lock';
 
-type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number;launcher?:string;launcherVerified?:boolean};
+export type BackendCheck={check:string;passed:boolean;nextAction:string};
+type Backend={loaded:boolean;ready:boolean;managed:boolean;pid?:number;executablePath?:string;expectedExecutable?:string;launcher?:string;launcherVerified?:boolean;checks?:BackendCheck[];desktopRecovery?:string};
+export const desktopRecovery='If the desktop still reports a bundled executable expectation after managed takeover, inspect active/queued work and finish it before any app-exit or ownership transition. Preserve existing sessions and worktrees, fully quit and relaunch the desktop app, then verify both registered projects load. If identity mismatch persists, stop and inspect desktop compatibility; do not disable identity verification. Automatic desktop attachment is not verified by bridge status.';
+export async function inspectManagedBackend(config:{executable:string;launcher:string;target:string},inspect:()=>Promise<any>,run=command,trust=trustedDaemon):Promise<Backend>{
+ const s=await inspect();let trusted=false,launcherVerified=false;
+ if(s.ready)try{trusted=trust(s.executablePath);}catch{} // Invalid trust evidence is a failed check, never adoption authority.
+ if(s.ready&&Number.isSafeInteger(s.pid)&&s.pid>0){
+  const parent=await run(['/bin/ps','-p',String(s.pid),'-o','ppid=']);const ppid=parent.stdout.trim();
+  if(parent.code===0&&/^[1-9][0-9]*$/.test(ppid)){
+   const args=await run(['/bin/ps','-p',ppid,'-o','command=']);
+   launcherVerified=args.code===0&&args.stdout.trim()===`/usr/bin/python3 ${config.launcher}`;
+  }
+ }
+ const same=s.ready&&s.executablePath===config.executable;
+ const mismatch=s.executablePath===bundledAO?'Desktop-first bundled daemon detected. Finish active work and verify session ownership in the desktop app before any operator-controlled transition; the bridge will not stop or adopt this daemon.':'Unexpected daemon executable detected. Preserve the process and inspect its executable and runtime registration; do not change the pin to bypass verification.';
+ return {loaded:await loaded(config.target,run),ready:s.ready,managed:s.ready?!!same&&trusted:true,expectedExecutable:config.executable,launcher:config.launcher,launcherVerified,...(s.ready?{pid:s.pid,executablePath:s.executablePath}:{}),desktopRecovery,checks:[
+  {check:'daemon-readiness',passed:!!s.ready,nextAction:'Inspect Orchestrator status; start only the registered managed service after resolving any existing daemon.'},
+  {check:'managed-executable',passed:!!same,nextAction:mismatch},
+  {check:'executable-trust',passed:trusted,nextAction:'Verify the registered executable hash and owner-controlled runtime files; preserve any unverified daemon.'},
+  {check:'managed-launcher',passed:launcherVerified,nextAction:'Verify the daemon PID, parent command /usr/bin/python3 and exact registered launcher path. Different daemon and launcher executable paths are expected; do not equate executable trust with launcher verification. Use a fresh guarded restart preview after correcting launcher evidence.'}
+ ]};
+}
 export type StackOps={
  projects():Promise<{project:string}[]>;
   // A start result must confirm the running poll's PID-bound startup receipt.
@@ -124,14 +145,9 @@ export function liveStackOps(readOnly=false,turns=turnBarrier(),persistent=true,
    if(action==='stop'&&persistent){const r=await command(['/bin/launchctl','disable',`${config.domain}/${p.label}`]);if(r.code!==0)throw Error('Intake stopped but could not disable login startup');}
    return result;
   },
-  backend:async()=>{const s=await inspect();let launcherVerified=false;
-   if(s.ready&&Number.isSafeInteger(s.pid)&&s.pid>0){
-    const parent=await run(['/bin/ps','-p',String(s.pid),'-o','ppid=']);const ppid=parent.stdout.trim();
-    if(parent.code===0&&/^[1-9][0-9]*$/.test(ppid)){const args=await run(['/bin/ps','-p',ppid,'-o','command=']);launcherVerified=args.code===0&&args.stdout.trim()===`/usr/bin/python3 ${config.launcher}`;}
-   }
-   return {loaded:await loaded(config.target,run),ready:s.ready,managed:s.ready?s.executablePath===config.executable&&trustedDaemon(s.executablePath):true,launcher:config.launcher,launcherVerified,...(s.ready?{pid:s.pid}:{})};},
+  backend:()=>inspectManagedBackend(config,inspect,run),
   backendStart:async()=>{
-   const s=await inspect();if(s.ready&&s.executablePath!==config.executable)throw Error('Another Orchestrator backend is running; preserved');
+   const b=await inspectManagedBackend(config,inspect,run);if(b.ready&&!b.managed)throw Error(`Another Orchestrator backend is running; preserved. ${b.checks?.filter(c=>!c.passed).map(c=>`${c.check}: ${c.nextAction}`).join(' ')}`);
    const enabled=await run(['/bin/launchctl','enable',config.target]);if(enabled.code!==0)throw Error('Could not enable Orchestrator service');
    if(!await loaded(config.target,run)){const r=await run(['/bin/launchctl','bootstrap',config.domain,config.plist]);if(r.code!==0)throw Error('Could not start Orchestrator service');}
    for(let i=0;i<100;i++){remaining();try{const p=await inspect();if(p.ready&&p.executablePath===config.executable)return;}catch{}await Bun.sleep(200);}

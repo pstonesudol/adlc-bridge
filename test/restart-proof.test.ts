@@ -36,3 +36,10 @@ test('verified intended launcher with a stale update flag can reconcile without 
   recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:true},services:[{loaded:true}],observedAt:2});expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8'))).toMatchObject({commit:'a'.repeat(40),restartRequired:false,classification:'hot'});
  }finally{f.close();}
 });
+test('post-restart failure names the launcher check and next action without clearing pending state',()=>{
+ const f=fixture();try{
+  expect(()=>recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:false},services:[],observedAt:1})).toThrow('managed-launcher');
+  expect(()=>recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:false},services:[],observedAt:1})).toThrow('fresh restart preview');
+  expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
+ }finally{f.close();}
+});

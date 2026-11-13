@@ -340,6 +340,28 @@ service on this Mac. They use the owner-only
 (`executable`, `sha256`, `serviceLabel`, `launcher`) and the matching installed
 LaunchAgent. They preserve unrelated Orchestrator installations and services.
 
+**Login/startup identity recovery:** the bridge does not have a verified documented
+desktop attachment setting/API. Existing launcher environment variables are not
+proof that the desktop attached. Automatic attachment needs separate desktop-side
+integration work; never disable executable verification to make projects visible.
+
+* Desktop first: a bundled daemon can be trusted yet is not the registered managed
+  daemon. A restart preview identifies `managed-executable` as failed and preserves
+  that daemon. Inspect active/queued sessions and ownership in the desktop app;
+  finish work before any operator-controlled ownership transition. Do not force-kill,
+  delete sessions/worktrees, or repin a foreign executable to clear the mismatch.
+* Service first: inspect `adlc services status --all --json`. Readiness, exact managed
+  executable, executable trust, and parent launcher are separate checks. Python and
+  the daemon normally use different executable paths. An unverified launcher must
+  not count as a verified restart; inspect the PID/parent command and registered
+  launcher, then obtain a fresh `adlc restart --all` preview before applying.
+* After managed takeover: if the desktop retains its bundled executable expectation,
+  inspect and finish active/queued work before any app exit or ownership transition;
+  preserve sessions/worktrees, fully quit and relaunch the desktop app, and check that
+  both registered projects load. If mismatch persists, preserve the running daemon
+  and inspect desktop compatibility. Bridge readiness alone does not prove desktop
+  attachment or project visibility.
+
 Grouped `services start|stop|restart|status` accepts `PROJECT`, `--project PROJECT`,
 or explicit `--all`. Flat `start`, `stop`, `restart`, and `status --all` are aliases;
 flat `status --project PROJECT` retains its existing **job-status** meaning.
