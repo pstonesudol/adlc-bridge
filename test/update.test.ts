@@ -359,6 +359,10 @@ function candidateFixture(options:{missing?:boolean;inconsistent?:boolean}={}){
 const FROZEN_ARTIFACT_TIMEOUT_MS=30_000;
 describe('fresh dependency-free preview/apply/status reuse the exact frozen artifact without lifecycle scripts',()=>{
  let f:ReturnType<typeof candidateFixture>,stage:Awaited<ReturnType<typeof stageCandidate>>;
+ const activate=async()=>{
+  f.io.install=async(_apply,root)=>{const built=snapshot(root,join(f.state,'versions'));writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:root,version:built.version,cli:built.cli,launcher:join(f.root,'adlc')}),{mode:0o600});return built;};
+  return f.manager.apply();
+ };
  // Real frozen preparation is an integration setup step, not repeated work
  // charged to a single test. Each preview/apply/status phase keeps its checks.
  beforeAll(async()=>{
@@ -377,11 +381,11 @@ describe('fresh dependency-free preview/apply/status reuse the exact frozen arti
   expect(existsSync(join(f.remote,'node_modules'))).toBe(false);expect(f.installs).toEqual([]);
  },FROZEN_ARTIFACT_TIMEOUT_MS);
  test('apply activates the exact prepared snapshot without running lifecycle scripts',async()=>{
-  f.io.install=async(_apply,root)=>{const built=snapshot(root,join(f.state,'versions'));writeFileSync(join(f.state,'installation.json'),JSON.stringify({source:root,version:built.version,cli:built.cli,launcher:join(f.root,'adlc')}),{mode:0o600});return built;};
-  expect(await f.manager.apply()).toMatchObject({activated:true,version:stage.version});
+  expect(await activate()).toMatchObject({activated:true,version:stage.version});
   expect(existsSync(join(stage.root,'lifecycle-ran'))).toBe(false);
  },FROZEN_ARTIFACT_TIMEOUT_MS);
  test('status retains the exact committed source, version and prior service selection',async()=>{
+  await activate();
   expect(await f.manager.status()).toMatchObject({source:{commit:f.commit,commitKnown:true},installed:{version:stage.version}});
   expect(f.services).toEqual({one:true,two:false});
  },FROZEN_ARTIFACT_TIMEOUT_MS);
