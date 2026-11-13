@@ -12,6 +12,7 @@ import {disableNativeFeedback} from './ao-policy';
 import {metadataCheckNames} from './linear';
 import {metadataBodyCovered,metadataFailureBodyCovered} from './pr-template-ci';
 import {ReviewRequests,ReviewRateLimit,ReviewResetUnrepresentable,REVIEW_GRACE_MS,REVIEW_TIMEOUT_MS,reviewEscalationReason,reviewRequestBody,reviewRequestMarker,type ReviewSchedule,type ReviewMode} from './coderabbit-scheduling';
+import {trustedRabbit,CODERABBIT_APP_ID} from './coderabbit-cooldowns';
 import {readFailure} from './provider-read';
 import {classifyCIFailure,readCIFailure,ciFinding,sameFailedCheck,CIFailureBlocked} from './ci-failures';
 
@@ -84,19 +85,25 @@ export function decision(e:any,allowedPaths:string[],waitingMs:number){
  return {state:'waiting_for_coderabbit',send:false,reason:e.reasons.join('; ')};
 }
 export async function postCodeRabbitReview(repo:string,pr:number,marker='',spawn=Bun.spawn,mode:ReviewMode='regular'){
- const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=${reviewRequestBody(mode,marker)}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+ return postCodeRabbitComment(repo,pr,reviewRequestBody(mode,marker),spawn);
+}
+export async function postCodeRabbitComment(repo:string,pr:number,body:string,spawn=Bun.spawn){
+ const p=spawn(['gh','api','--include','--method','POST',`repos/${repo}/issues/${pr}/comments`,'-f',`body=${body}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
  const [_out,_err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
  if(code!==0){const failure=readFailure('github','review-request',_err,code,undefined,Date.now(),_out,'preserve').evidence;
   if(failure.classification==='throttled'&&[403,429].includes(failure.httpStatus??0)){if(failure.retryAtUnrepresentable)throw new ReviewResetUnrepresentable();throw new ReviewRateLimit(failure.retryAt);}
  }
- if(code!==0)throw Error(`${mode} review request delivery uncertain; inspect before retry`);
+ if(code!==0)throw Error('CodeRabbit comment delivery uncertain; inspect before retry');
+ // gh --include may have proxy/interim header blocks. Accept only an actual
+ // JSON comment receipt; an unreadable successful response remains reserved.
+ try{return JSON.parse(_out.slice(_out.indexOf('{')));}catch{return null;}
 }
 /** Explicit whole-PR reassessment only; never used by automatic scheduling. */
 export async function postFullReview(repo:string,pr:number,marker='',spawn=Bun.spawn){return postCodeRabbitReview(repo,pr,marker,spawn,'full');}
 export function reviewDisplay(state:string){
  return ({waiting_for_ci:'Waiting for CI',waiting_for_coderabbit:'Waiting for CodeRabbit',waiting_for_review:'Waiting for CodeRabbit',remediation_pending:'Addressing feedback',needs_reconciliation:'Blocked — delivery needs reconciliation',blocked:'Blocked',ready_for_human:'Ready for your review',updating_branch:'Updating feature branch',waiting_for_worker:'Waiting for worker',completed:'Done'} as Record<string,string>)[state]??state;
 }
-const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,readCIFailure,contains:branchTransport.contains!};
+ const reviewIO={readiness,sessionEvidence,sendPilotRemediation,disableNativeFeedback,readBranchSnapshot,worktreeIdentity,readCIFailure,postAvailability:postCodeRabbitComment,contains:branchTransport.contains!};
 export class ReviewLoop{
  io:typeof reviewIO;
  requests:ReviewRequests;
@@ -127,7 +134,7 @@ export class ReviewLoop{
      SELECT l.job,COALESCE((SELECT t.pr FROM review_targets t WHERE t.job=l.job),0),l.head,l.body_hash,l.state,l.requested FROM full_review_requests_legacy l;
    DROP TABLE full_review_requests_legacy;`);
   }).immediate();
-   this.requests=new ReviewRequests(s);
+    this.requests=new ReviewRequests(s,now);
    s.db.exec(`CREATE TABLE IF NOT EXISTS branch_maintenance(job TEXT PRIMARY KEY REFERENCES jobs(id),repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT,state TEXT NOT NULL,reason TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
  }
  configureMetadataChecks(project:string,names:string[]){
@@ -183,7 +190,7 @@ export class ReviewLoop{
     const hold=this.requests.providerHold();
     return request?.state==='delivery_uncertain'?{state:'needs_reconciliation',send:false,head,reason:hold?`CodeRabbit review unavailable: provider-wide inspection hold; request remains reserved; preview reconcile-review-provider ${hold.job}`:`${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`}:undefined;
    }
-  list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,providerHold:this.requests.providerHold(),reviewerEvidence:this.reviewerStatus(t.job),maintenance:maintenanceStatus(this.s,t.job),displayStatus:reviewDisplay(t.state),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
+   list(project?:string){const rows=project?this.s.db.query('SELECT t.job,t.repo,t.pr,t.head,t.state,t.reason,t.remediate,t.updated FROM review_targets t JOIN jobs j ON j.id=t.job WHERE j.project=?').all(project):this.s.db.query('SELECT job,repo,pr,head,state,reason,remediate,updated FROM review_targets').all();return (rows as any[]).map(t=>({...t,providerHold:this.requests.providerHold(),reviewerEvidence:this.reviewerStatus(t.job),maintenance:maintenanceStatus(this.s,t.job),displayStatus:t.reason?.startsWith('CodeRabbit rate limited;')?t.reason:reviewDisplay(t.state),reviewCycle:this.requests.cooldowns.get(t.repo,t.pr),reviewRequest:this.s.db.query('SELECT * FROM coderabbit_requests WHERE repo=? AND pr=? ORDER BY requested DESC LIMIT 1').get(t.repo,t.pr)??null}));}
   private reviewerStatus(job:string){const row=this.s.db.query('SELECT * FROM reviewer_observations WHERE job=?').get(job) as any;return row?{head:row.head,observed:row.observed,ageMs:Math.max(0,Date.now()-row.observed),persistedOnly:true,...JSON.parse(row.evidence)}:null;}
   private reconcileRemediation(job:string,head:string,session:any,activeOnly=false){
    const pending=this.s.db.query("SELECT * FROM remediation WHERE job=? AND state='delivery_uncertain' ORDER BY attempt DESC LIMIT 1").get(job) as any;
@@ -223,6 +230,24 @@ export class ReviewLoop{
    return result;
   }).immediate();
  }
+  observeCooldown(job:string,e:any){
+   const t=this.get(job),o=e.coderabbitObservation;
+   if(o&&o.repo===t.repo&&o.pr===t.pr&&o.head===e.head&&Number.isSafeInteger(o.observed)&&o.observed<=this.now()&&this.now()-o.observed<=60000){
+    const p=boundReviewerPolicy(this.s,job).find(r=>r.id==='coderabbit')!;
+    this.requests.cooldowns.observe(o,this.requests.receipts(t.repo,t.pr),p.rateLimit);
+    this.requests.reconcileThrottle(t.repo,t.pr);
+    const c=this.requests.cooldowns.get(t.repo,t.pr);
+    const latest=c?(this.s.db.query('SELECT MAX(at) AS at FROM coderabbit_throttle_evidence WHERE repo=? AND pr=? AND cycle=?').get(t.repo,t.pr,c.cycle) as any).at:0;
+    const request=c?this.requests.get(t.repo,t.pr,e.head):null;
+    // Ledger initialization is observation time, not provider chronology: a
+    // throttle and its completed review can both predate our very first poll.
+    // Legacy cycles without provider evidence retain their known wait origin.
+    const after=Math.max(latest??c?.started??0,request?.requested??0);
+    const completed=(r:any)=>['APPROVED','CHANGES_REQUESTED'].includes(r.state)||r.state==='COMMENTED'&&o.checks?.some((check:any)=>check.app?.id===CODERABBIT_APP_ID&&check.head_sha===e.head&&check.status==='completed'&&check.conclusion==='success'&&!/rate[ _-]?limit|skip|paus/i.test(check.output?.title??'')&&Date.parse(check.started_at)>=after&&Date.parse(check.started_at)<=Date.parse(r.submitted_at)&&Date.parse(check.completed_at)>=Date.parse(r.submitted_at)&&Date.parse(check.completed_at)<=o.observed);
+    if(c&&o.reviews?.some((r:any)=>trustedRabbit(r)&&r.commit_id===e.head&&Date.parse(r.submitted_at)>after&&Date.parse(r.submitted_at)<=o.observed&&completed(r))&&!e.coderabbitPending)this.requests.cooldowns.complete(t.repo,t.pr,e.head);
+   }
+   return this.requests.cooldowns.get(t.repo,t.pr);
+  }
    async requestReview(job:string,pr:number,head:string,bodyHash:string,expected?:any){
     assertObservationFence();
     const t=this.get(job);if(this.completed(job)||!t||t.pr!==pr)return false;
@@ -233,8 +258,9 @@ export class ReviewLoop{
      if(!requestPolicy.enabled||!requestPolicy.requestReview)return false;
      const fresh=await this.io.readiness(t.repo,pr,JSON.parse(t.required_checks),this.metadataChecks(job),reviewerInput(reviewers));
     assertObservationFence();
-    const schedule:ReviewSchedule|undefined=fresh.reviewSchedule;
-     if(fresh.head!==head||fresh.descriptionHash!==bodyHash&&fresh.descriptionVersion!==bodyHash||!schedule||schedule.blocker||schedule.evidence?.recoverable===false||fresh.coderabbitPending||fresh.findings?.length||fresh.failedChecks?.length||fresh.pendingChecks?.length||fresh.missingChecks?.length||expected&&schedule.signature!==expected.reviewSchedule?.signature){
+     const schedule:ReviewSchedule|undefined=fresh.reviewSchedule;
+     this.observeCooldown(job,fresh);
+      if(fresh.prOpen===false||fresh.head!==head||fresh.descriptionHash!==bodyHash&&fresh.descriptionVersion!==bodyHash||!schedule||schedule.blocker||schedule.evidence?.recoverable===false||fresh.coderabbitPending||fresh.findings?.length||fresh.failedChecks?.length||fresh.pendingChecks?.length||fresh.missingChecks?.length||expected&&schedule.signature!==expected.reviewSchedule?.signature){
      const reason=schedule?.blocker??(schedule?.evidence?.recoverable===false?`CodeRabbit review unavailable: head ${head} has ${schedule.evidence.review&&!schedule.evidence.review.stale?`a current ${schedule.evidence.review.state} review`:`a ${schedule.evidence.classification} result`}; a new request is not supported`:'CodeRabbit review unavailable: identity, head, configuration or description changed before request; re-evaluate');
      this.record(job,{state:'blocked',send:false,head,reason},pr);return false;
     }
@@ -247,23 +273,28 @@ export class ReviewLoop{
      const target=this.get(job);if(!target||target.pr!==pr)return false;
      if(this.uncertainReview(job,pr,head))return false;
      if(!this.requests.claim(job,t.repo,pr,{...schedule,requestPolicy}))return false;
-    const inserted=this.s.db.query('INSERT OR IGNORE INTO full_review_requests VALUES (?,?,?,?,?,?)').run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
+    const inserted=this.s.db.query("INSERT INTO full_review_requests VALUES (?,?,?,?,?,?) ON CONFLICT(job,pr,head,body_hash) DO UPDATE SET state=excluded.state,requested=excluded.requested WHERE state='rate_limited'").run(job,pr,head,bodyHash,'delivery_uncertain',Date.now());
    if(!inserted.changes)return false;
-      this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason=? WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),`${requestPolicy.reviewMode==='full'?'Full':'Regular'} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`,job,pr);
+      this.s.db.query("UPDATE review_targets SET head_since=?,state='needs_reconciliation',reason=? WHERE job=? AND pr=? AND state!='completed'").run(Date.now(),`${this.requests.get(t.repo,pr,head).mode==='full'?'Full':'Regular'} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`,job,pr);
    return true;
   }).immediate();
     if(!reserved){const unresolved=this.uncertainReview(job,pr,head);if(unresolved)this.record(job,unresolved,pr);else if(this.requests.providerHold())this.record(job,{state:'blocked',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; preview reconcile-review-provider ${this.requests.providerHold().job} before any new request`},pr);return false;}
   // A lost reply keeps its durable reservation: never post the same request again.
    const marker=reviewRequestMarker(t.repo,pr,head);
-    try{await this.postReview(t.repo,pr,marker,Bun.spawn,requestPolicy.reviewMode);}
+     let delivered:any;
+     const cycle=this.requests.cooldowns.get(t.repo,pr),mode:ReviewMode=cycle&&cycle.state!=='completed'?'regular':requestPolicy.reviewMode;
+     try{
+      delivered=await this.postReview(t.repo,pr,marker,Bun.spawn,mode);
+      if(this.postReview===postCodeRabbitReview&&(!Number.isSafeInteger(delivered?.id)||delivered.body!==reviewRequestBody(mode,marker)||delivered.issue_url!==`https://api.github.com/repos/${t.repo}/issues/${pr}`||!Number.isSafeInteger(delivered.user?.id)))throw Error('Review comment receipt incomplete; delivery uncertain');
+     }
    catch(error){assertObservationFence();
      if(error instanceof ReviewResetUnrepresentable){const hold=this.requests.holdForInspection(job,t.repo,pr,head);this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; request remains reserved; preview reconcile-review-provider ${hold.job}`},pr);throw error;}
-     if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);this.s.db.query("DELETE FROM full_review_requests WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
-    this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: ${requestPolicy.reviewMode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
+      if(error instanceof ReviewRateLimit){this.s.db.transaction(()=>{const transportRetry=this.requests.cooldowns.http(t.repo,pr,head,this.requests.get(t.repo,pr,head).attempts,error.retryAt,requestPolicy.rateLimit);this.requests.settle(t.repo,pr,head,'rate_limited','confirmed HTTP rate-limit rejection',transportRetry);this.s.db.query("UPDATE full_review_requests SET state='rate_limited' WHERE job=? AND pr=? AND head=? AND body_hash=? AND state='delivery_uncertain'").run(job,pr,head,bodyHash);}).immediate();return false;}
+    this.record(job,{state:'needs_reconciliation',send:false,head,reason:`CodeRabbit review unavailable: ${mode} review request for head ${head} delivery uncertain; reconcile the marked PR comment before retry`},pr);throw error;}
   assertObservationFence();
    this.s.db.transaction(()=>{this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND body_hash=?").run(job,pr,head,bodyHash);
-   this.requests.settle(t.repo,pr,head,'accepted',marker);}).immediate();
-  this.s.event(job,'coderabbit_review_requested',JSON.stringify({pr,head,bodyHash,mode:requestPolicy.reviewMode}));
+    this.requests.settle(t.repo,pr,head,'accepted',delivered?.id?JSON.stringify(delivered):marker);}).immediate();
+   this.s.event(job,'coderabbit_review_requested',JSON.stringify({pr,head,bodyHash,mode}));
   return true;
  }
    async tick(job:string,branchPolicy?:BranchPolicy,remediationPolicy:RemediationPolicy=DEFAULT_REMEDIATION_POLICY,policy?:{project:string;checks:string[]},config?:any,action?:{watchdog:ActionWatchdog;id:string},maintenanceOnly=false){
@@ -433,15 +464,16 @@ export class ReviewLoop{
    // observation here rather than relaxing Lifecycle.current's authorization.
    try{if(l.current(job).plan_hash!==run.plan_hash)throw Error('Approval changed during review collection');}
     catch(error){const terminal=this.completed(job);if(terminal)return terminal;throw error;}
-   const receipt=this.requests.get(t.repo,t.pr,e.head);
-   if(receipt?.state==='delivery_uncertain'){
-    const marker=reviewRequestMarker(t.repo,t.pr,e.head);
-    const matched=e.requestComments?.filter((c:any)=>c.body===reviewRequestBody(receipt.mode,marker)&&Date.parse(c.created)>=receipt.requested&&c.author&&c.id);
-    if(matched?.length===1){this.requests.settle(t.repo,t.pr,e.head,'accepted',String(matched[0].id));this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE job=? AND pr=? AND head=? AND state='delivery_uncertain'").run(job,t.pr,e.head);}
+    const uncertain=this.requests.receipts(t.repo,t.pr).filter(r=>r.state==='delivery_uncertain');
+    for(const receipt of uncertain){
+     const marker=reviewRequestMarker(t.repo,t.pr,receipt.head);
+     const matched=e.requestComments?.filter((c:any)=>c.body===reviewRequestBody(receipt.mode,marker)&&Date.parse(c.created)+1000>=receipt.requested&&c.author&&c.id&&c.own===true);
+     if(matched?.length===1){this.requests.settle(t.repo,t.pr,receipt.head,'accepted',JSON.stringify({id:matched[0].id}));this.s.db.query("UPDATE full_review_requests SET state='accepted' WHERE pr=? AND head=? AND job IN (SELECT job FROM review_targets WHERE repo=? AND pr=?) AND state='delivery_uncertain'").run(t.pr,receipt.head,t.repo,t.pr);}
     else return record({state:'needs_reconciliation',send:false,head:e.head,reason:`CodeRabbit review unavailable: ${receipt.mode} request outcome uncertain; reconcile matching request evidence before retry`});
    }
-   const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
-   const since=t.head===e.head?t.head_since:Date.now();
+    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
+    const reviewCycle=this.observeCooldown(job,e);
+    const since=t.head===e.head?t.head_since:Date.now();
    const outcome=this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get()?this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job) as any:null;
    // Durable continuation state is authoritative across workflow and review
    // polling. A stale failed outcome must not block a recovered continuation,
@@ -491,7 +523,7 @@ export class ReviewLoop{
      const started=Date.now();this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?)').run(job,e.head,e.descriptionHash,e.templateSignature,started);
      return {body:e.descriptionHash,signature:e.templateSignature,started};
     }
-    if(prior.body===e.descriptionHash)return prior;
+     if(prior.body===e.descriptionHash)return prior;
     const started=Math.max(Date.now(),prior.started+1);
     this.s.db.query('INSERT INTO metadata_waits VALUES (?,?,?,?,?) ON CONFLICT(job,head,body) DO UPDATE SET signature=excluded.signature,started=excluded.started').run(job,e.head,e.descriptionHash,prior.signature,started);
     return {...prior,body:e.descriptionHash,started};
@@ -508,19 +540,54 @@ export class ReviewLoop{
    if(schedule?.blocker&&!e.findings.length)return record({state:'blocked',send:false,head:e.head,reason:schedule.blocker});
   const scheduleWait=schedule?this.requests.wait(t.repo,t.pr,schedule):null;
   if(schedule&&session.transcript.controller!=='ready')this.s.db.query('UPDATE coderabbit_waits SET started=? WHERE repo=? AND pr=? AND head=?').run(Date.now(),t.repo,t.pr,e.head);
-  const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
+   const idle=!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length;
+   const activeCycle=reviewCycle&&reviewCycle.state!=='completed'?this.requests.cooldowns.get(t.repo,t.pr):null;
+   const cooldownRetryReady=activeCycle?.state==='waiting'&&this.now()>=this.requests.cooldowns.effectiveRetry(activeCycle);
+   if(activeCycle){
+    // Throttle checks never prove completed review or spend remediation budget.
+    e.clear=false;
+     if(idle&&!e.customCheckBlocker){
+      const hold=this.requests.providerHold();
+      if(hold)return record({state:'blocked',send:false,head:e.head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; preview reconcile-review-provider ${hold.job} before any new request`});
+      if(['exhausted','already_reviewed'].includes(activeCycle.state))return record({state:'blocked',send:false,head:e.head,reason:this.requests.cooldowns.reason(activeCycle)});
+     const requestPolicy=boundReviewerPolicy(this.s,job).find(r=>r.id==='coderabbit')!;
+     let q=this.requests.cooldowns.query(activeCycle);
+     if(q?.state==='delivery_uncertain'){
+      const matches=e.requestComments?.filter((c:any)=>c.own===true&&c.body===q.body&&Date.parse(c.created)+1000>=q.requested)??[];
+      const comment=matches.length===1?e.coderabbitObservation?.comments.find((c:any)=>c.id===matches[0].id):null;
+      if(comment)this.requests.cooldowns.settleQuery(q,comment);
+      q=this.requests.cooldowns.query(activeCycle);
+     }
+     if(!q&&t.remediate&&requestPolicy.requestReview&&session.transcript.controller==='ready'&&!e.coderabbitPending&&!schedule?.blocker&&schedule?.evidence?.recoverable!==false&&e.prOpen!==false){
+      q=this.requests.cooldowns.claimQuery(activeCycle);
+      if(q){
+       try{l.current(job);const comment=await io.postAvailability(t.repo,t.pr,q.body);assertObservationFence();this.requests.cooldowns.settleQuery(q,comment);}
+       catch(error){assertObservationFence();if(error instanceof ObservationLeaseLost)throw error;if(error instanceof ReviewResetUnrepresentable){const hold=this.requests.holdForInspection(job,t.repo,t.pr,e.head,q);return record({state:'blocked',send:false,head:e.head,reason:`CodeRabbit review unavailable: provider-wide inspection hold; query rejected; preview reconcile-review-provider ${hold.job} before any new request`});}if(error instanceof ReviewRateLimit)this.requests.cooldowns.chatThrottle(q,error.retryAt);}
+       q=this.requests.cooldowns.query(activeCycle);
+      }
+     }
+     if(q?.state==='delivery_uncertain')return record({state:'needs_reconciliation',send:false,head:e.head,reason:`CodeRabbit review unavailable: availability query delivery uncertain; reconcile-review-query ${job} COMMENT_ID verifies an existing own comment only; never resend blindly`});
+     if(activeCycle.state==='requesting'){
+      const r=this.requests.get(t.repo,t.pr,e.head),age=this.now()-(r?.requested??activeCycle.next_action);
+      return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:age>=REVIEW_TIMEOUT_MS&&schedule?reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:activeCycle.attempts,requestState:r?.state??'unknown',mode:r?.mode}):'CodeRabbit review unavailable: regular retry delivered or uncertain; awaiting authenticated outcome, no blind resend'});
+     }
+     if(!cooldownRetryReady)return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:this.requests.cooldowns.reason(activeCycle)});
+    }
+   }
   if(schedule&&idle&&!e.clear&&!waiting&&!e.customCheckBlocker){
+   const sharedRetry=this.requests.sharedRetryAt(schedule);
+   if(!activeCycle&&sharedRetry>this.now())return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:`CodeRabbit rate limited; next retry at ${new Date(sharedRetry).toISOString()}`});
    const request=this.requests.get(t.repo,t.pr,e.head),age=Date.now()-(request?.state==='accepted'?request.requested:scheduleWait!.started);
-   if(request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt,mode:request.mode})});
-   if(schedule.evidence?.classification==='rate-limited'&&!request)return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:0,requestState:'none'})});
-   if(age>=REVIEW_TIMEOUT_MS&&request?.state!=='rate_limited')return record({state:'blocked',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request?.attempts??0,requestState:request?.state??'none',mode:request?.mode})});
-   if(schedule.incremental||Date.now()-scheduleWait!.started<REVIEW_GRACE_MS||session.transcript.controller!=='ready')return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:schedule.incremental?'Waiting for automatic incremental CodeRabbit review':'Waiting for final remediation batch and five-minute CodeRabbit grace period'});
+    if(!activeCycle&&request?.state==='rate_limited'&&(Date.now()<request.next_attempt||request.attempts>=3))return record({state:request.attempts>=3?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request.attempts,requestState:request.state,retryAt:request.next_attempt,mode:request.mode})});
+    if(!activeCycle&&schedule.evidence?.classification==='rate-limited'&&!request)return record({state:age>=REVIEW_TIMEOUT_MS?'blocked':'waiting_for_coderabbit',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:0,requestState:'none'})});
+    if(!activeCycle&&age>=REVIEW_TIMEOUT_MS&&request?.state!=='rate_limited')return record({state:'blocked',send:false,head:e.head,reason:reviewEscalationReason({repo:t.repo,pr:t.pr,head:e.head,schedule,attempts:request?.attempts??0,requestState:request?.state??'none',mode:request?.mode})});
+    if(schedule.incremental&&!cooldownRetryReady||Date.now()-scheduleWait!.started<REVIEW_GRACE_MS||session.transcript.controller!=='ready')return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:schedule.incremental&&!cooldownRetryReady?'Waiting for automatic incremental CodeRabbit review':'Waiting for final remediation batch and five-minute CodeRabbit grace period'});
   }
   // Only an established obligation gate supplies a current-head/body baseline;
   // the zero fallback is not evidence that an existing review covers an edit.
   const blockerAlreadyFresh=!!(customObligation&&waiting&&waitStart>0&&e.customCheckBlocker&&!e.coderabbitPending&&Number.isFinite(e.botReviewSubmittedAt)&&e.botReviewSubmittedAt>waitStart);
   const staleReason=staleCodeRabbitChangeRequestReason(e);
-  if(!schedule?.incremental&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA')||r==='Reviewer coderabbit: explicit current-head approval required'||r===staleReason)){
+   if((!schedule?.incremental||cooldownRetryReady)&&schedule?.evidence?.recoverable!==false&&!blockerAlreadyFresh&&!e.clear&&!e.findings.length&&!e.failedChecks.length&&!e.pendingChecks.length&&!e.missingChecks.length&&!e.coderabbitPending&&t.remediate&&session.transcript.controller==='ready'&&e.reasons.every((r:string)=>r.startsWith('CodeRabbit')||r.startsWith('Explicit latest-SHA')||r==='Reviewer coderabbit: explicit current-head approval required'||r===staleReason)){
    const requested=await this.requestReview(job,t.pr,e.head,reviewBodyKey,e);
    const stopped=this.get(job);if(stopped?.state==='blocked'&&stopped.reason?.startsWith('CodeRabbit review unavailable:'))return record({state:'blocked',send:false,head:e.head,reason:stopped.reason});
    const unresolved=this.uncertainReview(job,t.pr,e.head);if(unresolved)return record(unresolved);
@@ -529,7 +596,7 @@ export class ReviewLoop{
      // A concurrent completion keeps its terminal result; only a rebound target
      // makes this evidence stale.
      if(!headUpdate.changes&&this.get(job)?.pr!==t.pr)return {state:'blocked',send:false,head:e.head,reason:'Review target rebound to another PR during evaluation; re-evaluate evidence'};
-    return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:`${boundReviewerPolicy(this.s,job).find(r=>r.id==='coderabbit')!.reviewMode==='full'?'Full':'Regular'} CodeRabbit review requested for current commit and description`});
+     return record({state:'waiting_for_coderabbit',send:false,head:e.head,reason:`${this.requests.get(t.repo,t.pr,e.head)?.mode==='full'?'Full':'Regular'} CodeRabbit review requested for current commit and description`});
    }
   }
    if(waiting&&e.failedChecks.length&&e.failedChecks.every((c:any)=>metadataFailureCovered(e,c,false))&&waiting.signature===e.templateSignature){

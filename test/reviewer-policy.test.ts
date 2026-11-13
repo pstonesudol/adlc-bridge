@@ -262,7 +262,7 @@ for(const scenario of ['unapproved','approved','edited','stale-head','dismissed'
 test('a provider reset beyond 24 hours cannot be truncated into an early global retry',()=>{
  const s=new Store(':memory:');new ReviewLoop(s);const job=s.enqueue('p','i','spec');let clock=1000;
  const schedule={head:'head',signature:'configuration',blocker:null,incremental:false},requests=new ReviewRequests(s,()=>clock),reset=clock+3*86400000;
- expect(requests.claim(job,'o/r',1,schedule)).toBe(true);requests.settle('o/r',1,'head','rate_limited','verified provider reset',reset);
+ expect(requests.claim(job,'o/r',1,schedule)).toBe(true);requests.settle('o/r',1,'head','rate_limited','confirmed HTTP rate-limit rejection',reset);
  expect(requests.get('o/r',1,'head').next_attempt).toBe(reset);
  clock+=86400001;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'another-head'})).toBe(false);
  clock=reset+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);s.close();
@@ -275,11 +275,11 @@ test('request overrides use shared durable receipts and cannot evade resets acro
  p.requestReview=true;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(true);
  expect(requests.get('o/r',1,'head1').mode).toBe('full');
  expect(requests.claim(job,'o/r',1,{...schedule,head:'head2',requestPolicy:p})).toBe(false);
- requests.settle('o/r',1,'head1','rate_limited','HTTP 429',200000);
+ requests.settle('o/r',1,'head1','rate_limited','confirmed HTTP rate-limit rejection',200000);
  expect(requests.claim(job,'o/r',2,{...schedule,head:'head2',requestPolicy:p})).toBe(false);
  clock=200001;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(false);
  clock=601001;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(true);
- requests.settle('o/r',1,'head1','rate_limited','HTTP 429',700000);
+ requests.settle('o/r',1,'head1','rate_limited','confirmed HTTP rate-limit rejection',700000);
  clock=2000000;expect(requests.claim(job,'o/r',1,{...schedule,requestPolicy:p})).toBe(false);
  expect(requests.get('o/r',1,'head1').attempts).toBe(2);s.close();
 });

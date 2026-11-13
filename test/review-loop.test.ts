@@ -16,8 +16,9 @@ import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import
 import {turnBarrier} from '../src/turn-submission';
 import {DEFAULT_REMEDIATION_POLICY} from '../src/remediation';
 import {customFixture} from './coderabbit-fixture';
-import {ReviewRateLimit} from '../src/coderabbit-scheduling';
+import {ReviewRateLimit,ReviewRequests,ReviewResetUnrepresentable,reviewProviderHoldPreview} from '../src/coderabbit-scheduling';
 import {RECEIPT_FRESHNESS_MS} from '../src/receipt-reconciliation';
+import {CODERABBIT_APP_ID,cooldownDue,githubReviewTransportRetryAt} from '../src/coderabbit-cooldowns';
 import {ActionWatchdog} from '../src/action-watchdog';
 import {reviewerPolicy,reviewerTrust,reviewerApprovals,collectTrustedFeedback,bindReviewerPolicy,BOT_IDENTITIES,MAX_REVIEW_BODY_BYTES,MAX_REMEDIATION_PROMPT_BYTES} from '../src/reviewer-policy';
 const pending=()=>({clear:false,reasons:['CodeRabbit absent'],failedChecks:[],findings:[]});
@@ -98,6 +99,184 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+function cooldownChronologyFixture(){
+ const f=templateFixture(),at=Date.now(),stamp=(ms:number)=>new Date(at+ms).toISOString();
+ f.loop.configureMetadataChecks('project',[]);
+ const throttle={id:910,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,status:'completed',conclusion:'success',started_at:stamp(-121000),completed_at:stamp(-120000),output:{title:'Review rate limited'}};
+ const completed={...throttle,id:911,started_at:stamp(-90000),completed_at:stamp(-30000),output:{title:'Review completed'}};
+ const review={id:912,user:{id:136622811,type:'Bot',login:'coderabbitai[bot]'},commit_id:f.head,state:'APPROVED',submitted_at:stamp(-60000)};
+ const observation={repo:'owner/repo',pr:1,head:f.head,comments:[],checks:[throttle,completed],reviews:[review],observed:at};
+ Object.assign(f.e,{clear:true,reasons:[],findings:[],failedChecks:[],prOpen:true,coderabbitObservation:observation});
+ f.e.reviewSchedule={head:f.head,signature:'config',blocker:null,incremental:false,evidence:{classification:'current-review',recoverable:false}};
+ return {...f,at,stamp,observation,review,completed};
+}
+for(const state of ['APPROVED','CHANGES_REQUESTED','COMMENTED'])test(`DEV-82 chronology: ${state} after throttle/request but before first poll completes the cycle`,()=>{
+ const f=cooldownChronologyFixture();try{
+  f.review.state=state;f.e.clear=state==='APPROVED';
+  const requests=new ReviewRequests(f.s,()=>f.at-100000);
+  expect(requests.claim(f.id,'owner/repo',1,{head:f.head,signature:'config',blocker:null,incremental:false})).toBe(true);
+  requests.settle('owner/repo',1,f.head,'accepted',JSON.stringify({id:909}));
+  expect(f.loop.observeCooldown(f.id,f.e).state).toBe('completed');
+  // Completion is not approval, and a restart must not revive old throttling.
+  expect(f.e.clear).toBe(state==='APPROVED');
+  const restarted=new ReviewLoop(f.s,async()=>{throw Error('No review expected');},f.loop.io);
+  expect(restarted.observeCooldown(f.id,f.e)).toMatchObject({state:'completed',attempts:0});
+ }finally{f.s.close();}
+});
+test('DEV-82 chronology: approval completed before observation reaches the existing ready-for-human gate',async()=>{
+ const f=cooldownChronologyFixture();try{
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('No query expected');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'ready_for_human',send:false});
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).state).toBe('completed');
+  expect(f.reviews()).toBe(0);expect(queries).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+for(const scenario of ['before-throttle','before-request','before-later-throttle','wrong-head','untrusted','pending','commented-without-run','run-before-throttle','future'])test(`DEV-82 chronology still requires current completed review evidence: ${scenario}`,()=>{
+ const f=cooldownChronologyFixture();try{
+  if(scenario==='before-throttle')f.review.submitted_at=f.stamp(-180000);
+  if(scenario==='before-request'){
+   expect(f.loop.requests.claim(f.id,'owner/repo',1,{head:f.head,signature:'config',blocker:null,incremental:false})).toBe(true);
+   f.loop.requests.settle('owner/repo',1,f.head,'accepted',JSON.stringify({id:909}));
+  }
+  if(scenario==='before-later-throttle')f.observation.checks.push({...f.observation.checks[0],id:913,started_at:f.stamp(-31000),completed_at:f.stamp(-30000)});
+  if(scenario==='wrong-head')f.review.commit_id='b'.repeat(40);
+  if(scenario==='untrusted')f.review.user.id=7;
+  if(scenario==='pending')f.e.coderabbitPending=true;
+  if(scenario==='commented-without-run'){f.review.state='COMMENTED';f.observation.checks.splice(1);}
+  if(scenario==='run-before-throttle'){f.review.state='COMMENTED';f.completed.started_at=f.stamp(-180000);}
+  if(scenario==='future')f.review.submitted_at=f.stamp(60000);
+  expect(f.loop.observeCooldown(f.id,f.e).state).toBe('waiting');
+  if(scenario==='before-later-throttle')expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_throttle_evidence').get()).toEqual({n:2});
+ }finally{f.s.close();}
+});
+for(const incremental of [true,false])test(`DEV-82: durable cooldown yields one regular retry (incremental=${incremental}) without code budget`,async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);
+  Object.assign(f.e,{clear:true,findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  f.e.reviewSchedule={head:f.head,signature:'config',blocker:null,incremental,evidence:{classification:'rate-limited',recoverable:true}};
+  const at=Date.now(),run={id:882,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,status:'completed',conclusion:'success',started_at:new Date(at-1000).toISOString(),completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}};
+  Object.defineProperty(f.e,'coderabbitObservation',{get:()=>({repo:'owner/repo',pr:1,head:f.e.head,comments:[],checks:[run],observed:Date.now()})});
+  let queries=0,reviews=0,mode:any;
+  f.loop.io.postAvailability=async(_repo,_pr,body)=>{queries++;return {id:880,body,user:{id:7},created_at:new Date().toISOString()};};
+  f.loop.postReview=async(_repo,_pr,_marker,_spawn,selected)=>{reviews++;mode=selected;return {id:881};};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(f.loop.list()[0].displayStatus).toStartWith('CodeRabbit rate limited; next retry at ');
+  const watchdog=new ActionWatchdog(f.s),config={linear:{projectId:'project'},githubRepo:'owner/repo',automation:{orchestratorProject:'ao'}};
+  new Lifecycle(f.s).grantGit(f.id,f.s.get(f.id).plan_hash!,['inspect','commit','push-feature','open-pr'],'human');
+  const action=watchdog.scheduleReview(f.id,config);watchdog.finishReview(action.id,{state:'waiting_for_coderabbit'});
+  const evaluation=f.s.db.query('SELECT next_tick FROM watchdog_evaluations WHERE job=?').get(f.id) as any;
+  expect(evaluation.next_tick).toBe(f.loop.requests.cooldowns.get('owner/repo',1).next_action);
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(queries).toBe(1);expect(reviews).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  const c=f.loop.requests.cooldowns.get('owner/repo',1);setSystemTime(new Date(c.next_action+1));
+  await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);
+  expect(reviews).toBe(1);expect(mode).toBe('regular');expect(f.loop.requests.get('owner/repo',1,f.head).mode).toBe('regular');
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).attempts).toBe(1);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(f.loop.get(f.id).state).not.toBe('ready_for_human');
+ }finally{setSystemTime();f.s.close();}
+});
+test('DEV-82: uncertain availability query survives polls without blind resend or review',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now();f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:900,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('lost reply');};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'needs_reconciliation',send:false});
+  await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
+test('DEV-82: availability HTTP throttle is a shared transport hold, not a review attempt',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now(),reset=at+4*60*60000;
+  f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:921,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw new ReviewRateLimit(reset);};
+  const waiting=await f.loop.tick(f.id);expect(waiting).toMatchObject({state:'waiting_for_coderabbit',send:false});expect(waiting.reason).toContain(new Date(reset).toISOString());
+  const other=f.s.enqueue('other-project','other-issue','spec');
+  expect(f.loop.requests.claim(other,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(false);
+  expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_request_attempts').get()).toEqual({n:0});
+  expect(f.loop.requests.cooldowns.get('owner/repo',1).attempts).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+  expect(queries).toBe(1);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
+test('DEV-82: rejected availability query retains inspection hold, not fictitious delivery uncertainty',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now();Object.defineProperty(f.e,'coderabbitObservation',{get:()=>({repo:'owner/repo',pr:1,head:f.head,comments:[],observed:Date.now(),checks:[{id:922,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]})});
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw new ReviewResetUnrepresentable();};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.loop.get(f.id).reason).toContain('provider-wide inspection hold');
+  const ledger=f.loop.requests.cooldowns,c=ledger.get('owner/repo',1);
+  expect(ledger.query(c).state).toBe('inspection_rejected');expect(c.attempts).toBe(0);
+  const restarted=new ReviewRequests(f.s),other=f.s.enqueue('other','other','spec');
+  expect(restarted.providerHold().job).toBe(f.id);
+  expect(restarted.claim(other,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(false);
+  await f.loop.tick(f.id);expect(queries).toBe(1);expect(f.reviews()).toBe(0);
+  const preview=reviewProviderHoldPreview(f.s,f.id);restarted.reconcileProviderHold(f.id,preview.confirmation,'Operator');
+  setSystemTime(new Date(c.next_action+1));
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(queries).toBe(1);expect(f.reviews()).toBe(1);expect(ledger.get('owner/repo',1).attempts).toBe(1);
+ }finally{setSystemTime();f.s.close();}
+});
+for(const kind of ['developer-quota','query-transport'])test(`DEV-82: shared ${kind} waits suspend timeout and permit a first request after reset`,async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  if(kind==='developer-quota')f.e.reviewSchedule.quotaIdentity='github-user:7';
+  const at=Date.now(),reset=at+60*60000;
+  const ledger=f.loop.requests.cooldowns;
+  ledger.http('source/repo',2,'source',1,kind==='developer-quota'?reset-5*60000:undefined);
+  if(kind==='developer-quota')f.s.db.query("UPDATE coderabbit_cycles SET scope='github-user:7'").run();
+  else{const query=ledger.claimQuery(ledger.get('source/repo',2));ledger.chatThrottle(query,reset);}
+  const waiting=await f.loop.tick(f.id);expect(waiting.state).toBe('waiting_for_coderabbit');expect(waiting.reason).toContain(new Date(reset).toISOString());
+  expect(cooldownDue(f.s,f.id,at)).toBe(reset);expect(f.reviews()).toBe(0);
+  expect(f.s.db.query('SELECT started FROM coderabbit_waits WHERE repo=? AND pr=?').get('owner/repo',1)).toEqual({started:reset});
+  expect(f.loop.requests.cooldowns.get('owner/repo',1)).toBeNull();
+  // Reconstruct the scheduler to ensure the timeout baseline is durable.
+  f.loop.requests=new ReviewRequests(f.s);
+  setSystemTime(new Date(at+66*60000));
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'waiting_for_coderabbit',send:false});
+  expect(f.reviews()).toBe(1);expect(f.loop.requests.get('owner/repo',1,f.head).attempts).toBe(1);
+  expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{setSystemTime();f.s.close();}
+});
+test('DEV-82: HTTP response deadline stays separate from an already longer provider wait',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const at=Date.now(),ledger=f.loop.requests.cooldowns;
+  // Provider evidence can arrive after reservation but before HTTP settlement.
+  const reset=at+60000;f.loop.postReview=async()=>{ledger.http('owner/repo',1,f.head,99,at+120*60000);throw new ReviewRateLimit(reset);};
+  expect(await f.loop.requestReview(f.id,1,f.head,f.e.descriptionHash)).toBe(false);
+  expect(githubReviewTransportRetryAt(f.s)).toBe(reset+5*60000);
+  expect(ledger.get('owner/repo',1).next_action).toBeGreaterThan(githubReviewTransportRetryAt(f.s));
+ }finally{f.s.close();}
+});
+test('DEV-82: provider-wide inspection hold blocks availability publication on another PR',async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:true});
+  const holder=f.s.enqueue('project','other-issue','spec');
+  expect(f.loop.requests.claim(holder,'other/repo',2,{head:'other',signature:'config',blocker:null,incremental:false})).toBe(true);
+  const hold=f.loop.requests.holdForInspection(holder,'other/repo',2,'other'),at=Date.now();
+  f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:920,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;return null;};
+  expect(await f.loop.tick(f.id)).toMatchObject({state:'blocked',send:false});
+  expect(f.loop.get(f.id).reason).toContain('provider-wide inspection hold');
+  expect(queries).toBe(0);expect(f.reviews()).toBe(0);expect(f.loop.requests.providerHold().id).toBe(hold.id);
+  expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:0});
+ }finally{f.s.close();}
+});
+for(const blocked of ['paused','already-reviewed','closed','request-disabled'])test(`DEV-82: ${blocked} never sends a retry or availability query`,async()=>{
+ const f=templateFixture();try{
+  f.loop.configureMetadataChecks('project',[]);Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit approval missing'],prOpen:blocked!=='closed'});
+  const at=Date.now();f.e.coderabbitObservation={repo:'owner/repo',pr:1,head:f.head,comments:[],observed:at,checks:[{id:902,app:{id:CODERABBIT_APP_ID,slug:'coderabbitai'},head_sha:f.head,completed_at:new Date(at).toISOString(),output:{title:'Review rate limited'}}]};
+  if(blocked==='paused')f.e.reviewSchedule.blocker='CodeRabbit review unavailable: intentional pause';
+  if(blocked==='already-reviewed')f.e.reviewSchedule.evidence={classification:'current-review',recoverable:false};
+  if(blocked==='request-disabled')bindReviewerPolicy(f.s,f.id,[{id:'coderabbit',requestReview:false}]);
+  let queries=0;f.loop.io.postAvailability=async()=>{queries++;throw Error('must not send');};
+   const result=await f.loop.tick(f.id);expect(queries).toBe(0);expect(f.reviews()).toBe(0);
+   expect(f.loop.requests.cooldowns.get('owner/repo',1)).toMatchObject({state:'waiting',head:f.head,attempts:0});
+   expect(f.s.db.query('SELECT count(*) AS n FROM coderabbit_queries').get()).toEqual({n:0});
+   expect(result).toMatchObject({state:blocked==='paused'?'blocked':'waiting_for_coderabbit',send:false});
+   expect(result.reason).toStartWith(blocked==='paused'?'CodeRabbit review unavailable: intentional pause':'CodeRabbit rate limited; next retry at ');
+ }finally{f.s.close();}
+});
 for(const maintenanceOnly of [false,true])test(`required-check drift blocks historical readiness before any review IO (maintenance: ${maintenanceOnly})`,async()=>{
  const f=templateFixture();try{
   f.s.db.query("UPDATE review_targets SET state='ready_for_human',head=? WHERE job=?").run(f.head,f.id);
@@ -262,7 +441,7 @@ test('missing current-head review gets one request after grace, retries only con
   f.s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   let calls=0;f.loop.postReview=async()=>{if(++calls===1)throw new ReviewRateLimit(Date.now()+60000);};
   await f.loop.tick(f.id);await f.loop.tick(f.id);expect(calls).toBe(1);
-  f.s.db.query('UPDATE coderabbit_requests SET next_attempt=0,requested=?').run(Date.now()-60001);await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
+  setSystemTime(new Date(f.loop.requests.cooldowns.get('owner/repo',1).next_action+1));await Promise.all([f.loop.tick(f.id),f.loop.tick(f.id)]);expect(calls).toBe(2);
   await f.loop.tick(f.id);expect(calls).toBe(2);
   f.s.db.query('UPDATE coderabbit_requests SET requested=?').run(Date.now()-31*60*1000);
   const escalated=await f.loop.tick(f.id);
@@ -271,7 +450,7 @@ test('missing current-head review gets one request after grace, retries only con
   expect(escalated.reason).toContain('requested mode regular');
   expect(escalated.reason).toContain('never automatic escalation');
   expect(escalated.reason).not.toContain('ambiguous');
- }finally{f.s.close();}
+ }finally{setSystemTime();f.s.close();}
 });
 for(const extra of ['missing-coderabbit','required-human','advisory-trust-failure'])test(`automatic requests distinguish missing approval from other reviewer obligations: ${extra}`,async()=>{
  const f=templateFixture();try{
@@ -398,7 +577,7 @@ test('an uncertain PR #30 request is reconciled before any retry',async()=>{
   expect(f.loop.get(f.id).state).toBe('needs_reconciliation');
   expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
   expect(posts).toBe(1);
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',own:true,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');
   expect(posts).toBe(1);
  }finally{f.s.close();}
@@ -422,9 +601,21 @@ test('matching marked comment reconciles uncertain request without replay or inf
   Object.assign(f.e,{findings:[],failedChecks:[],reasons:['CodeRabbit absent']});f.loop.configureMetadataChecks('project',[]);
   let marker='',posts=0;f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('lost');};
   await expect(f.loop.tick(f.id)).rejects.toThrow('lost');
-  f.e.requestComments=[{id:42,author:'operator',body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  f.e.requestComments=[{id:42,author:'operator',own:true,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
   expect((await f.loop.tick(f.id)).state).toBe('waiting_for_coderabbit');expect(posts).toBe(1);
   expect(f.loop.requests.get('owner/repo',1,f.head).state).toBe('accepted');expect(f.e.clear).toBe(false);
+ }finally{f.s.close();}
+});
+for(const own of [undefined,null,false,'true',true])test(`uncertain review receipts require positive publisher ownership: ${own}`,async()=>{
+ const f=pr30LoopFixture();try{
+  let posts=0,marker='';f.loop.postReview=async(_repo,_pr,value)=>{posts++;marker=value??'';throw Error('reply lost');};
+  await expect(f.loop.tick(f.id)).rejects.toThrow('reply lost');
+  f.e.requestComments=[{id:42,author:'operator',own,body:`@coderabbitai review\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+  const result=await f.loop.tick(f.id);
+  expect(result.state).toBe(own===true?'waiting_for_coderabbit':'needs_reconciliation');
+  expect(f.loop.requests.get('owner/repo',1,f.head)).toMatchObject({state:own===true?'accepted':'delivery_uncertain',attempts:1});
+  expect(f.s.db.query('SELECT state FROM full_review_requests WHERE job=?').get(f.id)).toEqual({state:own===true?'accepted':'delivery_uncertain'});
+  expect(posts).toBe(1);expect(f.e.clear).toBe(false);
  }finally{f.s.close();}
 });
 test('new regular receipts reject a full-command match, while pre-mode uncertain full receipts reconcile without replay',async()=>{
@@ -437,7 +628,7 @@ test('new regular receipts reject a full-command match, while pre-mode uncertain
     f.s.db.exec('ALTER TABLE coderabbit_requests DROP COLUMN mode; ALTER TABLE coderabbit_request_attempts DROP COLUMN mode');
     f.loop=new ReviewLoop(f.s,f.loop.postReview,f.loop.io);
    }
-   const comment=(command:string)=>[{id:42,author:'operator',body:`@coderabbitai ${command}\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
+   const comment=(command:string)=>[{id:42,author:'operator',own:true,body:`@coderabbitai ${command}\n\n${marker}`,created:new Date(Date.now()+1000).toISOString()}];
    f.e.requestComments=comment(legacy?'review':'full review');
    expect((await f.loop.tick(f.id)).state).toBe('needs_reconciliation');
    f.e.requestComments=comment(legacy?'full review':'review');

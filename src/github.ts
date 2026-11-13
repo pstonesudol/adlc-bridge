@@ -188,8 +188,15 @@ export async function readiness(repo:string, number:number, required:string[],me
   for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='github-review'&&!actionable.has(findings[i]))findings.splice(i,1);
   if(reviewerEvidence.trust.some(t=>t.reviewer==='coderabbit'&&!t.fresh))for(let i=findings.length-1;i>=0;i--)if(findings[i].source==='coderabbit-custom')findings.splice(i,1);
   for(const trust of reviewerEvidence.trust){if(!trust.fresh){gate.clear=false;gate.reasons.push(`Reviewer ${trust.reviewer}: trust evidence expired during collection; refresh before clearance`);}}
+  // Reconcile only commands authored by the authenticated publishing principal.
+  // A copied request marker in somebody else's comment is not delivery proof.
+  const hasRequests=comments.some(c=>typeof c.body==='string'&&/<!-- adlc-coderabbit-(?:request|availability):/.test(c.body));
+  const publisher=hasRequests?await gh(['api','user']):null;
+  if(hasRequests&&!Number.isSafeInteger(publisher?.id))throw Error('Request publisher identity unavailable');
   return {url:final.html_url,head:evidence.head,...gate,unresolved,findings,failedChecks,pendingChecks,missingChecks,reviewerEvidence,
-    reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login})),
+     reviewSchedule,requestComments:comments.map(c=>({id:c.id,body:c.body,created:c.created_at,author:c.user?.login,own:publisher?.id===c.user?.id})),
+     coderabbitObservation:{repo,pr:number,head:final.head.sha,comments:trustedComments.concat(comments.filter(c=>!trustedComments.includes(c)&&typeof c.body==='string'&&/^@coderabbitai (?:review|full review|rate limit)(?:\s|$)/.test(c.body))),reviews:reviewerEvidence.trustedReviews,checks,author:final.user?{id:final.user.id,login:final.user.login}:undefined,observed:Date.now()},
+     prOpen:final.state==='open',
     descriptionVersion:version?.body===(final.body??'')&&version?.headRefOid===final.head.sha?digest(JSON.stringify([descriptionHash,version.createdAt,version.lastEditedAt])):null,
     coderabbitBodyReviewed:custom.bodyReviewed,customCheckBlocker:custom.blocker,reviewThreads:reviewThreadSummary,coderabbitRateLimited:coderabbitRateLimited(checks,first.head.sha),
      reviewEvidenceVersion:digest(JSON.stringify([trustedLatest,trustedComments.filter(c=>(c.body??'').includes('<!-- pre_merge_checks_walkthrough_start -->')).map(c=>[c.id,c.updated_at,c.body]),version,botChecks.map(c=>[c.id,c.head_sha,c.status,c.conclusion,c.started_at,c.completed_at])])),

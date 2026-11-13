@@ -32,7 +32,7 @@ for(const header of ['retry-after','quota-reset'])test(`publication-to-ledger pr
   expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
   let error:any;try{await postCodeRabbitReview('o/r',1,'marker',spawn);}catch(e){error=e;}
   expect(error).toBeInstanceOf(ReviewRateLimit);expect(error.retryAt).toBeGreaterThanOrEqual(now+48*60*60*1000);
-  requests.settle('o/r',1,'head','rate_limited','verified HTTP 429',error.retryAt);
+   requests.settle('o/r',1,'head','rate_limited','confirmed HTTP rate-limit rejection',error.retryAt);
   now+=24*60*60*1000+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(false);expect(requests.claim(job,'other/repo',2,{...schedule,head:'new-head'})).toBe(false);
   expect(requests.get('o/r',1,'head').attempts).toBe(1);
   now=error.retryAt+1;expect(requests.claim(job,'o/r',1,schedule)).toBe(true);
@@ -199,8 +199,9 @@ test('pre-mode shared receipts migrate as full without replay; a confirmed rejec
    s.db.exec('ALTER TABLE coderabbit_requests DROP COLUMN mode; ALTER TABLE coderabbit_request_attempts DROP COLUMN mode');
    s.db.query('INSERT INTO coderabbit_requests VALUES (?,?,?,?,?,?,1,?,0,?)').run('owner/repo',19,schedule.head,job,schedule.signature,state,1,'old evidence');
    s.db.query('INSERT INTO coderabbit_request_attempts VALUES (?,?,?,?,?,?,?,?,?)').run('owner/repo',19,schedule.head,1,schedule.signature,state,1,'old evidence',0);
-   const requests=new ReviewRequests(s,()=>100000);
+   let now=100000;const requests=new ReviewRequests(s,()=>now);
    expect(requests.get('owner/repo',19,schedule.head)).toMatchObject({mode:'full',state,attempts:1});
+   if(state==='rate_limited'){expect(requests.claim(job,'owner/repo',19,schedule)).toBe(false);now=requests.cooldowns.get('owner/repo',19).next_action+1;}
    expect(requests.claim(job,'owner/repo',19,schedule)).toBe(state==='rate_limited');
    if(state==='rate_limited'){
     expect(requests.get('owner/repo',19,schedule.head)).toMatchObject({mode:'regular',attempts:2});

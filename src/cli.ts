@@ -68,6 +68,8 @@ import {maintenanceStatus} from './branch-maintenance';
 import {integrationPreview,integrationRuntime,verifyIntegrations} from './integration-capabilities';
 import {reviewerPolicyView} from './reviewer-policy';
 import {ReviewRequests,reviewProviderHoldPreview} from './coderabbit-scheduling';
+import {githubRead} from './provider-read';
+import {cycleExtensionPreview} from './coderabbit-cooldowns';
 
 let [command='help',...a]=process.argv.slice(2);
 const requested=command,json=a.includes('--json'),modern=modernCommand(command,a),grouped=modern||!!groups[command]&&(a.length>0||command!=='projects')&&!(command==='projects'&&a.length===1&&a[0]==='--json')&&(command!=='routing'||['show','preview','--help','-h'].includes(a[0]));
@@ -461,7 +463,7 @@ Registered approved review targets can request bounded in-scope fixes from their
      }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-   if(!['approvals','review-status','reconcile-review-provider','reconcile-review-checks','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+    if(!['approvals','review-status','extend-review-cycle','reconcile-review-query','reconcile-review-provider','reconcile-review-checks','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
   const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
@@ -497,6 +499,25 @@ Registered approved review targets can request bounded in-scope fixes from their
     const store=new Store(db,true);
     try{return out(await new Workflow(store,liveTransport,undefined,true).previewReconcile(config));}finally{store.close();}
    }
+    if(command==='extend-review-cycle'||command==='reconcile-review-query'){
+     const extending=command==='extend-review-cycle';
+     if(extending?a.length!==1&&!(a.length===5&&a[1]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[2])&&a[3]==='--human'&&a[4].trim()):a.length!==2||!/^\d+$/.test(a[1]))throw Error('Use extend-review-cycle JOB [--confirm HASH --human NAME], or reconcile-review-query JOB COMMENT_ID');
+     if(!existsSync(db))throw Error('Existing database required');
+     const store=new Store(db,extending&&a.length===1);
+     try{
+      const target=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(a[0]) as any;
+      if(!target)throw Error('Registered review target required');
+      if(extending&&a.length===1)return out(cycleExtensionPreview(store,target.repo,target.pr));
+      new Lifecycle(store).current(a[0]);const requests=new ReviewRequests(store);
+      if(extending)return out(a.length===1?requests.cooldowns.extendPreview(target.repo,target.pr):requests.cooldowns.extend(target.repo,target.pr,a[2],a[4]));
+      const cycle=requests.cooldowns.get(target.repo,target.pr),query=cycle?requests.cooldowns.query(cycle):null;
+      if(query?.state!=='delivery_uncertain')throw Error('Uncertain availability query required');
+      const user=await githubRead(['api','user'],'query-reconcile'),comment=await githubRead(['api',`repos/${target.repo}/issues/comments/${a[1]}`],'query-reconcile');
+      new Lifecycle(store).current(a[0]);const fresh=store.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(a[0]) as any;
+      if(fresh?.repo!==target.repo||fresh?.pr!==target.pr||comment.issue_url!==`https://api.github.com/repos/${target.repo}/issues/${target.pr}`||comment.user?.id!==user.id||!requests.cooldowns.settleQuery(query,comment))throw Error('Own query comment or target does not match; uncertainty retained');
+      store.event(a[0],'coderabbit_query_reconciled',JSON.stringify({comment:comment.id,mutationReplay:false}));return out({state:'delivered',mutationReplay:false});
+     }finally{store.close();}
+    }
      if(command==='reconcile-review-checks'){
       if(a.length!==3&&!(a.length===5&&a[3]==='--confirm'&&/^[a-f0-9]{64}$/.test(a[4])))throw Error('Use reconcile-review-checks JOB CONFIG HUMAN [--confirm HASH]');
       const config=JSON.parse(readFileSync(req(a[1],'Config'),'utf8'));validate(config);

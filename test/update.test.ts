@@ -410,6 +410,8 @@ test('tampered staged build, lockfile and source fail closed instead of being re
   }finally{f.close();}
  }
 },30000);
+// This also prepares/verifies a real isolated artifact. CI exceeded the default
+// 5s deadline; use the same bounded budget as the adjacent artifact tests.
 test('artifact tampering during activation is caught by the final stage verification',async()=>{
  // Exercise real filesystem locks without depending on OS identity subprocesses
  // during frozen-artifact preparation. Native identity safety has its own tests.

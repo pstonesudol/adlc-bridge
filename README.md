@@ -21,6 +21,54 @@ Test failures fail the job and remain visible in the Actions step output.
 CI has read-only repository permissions, does not persist checkout credentials,
 and performs no deployment, merge or auto-merge actions.
 
+## CodeRabbit cooldown recovery
+
+The existing review loop keeps durable PR review cycles and per-head request
+receipts. GitHub comment delivery is not CodeRabbit acceptance. Authenticated,
+request-bound bot throttles can make a delivered request retryable; unknown
+delivery is reconciled, never blindly resent. Automatic retries use
+`@coderabbitai review`, never `full review` or `resume`. Intentional pauses,
+exclusions, current-head reviews and all independent approval gates remain.
+
+For a CodeRabbit reviewer entry, optional `rateLimit` settings are milliseconds:
+`{"buffer":300000,"fallback":3600000,"maxDelay":7200000,"jitter":0.05,"retryLimit":6,"window":86400000}`.
+These are defaults, not live configuration changes. A cycle starts at its first
+observed throttle, spans new heads/restarts, and ends at a completed review of
+the latest pending head. Six retries or 24 hours exhaust it. Fallback grows from
+60 to 120 minutes with 0–5% positive jitter; explicit resets get a five-minute
+positive buffer, never early jitter. Fresh reliable timing replaces fallback.
+Availability queries (`@coderabbitai rate limit`) use separate durable receipts,
+at most one per throttle wait episode; they do not consume review retry budget.
+
+`review-status` exposes the cycle, next retry and persisted request evidence.
+Cooldown notices use the existing enabled Linear blocker publisher without
+applying a blocker label while waiting. Waiting does not spend code-remediation
+budget. Exhaustion requires explicit operator action:
+
+```
+adlc extend-review-cycle JOB
+adlc extend-review-cycle JOB --confirm HASH --human NAME
+adlc reconcile-review-query JOB EXISTING_COMMENT_ID
+```
+
+Extension adds six retries and 24 hours but retains counts, evidence, cooldowns
+and delivery uncertainty; it does not send a request. Query reconciliation only
+accepts an exact existing query comment by the currently authenticated GitHub
+user on the registered PR. It never reposts it. Provider reset values that cannot
+be safely represented retain the existing inspection hold. Shared CodeRabbit
+cooldowns require explicit authenticated provider evidence naming a verified
+developer identity; shared GitHub credentials alone do not establish a quota.
+GitHub API throttles retain a separate conservative transport embargo.
+Legacy throttled receipts seed the new cycle with their earliest known throttle
+and already-spent retries. Unknown historical completion never resets a budget;
+an old exhausted episode requires the explicit extension path above.
+
+The shared implementation supports isolated ADLC Bridge and Honey Summer
+fixtures. No Honey Summer source/configuration or live-provider changes are
+required. Source changes do not activate the pinned installed runtime. Human
+installation and PR merging remain separate operator actions; no paid usage is
+enabled by recovery.
+
 ### Planning dependency observation
 
 Dependency bindings may opt into `stage: "planning"` (omitted stage retains
