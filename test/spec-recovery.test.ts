@@ -140,6 +140,17 @@ async function fixture(database=':memory:'){
  const complete=()=>{const d=s.db.query('SELECT * FROM spec_replans ORDER BY rowid DESC LIMIT 1').get() as any;e.transcript.controller='ready';e.transcript.turns.at(-1).state='completed';e.receiptObservation.observed=Date.now();e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,sequence:e.transcript.entries.length+1,turnId:d.client_id,text:`<!-- ADLC_REVISED_PLAN:${d.revision} -->\nNew plan\n${ready}`});};
  return {s,w,job,e,sends,edit,recovery,complete,hash};
 }
+for(const duplicate of ['completed','failed','cancelled','interrupted'])test(`prior completed delivery refuses duplicate ${duplicate} turn identity before replanning`,async()=>{
+ const f=await fixture();try{
+  f.edit('Revised requirements');const original=f.e.transcript.turns.at(-1);
+  f.e.transcript.turns.push({...original,state:duplicate});
+  const before={job:f.s.get(f.job),planning:f.w.planning(f.job),events:f.s.db.query('SELECT * FROM events').all()};
+  await expect(f.recovery.preview(f.job,config)).rejects.toThrow('unique owned turn');
+  expect(f.s.get(f.job)).toEqual(before.job);expect(f.w.planning(f.job)).toEqual(before.planning);expect(f.s.db.query('SELECT * FROM events').all()).toEqual(before.events);
+  expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();expect(f.sends).toHaveLength(1);
+  f.e.transcript.turns.pop();expect((await f.recovery.preview(f.job,config)).action).toBe('request_replanning');
+ }finally{f.s.close();}
+});
 test('DEV-67 unavailable pinned model on a revised plan retains dispatch and historical session/PR/delivery evidence',async()=>{
  const f=await fixture();try{
   new ReviewLoop(f.s).register(f.job,'owner/repo',17,['CI'],['src/**']);

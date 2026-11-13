@@ -223,6 +223,10 @@ test('initial planning edit has authoritative no-PR context and first creation s
 for(const kind of ['incomplete','ambiguous','attachment-conflict','stale-head','lookup-failure'])test(`no-PR planning defers ${kind} instead of treating missing evidence as absence`,async()=>{
  const f=fixture();try{
   f.c.replanning={automatic:true};f.edit('edit');const lookup=f.w.t.planningPRs!;
+  if(kind==='stale-head'){
+   f.e.session.prs=[{number:7,url:'https://github.com/owner/repo/pull/7',state:'open'}];
+   f.w.t.branchSnapshot=async()=>({branch:f.e.session.branch,head:'a'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open'});
+  }
   f.w.t.planningPRs=async(repo,branch)=>{
    if(kind==='lookup-failure')throw Error('lookup unavailable');
    const inventory=await lookup(repo,branch),p={number:7,url:`https://github.com/${repo}/pull/7`,repo,base:repo,branch,head:'a'.repeat(40),state:'open' as const};
@@ -232,6 +236,10 @@ for(const kind of ['incomplete','ambiguous','attachment-conflict','stale-head','
    return {...inventory,prs:[p]};
   };
   expect((await f.requests.sync(f.c))[0].state).toBe('blocked');expect(f.sends).toHaveLength(0);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();
+  if(kind==='stale-head'){
+   f.w.t.planningPRs=lookup;
+   expect((await f.requests.sync(f.c))[0].state).toBe('dispatched');expect(f.sends).toHaveLength(1);
+  }
  }finally{f.s.close();}
 });
 for(const malformed of [null,'{bad json}',JSON.stringify({version:1,paths:['src/**']})])test(`direct revised approval rejects missing/malformed scope (${malformed}) atomically`,async()=>{
@@ -257,6 +265,39 @@ test('a PR appearing between no-PR preview and dispatch invalidates the preview 
   f.w.t.planningPRs=async(repo,branch)=>{if(++reads>1)f.e.session.prs=[{number:9,url:`https://github.com/${repo}/pull/9`,state:'open'}];return original(repo,branch);};
   f.w.t.branchSnapshot=async()=>({branch:f.e.session.branch,head:'a'.repeat(40),headRepo:'owner/repo',baseRepo:'owner/repo',state:'open'});
   expect((await f.requests.sync(f.c))[0].state).toBe('blocked');expect(f.sends).toHaveLength(0);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();
+ }finally{f.s.close();}
+});
+for(const change of ['PR','head'])test(`${change} changes during asynchronous authorization invalidate identity before reservation`,async()=>{
+ const f=fixture();try{
+  f.edit('revised');let head='a'.repeat(40),authorized=0;
+  f.w.t.worktree=async()=>({branch:f.e.session.branch,tree:'/worktree',head});
+  f.w.t.branchSnapshot=async()=>({branch:f.e.session.branch,head,headRepo:'owner/repo',baseRepo:'owner/repo',state:'open'});
+  const preview=await f.recovery.preview(f.job,f.c);
+  await expect(f.recovery.reconcile(f.job,f.c,preview.confirmation,async()=>{
+   authorized++;await Promise.resolve();
+   if(change==='head')head='b'.repeat(40);else f.e.session.prs=[{number:7,url:'https://github.com/owner/repo/pull/7',state:'open'}];
+  })).rejects.toThrow('Evidence changed during authorization');
+  expect(authorized).toBe(1);expect(f.sends).toHaveLength(0);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toBeNull();
+ }finally{f.s.close();}
+});
+for(const kind of ['stale','future','incomplete','session','project','branch','terminated'])test(`accepted delivery with ${kind} evidence is uncertain, not dispatched, without replay`,async()=>{
+ const f=fixture();try{
+  f.c.replanning={automatic:true};f.edit('revised');await f.requests.sync(f.c);
+  const delivery=f.s.db.query('SELECT * FROM spec_replans').get();
+  // Isolate the accepted-receipt fallback, rather than an active owned turn.
+  f.e.transcript.entries=[];
+  expect((await f.requests.sync(f.c))[0].state).toBe('dispatched');
+  const evidence=structuredClone(f.e);evidence.receiptObservation.observed=Date.now();
+  if(kind==='stale')evidence.receiptObservation.observed=Date.now()-120001;
+  if(kind==='future')evidence.receiptObservation.observed=Date.now()+10000;
+  if(kind==='incomplete')evidence.receiptObservation.complete=false;
+  if(kind==='session')evidence.session.id='other';
+  if(kind==='project')evidence.session.projectId='other';
+  if(kind==='branch')evidence.session.branch='other';
+  if(kind==='terminated')evidence.session.isTerminated=true;
+  f.w.t.evidence=async()=>evidence;
+  expect((await f.requests.sync(f.c))[0].state).toBe('delivery_uncertain');expect(f.row().state).toBe('delivery_uncertain');
+  expect(f.sends).toHaveLength(1);expect(f.s.db.query('SELECT * FROM spec_replans').get()).toEqual(delivery);
  }finally{f.s.close();}
 });
 for(const when of ['admission','pre-dispatch'])test(`duplicate Linear reply IDs fail closed at ${when}`,async()=>{

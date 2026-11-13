@@ -62,7 +62,7 @@ export class SpecRequests{
    const sent=e.transcript?.entries?.find((x:any)=>x.clientMessageId===existing.client_id),turn=e.transcript?.turns?.find((x:any)=>x.id===sent?.turnId);
    const fresh=e.receiptObservation?.complete===true&&Date.now()-e.receiptObservation.observed>=0&&Date.now()-e.receiptObservation.observed<=120000;
    const owned=e.session?.id===existing.session&&e.session.projectId===proof.project&&e.session.branch===proof.branch&&e.session.isTerminated===false;
-   const state=fresh&&owned&&turn&&['running','queued'].includes(turn.state)?'actively_replanning':existing.state==='accepted'?'dispatched':'delivery_uncertain';
+   const state=fresh&&owned&&turn&&['running','queued'].includes(turn.state)?'actively_replanning':existing.state==='accepted'&&fresh&&owned?'dispatched':'delivery_uncertain';
    this.s.db.query('UPDATE spec_requests SET state=?,reason=NULL WHERE revision=?').run(state,r.id);return {state,revision:r.id};
   }
   if(c.replanning?.automatic===true){

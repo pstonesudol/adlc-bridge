@@ -90,7 +90,8 @@ export class SpecRecovery{
   for(const table of ['continuations','spec_replans'])if(this.s.db.query('SELECT name FROM sqlite_master WHERE name=?').get(table))requests.push(...(this.s.db.query(`SELECT * FROM ${table} WHERE job=?`).all(job) as any[]).filter(x=>x.revision!==r.id&&!(table==='continuations'?['failed','recovered']:['failed']).includes(x.state)));
    for(const request of requests){
     const entries=e.transcript.entries?.filter((x:any)=>x.clientMessageId===request.client_id),entry=entries?.[0];
-    if(entries?.length!==1||(request.session??request.session_id)!==p.session_id||!entry||turns.filter((t:any)=>t.id===entry.turnId&&t.state==='completed').length!==1)throw Error('Prior delivery lacks a completed receipt; require a unique owned turn and reconcile uncertainty/provider failure before replanning');
+    const owned=entry?turns.filter((t:any)=>t.id===entry.turnId):[];
+    if(entries?.length!==1||(request.session??request.session_id)!==p.session_id||!entry||owned.length!==1||owned[0].state!=='completed')throw Error('Prior delivery lacks a completed receipt; require a unique owned turn and reconcile uncertainty/provider failure before replanning');
   }
   if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='remediation'").get()&&this.s.db.query("SELECT 1 FROM remediation WHERE job=? AND state IN ('reserved','delivery_uncertain')").get(job))throw Error('Remediation delivery requires reconciliation; retained history is not reset');
   const local=await(this.w.t.worktree?this.w.t.worktree(job):worktreeIdentity(this.s,job));
@@ -142,7 +143,11 @@ export class SpecRecovery{
    const route=c.routing?.enabled?await this.w.router.choose(job,'planning',proof.spec,'Replan current requirements only: '+this.s.get(job).spec,c.routing,'planning'):undefined;
    if(route){if(!this.w.t.preflightRoute||!this.w.t.configureRoute)throw Error('Planning routing unavailable');await this.w.t.preflightRoute(route);await this.w.t.configureRoute(proof.session,route);}
     const fresh=await this.preview(job,c);if(fresh.confirmation!==confirmation)throw Error('Evidence changed before reservation');
-    if(authorize)await authorize();
+    if(authorize){
+     await authorize();
+     const afterAuthorization=await this.preview(job,c);
+     if(afterAuthorization.confirmation!==confirmation)throw Error('Evidence changed during authorization; refresh preview');
+    }
    this.s.db.transaction(()=>{
     if(latestRevision(this.s,job)?.id!==proof.revision||digest(this.s.get(job).spec)!==proof.spec||this.s.get(job).state!=='awaiting_plan')throw Error('Requirements changed before reservation');
      assertWorktreeAvailable(this.s,job);
