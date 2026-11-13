@@ -391,13 +391,15 @@ test('tampered staged build, lockfile and source fail closed instead of being re
   }finally{f.close();}
  }
 },30000);
+// This also prepares/verifies a real isolated artifact. CI exceeded the default
+// 5s deadline; use the same bounded budget as the adjacent artifact tests.
 test('artifact tampering during activation is caught by the final stage verification',async()=>{
  const f=candidateFixture();try{
   const preview=await f.manager.preview(),stop=f.io.stack.project;
   f.io.stack.project=async(action,id)=>{const result=await stop(action,id);if(action==='stop')writeFileSync(join(preview.staged.root,'src/cli.ts'),'changed during activation');return result;};
   await expect(f.manager.apply()).rejects.toThrow('artifact was modified');expect(f.installs).toEqual([]);expect(f.services.one).toBe(true);expect(f.manager.turns.isPaused()).toBe(false);
  }finally{f.close();}
-});
+},30_000);
 test('a changed authoritative candidate after a saved preview requires a fresh explicit preview',async()=>{
  const f=fixture();try{
   f.io.stage=async(_p,c)=>({root:join(f.root,'stage'),commit:c.commit,version:'v2',files:['src/cli.ts'],artifact:{lockfile:'lock',digest:'artifact'}});
