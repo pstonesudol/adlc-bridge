@@ -81,7 +81,9 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
     // changes (install.ts). Permit guarded recovery from that stale launcher;
     // executable trust and worker ownership remain mandatory before disruption.
     // recordVerifiedRestart must verify the intended launcher after replacement.
-    if(action==='restart'&&o.all){result.backend=await ops.backend();if(!result.backend.ready||!result.backend.managed)throw Error('Restart backend identity/readiness check failed; backend and workers preserved. Inspect the failed backend checks in a fresh restart preview.');}
+    // No ready daemon is not a foreign-daemon conflict. Confirmation and complete
+    // inventory are still required below, and startup must verify readiness.
+    if(action==='restart'&&o.all){result.backend=await ops.backend();if(result.backend.ready&&!result.backend.managed)throw Error('Restart backend identity check failed: a ready backend is not managed by this installation; backend and workers preserved. Inspect the failed backend checks in a fresh restart preview.');}
     if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error(savedRestart?`Confirmation missing or stale; run ${rerun}`:'Confirmation missing or stale; preview the exact selected action again');
      if(savedRestart){if(initialIdentity!==restartIdentity(state!))throw Error(`Restart identity changed; run ${rerun}`);
       if(!o.apply||!o.confirm)throw Error('Restart apply confirmation missing');

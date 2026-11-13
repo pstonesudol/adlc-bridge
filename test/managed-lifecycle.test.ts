@@ -99,7 +99,21 @@ test('desktop-first preview retains backend checks when inventory fails, without
 test('foreign backend restart with explicit confirmation refuses before service or worker mutation',async()=>{
  const f=fixture(),o={all:true,timeout:30};const p=await controlManagedLifecycle('restart',o,f.ops);
  f.ops.backend=async()=>({ready:true,loaded:true,managed:false});
- await expect(controlManagedLifecycle('restart',{...o,apply:true,confirm:p.confirm},f.ops)).rejects.toThrow('identity/readiness');expect(f.calls).toEqual([]);
+  await expect(controlManagedLifecycle('restart',{...o,apply:true,confirm:p.confirm},f.ops)).rejects.toThrow('identity check failed');expect(f.calls).toEqual([]);
+});
+test('non-ready backend does not itself block a confirmed restart with complete inventory',async()=>{
+ const f=fixture();f.setWorkers([]);f.inventory.children=[];
+ const original=f.ops.backend,start=f.ops.backendStart;let started=false;
+ f.ops.backend=async()=>{const b=await original();return {...b,ready:started&&b.ready,loaded:started&&b.loaded};};
+ f.ops.backendStart=async()=>{await start();started=true;};
+ const result=await apply(f,'restart',{all:true,timeout:30});
+ expect(result.complete).toBe(true);expect(result.backend.ready).toBe(true);
+ expect(f.calls).toContain('backend:start');expect(f.calls).toContain('start:one:true');expect(f.calls).toContain('start:two:true');
+});
+test('non-ready backend still refuses incomplete inventory before any mutation',async()=>{
+ const f=fixture();f.ops.backend=async()=>({ready:false,loaded:false,managed:true});f.inventory.complete=false;
+ await expect(apply(f,'restart',{all:true,timeout:30})).rejects.toThrow('Worker/process inventory incomplete');
+ expect(f.calls).toEqual([]);
 });
 test('isolated CLI restart preview emits a confirmation hash without creating state',()=>{
  const root=mkdtempSync(join(tmpdir(),'managed-restart-preview-'));try{
