@@ -98,6 +98,16 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+for(const maintenanceOnly of [false,true])test(`required-check drift blocks historical readiness before any review IO (maintenance: ${maintenanceOnly})`,async()=>{
+ const f=templateFixture();try{
+  f.s.db.query("UPDATE review_targets SET state='ready_for_human',head=? WHERE job=?").run(f.head,f.id);
+  let reads=0;const unexpected=async()=>{reads++;throw Error('No provider IO allowed under stale required-check policy');};
+  f.loop.io.sessionEvidence=unexpected;f.loop.io.readBranchSnapshot=unexpected;f.loop.io.readiness=unexpected;
+  for(let n=0;n<2;n++)expect(await f.loop.tick(f.id,undefined,undefined,undefined,{requiredChecks:['CI','Security']} as any,undefined,maintenanceOnly)).toMatchObject({state:'blocked',send:false,reason:'Required-check policy changed; explicit review-target reconciliation required'});
+  expect(f.loop.get(f.id)).toMatchObject({state:'blocked',required_checks:'["CI"]'});
+  expect(reads).toBe(0);expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);expect(f.s.get(f.id).attempts).toBe(0);
+ }finally{f.s.close();}
+});
 test('DEV-97: early blockers refresh head and edited evidence bindings without resetting budgets',async()=>{
  const f=templateFixture();try{
   f.loop.configureMetadataChecks('project',[]);

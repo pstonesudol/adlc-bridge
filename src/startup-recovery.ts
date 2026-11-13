@@ -176,8 +176,9 @@ export class StartupRecovery{
   if(!interrupted){
    const result=await this.w.executionStatus(job,e,c);
     if(result?.state==='pr_handoff'){
-     const target=row(this.s,'review_targets',job);
-     if(!target||target.repo!==c.githubRepo||target.pr!==result.pr?.number)this.io.register?.(job,result,c);
+     // Registration is idempotent, but also validates check/scope/remediation
+     // policy and refreshes verification. A matching PR alone cannot skip it.
+     this.io.register?.(job,result,c);
     }
    return {job,outcome:reattached?'reattached':result?.state==='pr_handoff'?'reattached':['needs_input','blocked_dependency','failed','blocked','needs_reconciliation'].includes(result?.state)?'blocked':'waiting',state:result?.state,nextAction:result?.state==='pr_handoff'?'Published PR returned to ordinary CI/review polling':result?.reason??'Completed delivery reconciled; no implementation resend'};
   }

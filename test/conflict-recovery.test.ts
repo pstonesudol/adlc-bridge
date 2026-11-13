@@ -157,7 +157,7 @@ for(const incident of ['DEV-82','DEV-110'])test(`${incident}: reboot settles exa
   for(let n=0;n<3;n++)expect(await startup.pass(c,true)).toMatchObject({blocked:0,reattached:1});
   expect(worktreeReservation(reopened,f.job)).toBeUndefined();
   expect(reopened.db.query("SELECT count(*) AS n FROM events WHERE kind='conflict_reservation_settled'").get()).toEqual({n:1});
-  expect(registrations).toHaveLength(0); // The existing review target is retained.
+   expect(registrations).toHaveLength(3); // Revalidate policy; the existing target remains.
   expect(reopened.db.query('SELECT head,state FROM review_targets').get()).toMatchObject({head,state:'waiting_for_ci'});
   expect(f.sends()).toBe(1);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
   expect(f.s.get(f.job).attempts).toBe(attempts);expect(JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all())).toBe(budget);
@@ -174,6 +174,50 @@ test('settlement preserves unrelated review and budget gates and is idempotent',
   expect(target).toMatchObject({state:'needs_reconciliation',reason:'CodeRabbit delivery uncertain'});
   expect(await f.recovery.reconcileSettled(f.job,f.config)).toBeNull();
   expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.s.db.query('SELECT * FROM remediation_budget').all()).toEqual(budget);
+ }finally{f.close();}
+},60000);
+for(const fault of ['turn-identity','terminal-state','missing-binding','changed-binding','changed-during-proof','matching'])test(`settlement checks persisted resolution receipt without rewriting it: ${fault}`,async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f);let reads=0;
+  const ledger=new ReceiptReconciliation(f.s);
+  if(fault==='turn-identity')f.s.db.query("UPDATE delivery_receipts SET turn='different-turn' WHERE client=?").run(r.client_id);
+  if(fault==='terminal-state')f.s.db.query("UPDATE delivery_receipts SET state='failed',turn='resolution' WHERE client=?").run(r.client_id);
+  if(fault==='missing-binding')f.s.db.query('DELETE FROM delivery_receipts WHERE client=?').run(r.client_id);
+  if(fault==='changed-binding')f.s.db.query("UPDATE delivery_receipts SET attempt='remediation:other' WHERE client=?").run(r.client_id);
+  if(fault==='matching')expect(ledger.inspect(ledger.get(r.client_id),await f.io.evidence(),true).state).toBe('completed');
+  const io={...f.io,evidence:async()=>{const e=await f.io.evidence();if(fault==='changed-during-proof'&&++reads===4)f.s.db.query("UPDATE delivery_receipts SET turn='different-turn' WHERE client=?").run(r.client_id);return e;}};
+  const before=ledger.get(r.client_id),target=f.s.db.query('SELECT * FROM review_targets').get(),remediation=f.s.db.query('SELECT * FROM remediation').all(),mark=f.commands.length;
+  const recovery=new ConflictRecovery(f.s,io as any);
+  if(fault==='matching'){
+   expect(await recovery.reconcileSettled(f.job,f.config)).toMatchObject({state:'completed'});
+   expect(worktreeReservation(f.s,f.job)).toBeUndefined();
+  }else{
+   await expect(recovery.reconcileSettled(f.job,f.config)).rejects.toThrow(fault==='changed-during-proof'?'persisted resolution receipt changed':'resolution delivery');
+   expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);expect(f.recovery.row(f.job).state).toBe('pushing');
+   expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual(remediation);
+   await expect(recovery.manualPreview(f.job,f.config)).rejects.toThrow('resolution delivery');
+  }
+  expect(ledger.get(r.client_id)).toEqual(fault==='changed-during-proof'?{...before,turn:'different-turn'}:before);
+  expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+ }finally{f.close();}
+},60000);
+test('settlement rechecks the persisted resolution receipt inside its release transaction',async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),auth=f.recovery.auth.bind(f.recovery);let checks=0;
+  f.recovery.auth=(...args)=>{const result=auth(...args);if(++checks===5)f.s.db.query("UPDATE delivery_receipts SET turn='different-turn' WHERE client=?").run(r.client_id);return result;};
+  const target=f.s.db.query('SELECT * FROM review_targets').get(),remediation=f.s.db.query('SELECT * FROM remediation').all();
+  await expect(f.recovery.reconcileSettled(f.job,f.config)).rejects.toThrow('persisted resolution receipt changed before settlement');
+  expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual(remediation);
+ }finally{f.close();}
+},60000);
+test('operator fallback retains the reservation if its persisted resolution receipt changes during verification',async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),d=JSON.parse(r.detail);d.verification=[];
+  f.s.db.query('UPDATE conflict_recoveries SET detail=? WHERE id=?').run(JSON.stringify(d),r.id);
+  const recovery=new ConflictRecovery(f.s,{...f.io,verify:async()=>{f.s.db.query("UPDATE delivery_receipts SET turn='different-turn' WHERE client=?").run(r.client_id);return {code:0,out:'verified',err:''};}} as any);
+  const preview=await recovery.manualPreview(f.job,f.config),target=f.s.db.query('SELECT * FROM review_targets').get(),remediation=f.s.db.query('SELECT * FROM remediation').all();
+  await expect(recovery.manualConfirm(f.job,f.config,preview.confirmation,'human')).rejects.toThrow('persisted resolution receipt changed before completion');
+  expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(f.s.db.query('SELECT * FROM remediation').all()).toEqual(remediation);
  }finally{f.close();}
 },60000);
 test('concurrent settlement observers commit one release and one review transition',async()=>{

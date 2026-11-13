@@ -99,12 +99,18 @@ export class ConflictRecovery{
      if(turn?.state!=='completed'||!report.valid||report.receipt?.outcome!=='host-ready'||[...(terminal?.text??'').matchAll(/<!--\s*ADLC_WORKER_STATUS\b/g)].length!==1)throw Error(`Reservation ${r.id}: authoritative completed host-ready resolution receipt missing; never resend`);
     }
    }
+   const ledger=new ReceiptReconciliation(this.s),resolutionReceipt=ledger.get(r.client_id);
+   if(d.conflicts?.length||publication?.proof?.message==='completed'||resolutionReceipt){
+    const receipt=ledger.inspect({job:r.job,plan:r.plan,spec:x.auth.spec,session:r.session,client:r.client_id,attempt:`remediation:${r.attempt}`},x.e,false);
+    if(receipt.state!=='completed')throw Error(`Reservation ${r.id}: resolution delivery ${receipt.code}: ${receipt.reason}; reservation retained, never resend`);
+   }
    const target=this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any;
    if(!target||target.repo!==r.repo||target.pr!==r.pr||target.state==='completed')throw Error(`Reservation ${r.id}: current open review target proof missing`);
    const final=await this.inspect(job,c,r.repo,r.pr);
    const identity=(e:any)=>[e.session.id,e.session.projectId,e.session.kind,e.session.branch,e.session.isTerminated,e.session.activity?.state,e.session.prs,e.transcript.controller,e.transcript.entries,e.transcript.turns];
    if(JSON.stringify(final.auth)!==JSON.stringify(x.auth)||JSON.stringify(final.b)!==JSON.stringify(x.b)||JSON.stringify(final.facts)!==JSON.stringify(x.facts)||JSON.stringify(identity(final.e))!==JSON.stringify(identity(x.e))||final.e.receiptObservation?.complete!==true)throw Error(`Reservation ${r.id}: session, worktree or publication changed during settlement proof`);
-   return {job,id:r.id,head:d.result,tree,action:'settle-published-reservation',confirmation:digest(JSON.stringify([r,x.auth,x.b,target,tree,publication])),reservation:r,auth:x.auth,target,detail:d};
+   if(JSON.stringify(ledger.get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed during settlement proof`);
+   return {job,id:r.id,head:d.result,tree,action:'settle-published-reservation',confirmation:digest(JSON.stringify([r,x.auth,x.b,target,tree,publication,resolutionReceipt])),reservation:r,auth:x.auth,target,detail:d,resolutionReceipt};
   }
   async reconcileSettled(job:string,c:any,confirmation?:string){return this.io.submit(async()=>{
    const first=await this.settledPreview(job,c);if(!first)return null;
@@ -114,6 +120,7 @@ export class ConflictRecovery{
    return this.s.db.transaction(()=>{
     assertObservationFence();
     if(JSON.stringify(this.auth(job,c))!==JSON.stringify(fresh.auth)||JSON.stringify(this.row(job))!==JSON.stringify(fresh.reservation)||JSON.stringify(this.s.db.query('SELECT * FROM review_targets WHERE job=?').get(job))!==JSON.stringify(fresh.target)||worktreeReservation(this.s,job)?.id!==fresh.id)throw Error(`Reservation ${fresh.id}: authority, target or reservation changed before settlement`);
+    if(JSON.stringify(new ReceiptReconciliation(this.s).get(fresh.reservation.client_id))!==JSON.stringify(fresh.resolutionReceipt))throw Error(`Reservation ${fresh.id}: persisted resolution receipt changed before settlement`);
     this.set(fresh.reservation,'completed',fresh.detail);
     this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state IN ('reserved','delivery_uncertain')").run(job,fresh.reservation.attempt);
     // Preserve independent review gates, including blocked/uncertain reviewer
@@ -173,12 +180,16 @@ export class ConflictRecovery{
   await this.noOperation(r.worktree);
   if(await this.git(r.worktree,'show','-s','--format=%P',b.head)!==`${r.head} ${r.base}`)throw Error('Operator reconciliation requires exact original two-parent merge; never rewrite history to satisfy this check');
   await this.assertResolved(r,d);
-  if(d.conflicts.length){
-   const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
-   if(!turn||!['completed','failed','cancelled','interrupted'].includes(turn.state))throw Error('Resolution delivery must have an authoritative terminal receipt before manual release');
-  }
+   const ledger=new ReceiptReconciliation(this.s),resolutionReceipt=ledger.get(r.client_id);
+   if(d.conflicts.length){
+    const entry=x.e.transcript.entries.find((e:any)=>e.clientMessageId===r.client_id),turn=entry&&x.e.transcript.turns.find((t:any)=>t.id===entry.turnId);
+    if(!turn||!['completed','failed','cancelled','interrupted'].includes(turn.state))throw Error('Resolution delivery must have an authoritative terminal receipt before manual release');
+    const receipt=ledger.inspect({job:r.job,plan:r.plan,spec:x.auth.spec,session:r.session,client:r.client_id,attempt:`remediation:${r.attempt}`},x.e,false);
+    if(!['completed','failed','cancelled'].includes(receipt.state))throw Error(`Reservation ${r.id}: resolution delivery ${receipt.code}: ${receipt.reason}; preserve conflicting receipt evidence`);
+   }
   const tree=await this.git(r.worktree,'rev-parse',`${b.head}^{tree}`);
-   return {job,id:r.id,head:b.head,base:r.base,tree,stage:r.state,reason:r.reason,automaticSettlementBlocker,confirmation:digest(JSON.stringify([r,b.head,tree])),preview:true,action:'verify-published-merge',note:'Confirmation runs configured verification and releases only this proven completed reservation; no send, commit, push, reset or scope expansion'};
+   if(JSON.stringify(ledger.get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed during manual preview`);
+   return {job,id:r.id,head:b.head,base:r.base,tree,stage:r.state,reason:r.reason,automaticSettlementBlocker,resolutionReceipt,confirmation:digest(JSON.stringify([r,b.head,tree,resolutionReceipt])),preview:true,action:'verify-published-merge',note:'Confirmation runs configured verification and releases only this proven completed reservation; no send, commit, push, reset or scope expansion'};
  }
  async manualConfirm(job:string,c:any,hash:string,human:string){
   if(!human?.trim())throw Error('Explicit human operator required');
@@ -194,7 +205,7 @@ export class ConflictRecovery{
     }
     const x=await this.guard(r,c,proof.head);await this.noOperation(r.worktree);await this.assertResolved(r,d);
     if(!x.facts.clean||x.facts.head!==proof.head||await this.git(r.worktree,'write-tree')!==proof.tree)throw Error('Verification changed worktree or published evidence');
-    this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d,c);
+     this.s.event(job,'conflict_operator_reconciliation',JSON.stringify({human,hash,head:proof.head}));this.complete(r,d,c,proof.resolutionReceipt);
     return {...proof,preview:false,state:'completed',mergePR:false};
    }catch(e){this.set(r,'manual_verifying',d,e instanceof Error?e.message:'Verification uncertain');throw e;}
   });
@@ -469,12 +480,13 @@ export class ConflictRecovery{
   if(observed.head!==d.result)throw Error(`Normal push rejected or uncertain (${pushed.code}): ${pushed.err.slice(0,2000)}; remote ${observed.head}; preserve commit ${d.result}`);
   await this.guard(r,c,d.result);this.complete(r,d,c);return null;
  }
- complete(r:any,d:any,c:any){this.s.db.transaction(()=>{
+  complete(r:any,d:any,c:any,resolutionReceipt?:any){this.s.db.transaction(()=>{
   // Approval, scope or grants can be revoked during the final asynchronous Git
   // checks. Recheck inside this transaction and leave the reservation untouched
   // on failure; never release it under stale authorization.
   const a=this.auth(r.job,c);
-  if(a.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy)throw Error('Current approval, policy or scope changed before completion; reservation retained for reconciliation');
+   if(a.plan!==r.plan||JSON.stringify(c.conflictRecovery)!==r.policy)throw Error('Current approval, policy or scope changed before completion; reservation retained for reconciliation');
+   if(resolutionReceipt!==undefined&&JSON.stringify(new ReceiptReconciliation(this.s).get(r.client_id))!==JSON.stringify(resolutionReceipt))throw Error(`Reservation ${r.id}: persisted resolution receipt changed before completion`);
   this.set(r,'completed',d);
   this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=?").run(r.job,r.attempt);
   this.s.db.query("UPDATE review_targets SET head=?,head_since=?,state='waiting_for_ci',reason='Base merged; fresh latest-SHA CI and CodeRabbit required',last_signature=NULL WHERE job=?").run(d.result,Date.now(),r.job);
