@@ -95,7 +95,13 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
    const start=async()=>{
     time();
     let releaseGlobal=false;
-    if(o.all){ops.turns.pause();await ops.backendStart();const b=await ops.backend();result.backend=b;if(!b.managed||!b.ready)throw Error('Managed backend readiness/compatibility unverified; intake remains paused');}
+    if(o.all){
+     ops.turns.pause();await ops.backendStart();const b=await ops.backend();result.backend=b;
+     if(!b.managed||!b.ready)throw Error('Managed backend readiness/compatibility unverified; intake remains paused');
+     // A stale prior launcher may be replaced, but the saved-restart path must
+     // verify its replacement before starting any project or recovery work.
+     if(savedRestart&&b.launcherVerified!==true)throw Error('Restart verification incomplete (managed-launcher); pending restart preserved and intake remains paused. Inspect the registered launcher, then run a fresh restart preview.');
+    }
     else{
      if(ops.turns.isPaused()){
       if(!ops.holdProject)throw Error('Cannot preserve other project pauses; global intake remains paused');

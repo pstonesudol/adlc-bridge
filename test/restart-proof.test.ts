@@ -28,6 +28,7 @@ test('explicit confirmation stays supported and verification failure preserves p
   const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state),original=f.ops.backend;
   let starts=0;const start=f.ops.backendStart;f.ops.backendStart=async()=>{starts++;await start();};f.ops.backend=async()=>({...await original(),launcherVerified:starts===0});
   await expect(controlManagedLifecycle('restart',{all:true,timeout:30,apply:true,confirm:p.confirm},f.ops,30000,f.state)).rejects.toThrow('pending restart preserved');expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
+  expect(f.calls).not.toContain('start');expect(f.ops.turns.isPaused()).toBe(true);
  }finally{f.close();}
 });
 test('verified intended launcher with a stale update flag can reconcile without resetting update history',()=>{
@@ -44,10 +45,11 @@ test('post-restart failure names the launcher check and next action without clea
  }finally{f.close();}
 });
 test('stale prior launcher recovery is disclosed and only a verified replacement clears pending restart',async()=>{
- for(const replacementVerified of [true,false]){const f=fixture();try{
+  for(const replacementVerified of [true,false,undefined]){const f=fixture();try{
   const original=f.ops.backend,start=f.ops.backendStart;let restarted=false;
   f.ops.backend=async()=>({...await original(),launcherVerified:restarted&&replacementVerified});
   f.ops.backendStart=async()=>{await start();restarted=true;};
+  f.ops.recover=async()=>{f.calls.push('recover');return {admit:true};};
   const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state);
   expect(p.backend.launcherVerified).toBe(false);expect(p.savedPreview).toBe(true);expect(f.calls).toEqual([]);
   expect(p.note).toContain('may replace a prior launcher');expect(p.note).toContain('not verification of the current launcher');expect(p.note).toContain('Post-restart');
@@ -55,6 +57,9 @@ test('stale prior launcher recovery is disclosed and only a verified replacement
   if(replacementVerified)expect((await apply()).restartVerification.verified).toBe(true);
   else await expect(apply()).rejects.toThrow('managed-launcher');
   expect(f.calls).toContain('backend:stop');expect(f.calls).toContain('backend:start');
+  if(replacementVerified){expect(f.calls).toContain('start');expect(f.calls).toContain('recover');}
+  else{expect(f.calls).not.toContain('start');expect(f.calls).not.toContain('recover');}
+  expect(f.ops.turns.isPaused()).toBe(!replacementVerified);
   expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(!replacementVerified);
  }finally{f.close();}}
 });
