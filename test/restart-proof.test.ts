@@ -28,11 +28,46 @@ test('explicit confirmation stays supported and verification failure preserves p
   const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state),original=f.ops.backend;
   let starts=0;const start=f.ops.backendStart;f.ops.backendStart=async()=>{starts++;await start();};f.ops.backend=async()=>({...await original(),launcherVerified:starts===0});
   await expect(controlManagedLifecycle('restart',{all:true,timeout:30,apply:true,confirm:p.confirm},f.ops,30000,f.state)).rejects.toThrow('pending restart preserved');expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
+  expect(f.calls).not.toContain('start');expect(f.ops.turns.isPaused()).toBe(true);
  }finally{f.close();}
 });
 test('verified intended launcher with a stale update flag can reconcile without resetting update history',()=>{
  const f=fixture();try{
   expect(()=>recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:false},services:[{loaded:true}],observedAt:1})).toThrow();
   recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:true},services:[{loaded:true}],observedAt:2});expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8'))).toMatchObject({commit:'a'.repeat(40),restartRequired:false,classification:'hot'});
+ }finally{f.close();}
+});
+test('post-restart failure names the launcher check and next action without clearing pending state',()=>{
+ const f=fixture();try{
+  expect(()=>recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:false},services:[],observedAt:1})).toThrow('managed-launcher');
+  expect(()=>recordVerifiedRestart(f.state,{backend:{ready:true,managed:true,launcherVerified:false},services:[],observedAt:1})).toThrow('fresh restart preview');
+  expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
+ }finally{f.close();}
+});
+test('stale prior launcher recovery is disclosed and only a verified replacement clears pending restart',async()=>{
+  for(const replacementVerified of [true,false,undefined]){const f=fixture();try{
+  const original=f.ops.backend,start=f.ops.backendStart;let restarted=false;
+  f.ops.backend=async()=>({...await original(),launcherVerified:restarted&&replacementVerified});
+  f.ops.backendStart=async()=>{await start();restarted=true;};
+  f.ops.recover=async()=>{f.calls.push('recover');return {admit:true};};
+  const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state);
+  expect(p.backend.launcherVerified).toBe(false);expect(p.savedPreview).toBe(true);expect(f.calls).toEqual([]);
+  expect(p.note).toContain('may replace a prior launcher');expect(p.note).toContain('not verification of the current launcher');expect(p.note).toContain('Post-restart');
+  const apply=()=>controlManagedLifecycle('restart',{all:true,timeout:30,apply:true},f.ops,30000,f.state);
+  if(replacementVerified)expect((await apply()).restartVerification.verified).toBe(true);
+  else await expect(apply()).rejects.toThrow('managed-launcher');
+  expect(f.calls).toContain('backend:stop');expect(f.calls).toContain('backend:start');
+  if(replacementVerified){expect(f.calls).toContain('start');expect(f.calls).toContain('recover');}
+  else{expect(f.calls).not.toContain('start');expect(f.calls).not.toContain('recover');}
+  expect(f.ops.turns.isPaused()).toBe(!replacementVerified);
+  expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(!replacementVerified);
+ }finally{f.close();}}
+});
+test('stale launcher recovery still refuses newly busy work before mutation',async()=>{
+ const f=fixture();try{
+  const original=f.ops.backend;f.ops.backend=async()=>({...await original(),launcherVerified:false});
+  await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops,30000,f.state);f.busy();
+  await expect(controlManagedLifecycle('restart',{all:true,timeout:30,apply:true},f.ops,30000,f.state)).rejects.toThrow('Worker became busy');
+  expect(f.calls).toEqual([]);expect(JSON.parse(readFileSync(join(f.state,'update-state.json'),'utf8')).restartRequired).toBe(true);
  }finally{f.close();}
 });

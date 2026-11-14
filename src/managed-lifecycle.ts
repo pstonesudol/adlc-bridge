@@ -46,6 +46,7 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   if(savedRestart&&o.apply&&!o.confirm)o={...o,confirm:loadRestartProof(state!,{...proofBinding,backend:await ops.backend()},ops.now())};
   const initialIdentity=savedRestart?restartIdentity(state!):null;
   const result:any={scope:o.all?'all':'project',projects:ids,action,mode:o.mode??(action==='start'?'start':action==='restart'?'restart':o.all?'shutdown':'pause'),persistent,globalIntakePaused:ops.turns.isPaused(),services:[],workers:null,children:null,inventoryComplete:false,errors:[],resume:'Existing sessions and worktrees are preserved; startup recovery requires exact receipts and unchanged current authorization. Ambiguous jobs remain blocked.'};
+  if(action==='restart'&&o.all)result.restartContract='A guarded restart may replace a prior launcher that is unverified or stale after installation, but only with verified registered executable identity, service definition and worker ownership/activity guards. A saved preview is confirmation evidence, not verification of the current launcher or a successful restart. Post-restart readiness, managed executable, intended launcher and project services must verify before success is recorded or pending restart is cleared.';
  const tracked=new Map<string,ProcessIdentity>();
  const scoped=(i:Inventory)=>i.workers.filter(w=>w.owned&&ids.includes(w.project));
  const observe=async()=>{const i=await ops.inventory();for(const p of i.children)tracked.set(`${p.pid}:${p.started}`,p);result.workers=scoped(i);result.sharedOrExternal=i.workers.filter(w=>!w.owned||!ids.includes(w.project));result.children=i.children;result.observedAt=ops.now();result.externalProcesses=i.externalProcesses;result.inventoryComplete=i.complete;return i;};
@@ -57,13 +58,17 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
    result.complete=!result.errors.length&&result.inventoryComplete===true;return result;
  }
  const disruptive=action==='restart'||action==='stop'&&o.mode!=='pause'&&(!!o.all||!!o.mode);
- if(o.preview||disruptive&&!o.apply){
-  const i=disruptive?await observe():{workers:[],children:[],complete:true,externalProcesses:'Not inspected'};
+  if(o.preview||disruptive&&!o.apply){
+   if(o.all)try{result.backend=await ops.backend();}catch{result.errors.push({resource:'backend',message:'Backend evidence unavailable; inspect runtime registration and service definition. Backend preserved.'});}
+   let i:Inventory={workers:[],children:[],complete:true,externalProcesses:'Not inspected'};
+   if(disruptive)try{i=await observe();}catch{ i={workers:[],children:[],complete:false,externalProcesses:'Inventory unavailable; backend preserved'};result.errors.push({resource:'workers/processes',message:'Worker/process inventory unavailable; preserve existing sessions and inspect daemon identity and activity before retrying.'}); }
    result.preview=true;result.confirm=lifecycleConfirmation(action,o,ids,i);
    if(savedRestart){
-    if(i.complete){const backend=await ops.backend();if(backend.managed&&backend.ready){saveRestartProof(state!,{...proofBinding,backend},result.confirm,ops.now());result.savedPreview=true;}}
+    if(i.complete){const backend=result.backend;if(backend?.managed&&backend.ready){saveRestartProof(state!,{...proofBinding,backend},result.confirm,ops.now());result.savedPreview=true;}}
    }
-   result.note=savedRestart?(result.savedPreview?'Preview saved for ten minutes. Re-run the same options with --apply; --apply --confirm HASH remains supported.':'Incomplete preview was not saved. Resolve unknown evidence and run adlc restart --all again before --apply.'):'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.';return result;
+    result.note=savedRestart?(result.savedPreview?'Preview saved for ten minutes. Re-run the same options with --apply; --apply --confirm HASH remains supported.':'Incomplete preview was not saved. Resolve unknown evidence and run adlc restart --all again before --apply.'):'Preview only. Re-run the same options with --apply --confirm HASH. Changed worker ownership/identity requires a new preview.';
+    if(result.restartContract)result.note+=' '+result.restartContract;
+    return result;
  }
  return ops.turns.run(async()=>{
   const time=()=>{if(ops.now()>=deadline)throw Error('Lifecycle timeout; remaining resources are reported. No force escalation was attempted');};
@@ -72,6 +77,13 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
   const wait=async(test:()=>Promise<boolean>)=>{for(;;){time();if(await test())return;await ops.sleep(Math.min(200,Math.max(1,deadline-ops.now())));}};
   try{
    time();
+    // Installation migrates the registered launcher before the running parent
+    // changes (install.ts). Permit guarded recovery from that stale launcher;
+    // executable trust and worker ownership remain mandatory before disruption.
+    // recordVerifiedRestart must verify the intended launcher after replacement.
+    // No ready daemon is not a foreign-daemon conflict. Confirmation and complete
+    // inventory are still required below, and startup must verify readiness.
+    if(action==='restart'&&o.all){result.backend=await ops.backend();if(result.backend.ready&&!result.backend.managed)throw Error('Restart backend identity check failed: a ready backend is not managed by this installation; backend and workers preserved. Inspect the failed backend checks in a fresh restart preview.');}
     if(disruptive){const i=await read();if(!o.confirm||o.confirm!==lifecycleConfirmation(action,o,ids,i))throw Error(savedRestart?`Confirmation missing or stale; run ${rerun}`:'Confirmation missing or stale; preview the exact selected action again');
      if(savedRestart){if(initialIdentity!==restartIdentity(state!))throw Error(`Restart identity changed; run ${rerun}`);
       if(!o.apply||!o.confirm)throw Error('Restart apply confirmation missing');
@@ -83,7 +95,13 @@ export async function controlManagedLifecycle(action:LifecycleAction,o:Lifecycle
    const start=async()=>{
     time();
     let releaseGlobal=false;
-    if(o.all){ops.turns.pause();await ops.backendStart();const b=await ops.backend();result.backend=b;if(!b.managed||!b.ready)throw Error('Managed backend readiness/compatibility unverified; intake remains paused');}
+    if(o.all){
+     ops.turns.pause();await ops.backendStart();const b=await ops.backend();result.backend=b;
+     if(!b.managed||!b.ready)throw Error('Managed backend readiness/compatibility unverified; intake remains paused');
+     // A stale prior launcher may be replaced, but the saved-restart path must
+     // verify its replacement before starting any project or recovery work.
+     if(savedRestart&&b.launcherVerified!==true)throw Error('Restart verification incomplete (managed-launcher); pending restart preserved and intake remains paused. Inspect the registered launcher, then run a fresh restart preview.');
+    }
     else{
      if(ops.turns.isPaused()){
       if(!ops.holdProject)throw Error('Cannot preserve other project pauses; global intake remains paused');

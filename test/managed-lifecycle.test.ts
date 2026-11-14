@@ -90,6 +90,31 @@ test('restart --all --preview returns a confirmation hash without mutations',asy
  const result=await lifecycleCLI('restart',['--all','--preview'],'unused',async(action,options)=>controlManagedLifecycle(action,options,f.ops));
  expect(result.preview).toBe(true);expect(result.confirm).toMatch(/^[a-f0-9]{64}$/);expect(f.calls).toEqual([]);expect(f.paused()).toBe(false);
 });
+test('desktop-first preview retains backend checks when inventory fails, without changing sessions or services',async()=>{
+ const f=fixture();f.ops.backend=async()=>({ready:true,loaded:false,managed:false,checks:[{check:'managed-executable',passed:false,nextAction:'Desktop-first bundled daemon: finish active work before an operator-controlled transition.'}]});
+ f.ops.inventory=async()=>{throw Error('Untrusted backend; preserved');};
+ const p=await controlManagedLifecycle('restart',{all:true,timeout:30},f.ops);
+ expect(p.backend.checks[0].check).toBe('managed-executable');expect(p.errors[0].resource).toBe('workers/processes');expect(p.savedPreview).toBeUndefined();expect(f.calls).toEqual([]);
+});
+test('foreign backend restart with explicit confirmation refuses before service or worker mutation',async()=>{
+ const f=fixture(),o={all:true,timeout:30};const p=await controlManagedLifecycle('restart',o,f.ops);
+ f.ops.backend=async()=>({ready:true,loaded:true,managed:false});
+  await expect(controlManagedLifecycle('restart',{...o,apply:true,confirm:p.confirm},f.ops)).rejects.toThrow('identity check failed');expect(f.calls).toEqual([]);
+});
+test('non-ready backend does not itself block a confirmed restart with complete inventory',async()=>{
+ const f=fixture();f.setWorkers([]);f.inventory.children=[];
+ const original=f.ops.backend,start=f.ops.backendStart;let started=false;
+ f.ops.backend=async()=>{const b=await original();return {...b,ready:started&&b.ready,loaded:started&&b.loaded};};
+ f.ops.backendStart=async()=>{await start();started=true;};
+ const result=await apply(f,'restart',{all:true,timeout:30});
+ expect(result.complete).toBe(true);expect(result.backend.ready).toBe(true);
+ expect(f.calls).toContain('backend:start');expect(f.calls).toContain('start:one:true');expect(f.calls).toContain('start:two:true');
+});
+test('non-ready backend still refuses incomplete inventory before any mutation',async()=>{
+ const f=fixture();f.ops.backend=async()=>({ready:false,loaded:false,managed:true});f.inventory.complete=false;
+ await expect(apply(f,'restart',{all:true,timeout:30})).rejects.toThrow('Worker/process inventory incomplete');
+ expect(f.calls).toEqual([]);
+});
 test('isolated CLI restart preview emits a confirmation hash without creating state',()=>{
  const root=mkdtempSync(join(tmpdir(),'managed-restart-preview-'));try{
   const db=join(root,'missing.sqlite'),ao=join(root,'fixture-ao');
