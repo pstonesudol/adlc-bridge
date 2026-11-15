@@ -78,7 +78,11 @@ export class LinearBlockers{
    this.s.db.query("UPDATE blocker_notices SET state='posted',created=?,reason=NULL WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
   }else{
    if(row.state!=='reserved')throw Error('Blocker comment delivery uncertain or missing; never repost blindly');
-   if(options?.guard)options.guard(await readLinearIssue(j.issue,this.api));
+    if(options?.guard){
+     const fresh=await readLinearIssue(j.issue,this.api);
+     if(!fresh||fresh.id!==j.issue||fresh.project?.id!==c.linear.projectId||fresh.team?.id!==c.linear.teamId||fresh.labels?.pageInfo?.hasNextPage!==false)throw Error('Linear blocker identity or label scope mismatch');
+     options.guard(fresh);
+    }
    const claim=this.s.db.query("UPDATE blocker_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
    if(!claim.changes)return {job,state:'delivery_uncertain',reason:'Blocker comment already claimed'};
    const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:row.comment_id,issueId:j.issue,body:row.body,doNotSubscribeToIssue:false}}).catch(()=>{throw Error('Blocker comment delivery uncertain; never repost blindly');});

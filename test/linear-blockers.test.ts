@@ -166,6 +166,31 @@ test('planning failure notice guards requirement changes before external publica
   await publisher.sync(f.config);expect(f.creates).toBe(0);
  }finally{f.s.close();}
 });
+for(const mismatch of ['project','team','identity','missing'] as const)test(`planning failure notice rejects ${mismatch} change on the pre-publication reread`,async()=>{
+ const f=fixture();try{
+  await planningFailure(f);const publisher=f.blockers(),api=publisher.api;
+  let reads=0;
+  publisher.api=async(q,v)=>{
+   const result=await api(q,v);
+   if(q.includes('query($id:String!){issue')){
+    reads++;
+    if(reads===2){
+     if(mismatch==='missing')return {issue:null};
+     const issue={...result.issue};
+     if(mismatch==='identity')issue.id='other';
+     else issue[mismatch]={id:'other'};
+     return {issue};
+    }
+   }
+   return result;
+  };
+  const result=await publisher.sync(f.config);
+  expect(reads).toBe(2);
+  expect(result).toContainEqual({job:f.id,state:'needs_reconciliation',reason:'Planning failure notice requires reconciliation; no blind repost'});
+  expect(f.creates).toBe(0);expect(f.updates).toBe(0);expect(f.comments).toHaveLength(0);expect(f.labels).toEqual(['ready','team']);
+  expect(f.s.db.query('SELECT state FROM blocker_notices WHERE job=?').get(f.id)).toEqual({state:'reserved'});
+ }finally{f.s.close();}
+});
 for(const [state,phase] of [['waiting_for_coderabbit','inventory'],['blocked','inventory'],['blocked','created']] as const)test(`CodeRabbit notice rejects a replacement approved plan during ${phase} (${state})`,async()=>{
  const f=fixture();try{
   f.running();const loop=new ReviewLoop(f.s),original=f.s.get(f.id),replacement='replacement approved plan',hash=digest(JSON.stringify([original.spec,replacement]));

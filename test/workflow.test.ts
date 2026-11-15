@@ -89,9 +89,11 @@ test('first planning blocker survives restart without another provider probe, tu
  const {s,f,w,id}=await failedFirstPlan(path);let reopened:Store|undefined;
  try{
   await w.tick(config);const saved=s.db.query('SELECT * FROM planning_failure_blockers').all();s.close();
-  reopened=new Store(path);f.s=reopened;
-  Object.assign(f,{planningFailureFacts:async()=>{throw Error('must not probe persisted failure');}});
-  const resumed=new Workflow(reopened,f);await resumed.tick(config);await resumed.tick(config);
+   reopened=new Store(path);f.s=reopened;
+   let probes=0;
+   Object.assign(f,{planningFailureFacts:async()=>{probes++;throw Error('must not probe persisted failure');}});
+   const resumed=new Workflow(reopened,f);await resumed.tick(config);await resumed.tick(config);
+   expect(probes).toBe(0);
   expect(reopened.db.query('SELECT * FROM planning_failure_blockers').all()).toEqual(saved);
   expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(0);expect(resumed.planning(id).state).toBe('needs_reconciliation');
  }finally{reopened?.close();if(!reopened)s.close();rmSync(root,{recursive:true,force:true});}
