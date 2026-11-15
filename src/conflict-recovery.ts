@@ -9,7 +9,7 @@ import {ReceiptReconciliation,RECEIPT_FRESHNESS_MS} from './receipt-reconciliati
 import {Lifecycle} from './lifecycle';
 import {DeliveryRecovery,type DeliveryFacts} from './delivery-recovery';
 import {recoveryTransport} from './delivery-evidence';
-import {readBranchSnapshot,type BranchSnapshot} from './branch-updates';
+import {readBranchSnapshot,branchTransport,type BranchSnapshot} from './branch-updates';
 import {assertDeliveryTarget} from './delivery-identity';
 import {sessionEvidence} from './session-evidence';
 import {liveTransport} from './workflow-transport';
@@ -44,12 +44,12 @@ export const verificationCommand:RecoveryCommand=async(args,cwd)=>{
    const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);return {code,out,err};
   }finally{rmSync(home,{recursive:true,force:true});}
 };
-export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;evidence:typeof sessionEvidence;command:RecoveryCommand;verify:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
+export type ConflictIO={facts(job:string,c:any):Promise<DeliveryFacts>;snapshot(repo:string,pr:number):Promise<BranchSnapshot>;contains(repo:string,ancestor:string,head:string):Promise<boolean>;evidence:typeof sessionEvidence;command:RecoveryCommand;verify:RecoveryCommand;send:typeof liveTransport.sendImplementation;submit:typeof withTurnSubmission};
 const sha=(v:string)=>/^[a-f0-9]{40,64}$/.test(v);
 export class ConflictRecovery{
  io:ConflictIO;
  constructor(public s:Store,overrides:Partial<ConflictIO>={}){
-   this.io=fencedIO({facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides});
+   this.io=fencedIO({facts:(job,c)=>recoveryTransport(s,undefined,undefined,true).inspect(job,c),snapshot:readBranchSnapshot,contains:branchTransport.contains!,evidence:sessionEvidence,command:recoveryCommand,verify:verificationCommand,send:liveTransport.sendImplementation,submit:withTurnSubmission,...overrides});
  }
  install(){this.s.db.exec(`CREATE TABLE IF NOT EXISTS conflict_recoveries(
  id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),plan TEXT NOT NULL,worktree TEXT NOT NULL,
@@ -77,7 +77,17 @@ export class ConflictRecovery{
     if(saved)publication=JSON.parse(saved.detail);
    }
    if(!sha(d.result??''))throw Error(`Reservation ${r.id}: missing exact published result SHA; preview reconcile-publication ${job} CONFIG SOURCE HUMAN`);
-   const x=await this.guard(r,c,d.result,publication?.proof?.base??r.base);
+   // Publication proves the base merged at handoff, not that the base will
+   // never advance again. Observe its successor without fetching or replaying
+   // Git; ordinary maintenance owns any subsequent update.
+   const publishedBase=publication?.proof?.base??r.base;
+   if(!sha(publishedBase))throw Error(`Reservation ${r.id}: exact verified publication base missing; reservation retained`);
+   const current=await this.io.snapshot(r.repo,r.pr);
+   const x=await this.guard(r,c,d.result,current.base);
+   if(current.base!==publishedBase){
+    if(!await this.io.contains(r.repo,publishedBase,d.result))throw Error(`Reservation ${r.id}: published head ${d.result} does not provably include verified base ${publishedBase}; reservation retained`);
+    if(!await this.io.contains(r.repo,publishedBase,current.base))throw Error(`Reservation ${r.id}: current base ${current.base} is not a proven descendant of published base ${publishedBase}; reservation retained`);
+   }
    if(x.e.session.projectId!==x.auth.project||x.e.session.kind!=='worker')throw Error(`Reservation ${r.id}: exact native worker/project identity missing`);
    const age=Date.now()-x.e.receiptObservation?.observed;
    if(x.e.receiptObservation?.complete!==true||!Number.isFinite(age)||age<0||age>RECEIPT_FRESHNESS_MS||!Array.isArray(x.e.transcript.entries)||new Set(x.e.transcript.turns.map((t:any)=>t.id)).size!==x.e.transcript.turns.length)throw Error(`Reservation ${r.id}: fresh complete authoritative delivery inventory missing`);
@@ -87,7 +97,7 @@ export class ConflictRecovery{
    const verified=(v:any)=>Array.isArray(v)&&v.length===c.conflictRecovery.verification.length&&v.every((item:any,i:number)=>item.code===0&&JSON.stringify(item.argv)===JSON.stringify(c.conflictRecovery.verification[i]));
    if(publication){
     const p=publication.proof;
-    if(p?.active?.id!==r.id||p.head!==d.result||p.base!==x.b.base||p.target?.repo!==r.repo||p.target?.pr!==r.pr||p.worktree!==x.facts.worktree||p.branch!==r.branch||JSON.stringify(p.auth)!==JSON.stringify(x.auth)||JSON.stringify(p.policy)!==r.policy||p.message==='uncertain'||!verified(publication.verification))throw Error(`Reservation ${r.id}: attributable current publication/verification or terminal delivery proof missing`);
+    if(p?.active?.id!==r.id||p.head!==d.result||p.target?.repo!==r.repo||p.target?.pr!==r.pr||p.worktree!==x.facts.worktree||p.branch!==r.branch||JSON.stringify(p.auth)!==JSON.stringify(x.auth)||JSON.stringify(p.policy)!==r.policy||p.message==='uncertain'||!verified(publication.verification))throw Error(`Reservation ${r.id}: attributable current publication/verification or terminal delivery proof missing`);
    }else{
     if(d.tree!==tree||!verified(d.verification)||await this.git(r.worktree,'show','-s','--format=%P',d.result)!==`${r.head} ${r.base}`)throw Error(`Reservation ${r.id}: exact merge tree/parents and successful configured verification proof missing`);
     if(!Array.isArray(d.conflicts))throw Error(`Reservation ${r.id}: recorded conflict set missing`);

@@ -18,6 +18,7 @@ import {sendPilotRemediation} from '../src/pilot';
 import {assertWorktreeAvailable,worktreeReservation,conflictRecoveryStatus} from '../src/worktree-reservation';
 import {DeliveryRecovery} from '../src/delivery-recovery';
 import {maintenance} from '../src/maintenance';
+import {ActionWatchdog} from '../src/action-watchdog';
 
 async function fixture(filename='app.txt'){
  const dir=realpathSync(mkdtempSync(join(tmpdir(),'adlc-conflict-'))),source=join(dir,'source'),remote=join(dir,'remote.git'),tree=join(dir,'tree');
@@ -43,8 +44,9 @@ async function fixture(filename='app.txt'){
  let sends=0,owners=['worker'],idle=true,lost=false;
   const initialHead=await git(remote,'rev-parse',`refs/heads/${reserved.branch}`);
   const snapshot=async()=>{const head=await git(remote,'rev-parse',`refs/heads/${reserved.branch}`);return {head,base:await git(remote,'rev-parse','refs/heads/main'),branch:reserved.branch,baseBranch:'main',defaultBranch:'main',headRepo:'owner/repo',baseRepo:'owner/repo',state:'open',draft:false,mergeable:head===initialHead?false:true,behind:head===initialHead?1:0};};
-  const io={command,snapshot,evidence:async()=>({...e,receiptObservation:{complete:true,observed:Date.now()}}),submit:async<T>(fn:()=>Promise<T>)=>fn(),send:async(_s:string,_p:string,id:string)=>{sends++;if(lost)throw Error('Lost receipt');e.transcript.entries=[{clientMessageId:id,turnId:'resolution'}];e.transcript.turns=[{id:'resolution',state:'running'}];},facts:async()=>{const b=await snapshot();return {session:'worker',project:'ao',reserved:reserved.branch,worktree:tree,branch:await git(tree,'branch','--show-current'),head:await git(tree,'rev-parse','HEAD'),anchor:await git(tree,'rev-parse',reserved.branch),clean:!(await git(tree,'status','--porcelain')),isolated:true,lineage:true,idle,completed:true,owners,candidates:[{repo:'owner/repo',pr:1,url:'https://github.com/owner/repo/pull/1',branch:reserved.branch,head:b.head,baseBranch:'main',defaultBranch:'main',fork:false,state:'open',draft:false}]};}};
- const recovery=new ConflictRecovery(s,io as any);
+  const contains=async(_repo:string,ancestor:string,head:string)=>(await command(['git','merge-base','--is-ancestor',ancestor,head],tree)).code===0;
+  const io={command,snapshot,contains,evidence:async()=>({...e,receiptObservation:{complete:true,observed:Date.now()}}),submit:async<T>(fn:()=>Promise<T>)=>fn(),send:async(_s:string,_p:string,id:string)=>{sends++;if(lost)throw Error('Lost receipt');e.transcript.entries=[{clientMessageId:id,turnId:'resolution'}];e.transcript.turns=[{id:'resolution',state:'running'}];},facts:async()=>{const b=await snapshot();return {session:'worker',project:'ao',reserved:reserved.branch,worktree:tree,branch:await git(tree,'branch','--show-current'),head:await git(tree,'rev-parse','HEAD'),anchor:await git(tree,'rev-parse',reserved.branch),clean:!(await git(tree,'status','--porcelain')),isolated:true,lineage:true,idle,completed:true,owners,candidates:[{repo:'owner/repo',pr:1,url:'https://github.com/owner/repo/pull/1',branch:reserved.branch,head:b.head,baseBranch:'main',defaultBranch:'main',fork:false,state:'open',draft:false}]};}};
+  const recovery=new ConflictRecovery(s,io as any);
   return {s,job,workflow,l,plan,config,dir,tree,remote,source,branch:reserved.branch,e,io,recovery,commands,git,sends:()=>sends,setOwners:(v:string[])=>owners=v,lose:()=>lost=true,resolve:()=>{writeFileSync(join(tree,filename),'feature=new\nsafety=new\n');e.transcript.turns=[{id:'resolution',state:'completed'}];e.transcript.entries.push({kind:'message',role:'assistant',origin:'provider',streaming:false,turnId:'resolution',text:`<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome:'host-ready',reason:`Resolved ${filename}; host staging, verification and publication remain`,questions:[],dependencies:[]})} -->`});},close:()=>{s.close();rmSync(dir,{recursive:true,force:true});}};
 }
 test('reserved conflict recovery retries six read failures before any mutation',async()=>{
@@ -162,6 +164,52 @@ for(const incident of ['DEV-82','DEV-110'])test(`${incident}: reboot settles exa
   expect(f.sends()).toBe(1);expect(mutating(f.commands.slice(mark))).toHaveLength(0);
   expect(f.s.get(f.job).attempts).toBe(attempts);expect(JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all())).toBe(budget);
  }finally{reopened?.close();f.close();}
+},60000);
+test('DEV-121: restart reconciles verified operator handoff after base advances, then schedules one clean behind update',async()=>{
+ const f=await fixture();let reopened:Store|undefined;
+ try{
+  await f.recovery.tick(f.job,f.config,'owner/repo',1);f.resolve();
+  await f.git(f.tree,'add','app.txt');await f.git(f.tree,'commit','-m','Operator-assisted base merge');await f.git(f.tree,'push','origin',`HEAD:refs/heads/${f.branch}`);
+  const preview=await f.recovery.publishedPreview(f.job,f.config,'merge','human');
+  await f.recovery.publishedConfirm(f.job,f.config,'merge','human',preview.confirmation);
+  const r=f.recovery.row(f.job),head=JSON.parse(r.detail).result;
+  // A retained legacy reservation still points at an attributable, verified
+  // publication. The later base tip is not the base of that handoff.
+  f.s.db.query("UPDATE conflict_recoveries SET state='resolving',reason='Retained after operator handoff' WHERE id=?").run(r.id);
+  f.s.db.query("UPDATE review_targets SET state='blocked',reason='Stale review evidence',head=?").run(head);
+  const ledger=new ReceiptReconciliation(f.s);
+  ledger.reserve({job:f.job,plan:f.plan,spec:digest(f.s.get(f.job).spec),session:'worker',client:'original',attempt:'implementation:1'});ledger.accepted('original');
+  f.e.transcript.entries.unshift({clientMessageId:'original',turnId:'implementation'});f.e.transcript.turns.unshift({id:'implementation',state:'completed'});
+  writeFileSync(join(f.source,'later-base.txt'),'new base change\n');await f.git(f.source,'add','.');await f.git(f.source,'commit','-m','Base advances after handoff');await f.git(f.source,'push','origin','main');
+  const snapshot=async()=>({...await f.io.snapshot(),behind:1,mergeable:true});
+  const io={...f.io,snapshot},c={...f.config,automation:{planningEnabled:true,orchestratorProject:'ao'},branchUpdate:{enabled:true,authorizedBy:'human',maxUpdates:3}};
+  reopened=new Store(join(f.dir,'state.sqlite'));
+  const w=new Workflow(reopened,{...io,worktree:async()=>({tree:f.tree,branch:f.branch,head}),branchSnapshot:snapshot} as any);
+  const startup=new StartupRecovery(reopened,w,{inventory:async()=>[f.e.session],requirements:async()=>{},inspect:async()=>({tree:f.tree,branch:f.branch,prs:[{url:'https://github.com/owner/repo/pull/1'}]}) as any,conflict:io as any});
+  const mark=f.commands.length,budget=JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all());
+  for(let n=0;n<2;n++)expect(await startup.pass(c,true)).toMatchObject({blocked:0,reattached:1});
+  expect(worktreeReservation(reopened,f.job)).toBeUndefined();
+  expect(reopened.db.query("SELECT count(*) AS n FROM events WHERE kind='conflict_reservation_settled'").get()).toEqual({n:1});
+  expect(reopened.db.query('SELECT state,reason FROM review_targets').get()).toMatchObject({state:'blocked',reason:'Stale review evidence'});
+  const watchdog=new ActionWatchdog(reopened);expect(watchdog.beginMaintenance(f.job,c)).toBe(true);
+  let updates=0;const updater=new BranchUpdates(reopened,{read:snapshot,contains:io.contains,update:async(repo,pr,expected)=>{expect([repo,pr,expected]).toEqual(['owner/repo',1,head]);updates++;}});
+  for(let n=0;n<3;n++)expect((await updater.ensure(f.job,'owner/repo',1,f.e,c.branchUpdate))?.state).toBe('updating_branch');
+  expect(updates).toBe(1);expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+  expect(JSON.stringify(f.s.db.query('SELECT * FROM remediation_budget').all())).toBe(budget);
+ }finally{reopened?.close();f.close();}
+},60000);
+for(const fault of ['missing-inclusion','unrelated-base','unavailable'])test(`DEV-121: advanced-base settlement retains reservation on ${fault}`,async()=>{
+ const f=await fixture();try{
+  const r=await publishedReservation(f),head=JSON.parse(r.detail).result,base='f'.repeat(40),mark=f.commands.length;
+  const io={...f.io,snapshot:async()=>({...await f.io.snapshot(),base,behind:1}),contains:async(_repo:string,_ancestor:string,descendant:string)=>{
+   if(fault==='unavailable')throw Error('Base ancestry observation unavailable');
+   return fault==='missing-inclusion'?descendant!==head:descendant!==base;
+  }};
+  const recovery=new ConflictRecovery(f.s,io as any),before=recovery.row(f.job),target=f.s.db.query('SELECT * FROM review_targets').get();
+  await expect(recovery.reconcileSettled(f.job,f.config)).rejects.toThrow(fault==='missing-inclusion'?'does not provably include':fault==='unrelated-base'?'not a proven descendant':'ancestry observation unavailable');
+  expect(recovery.row(f.job)).toEqual(before);expect(worktreeReservation(f.s,f.job)?.id).toBe(r.id);
+  expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(target);expect(mutating(f.commands.slice(mark))).toHaveLength(0);expect(f.sends()).toBe(1);
+ }finally{f.close();}
 },60000);
 test('settlement preserves unrelated review and budget gates and is idempotent',async()=>{
  const f=await fixture();try{
