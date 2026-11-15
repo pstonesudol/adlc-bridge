@@ -54,6 +54,77 @@ class Fake implements WorkflowTransport{
   e.session.prs=[{state:'open',number:1,url:'https://github.com/owner/repo/pull/1'}];
  }
 }
+async function failedFirstPlan(path=':memory:'){
+ const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','first-failure',JSON.stringify({identifier:'DEV-111',title:'Task',description:'Report failure only'}));
+ await w.startPlanning(id,config);
+ const e=f.sessions.get('session-1'),d=w.planning(id);
+ e.transcript={controller:'ready',entries:[{sequence:1,kind:'message',role:'user',clientMessageId:d.client_id,turnId:'first',text:f.starts[0].prompt}],turns:[{id:'first',state:'failed'}]};
+ return {s,f,w,id,e};
+}
+for(const [error,authenticationState,classification,action] of [
+ [{code:'subscription_sharing_unsupported_capability'},'authenticated','fresh_conversation_unverified','documented, verified'],
+ [{httpStatus:401},'unauthenticated','authentication','Sign in'],
+ ['HTTP 401 subscription_sharing_unsupported_capability PRIVATE','authenticated','unknown','Inspect the original'],
+ [undefined,undefined,'unknown','Inspect the original'],
+] as const)test(`first planning failure reports ${classification} without any recovery dispatch (${action})`,async()=>{
+ const {s,f,w,id,e}=await failedFirstPlan();try{
+  Object.assign(f,{planningFailureFacts:async()=>({turn:{id:'first',state:'failed',error},capabilities:['fork_current','resume'],authenticationState})});
+  const run=new Planning(s).get(id),receipt=structuredClone(e.transcript),dispatch=w.planning(id);
+  const {ApprovalPolicyStore}=await import('../src/approval-policy');
+  const c={...config,approval:{mode:'ready-queue' as const,id:'queue',authorizedBy:'human',scope:['src/**'],gitScope:'feature-pr' as const}};
+  new ApprovalPolicyStore(s).snapshot('p',new Set(['first-failure']));
+  await Promise.all([w.tick(c),w.tick(c)]);await w.tick(c);
+  const blockers=s.db.query('SELECT * FROM planning_failure_blockers').all() as any[];
+  expect(blockers).toHaveLength(1);expect(blockers[0]).toMatchObject({classification,session_id:'session-1',turn_id:'first',client_id:dispatch.client_id,worktree:run.worktree});
+  expect(blockers[0].next_action).toContain(action);expect(JSON.stringify(blockers)).not.toContain('PRIVATE');
+  expect(w.planning(id)).toMatchObject({state:'needs_reconciliation',client_id:dispatch.client_id,session_id:dispatch.session_id});
+  expect(new Planning(s).get(id)).toEqual(run);expect(e.transcript).toEqual(receipt);expect(s.get(id)).toMatchObject({state:'awaiting_plan',plan:null,approved_hash:null});
+  expect(w.implementation(id)).toBeNull();expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(0);
+  expect(()=>w.approve(id,'invented','human',['src/**'],'supervised-host',ops)).toThrow('captured current plan');
+  expect(s.db.query("SELECT * FROM events WHERE kind='first_planning_failure_blocked'").all()).toHaveLength(1);
+ }finally{s.close();}
+});
+test('first planning blocker survives restart without another provider probe, turn, or worker',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'planning-failure-')),path=join(root,'state.sqlite');
+ const {s,f,w,id}=await failedFirstPlan(path);let reopened:Store|undefined;
+ try{
+  await w.tick(config);const saved=s.db.query('SELECT * FROM planning_failure_blockers').all();s.close();
+  reopened=new Store(path);f.s=reopened;
+  Object.assign(f,{planningFailureFacts:async()=>{throw Error('must not probe persisted failure');}});
+  const resumed=new Workflow(reopened,f);await resumed.tick(config);await resumed.tick(config);
+  expect(reopened.db.query('SELECT * FROM planning_failure_blockers').all()).toEqual(saved);
+  expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(0);expect(resumed.planning(id).state).toBe('needs_reconciliation');
+ }finally{reopened?.close();if(!reopened)s.close();rmSync(root,{recursive:true,force:true});}
+});
+for(const change of ['receipt','duplicate','later-turn','stale','owner'] as const)test(`ambiguous first planning evidence (${change}) cannot acquire a classified failure`,async()=>{
+ const {s,f,w,e}=await failedFirstPlan();try{
+  if(change==='receipt')e.transcript.entries=[];
+  if(change==='duplicate')e.transcript.entries.push({...e.transcript.entries[0],sequence:2});
+  if(change==='later-turn')e.transcript.turns.push({id:'other',state:'failed'});
+  if(change==='owner')e.session.id='other';
+  if(change==='stale')f.evidence=async()=>({...e,receiptObservation:{complete:true,observed:Date.now()-120001}});
+  await w.tick(config);expect(s.db.query('SELECT * FROM planning_failure_blockers').all()).toHaveLength(0);expect(f.sends).toHaveLength(0);expect(f.starts).toHaveLength(1);
+ }finally{s.close();}
+});
+test('requirements changed during failure observation cannot persist stale classification',async()=>{
+ const {s,f,w,id}=await failedFirstPlan();try{
+  Object.assign(f,{planningFailureFacts:async()=>{s.enqueue('p','first-failure','changed requirements');return {turn:{id:'first',state:'failed',error:{httpStatus:401}},authenticationState:'unauthenticated'};}});
+  await w.tick(config);expect(s.db.query('SELECT * FROM planning_failure_blockers').all()).toHaveLength(0);expect(f.sends).toHaveLength(0);expect(w.implementation(id)).toBeNull();
+ }finally{s.close();}
+});
+test('routed planning failure binds and preserves the original message delivery rather than the spawn request',async()=>{
+ const {s,f,w,id,e}=await failedFirstPlan();try{
+  const route={harness:'codex',model:'model',mode:'plan'} as any;e.session.harness='codex';
+  const client='original-plan-message';e.transcript.entries[0].clientMessageId=client;
+  s.db.query('INSERT INTO planning_delivery VALUES (?,?,?,?)').run(id,'session-1',client,'accepted');
+  const delivery=s.db.query('SELECT * FROM planning_delivery WHERE job=?').get(id);
+  Object.assign(f,{planningFailureFacts:async()=>({turn:{id:'first',state:'failed',error:{code:'subscription_sharing_unsupported_capability'}},authenticationState:'authenticated',capabilities:['fork_current']})});
+  for(let n=0;n<2;n++)expect(await w.deliverPlanning(id,'session-1',route,undefined,config)).toMatchObject({state:'needs_reconciliation'});
+  expect(s.db.query('SELECT * FROM planning_delivery WHERE job=?').get(id)).toEqual(delivery);
+  expect(s.db.query('SELECT client_id FROM planning_failure_blockers').all()).toEqual([{client_id:client}]);
+  expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(0);expect(w.implementation(id)).toBeNull();
+ }finally{s.close();}
+});
 async function planned(path=':memory:'){
  const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue',JSON.stringify({identifier:'DEMO-1',title:'Test',description:'Update src/a.ts'}));
  await w.tick(config);f.completePlan();await w.tick(config);return {s,f,w,id,hash:s.get(id).plan_hash};

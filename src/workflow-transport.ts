@@ -53,7 +53,16 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
    if(d.session?.id===s.id&&d.session.projectId===project&&d.session.branch===branch&&(includeTerminated||!d.session.isTerminated))matches.push(d.session);
   }return matches;
  },
-  evidence:sessionEvidence,
+   evidence:sessionEvidence,
+   async planningFailureFacts(session,turn){
+    if(!/^[\w-]+$/.test(session))throw Error('Invalid planning session');
+    const snapshot=await api(`sessions/${encodeURIComponent(session)}/conversation`);
+    const matches=Array.isArray(snapshot.turns)?snapshot.turns.filter((t:any)=>t.id===turn):[];
+    if(matches.length!==1||snapshot.controller!=='ready')throw Error('Unverified failed planning turn');
+    // No capability in the current adapter verifies fresh-conversation creation.
+    // In particular fork_current/history/resume cannot be substituted for it.
+    return {turn:matches[0],capabilities:snapshot.capabilities,authenticationState:snapshot.account?.authenticationState};
+   },
   planningPRs:readPlanningPRs,
   async restorePlan(session,project){
    let p:ReturnType<typeof spawn>;

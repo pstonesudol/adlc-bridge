@@ -16,13 +16,25 @@ export function safeOutput<T>(value:T):T{
 }
 export function hasTable(s:Store,name:string){return !!s.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);}
 export function evidenceRows(s:Store,name:string,job:string){return hasTable(s,name)?s.db.query(`SELECT * FROM ${name} WHERE job=? LIMIT 100`).all(job) as any[]:[];}
+/** Historical failures never attach themselves to a new requirement/owner. */
+export function currentPlanningFailure(s:Store,job:string):any{
+ const j=s.get(job);
+ if(j.state!=='awaiting_plan'||!hasTable(s,'planning_failure_blockers'))return null;
+ const p=evidenceRows(s,'planning_runs',job)[0],d=evidenceRows(s,'planning_dispatch',job)[0];
+ if(!p||!d||d.state!=='needs_reconciliation'||p.spec_hash!==digest(j.spec)||d.spec_hash!==p.spec_hash||p.session_id!==d.session_id)return null;
+ const row=s.db.query('SELECT * FROM planning_failure_blockers WHERE job=? AND spec_hash=? AND revision_id IS ? AND session_id=? AND worktree=? AND dispatch_client=? ORDER BY observed DESC LIMIT 1').get(job,p.spec_hash,latestRevision(s,job)?.id??null,p.session_id,p.worktree,d.client_id) as any;
+ const delivery=evidenceRows(s,'planning_delivery',job)[0];
+ return row&&row.client_id===(delivery?.client_id??d.client_id)&&(!delivery||delivery.session_id===p.session_id)&&d.reason===row.reason?row:null;
+}
 export type OperatorBlocker={code:string;reason:string;nextAction:string;observedAt:string|number|null;kind:'blocker'|'wait'};
 /** Read-only presentation of existing engine outcomes, never a lifecycle engine. */
 export function jobBlockers(s:Store,job:string){
  const j=s.get(job),blockers:OperatorBlocker[]=[];
  if(j.state==='done')return {version:digest(JSON.stringify([j.plan_hash,'done'])),primary:null,blockers};
  const add=(code:string,reason:string,nextAction:string,observedAt:any=null,kind:'blocker'|'wait'='blocker')=>blockers.push({code,reason:redact(reason),nextAction,observedAt,kind});
- const inspect=`adlc jobs explain ${job} --project ${j.project}`;
+  const inspect=`adlc jobs explain ${job} --project ${j.project}`;
+  const planningFailure=currentPlanningFailure(s,job);
+  if(planningFailure)add(`planning_failure:${planningFailure.classification}`,planningFailure.reason,planningFailure.next_action,planningFailure.observed);
  const revision=latestRevision(s,job);
  if(revision&&!['authorized','preplanning'].includes(revision.state))add('requirements_changed','Requirements changed; previous approval cannot authorize continuation',`adlc spec-reconcile ${job} CONFIG`,revision.created);
  if(j.plan_hash&&j.plan_hash!==digest(JSON.stringify([j.spec,j.plan])))add('stale_plan','Plan does not bind current requirements',`adlc plan-reconcile ${job} CONFIG SEQUENCE`,j.updated);

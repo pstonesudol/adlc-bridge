@@ -3,7 +3,7 @@ import {Store} from './core';
 import {actionStatus} from './action-watchdog';
 import {receiptStatus} from './remediation-receipts';
 import {maintenanceStatus} from './branch-maintenance';
-import {jobBlockers,blockerText,safeOutput} from './operator-evidence';
+import {jobBlockers,blockerText,safeOutput,currentPlanningFailure} from './operator-evidence';
 export class OperatorError extends Error {
  constructor(message:string,public code=2,public candidates:unknown[]=[]){super(message);}
 }
@@ -50,7 +50,8 @@ export function jobViews(path:string,project?:string,reference?:string){
     const planning=table('planning_dispatch',j.id),implementation=table('implementation_dispatch',j.id),outcome=table('worker_outcomes',j.id),wait=table('dependency_waits',j.id),observation=table('recovery_observations',j.id);
    const currentOutcome=outcome?.plan_hash===j.plan_hash&&!(wait?.plan===j.plan_hash&&wait.state==='resumed')?outcome:null;
    const dependency=wait?.plan===j.plan_hash&&wait.state==='waiting_for_dependencies'?wait:null;
-   const state=j.state==='done'?'complete':j.state==='blocked'?'blocked':dependency||currentOutcome?.outcome==='blocked_dependency'?'dependency_wait':currentOutcome&&['needs_input','failed','uncertain','needs_reconciliation'].includes(currentOutcome.outcome)?'blocked':j.state==='awaiting_approval'?'approval_wait':j.state==='awaiting_plan'&&!planning?'awaiting_plan':'working';
+   const planningFailure=currentPlanningFailure(s,j.id);
+   const state=j.state==='done'?'complete':j.state==='blocked'||planningFailure?'blocked':dependency||currentOutcome?.outcome==='blocked_dependency'?'dependency_wait':currentOutcome&&['needs_input','failed','uncertain','needs_reconciliation'].includes(currentOutcome.outcome)?'blocked':j.state==='awaiting_approval'?'approval_wait':j.state==='awaiting_plan'&&!planning?'awaiting_plan':'working';
    let ticket=null;try{ticket=JSON.parse(j.spec).identifier??null;}catch{}
     let readError=null;try{readError=JSON.parse(observation?.reason??'null');}catch{}
      const automatic=!readError||['throttled','timeout','network','server'].includes(readError.classification),activeObservation=observation&&state==='working'&&j.state==='approved'&&j.approved_hash===j.plan_hash;
@@ -58,8 +59,8 @@ export function jobViews(path:string,project?:string,reference?:string){
       const blockers=jobBlockers(s,j.id);
      const phase=state==='complete'?'complete':blockers.blockers.some(b=>b.code==='requirements_changed')?'requirements_changed':blockers.blockers.some(b=>/uncertain|reconciliation/.test(b.code))?'uncertain_delivery':blockers.blockers.some(b=>b.code==='budget_exhausted')?'budget_exhausted':blockers.primary?.code??(implementation?.state?.includes('queued')||planning?.state?.includes('queued')?'queued':state==='working'?'tracked_activity_unknown':state);
      return safeOutput({job:j.id,project:j.project,issue:j.issue,ticket,...blockers,phase,views:{review:table('review_targets',j.id)?'persisted target present':'No persisted review target; this does not imply no job or no work.',dependencies:dependency?'Current dependency wait':'No current persisted dependency wait; admission remains unverified.'},state:activeObservation?(automatic?'observation_wait':'blocked'):state,orchestrationState:j.state,observation:observation?{failures:observation.failures,nextRetry:activeObservation&&automatic?observation.next_read:null,error:readError,evidenceAgeMs:readError?.timestamp?Math.max(0,Date.now()-readError.timestamp):null}:null,
-     reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
-     nextAction:activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.',
+     reason:activeObservation?`${readError?.provider??'unknown'} read observation: ${readError?.classification??'legacy unknown cause'}; other persisted blockers remain applicable`:j.reason??planningFailure?.reason??dependency?.reason??currentOutcome?.reason??`Persisted job state: ${j.state}`,
+     nextAction:planningFailure?.next_action??(activeObservation?(automatic?'Wait for a supervised observation probe; inspect review-status for cooldown.':`Inspect provider access/configuration locally, then adlc retry-observation ${j.id}; do not replay mutations.`):state==='awaiting_plan'?'Inspect queue list for eligibility and planning capacity; no worker has been dispatched.':state==='complete'?'No job action required; merging remains human-only.':state==='approval_wait'?`adlc jobs show-plan ${j.id}`:state==='dependency_wait'?'adlc jobs dependency-status':state==='blocked'?`adlc jobs recover ${j.id}`:'Inspect existing worker in Agent Orchestrator; inspection does not dispatch.'),
       watchdog:actionStatus(s,j.id),
        receipts,
        maintenance:maintenanceStatus(s,j.id),review:table('review_targets',j.id),reviewerPolicy:table('reviewer_policy',j.id),reviewerEvidence:table('reviewer_observations',j.id),

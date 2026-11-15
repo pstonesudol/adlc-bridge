@@ -8,6 +8,10 @@ import {ReviewLoop,decision} from '../src/review-loop';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {Lifecycle} from '../src/lifecycle';
+import {Planning} from '../src/planning';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 test('posted observation notice is rechecked hourly without duplicates',async()=>{
  const f=fixture();try{
  f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));
@@ -76,8 +80,8 @@ test('CodeRabbit cooldown notices deduplicate and do not apply a blocker label w
   expect(f.creates).toBe(2);expect(f.comments[1].body).toContain('retry budget exhausted');expect(f.labels).toContain(labelId);
  }finally{f.s.close();}
 });
-function fixture(){
- const s=new Store(':memory:');new Workflow(s,{} as any);
+function fixture(path=':memory:'){
+ const s=new Store(path);new Workflow(s,{} as any);
  const id=s.enqueue('p','issue',spec);
  const planHash=digest(JSON.stringify([spec,'plan']));
  s.db.query("UPDATE jobs SET state='approved',plan='plan',plan_hash=?,approved_hash=?,actor='human' WHERE id=?").run(planHash,planHash,id);
@@ -133,6 +137,35 @@ function fixture(){
   blockers:()=>new LinearBlockers(s,api)
  };
 }
+async function planningFailure(f:ReturnType<typeof fixture>){
+ f.s.db.query("UPDATE jobs SET state='awaiting_plan',plan=NULL,plan_hash=NULL,approved_hash=NULL,actor=NULL WHERE id=?").run(f.id);
+ const p=new Planning(f.s),r=p.reserve(f.id,'ao');p.gate(f.id,'ao','worker',r.branch,'/worktree');
+ f.s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(f.id,r.spec_hash,'planning','worker',null,'first-client');
+ const w=new Workflow(f.s,{evidence:async()=>({session:{id:'worker',projectId:'ao',branch:r.branch,isTerminated:false},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[{kind:'message',role:'user',clientMessageId:'first-client',turnId:'first'}],turns:[{id:'first',state:'failed'}]}})} as any);
+ await w.reconcilePlanning(f.id,f.config);
+}
+test('first planning failure notice is comment-only and deduplicated after restart and lost response',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'planning-notice-')),path=join(root,'state.sqlite'),f=fixture(path);let reopened:Store|undefined;
+ try{
+  await planningFailure(f);const saved=f.s.db.query('SELECT * FROM planning_failure_blockers').all(),dispatch=f.s.db.query('SELECT * FROM planning_dispatch').all();
+  const publisher=f.blockers();f.loseReplyAfterCreate();
+  await publisher.sync(f.config);expect(f.creates).toBe(1);expect(f.updates).toBe(0);
+  f.s.close();reopened=new Store(path);const resumed=new LinearBlockers(reopened,publisher.api);
+  await Promise.all([resumed.sync(f.config),resumed.sync(f.config)]);await resumed.sync(f.config);
+  expect(f.creates).toBe(1);expect(f.updates).toBe(0);expect(f.labels).toEqual(['ready','team']);
+  expect(f.comments[0].body).toContain('first planning turn blocked');expect(f.comments[0].body).toContain('Next action: Inspect the original failed turn');expect(f.comments[0].body).toContain('No retry');
+  expect(reopened.db.query('SELECT * FROM planning_failure_blockers').all()).toEqual(saved);expect(reopened.db.query('SELECT * FROM planning_dispatch').all()).toEqual(dispatch);
+  expect(reopened.get(f.id)).toMatchObject({state:'awaiting_plan',plan:null,approved_hash:null});
+ }finally{reopened?.close();if(!reopened)f.s.close();rmSync(root,{recursive:true,force:true});}
+});
+test('planning failure notice guards requirement changes before external publication',async()=>{
+ const f=fixture();try{
+  await planningFailure(f);const publisher=f.blockers(),api=publisher.api;
+  publisher.api=async(q,v)=>{const result=await api(q,v);if(q.includes('comments(first:100'))f.s.enqueue('p','issue','changed requirements');return result;};
+  await publisher.sync(f.config);expect(f.creates).toBe(0);expect(f.updates).toBe(0);
+  await publisher.sync(f.config);expect(f.creates).toBe(0);
+ }finally{f.s.close();}
+});
 for(const [state,phase] of [['waiting_for_coderabbit','inventory'],['blocked','inventory'],['blocked','created']] as const)test(`CodeRabbit notice rejects a replacement approved plan during ${phase} (${state})`,async()=>{
  const f=fixture();try{
   f.running();const loop=new ReviewLoop(f.s),original=f.s.get(f.id),replacement='replacement approved plan',hash=digest(JSON.stringify([original.spec,replacement]));

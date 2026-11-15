@@ -6,7 +6,7 @@ import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
 import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} from './spec-revisions';
 import {readinessFor,applicableResolution} from './readiness';
-import {jobBlockers,blockerText,redact} from './operator-evidence';
+import {jobBlockers,blockerText,redact,currentPlanningFailure} from './operator-evidence';
 
 export type BlockerSurface={enabled:boolean;labelId?:string};
 export type BlockerConfig={linear:{projectId:string;teamId:string;readyLabelId?:string};blockerSync?:BlockerSurface};
@@ -143,7 +143,18 @@ export class LinearBlockers{
    FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.project=? AND j.state NOT IN ('awaiting_plan','done') AND w.plan_hash=j.plan_hash`).all(c.linear.projectId) as any[]).map(r=>({...r,worker:true}));
    const results:any[]=[];
     const recoveries=recoveryRows(this.s);
-    const handled=new Set<string>();
+     const handled=new Set<string>();
+    for(const j of this.s.list().filter(j=>j.project===c.linear.projectId&&j.state==='awaiting_plan')){
+     const failure=currentPlanningFailure(this.s,j.id);if(!failure)continue;
+     handled.add(j.id);
+     const spec=this.s.get(j.id).spec;
+     const guard=(issue:any)=>{
+      if(currentPlanningFailure(this.s,j.id)?.binding!==failure.binding||this.s.get(j.id).spec!==spec||spec!==JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''}))throw Error('Planning failure requirements or ownership changed; refresh before publication');
+     };
+     const body=`## ADLC: first planning turn blocked\n\nReason: ${failure.reason}\n\nNext action: ${failure.next_action}\n\nThe existing worker, worktree and failed planning receipt are preserved. No retry, conversation creation or worker replacement is authorized. Normal readiness and approval gates remain required.`;
+     try{results.push(await this.leave(j.id,{plan_hash:null,outcome:'needs_reconciliation',reason:failure.reason,questions:'[]',dependencies:'[]'},c,{binding:`planning-failure:${failure.binding}`,body,applyLabel:false,guard}));}
+     catch{results.push({job:j.id,state:'needs_reconciliation',reason:'Planning failure notice requires reconciliation; no blind repost'});}
+    }
    // Invalid planning evidence is a reconciliation gate, not an invitation to
    // approve it. Reuse this publisher's durable dedupe and uncertainty handling.
    for(const j of this.s.list().filter(j=>j.project===c.linear.projectId&&j.state==='awaiting_approval')){

@@ -24,6 +24,8 @@ import {RoutePreflightFailure} from './routing-session';
 import {ensureDispatchRoutes,recordDispatchRoute} from './dispatch-route';
 import type {PlanningPRInventory} from './planning-prs';
 import {activePlanning,assertPlanningCapacity} from './planning-capacity';
+import {currentPlanningFailure} from './operator-evidence';
+import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 
 export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 export {activePlanning} from './planning-capacity';
@@ -40,6 +42,7 @@ export interface WorkflowTransport{
   branchSnapshot?(repo:string,pr:number):Promise<any>;
   planningPRs?(repo:string,branch:string):Promise<PlanningPRInventory>;
   restorePlan?(session:string,project:string):Promise<void>;
+  planningFailureFacts?(session:string,turn:string):Promise<{turn:any;capabilities:unknown;authenticationState:unknown}>;
 }
 export class Workflow{
  planningDependencies:PlanningDependencies;
@@ -72,7 +75,11 @@ export class Workflow{
     actor TEXT NOT NULL,reason TEXT);`);
    if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name==='discovery'))s.db.exec('ALTER TABLE worker_outcomes ADD COLUMN discovery TEXT');
    for(const name of ['revision_id','dispatch_id'])if(!(s.db.query('PRAGMA table_info(worker_outcomes)').all() as any[]).some(x=>x.name===name))s.db.exec(`ALTER TABLE worker_outcomes ADD COLUMN ${name} TEXT`);
-  if(!(s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))s.db.exec('ALTER TABLE continuations ADD COLUMN failed_at INTEGER');
+   if(!(s.db.query('PRAGMA table_info(continuations)').all() as any[]).some(x=>x.name==='failed_at'))s.db.exec('ALTER TABLE continuations ADD COLUMN failed_at INTEGER');
+   s.db.exec(`CREATE TABLE IF NOT EXISTS planning_failure_blockers (
+    binding TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),spec_hash TEXT NOT NULL,revision_id TEXT,
+    session_id TEXT NOT NULL,worktree TEXT NOT NULL,dispatch_client TEXT NOT NULL,client_id TEXT NOT NULL,turn_id TEXT NOT NULL,
+    classification TEXT NOT NULL,reason TEXT NOT NULL,next_action TEXT NOT NULL,observed INTEGER NOT NULL);`);
  }
  planning(job:string):any{return this.s.db.query('SELECT * FROM planning_dispatch WHERE job=?').get(job);}
  implementation(job:string):any{return this.s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job);}
@@ -171,6 +178,8 @@ export class Workflow{
   if(dispatch.spec_hash!==digest(j.spec))return this.blockPlan(job,'Specification changed; reconcile previous planning session');
   if(j.state==='awaiting_approval'){await this.prepareImplementationRoute(job,c);return {state:j.state};}
   if(j.state!=='awaiting_plan')return {state:j.state};
+   const failure=currentPlanningFailure(this.s,job);
+   if(failure)return {state:'needs_reconciliation',reason:failure.reason,nextAction:failure.next_action};
   let session=dispatch.session_id;
   if(!session){
    const matches=await this.t.findPlans(r.project,r.branch);
@@ -180,10 +189,12 @@ export class Workflow{
    this.s.db.query('UPDATE planning_runs SET session_id=? WHERE job=?').run(session,job);
   }
   const route=this.router.get(job,'planning');
-  if(route){assertRequiredIntegrations(c);const delivery=await this.deliverPlanning(job,session,JSON.parse(route.route),c.approval);if(delivery.state!=='planning_delivered')return delivery;}
+   if(route){assertRequiredIntegrations(c);const delivery=await this.deliverPlanning(job,session,JSON.parse(route.route),c.approval,c);if(delivery.state!=='planning_delivered')return delivery;}
   const e=await this.t.evidence(session);
   if(e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)return this.blockPlan(job,'Planning session identity changed or terminated');
-  if(e.transcript?.controller!=='ready')return {state:'planning',session};
+   if(e.transcript?.controller!=='ready')return {state:'planning',session};
+   const failed=await this.reportFirstPlanningFailure(job,e,c);
+   if(failed)return failed;
   const marker=`<!-- ADLC_PLAN_READY:${r.correlation} -->`;
   const complete=new Set((e.transcript.turns??[]).filter((x:any)=>x.state==='completed').map((x:any)=>x.id));
   const entry=[...(e.transcript.entries??[])].reverse().find((x:any)=>x.kind==='message'&&x.role==='assistant'&&x.origin==='provider'&&!x.streaming&&complete.has(x.turnId)&&x.text?.includes(marker));
@@ -203,8 +214,8 @@ export class Workflow{
   const j=this.s.get(job);if(j.state!=='awaiting_approval')throw Error('Captured plan required for implementation routing');
   await this.router.choose(job,'implementation',digest(JSON.stringify([j.spec,j.plan_hash])),`Implement the requested task (planning is complete; supporting checks are part of the change):\n${j.spec}`,c.routing);
  }
- async deliverPlanning(job:string,session:string,route:Route,policy?:ApprovalPolicy){return this.submit(()=>this.deliverPlanningWithinBarrier(job,session,route,policy));}
-  private async deliverPlanningWithinBarrier(job:string,session:string,route:Route,policy?:ApprovalPolicy){
+  async deliverPlanning(job:string,session:string,route:Route,policy?:ApprovalPolicy,c?:WorkflowConfig){return this.submit(()=>this.deliverPlanningWithinBarrier(job,session,route,policy,c));}
+   private async deliverPlanningWithinBarrier(job:string,session:string,route:Route,policy?:ApprovalPolicy,c?:WorkflowConfig){
    assertWorktreeAvailable(this.s,job);
   const r=new Planning(this.s).get(job),j=this.s.get(job);
   if(j.state!=='awaiting_plan'||r.spec_hash!==digest(j.spec))throw Error('Planning eligibility changed');
@@ -215,7 +226,7 @@ export class Workflow{
    if(delivery.session_id!==session)throw Error('Planning delivery/session mismatch');
    const receipt=e.transcript.entries.find((x:any)=>x.clientMessageId===delivery.client_id);
    const turn=receipt&&e.transcript.turns?.find((t:any)=>t.id===receipt.turnId);
-   if(turn&&['failed','cancelled','interrupted'].includes(turn.state))return this.blockPlan(job,'Planning turn failed or was cancelled; inspect provider/authentication before recovery');
+    if(turn&&['failed','cancelled','interrupted'].includes(turn.state))return await this.reportFirstPlanningFailure(job,e,c)??this.blockPlan(job,'Planning turn failed or was cancelled; inspect provider/authentication before recovery');
    if(!receipt)return {state:'needs_reconciliation',reason:'Planning delivery receipt missing; never resend'};
    return {state:'planning_delivered'};
   }
@@ -233,7 +244,38 @@ export class Workflow{
   try{await this.t.sendImplementation(session,prompt,clientId);this.s.db.query("UPDATE planning_delivery SET state='accepted' WHERE job=?").run(job);}catch{this.s.event(job,'planning_delivery_uncertain',clientId);}
   return {state:'planning',session};
  }
- blockPlan(job:string,reason:string){this.s.db.query("UPDATE planning_dispatch SET state='needs_reconciliation',reason=? WHERE job=?").run(reason,job);return {state:'needs_reconciliation',reason};}
+  blockPlan(job:string,reason:string){this.s.db.query("UPDATE planning_dispatch SET state='needs_reconciliation',reason=? WHERE job=?").run(reason,job);return {state:'needs_reconciliation',reason};}
+  /** Reporting only. Neither capability hints nor a sign-in grant retry authority. */
+  private async reportFirstPlanningFailure(job:string,e:any,c?:WorkflowConfig){
+   const j=this.s.get(job),p=new Planning(this.s).get(job),d=this.planning(job),revision=latestRevision(this.s,job)?.id??null;
+   const age=Date.now()-e.receiptObservation?.observed,turns=e.transcript?.turns,entries=e.transcript?.entries;
+   if(j.state!=='awaiting_plan'||j.plan||p?.state!=='provisioned'||!p.worktree||!p.session_id||p.session_id!==d?.session_id||p.spec_hash!==digest(j.spec)||d.spec_hash!==p.spec_hash||
+    (c&&j.project!==c.linear.projectId)||e.session?.id!==p.session_id||e.session.projectId!==p.project||e.session.branch!==p.branch||e.session.isTerminated!==false||
+    e.transcript?.controller!=='ready'||e.receiptObservation?.complete!==true||!Number.isFinite(age)||age<0||age>RECEIPT_FRESHNESS_MS||
+    !Array.isArray(turns)||turns.length!==1||turns[0].state!=='failed'||typeof turns[0].id!=='string'||!Array.isArray(entries))return null;
+   const delivery=this.s.db.query('SELECT * FROM planning_delivery WHERE job=?').get(job) as any;
+   if(delivery&&delivery.session_id!==p.session_id)return null;
+   const client=delivery?.client_id??d.client_id,receipts=entries.filter((x:any)=>x.clientMessageId===client);
+   if(receipts.length!==1||receipts[0].kind!=='message'||receipts[0].role!=='user'||receipts[0].turnId!==turns[0].id)return null;
+   let facts:any;
+   try{facts=await this.t.planningFailureFacts?.(p.session_id,turns[0].id);}catch{/* Unverified is a blocker, not permission to retry. */}
+   const native=facts?.turn?.id===turns[0].id&&facts.turn.state==='failed'?facts:null;
+   const authentication=native&&(native.authenticationState==='unauthenticated'||native.turn.error?.httpStatus===401);
+   const capability=native?.turn.error?.code==='subscription_sharing_unsupported_capability';
+   const classification=authentication?'authentication':capability?'fresh_conversation_unverified':'unknown';
+   const reason=authentication?'First planning turn failed with provider authentication evidence.':capability?'First planning turn failed with subscription_sharing_unsupported_capability; same-worker fresh-conversation recovery is unverified.':'First planning turn failed; the provider cause and same-worker fresh-conversation recovery are unverified.';
+   const nextAction=authentication?'Sign in to the active provider locally in Agent Orchestrator, then inspect the existing failed turn. Sign-in does not authorize a retry.':capability?'Obtain a documented, verified Orchestrator/harness fresh-conversation API preserving this worker, worktree and permissions. No retry is available; preserve the failed receipt.':'Inspect the original failed turn and provider sign-in status locally. Fresh-conversation recovery needs a documented, verified same-worker API; do not retry or replace the worker.';
+   const binding=digest(JSON.stringify([job,p.spec_hash,revision,p.session_id,p.worktree,d.client_id,client,turns[0].id]));
+   return this.s.db.transaction(()=>{
+    const currentDelivery=this.s.db.query('SELECT * FROM planning_delivery WHERE job=?').get(job);
+    if(JSON.stringify(this.s.get(job))!==JSON.stringify(j)||JSON.stringify(currentDelivery)!==JSON.stringify(delivery)||JSON.stringify(new Planning(this.s).get(job))!==JSON.stringify(p)||JSON.stringify(this.planning(job))!==JSON.stringify(d)||(latestRevision(this.s,job)?.id??null)!==revision)return {state:'needs_reconciliation',reason:'Planning binding changed during failure observation; refresh without retry'};
+    const inserted=this.s.db.query('INSERT OR IGNORE INTO planning_failure_blockers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(binding,job,p.spec_hash,revision,p.session_id,p.worktree,d.client_id,client,turns[0].id,classification,reason,nextAction,Date.now()).changes;
+    const saved=this.s.db.query('SELECT * FROM planning_failure_blockers WHERE binding=?').get(binding) as any;
+    this.s.db.query("UPDATE planning_dispatch SET state='needs_reconciliation',reason=? WHERE job=?").run(saved.reason,job);
+    if(inserted)this.s.event(job,'first_planning_failure_blocked',JSON.stringify({binding,classification,session:p.session_id,turn:turns[0].id}));
+    return {state:'needs_reconciliation',reason:saved.reason,nextAction:saved.next_action};
+   }).immediate();
+  }
  approve(job:string,hash:string,actor:string,paths:string[],runtime:string,operations:string[],standing?:{project:string;policy:ApprovalPolicy},acknowledge?:{readiness?:boolean}){
   if(runtime!=='supervised-host')throw Error('Only supervised-host coding is supported; Docker coding has been removed');
   if(!validScopes(paths)||paths.some(p=>!p.startsWith('!')&&p.split('/').some(x=>x==='.git'||x.startsWith('.env'))))throw Error('Explicit safe repository-relative scope required');
