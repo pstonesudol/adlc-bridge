@@ -2,6 +2,16 @@ import {test,expect} from 'bun:test';
 import {bridgePlanningHook,createWorkflowTransport} from '../src/workflow-transport';
 import {verifiedInstallationSource} from '../src/install-state';
 import {mkdtempSync,mkdirSync,writeFileSync,chmodSync,rmSync,realpathSync,symlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+test('planning failure facts inspect only the exact native failed turn without a mutation',async()=>{
+ const requests:any[]=[],turn={id:'first',state:'failed',error:{code:'subscription_sharing_unsupported_capability'}};
+ const t=createWorkflowTransport(async op=>op(),undefined,async(path,method,body)=>{requests.push([path,method,body]);return {controller:'ready',turns:[turn],capabilities:['fork_current'],account:{authenticationState:'authenticated'}};});
+ expect(await t.planningFailureFacts!('worker','first')).toEqual({turn,capabilities:['fork_current'],authenticationState:'authenticated'});
+ expect(requests).toEqual([['sessions/worker/conversation',undefined,undefined]]);
+ for(const turns of [[],[turn,turn]]){
+  const bad=createWorkflowTransport(async op=>op(),undefined,async()=>({controller:'ready',turns}));
+  await expect(bad.planningFailureFacts!('worker','first')).rejects.toThrow('Unverified');
+ }
+});
 test('implementation send has a bounded timeout and retains uncertain-delivery handling',async()=>{
  for(const code of [0,1]){let options:any;const transport=createWorkflowTransport(async operation=>operation(),((_args:any,opts:any)=>{options=opts;return {stdout:new Response('').body,stderr:new Response('').body,exited:Promise.resolve(code)};}) as any);
   const result=transport.sendImplementation('worker','prompt','key');if(code===0)await result;else await expect(result).rejects.toThrow('Implementation delivery uncertain');expect(options).toEqual({stdout:'pipe',stderr:'pipe',timeout:30000});

@@ -3,10 +3,31 @@ import {mkdtempSync,rmSync,existsSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Store} from '../src/core';
+import {Workflow} from '../src/workflow';
+import {Planning} from '../src/planning';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
 const cli=join(import.meta.dir,'../src/cli.ts');
+test('CLI presents persisted first planning failure and local sign-in action without approving or sending',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'operator-planning-')),path=join(root,'state.sqlite'),s=new Store(path);try{
+  const id=s.enqueue('p','issue',JSON.stringify({identifier:'DEV-111',title:'Report',description:''}));
+  const w=new Workflow(s,{evidence:async()=>({session:{id:'worker',projectId:'ao',branch:r.branch,isTerminated:false},receiptObservation:{complete:true,observed:Date.now()},transcript:{controller:'ready',entries:[{kind:'message',role:'user',clientMessageId:'first-client',turnId:'first'}],turns:[{id:'first',state:'failed'}]}}),planningFailureFacts:async()=>({turn:{id:'first',state:'failed',error:{httpStatus:401}},authenticationState:'unauthenticated'})} as any);
+  const p=new Planning(s),r=p.reserve(id,'ao');p.gate(id,'ao','worker',r.branch,'/worktree');
+  s.db.query('INSERT INTO planning_dispatch VALUES (?,?,?,?,?,?)').run(id,r.spec_hash,'planning','worker',null,'first-client');
+  await w.reconcilePlanning(id,{linear:{projectId:'p'}} as any);
+  expect(jobViews(path)[0]).toMatchObject({state:'blocked',orchestrationState:'awaiting_plan',reason:'First planning turn failed with provider authentication evidence.',nextAction:expect.stringContaining('Sign in'),primary:{code:'planning_failure:authentication'}});
+  const before=readFileSync(path),run=(...args:string[])=>Bun.spawnSync([process.execPath,cli,...args],{env:{PATH:process.env.PATH,HOME:root,ADLC_DB:path}});
+  const text=run('jobs','status','DEV-111','--project','p');expect(text.exitCode).toBe(0);expect(text.stdout.toString()).toContain('Next: Sign in');
+  const json=run('jobs','status','DEV-111','--project','p','--json');expect(json.exitCode).toBe(0);expect(JSON.parse(json.stdout.toString()).data.jobs[0].nextAction).toContain('does not authorize a retry');
+  expect(readFileSync(path)).toEqual(before);expect(w.implementation(id)).toBeNull();
+  s.db.query('INSERT INTO planning_delivery VALUES (?,?,?,?)').run(id,'worker','changed-client','accepted');
+  expect(jobViews(path)[0].blockers.some((b:any)=>b.code==='planning_failure:authentication')).toBe(false);
+  s.db.query('DELETE FROM planning_delivery WHERE job=?').run(id);
+  expect(jobViews(path)[0].primary.code).toBe('planning_failure:authentication');
+  s.enqueue('p','issue','changed requirements');expect(jobViews(path)[0].blockers.some((b:any)=>b.code==='planning_failure:authentication')).toBe(false);
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
+});
 test('metrics CLI is bounded, versioned, sanitized and strictly read-only',()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-metrics-'));try{
  const path=join(root,'state.sqlite'),s=new Store(path),id=s.enqueue('p','i','PRIVATE SPEC');s.event(id,'review_state_changed',JSON.stringify({state:'ready_for_human',head:'a'.repeat(40),reason:'PRIVATE REASON'}));s.close();
