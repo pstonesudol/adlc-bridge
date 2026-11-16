@@ -52,10 +52,10 @@ export class FeaturePublish{
     const input=JSON.parse(op.payload);
     try{
      if(op.kind==='issue'){
-      const b=await this.api(`mutation($input:IssueCreateInput!){issueCreate(input:$input){success issue{${issueFields}}}}`,{input});
+       const b=await this.api(`mutation($input:IssueCreateInput!){issueCreate(input:$input){success issue{${issueFields}}}}`,{input},{beforeSend:()=>{this.approved(id);}});
       if(!b.issueCreate?.success)throw Error('Issue creation not confirmed');this.verifyIssue(b.issueCreate.issue,input,target);
      }else{
-      const b=await this.api('mutation($input:IssueRelationCreateInput!){issueRelationCreate(input:$input){success issueRelation{id type issue{id}relatedIssue{id}}}}',{input});
+       const b=await this.api('mutation($input:IssueRelationCreateInput!){issueRelationCreate(input:$input){success issueRelation{id type issue{id}relatedIssue{id}}}}',{input},{beforeSend:()=>{this.approved(id);}});
       const r=b.issueRelationCreate?.issueRelation;if(!b.issueRelationCreate?.success||r?.id!==input.id||r.type!=='blocks'||r.issue?.id!==input.issueId||r.relatedIssue?.id!==input.relatedIssueId)throw Error('Dependency creation not confirmed');
      }
     }catch(error){

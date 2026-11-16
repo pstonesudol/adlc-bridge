@@ -63,3 +63,29 @@ test('a known pre-send quota failure does not strand feature publication reserva
   unavailable=false;await publisher.publish(id);expect(f.creates).toBe(2);expect(f.relations.size).toBe(1);expect(s.db.query('SELECT id FROM feature_publications ORDER BY id').all()).toEqual(before.map(({id})=>({id})));
  }finally{s.close();}
 });
+
+for(const kind of ['issue','relation'])test(`cancellation while ${kind} creation waits for quota admission prevents the send and releases only the unsent reservation`,async()=>{
+ const {s,planner,id}=await plannedFeature(),f=apiFixture();let now=1800000000000,cancelled=false,mutations=0;
+ const quotas=new LinearCooldowns(s,()=>now,async ms=>{
+  now+=ms;
+  if(!cancelled&&s.db.query("SELECT id FROM feature_publications WHERE plan=? AND kind=? AND state='delivery_uncertain'").get(id,kind)){
+   cancelled=true;await planner.cancel(id);
+  }
+ });
+ quotas.verify('key','11111111-1111-1111-1111-111111111111');
+ const publisher=new FeaturePublish(s,planner,createLinearAPI((async(_url:any,init:any)=>{
+  const {query,variables}=JSON.parse(init.body);
+  if(query.startsWith('mutation')){mutations++;expect(planner.get(id).state).not.toBe('cancelled');}
+  return Response.json({data:await f.api(query,variables)});
+ }) as typeof fetch,()=> 'key',quotas));
+ try{
+  planner.approve(id,planner.get(id).hash,'human');await expect(publisher.publish(id)).rejects.toBeInstanceOf(LinearPreSendFailure);
+  expect(cancelled).toBe(true);expect(planner.get(id).state).toBe('cancelled');expect(planner.get(id).approved_hash).toBeNull();
+  expect(f.creates).toBe(kind==='issue'?0:2);expect(f.relations.size).toBe(0);expect(mutations).toBe(kind==='issue'?0:2);
+  expect(s.db.query("SELECT count(*) AS n FROM feature_publications WHERE state='delivery_uncertain'").get()).toEqual({n:0});
+  expect(s.db.query("SELECT count(*) AS n FROM feature_publications WHERE kind=? AND state='reserved'").get(kind)).toEqual({n:kind==='issue'?2:1});
+  expect(s.db.query("SELECT count(*) AS n FROM feature_publications WHERE state='confirmed'").get()).toEqual({n:kind==='issue'?0:2});
+  expect(s.db.query('SELECT count(*) AS n FROM feature_issue_holds WHERE plan=?').get(id)).toEqual({n:2});
+  await expect(publisher.publish(id)).rejects.toThrow('human-approved');expect(mutations).toBe(kind==='issue'?0:2);
+ }finally{s.close();}
+});
