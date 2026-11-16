@@ -27,7 +27,7 @@ import {activePlanning,assertPlanningCapacity} from './planning-capacity';
 import {currentPlanningFailure} from './operator-evidence';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {RevisionDelivery} from './revision-delivery';
-import {DependencySetup} from './dependency-setup';
+import {DependencySetup,setupInputPaths} from './dependency-setup';
 import type {DependencySetupPolicy} from './dependency-setup-policy';
 
 export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext;dependencySetup?:DependencySetupPolicy};
@@ -320,7 +320,13 @@ export class Workflow{
    return {job,state:'approved_pending',runtime,paths,mergeEnabled:false};
   })();
  }
- async executeApproved(job:string,c?:WorkflowConfig){return this.submit(()=>this.executeApprovedWithinBarrier(job,c));}
+  async executeApproved(job:string,c?:WorkflowConfig){return this.submit(()=>this.executeApprovedWithinBarrier(job,c));}
+  private dependencyPlanReview(job:string,c?:WorkflowConfig){
+   if(!c?.dependencySetup)return;
+   const covered=setupInputPaths(c.dependencySetup),paths=planPaths(this.s.get(job).plan??'');
+   const affected=paths?covered.filter(path=>paths.includes(path)):covered;
+   if(affected.length)return `Operator review required before implementation dispatch: ${paths?'plan changes covered setup inputs':'plan lacks exactly one valid concrete ADLC_PLAN_SCOPE receipt; cannot exclude changes to covered setup inputs'}: ${affected.join(', ')}. Preserve this worker and worktree; rebuilding dependencies from changed inputs is deferred. Replan within supported v1 scope before dispatch.`;
+  }
    private async executeApprovedWithinBarrier(job:string,c?:WorkflowConfig){
     if(c)assertRequiredIntegrations(c);
    const reservation=worktreeReservation(this.s,job);
@@ -343,6 +349,11 @@ export class Workflow{
    // A reserved receipt means a send may already have crossed the boundary,
    // even if an older dispatch projection still says pending. Never replay it.
    if(d.state!=='approved_pending'||new ReceiptReconciliation(this.s).get(d.client_id)||e.transcript?.entries?.some((x:any)=>x.clientMessageId===d.client_id))return this.executionStatus(job,e,c);
+   const dependencyReview=this.dependencyPlanReview(job,c);
+   if(dependencyReview){
+    this.s.db.query("UPDATE implementation_dispatch SET reason=? WHERE job=? AND client_id=? AND state='approved_pending'").run(dependencyReview,job,d.client_id);
+    return {state:'dependency_setup_blocked',reason:dependencyReview};
+   }
   const managed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='clarification_receipts'").get()&&(this.s.db.query("SELECT context FROM clarification_receipts WHERE job=? AND state!='superseded'").all(job) as any[]).some(row=>{const context=JSON.parse(row.context);return context.planHash===j.plan_hash&&context.specHash===digest(j.spec);});
   if(managed)assertApprovalReadiness(this.s,job,j.actor,false);
   if(e.transcript?.controller!=='ready')return {state:'waiting_for_worker'};
@@ -737,6 +748,8 @@ export class Workflow{
   let claim:any;
   this.s.db.exec('CREATE TABLE IF NOT EXISTS remediation_continuations(client_id TEXT PRIMARY KEY,job TEXT NOT NULL REFERENCES jobs(id),handle TEXT NOT NULL);');
    await guard?.();
+   const dependencyReview=this.dependencyPlanReview(job,c);
+   if(dependencyReview)throw Error(dependencyReview);
    await this.dependencySetup.ensure(job,c);
   const local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));
   if(local.branch!==deliveryBranch(this.s,job,e.session))throw Error('Worktree branch changed; reconcile before continuation');

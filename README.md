@@ -184,6 +184,18 @@ binding and any partial output under separate authority; there is no automatic
 reset/retry API. The normal approval/continuation receipt guards remain in force.
 Never replace the worker or replay a send to recover setup.
 
+With offline dependency setup configured, a plan must declare exactly one valid,
+concrete `ADLC_PLAN_SCOPE` receipt. Before implementation dispatch, plans proposing
+changes to a covered root/workspace manifest or lockfile (or lacking an unambiguous
+scope) stop for operator review with the covered paths named. A broad Git grant or
+standing approval does not bypass this gate; replan within supported v1 scope.
+If setup inputs change or disappear after installation, guarded resume and
+verification stop and name the changed input files. Preserve the same worktree,
+staged edits, receipts and installed outputs for operator review. Rebuilding from
+changed inputs is deferred; neither rechecking nor recording an answer authorizes
+reinstallation. Absent dependency outputs are checked as directories against Git
+ignore rules, including `node_modules/`; tracked or non-ignored outputs still block.
+
 Configured verification uses the guarded runner, which requires an existing
 ready same-worker receipt. It copies dependencies into the owner-private
 verification snapshot, compares the copy against recorded fingerprints, and

@@ -14,7 +14,7 @@ import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {isImmutableImage} from './verification';
 
 const action='Operator: inspect dependencySetup, the pinned image/cache and named prerequisite; prepare the approved cache/runtime separately, then recheck this same worker. Never enable scripts, go online, reset edits or resend delivery.';
-export class SetupBlocker extends Error{constructor(message:string){super(`${message}. ${action}`);}}
+export class SetupBlocker extends Error{constructor(message:string,nextAction=action){super(`${message}. ${nextAction}`);}}
 function present(path:string){try{lstatSync(path);return true;}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}}
 function safe(root:string,path:string,file=false){
  if(/[,\x00-\x1f]/.test(root))throw new SetupBlocker('Worktree path cannot be represented safely as a runtime mount');
@@ -24,6 +24,9 @@ function safe(root:string,path:string,file=false){
  return p;
 }
 const lifecycle=['preinstall','install','postinstall','prepare','prepublish','preprepare','postprepare'];
+export function setupInputPaths(p:DependencySetupPolicy){
+ validateDependencySetup(p);return [...p.manifests,p.lockfile].map(path=>join(p.cwd,path));
+}
 export function setupInputs(tree:string,p:DependencySetupPolicy){
  validateDependencySetup(p);const root=safe(realpathSync(tree),p.cwd),files:Record<string,string>={};
  for(const path of [...p.manifests,p.lockfile]){const full=safe(root,path,true);if(lstatSync(full).size>8_000_000)throw new SetupBlocker(`Oversized input ${path}`);files[path]=readFileSync(full,'utf8');}
@@ -130,13 +133,30 @@ export class DependencySetup{
   validateDependencySetup(c.dependencySetup);const policy=c.dependencySetup as DependencySetupPolicy;
   if(c.verification?.mode!=='container'||!isImmutableImage(c.verification.container?.image))throw new SetupBlocker('Existing immutable container verification runtime required');
   this.table();
-  const facts=await this.io.facts(job,c,checkOnly),input=setupInputs(facts.worktree,policy),runtime=facts.runtime as any;
+   const facts=await this.io.facts(job,c,checkOnly),runtime=facts.runtime as any;
   // Holds belong to the worktree, not just one hash of its mutable inputs.
   const assertNoHolds=()=>{
    const hold=(this.s.db.query("SELECT binding,worktree,state FROM dependency_setups WHERE state IN ('blocked','installing','publishing')").all() as any[]).find(row=>canonicalWorktree(row.worktree)===facts.worktree);
    if(hold)throw new SetupBlocker(`Retained ${hold.state} setup ${hold.binding}; operator reconciliation required, never replay after input changes`);
   };
-  assertNoHolds();
+   assertNoHolds();
+   // A new binding is not authority to rebuild outputs from changed inputs.
+   // Read the retained file hashes before parsing current manifests/lockfile so
+   // missing or invalid JSON inputs still produce an exact changed-path blocker.
+   const ready=(this.s.db.query("SELECT worktree,proof FROM dependency_setups WHERE job=? AND state='ready'").all(job) as any[]).filter(row=>canonicalWorktree(row.worktree)===facts.worktree);
+   for(const row of ready){
+    const prior=JSON.parse(row.proof),oldPaths=setupInputPaths(prior.policy),currentPaths=setupInputPaths(policy),changed=new Set<string>();
+    for(const path of new Set([...oldPaths,...currentPaths])){
+     const key=[...prior.policy.manifests,prior.policy.lockfile].find((key:string)=>join(prior.policy.cwd,key)===path);
+     if(!oldPaths.includes(path)||!currentPaths.includes(path)){changed.add(path);continue;}
+     try{
+      const full=safe(facts.worktree,path,true);
+      if(lstatSync(full).size>8_000_000||digest(readFileSync(full,'utf8'))!==prior.inputs[key!])changed.add(path);
+     }catch{changed.add(path);}
+    }
+    if(changed.size)throw new SetupBlocker(`Setup inputs changed after installation: ${[...changed].sort().join(', ')}; stop resume and preserve worktree and installed outputs`, 'Operator review required: inspect the named files in this same worker. Rebuilding dependencies from changed inputs is deferred; do not reinstall, delete outputs, reset edits or resend delivery.');
+   }
+   const input=setupInputs(facts.worktree,policy);
   const proof={facts,policy,image:c.verification.container.image,inputs:Object.fromEntries(Object.entries(input.files).map(([path,text])=>[path,digest(text)]))},binding=digest(JSON.stringify(proof));
   const row=this.s.db.query('SELECT * FROM dependency_setups WHERE binding=?').get(binding) as any;
   const outputs=input.outputs.map(path=>safe(input.root,path));
@@ -147,7 +167,7 @@ export class DependencySetup{
    if(present(outputs[i]))throw new SetupBlocker(`Unmanaged dependency output ${input.outputs[i]} exists; preserve it and reconcile separately`);
    const rel=relative(facts.worktree,outputs[i]);
    if(await command(['git','--no-optional-locks','ls-files','--',rel],facts.worktree))throw new SetupBlocker(`Tracked dependency output ${rel}`);
-   try{await command(['git','--no-optional-locks','check-ignore','--',rel],facts.worktree);}catch{throw new SetupBlocker(`Dependency output ${rel} must already be ignored; operator review required`);}
+    try{await command(['git','--no-optional-locks','check-ignore','--',`${rel}/`],facts.worktree);}catch{throw new SetupBlocker(`Dependency output ${rel} must already be ignored; operator review required`);}
   }
   const index=await command(['git','--no-optional-locks','diff','--cached','--binary'],facts.worktree);
   const unchanged=async()=>{if(JSON.stringify(await this.io.facts(job,c))!==JSON.stringify(facts)||JSON.stringify(setupInputs(facts.worktree,policy).files)!==JSON.stringify(input.files)||await command(['git','--no-optional-locks','diff','--cached','--binary'],facts.worktree)!==index)throw new SetupBlocker('Approval, worker, inputs or staged edits changed during setup; preserve work for reconciliation');};

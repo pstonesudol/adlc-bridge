@@ -4,7 +4,7 @@ import {join} from 'node:path';
 import {runInNewContext} from 'node:vm';
 import {tmpdir} from 'node:os';
 import {Store} from '../src/core';
-import {DependencySetup,setupInputs,installOffline,offlineSetupProgram,setupWorkerOwners,type SetupBinding} from '../src/dependency-setup';
+import {DependencySetup,setupInputs,installOffline,offlineSetupProgram,setupWorkerOwners,outputDigest,type SetupBinding} from '../src/dependency-setup';
 import {validateDependencySetup} from '../src/dependency-setup-policy';
 import {runVerification,validateVerification} from '../src/verification';
 import {validate} from '../src/linear';
@@ -69,6 +69,33 @@ test('blocked cache install retains staged edits and blocks duplicate setup afte
   await expect(new DependencySetup(f.s,io).ensure(f.job,f.c)).rejects.toThrow('Setup failed');
   await expect(new DependencySetup(f.s,io).ensure(f.job,f.c)).rejects.toThrow('Operator');
   expect(calls).toBe(1);expect(git(f.tree,'diff','--cached','--binary')).toBe(before);
+ }finally{f.close();}
+});
+test('absent root and workspace outputs accept directory-only ignore rules',async()=>{
+ const f=fixture();try{
+  writeFileSync(join(f.tree,'.gitignore'),'node_modules/\n.adlc-dependencies-*/\n');
+  expect(await f.setup.ensure(f.job,f.c)).toMatchObject({state:'ready'});expect(f.installs()).toBe(1);
+ }finally{f.close();}
+});
+for(const tracked of [false,true])test(`absent dependency output is rejected when ${tracked?'tracked in the index':'not ignored'}`,async()=>{
+ const f=fixture();try{
+  if(tracked){mkdirSync(join(f.tree,'frontend/node_modules'));writeFileSync(join(f.tree,'frontend/node_modules/tracked.txt'),'tracked');git(f.tree,'add','-f','frontend/node_modules/tracked.txt');rmSync(join(f.tree,'frontend/node_modules'),{recursive:true});}
+  else writeFileSync(join(f.tree,'.gitignore'),'/node_modules/\n'); // workspace output is not ignored
+  const before=git(f.tree,'diff','--cached','--binary');
+  await expect(f.setup.ensure(f.job,f.c)).rejects.toThrow(tracked?'Tracked dependency output':'must already be ignored');
+  expect(f.installs()).toBe(0);expect(git(f.tree,'diff','--cached','--binary')).toBe(before);
+ }finally{f.close();}
+});
+for(const path of ['package.json','frontend/package.json','package-lock.json'])for(const missing of [false,true])test(`ready setup identifies ${missing?'missing':'changed'} input ${path} without rebuilding`,async()=>{
+ const f=fixture();try{
+  await f.setup.ensure(f.job,f.c);const outputs=outputDigest(join(f.tree,'node_modules'),join(f.tree,'node_modules'),f.tree),receipts=f.s.db.query('SELECT * FROM dependency_setups').all();
+  if(missing)rmSync(join(f.tree,path));else writeFileSync(join(f.tree,path),'invalid JSON but an exact changed input');
+  git(f.tree,'add',path);const before=git(f.tree,'diff','--cached','--binary');
+  for(const checkOnly of [false,true]){
+   const attempt=new DependencySetup(f.s,f.io).ensure(f.job,f.c,checkOnly);
+   await expect(attempt).rejects.toThrow(`Setup inputs changed after installation: ${path};`);
+  }
+  expect(f.installs()).toBe(1);expect(outputDigest(join(f.tree,'node_modules'),join(f.tree,'node_modules'),f.tree)).toBe(outputs);expect(f.s.db.query('SELECT * FROM dependency_setups').all()).toEqual(receipts);expect(git(f.tree,'diff','--cached','--binary')).toBe(before);
  }finally{f.close();}
 });
 for(const change of ['manifest','cache','image','session'])test(`failed setup hold survives ${change} changes across service restart`,async()=>{
