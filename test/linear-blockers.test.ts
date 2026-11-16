@@ -12,6 +12,19 @@ import {Planning} from '../src/planning';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {LinearPreSendCooldown} from '../src/linear-cooldowns';
+import {LinearPreSendFailure} from '../src/linear-api';
+for(const failure of [new LinearPreSendCooldown(Date.now()+60000),new LinearPreSendFailure('quota storage unavailable')])test(`${failure.constructor.name} keeps blocker comment ownership reserved and later posts exactly once`,async()=>{
+ const f=fixture(),blockers=f.blockers(),api=blockers.api;let hold=true;
+ blockers.api=async(q,v)=>{if(hold&&q.startsWith('mutation'))throw failure;return api(q,v);};
+ try{
+  await blockers.sync(f.config);const before=f.s.db.query('SELECT * FROM blocker_notices').get() as any;
+  expect(before.state).toBe('reserved');expect(f.creates).toBe(0);
+  hold=false;await blockers.sync(f.config);const after=f.s.db.query('SELECT * FROM blocker_notices').get() as any;
+  expect(after.comment_id).toBe(before.comment_id);expect(after.state).toBe('posted');expect(f.creates).toBe(1);
+  await blockers.sync(f.config);expect(f.creates).toBe(1);
+ }finally{f.s.close();}
+});
 test('posted observation notice is rechecked hourly without duplicates',async()=>{
  const f=fixture();try{
  f.running();new RecoveryObservation(f.s).failed(f.id,readFailure('github','branch-read','HTTP 401',1));

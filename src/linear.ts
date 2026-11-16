@@ -12,6 +12,8 @@ import {validateDependencies,type DependencyPolicy} from './dependency-policy';
 import {validateIntegrationPolicy,type IntegrationPolicy} from './integration-capabilities';
 import {reviewerPolicy,type ReviewerConfig} from './reviewer-policy';
 import {validateReplanning,type ReplanningPolicy} from './spec-requests';
+import {coordinatedLinearFetch} from './linear-api';
+import {LinearCooldowns,LinearCooldown} from './linear-cooldowns';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -72,9 +74,11 @@ export function validate(c: any): asserts c is ProjectConfig {
     if (!/^[0-9a-f-]{36}$/i.test(c.linear?.[key] ?? '')) throw Error(`Verified Linear ${key} UUID required`);
   }
 }
-export async function poll(c: ProjectConfig, store: Store, token: string,send=fetch) {
+export async function poll(c: ProjectConfig, store: Store, token: string,send=fetch,quotas=new LinearCooldowns(store)) {
   validate(c);
   if (!token) throw Error('ADLC_LINEAR_TOKEN required; existing application credentials are never copied');
+  send=coordinatedLinearFetch(quotas,token,send,c.linear.projectId);
+  try{
   const policyStore=new ApprovalPolicyStore(store),pollToken=randomUUID(),observed=Date.now();
   store.db.query('INSERT INTO queue_poll_heads VALUES (?,?) ON CONFLICT(project) DO UPDATE SET token=excluded.token').run(c.linear.projectId,pollToken);
   let after: string | null = null;
@@ -86,8 +90,8 @@ export async function poll(c: ProjectConfig, store: Store, token: string,send=fe
   do {
     const response = await send('https://api.linear.app/graphql', {
       method: 'POST', headers: { Authorization: token, 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(20000),
       body: JSON.stringify({ query: `query($project: ID!, $team: ID!, $state: ID!, $label: ID!, $after: String) {
+        viewer { id }
         issues(first: 50, after: $after, filter: { project: {id: {eq: $project}}, team: {id: {eq: $team}}, state: {id: {eq: $state}}, labels: {some: {id: {eq: $label}}} }) {
           nodes { id identifier title description project { id } team { id } state { id } labels(first: 100) {nodes {id name} pageInfo {hasNextPage}} }
           pageInfo { hasNextPage endCursor }
@@ -113,7 +117,7 @@ export async function poll(c: ProjectConfig, store: Store, token: string,send=fe
     const owned=store.db.query("SELECT j.issue FROM jobs j JOIN planning_runs p ON p.job=j.id WHERE j.project=? AND p.session_id IS NOT NULL AND j.state NOT IN ('done')").all(c.linear.projectId) as any[];
     for(let offset=0;offset<owned.length;offset+=50){
       const ids=owned.slice(offset,offset+50).map(j=>j.issue);
-      const response=await send('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},signal:AbortSignal.timeout(20000),body:JSON.stringify({query:`query($ids:[ID!]!){issues(first:100,filter:{id:{in:$ids}}){nodes{id identifier title description project{id} team{id} state{id} labels(first:100){nodes{id name}pageInfo{hasNextPage}}}pageInfo{hasNextPage}}}`,variables:{ids}})});
+      const response=await send('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},body:JSON.stringify({query:`query($ids:[ID!]!){viewer{id} issues(first:100,filter:{id:{in:$ids}}){nodes{id identifier title description project{id} team{id} state{id} labels(first:100){nodes{id name}pageInfo{hasNextPage}}}pageInfo{hasNextPage}}}`,variables:{ids}})});
       const body:any=await response.json();if(!response.ok||body.errors||!Array.isArray(body.data?.issues?.nodes)||body.data.issues.pageInfo?.hasNextPage!==false)throw Error('Incomplete owned Linear issue snapshot');
       for(const issue of body.data.issues.nodes){
         if(!ids.includes(issue.id)||issue.project?.id!==c.linear.projectId||issue.team?.id!==c.linear.teamId||issue.labels?.pageInfo?.hasNextPage!==false)throw Error('Owned issue scope mismatch');
@@ -133,7 +137,7 @@ export async function poll(c: ProjectConfig, store: Store, token: string,send=fe
        // Keep an existing captured planning wait eligible for observation, not
        // authorization. Its receipt still gates approval until verified proof.
        if(c.dependencyRecovery?.enabled&&c.dependencyRecovery.jobs?.some(d=>d.issue===issue.id&&d.stage==='planning')&&store.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()&&store.db.query("SELECT name FROM sqlite_master WHERE name='plan_readiness'").get()&&store.db.query("SELECT 1 FROM planning_runs p JOIN jobs j ON j.id=p.job JOIN plan_readiness r ON r.job=j.id AND r.plan_hash=j.plan_hash WHERE j.issue=? AND j.project=? AND j.state='awaiting_approval' AND p.state='plan_captured' AND r.valid=1 AND r.source='receipt' AND r.state='blocked-by-dependency' AND r.spec_hash=? AND p.spec_hash=r.spec_hash AND j.spec=?").get(issue.id,c.linear.projectId,digest(JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''})),JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''})))continue;
-       const response=await send('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},signal:AbortSignal.timeout(20000),body:JSON.stringify({query:`query($ids:[ID!]!){issues(first:100,filter:{id:{in:$ids}}){nodes{id state{type} project{id} team{id}}pageInfo{hasNextPage}}}`,variables:{ids:deps.map(d=>d.prerequisite)}})});
+        const response=await send('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:token,'Content-Type':'application/json'},body:JSON.stringify({query:`query($ids:[ID!]!){viewer{id} issues(first:100,filter:{id:{in:$ids}}){nodes{id state{type} project{id} team{id}}pageInfo{hasNextPage}}}`,variables:{ids:deps.map(d=>d.prerequisite)}})});
       const body:any=await response.json();if(!response.ok||body.errors||!Array.isArray(body.data?.issues?.nodes)||body.data.issues.pageInfo?.hasNextPage!==false)throw Error('Incomplete dependency state snapshot');
       if(deps.some(d=>!body.data.issues.nodes.some((n:any)=>n.id===d.prerequisite&&n.state?.type==='completed'&&n.project?.id===c.linear.projectId&&n.team?.id===c.linear.teamId&&(!(store.db.query('SELECT state FROM jobs WHERE issue=? AND project=?').get(d.prerequisite,c.linear.projectId) as any)||(store.db.query('SELECT state FROM jobs WHERE issue=? AND project=?').get(d.prerequisite,c.linear.projectId) as any).state==='done'))))dependencyBlocked.set(issue.id,'Feature prerequisites must be completed before this ticket is picked up');
     }
@@ -165,5 +169,7 @@ export async function poll(c: ProjectConfig, store: Store, token: string,send=fe
       }
     }
   })();
+  quotas.state(c.linear.projectId,'snapshot_complete');
   return { ingested: count, executionEnabled: false };
+  }catch(error){quotas.state(c.linear.projectId,error instanceof LinearCooldown?'cooldown':'snapshot_failed');throw error;}
 }

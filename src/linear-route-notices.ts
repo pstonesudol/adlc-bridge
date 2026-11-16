@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {Store} from './core';
 import {dispatchRouteBinding,ensureDispatchRoutes} from './dispatch-route';
 import {TaskRouting} from './task-routing';
-import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {linearAPI,readLinearIssue,withLinearReservation,type LinearAPI} from './linear-api';
 
 // This surface requests approval only. It cannot change a route, grant approval,
 // or replay an uncertain implementation. Comment retries require a complete
@@ -56,7 +56,7 @@ export class LinearRouteNotices{
    if(!this.current(j.id,check))continue;
    const claim=this.s.db.query("UPDATE dispatch_route_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(j.id,check.binding);
    if(!claim.changes)continue;
-   const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body}});
+    const b=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body}}),()=>{this.s.db.query("UPDATE dispatch_route_notices SET state='reserved' WHERE job=? AND binding=? AND comment_id=? AND state='delivery_uncertain'").run(j.id,check.binding,n.comment_id);});
    if(!b.commentCreate?.success||b.commentCreate.comment?.id!==n.comment_id||b.commentCreate.comment.body!==n.body)throw Error('Route notice outcome uncertain; reconcile exact comment, never repost blindly');
    this.s.db.query("UPDATE dispatch_route_notices SET state='posted' WHERE job=? AND binding=?").run(j.id,check.binding);
    results.push({job:j.id,state:'route_approval_requested'});

@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import {Workflow,type WorkflowConfig} from './workflow';
 import {ApprovalPolicyStore,featureGit} from './approval-policy';
 import {validScopes,planPaths,scopeAllows} from './file-scope';
-import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {linearAPI,readLinearIssue,withLinearReservation,type LinearAPI} from './linear-api';
 import {latestRevision} from './spec-revisions';
 import {readinessFor,applicableResolution} from './readiness';
 export type ApprovalSurface={enabled:boolean;approverIds:string[];scope:string[]};
@@ -84,7 +84,7 @@ export class LinearApprovals{
    await this.current(job,c);if(this.binding(job,c)!==binding)throw Error('Plan changed before publication');
    const claim=this.s.db.query("UPDATE plan_approval_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
    if(!claim.changes)return {state:'notice_delivery_uncertain'};
-   const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}});
+    const b=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}}),()=>{this.s.db.query("UPDATE plan_approval_notices SET state='reserved' WHERE job=? AND binding=? AND comment_id=? AND state='delivery_uncertain'").run(job,binding,n.comment_id);});
    posted=b.commentCreate?.comment;
    if(!b.commentCreate?.success||posted?.id!==n.comment_id||posted.body!==n.body||!Number.isFinite(Date.parse(posted.createdAt)))throw Error('Plan notice delivery requires reconciliation');
    this.s.db.query("UPDATE plan_approval_notices SET state='posted',created=? WHERE job=? AND binding=?").run(posted.createdAt,job,binding);
