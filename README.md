@@ -135,6 +135,61 @@ separate human actions.
 
 ## Configuration-driven verification and setup (v1)
 
+### Offline worker dependency setup
+
+Projects may opt into `dependencySetup` alongside **container** verification:
+
+```json
+{
+  "version": 1,
+  "runtime": "verification-container",
+  "cwd": ".",
+  "lockfile": "package-lock.json",
+  "manifests": ["package.json", "frontend/package.json"],
+  "cache": "/opt/npm-cache"
+}
+```
+
+This is a template, not live configuration. Keep the existing immutable
+`verification.container.image` and host-validated runtime's pinned Docker tool.
+An operator must separately provision that **existing** image with Node/npm and
+the complete cache at the image-internal path. The bridge never builds, pulls,
+downloads or activates an image, fills a cache online, or copies credentials.
+Missing runtime/cache entries block with an operator next action. Online installs
+are deferred; changing this policy requires a new plan/authorization.
+
+The same owned, approved, idle worker is checked before initial implementation
+or a guarded continuation. Only explicit manifests and the existing npm v2/v3
+lockfile enter the network-disabled container. It runs
+`npm ci --ignore-scripts --offline --no-audit --no-fund` using a private copy of
+the cache. There is no host/script/network fallback. Exact workspace paths are
+required (no globs in v1); git/file dependencies, undeclared workspaces and
+packages advertising lifecycle scripts/native build requirements block for
+operator review. This conservative check can block optional scripts too; it
+never infers permission to run them.
+
+Installation happens in disposable storage; generated dependency trees are
+published only to already-ignored, untracked `node_modules` locations in the
+registered worktree. Existing unmanaged output is preserved and blocks setup;
+reconcile it separately rather than asking the bridge to delete it. Source,
+lockfiles, staged edits and hooks are never reset, rewritten or disabled.
+Container setup does not mean the coding agent or host Git hooks are contained;
+native/ABI-dependent packages may remain unsupported under the no-script policy.
+
+Durable `dependency_setups` receipts bind plan/spec, dispatch, worker, worktree,
+grant, configuration, immutable image and input contents. Ready receipts are
+rechecked against dependency contents; failed/interrupted/publishing attempts
+remain holds, not retry permission. Operator review must reconcile the retained
+binding and any partial output under separate authority; there is no automatic
+reset/retry API. The normal approval/continuation receipt guards remain in force.
+Never replace the worker or replay a send to recover setup.
+
+Configured verification uses the guarded runner, which requires an existing
+ready same-worker receipt and mounts its dependency outputs read-only. It never
+installs while an implementation turn is active. A changed input/image or
+modified/missing output stops verification for same-worker reconciliation.
+Unconfigured legacy projects keep their prior behavior.
+
 Project JSON keeps repository/Linear mappings, approval and routing policies, and
 an optional `verification` object. Machine JSON is separate: copy
 `config/runtime.example.json` to an ignored local file and replace every path

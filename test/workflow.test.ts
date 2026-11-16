@@ -12,6 +12,17 @@ import {revisedHandoff,latestRevision} from '../src/spec-revisions';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
+test('dependency setup blocks before initial dispatch and reuses the same worker after readiness',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),job=s.enqueue('p','setup','Task');
+ try{
+  await w.startPlanning(job,config);f.completePlan();await w.reconcilePlanning(job,config);
+  w.approve(job,s.get(job).plan_hash,'human',['src/**'],'supervised-host',ops);
+  let ready=false,calls=0;w.dependencySetup.ensure=async()=>{calls++;if(!ready)throw Error('Missing offline cache; operator review required');return {state:'ready',binding:'verified'};};
+  expect(await w.executeApproved(job,config)).toMatchObject({state:'dependency_setup_blocked'});expect(f.sends).toHaveLength(0);expect(w.implementation(job).state).toBe('approved_pending');
+  ready=true;await w.executeApproved(job,config);await w.executeApproved(job,config);
+  expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(1);expect(f.sends[0].id).toBe('session-1');expect(calls).toBe(2);
+ }finally{s.close();}
+});
 class Fake implements WorkflowTransport{
  starts:any[]=[];sends:any[]=[];sessions=new Map<string,any>();loseSpawn=false;loseSend=false;
  constructor(public s:Store){}
@@ -629,6 +640,19 @@ test('guarded resume requires current resolution, resends no original request an
  f.sessions.get('session-1').transcript.controller='ready';
  await expect(w.resume(id,config)).rejects.toThrow('already in flight');
  expect(f.sends.length).toBe(before+1);s.close();
+});
+test('dependency setup blocker cannot reserve a continuation or replace its existing worker',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+  f.workerReceipt(workerBlock('blocked-dependency',undefined,'offline-cache'));await w.tick(config);
+  recordResolution(s,id,'dependency-satisfied','operator','Approved cache prerequisite provisioned separately');
+  w.dependencySetup.ensure=async()=>{throw Error('Cache entry still missing; operator review required');};
+  await expect(w.resume(id,config)).rejects.toThrow('Cache entry still missing');
+  expect(s.db.query('SELECT * FROM continuations').all()).toHaveLength(0);expect(f.sends).toHaveLength(1);expect(f.starts).toHaveLength(1);
+  w.dependencySetup.ensure=async()=>({state:'ready',binding:'verified'});
+  expect(await w.resume(id,config)).toMatchObject({state:'continuation_delivery_accepted',session:'session-1'});
+  await expect(w.resume(id,config)).rejects.toThrow();expect(f.sends).toHaveLength(2);expect(f.starts).toHaveLength(1);
+ }finally{s.close();}
 });
 
 test('failed continuation requires exact reviewed delivery recovery before another resume',async()=>{
