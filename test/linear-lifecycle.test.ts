@@ -1,5 +1,7 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {ReviewLoop} from '../src/review-loop';import {LinearLifecycle} from '../src/linear-lifecycle';import {Lifecycle} from '../src/lifecycle';import {DeliveryRecovery} from '../src/delivery-recovery';
 import {LinearPreSendCooldown} from '../src/linear-cooldowns';
+import {createLinearAPI,LinearPreSendFailure} from '../src/linear-api';
+import {LinearCooldowns} from '../src/linear-cooldowns';
 const c={linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},githubRepo:'owner/repo',statusSync:{enabled:true,inProgress:'progress',inReview:'review',done:'done'}};
 function fixture(){const s=new Store(':memory:');new Workflow(s,{} as any);new ReviewLoop(s);new Lifecycle(s);const spec={identifier:'DEV-1',title:'Task',description:'Requirements'},id=s.enqueue('p','issue',JSON.stringify(spec));const p=new Planning(s);p.reserve(id,'ao');p.gate(id,'ao','worker',p.get(id).branch,'/worktree');let state='todo',updates=0,merged=false,lost=false,noticeFailure=false,noticeCalls=0;const posted:any[]=[],issueChanges:any={};let beforeAPI:(q:string)=>void=()=>{};
  const issue=()=>({id:'issue',...spec,project:{id:'p'},team:{id:'t'},state:{id:state},labels:{nodes:[{id:'ready'}],pageInfo:{hasNextPage:false}},...issueChanges});
@@ -37,6 +39,23 @@ test('pre-send cooldown releases only an unsent status transition, allowing a fr
   await f.sync.sync(c);expect(f.updates).toBe(0);expect(f.s.db.query('SELECT * FROM linear_transitions').all()).toEqual([]);
   hold=false;await f.sync.sync(c);expect(f.updates).toBe(1);expect(f.state).toBe('progress');
   await f.sync.sync(c);expect(f.updates).toBe(1);
+ }finally{f.s.close();}
+});
+for(const changed of ['specification','revision'])test(`status send rechecks ${changed} after admission and releases its unsent transition`,async()=>{
+ const f=fixture(),api=f.sync.api;let now=1800000000000,changedDuringWait=false;
+ const before=f.s.get(f.id).spec,binding=(f.s.db.query('SELECT spec_hash FROM planning_runs WHERE job=?').get(f.id) as any).spec_hash;
+ const quotas=new LinearCooldowns(f.s,()=>now,async ms=>{
+  now+=ms;
+  if(!changedDuringWait&&f.s.db.query('SELECT * FROM linear_transitions WHERE job=?').get(f.id)){
+   changedDuringWait=true;f.s.enqueue('p','issue',JSON.stringify({identifier:'DEV-1',title:'Task',description:'changed while pacing'}));
+   if(changed==='revision')f.s.enqueue('p','issue',before);
+  }
+ });
+ quotas.verify('key','11111111-1111-1111-1111-111111111111');
+ f.sync.api=createLinearAPI((async(_url:any,init:any)=>{const {query,variables}=JSON.parse(init.body);return Response.json({data:await api(query,variables)});}) as typeof fetch,()=> 'key',quotas);
+ try{
+  await expect(f.sync.move(f.id,'in-progress','progress',c,binding,null)).rejects.toBeInstanceOf(LinearPreSendFailure);
+  expect(changedDuringWait).toBe(true);expect(f.updates).toBe(0);expect(f.state).toBe('todo');expect(f.s.db.query('SELECT * FROM linear_transitions').all()).toEqual([]);
  }finally{f.s.close();}
 });
 test('pre-send cooldown retains remediation notice ID and permits publication after the hold',async()=>{

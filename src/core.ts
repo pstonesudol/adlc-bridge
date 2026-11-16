@@ -21,7 +21,7 @@ export class Store {
       this.db=new Database(path,{readonly:true,create:false});
       try {
         const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
-        if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
+        if (!Number.isInteger(version) || version < 0 || version > 3) throw Error(`Unsupported SQLite schema version: ${version}`);
         if (version === 0 && this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").get()) throw Error('Unversioned nonempty database; refusing read-only access');
       } catch (error) { this.db.close(); throw error; }
       return;
@@ -32,11 +32,11 @@ export class Store {
     try {
     this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
     const initialVersion = (this.db.query('PRAGMA user_version').get() as any).user_version;
-    if (initialVersion > 2) throw Error(`Unsupported SQLite schema version: ${initialVersion}`);
+    if (initialVersion > 3) throw Error(`Unsupported SQLite schema version: ${initialVersion}`);
     this.db.exec('PRAGMA journal_mode=WAL;');
     this.db.transaction(() => {
       const version = (this.db.query('PRAGMA user_version').get() as any).user_version;
-      if (!Number.isInteger(version) || version < 0 || version > 2) throw Error(`Unsupported SQLite schema version: ${version}`);
+      if (!Number.isInteger(version) || version < 0 || version > 3) throw Error(`Unsupported SQLite schema version: ${version}`);
       if (version === 0) {
         if (this.db.query("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'").get()) throw Error('Unversioned nonempty database; refusing initialization');
         this.db.exec(`
@@ -76,11 +76,18 @@ export class Store {
         if(!matches('approvals_job_seq','approvals',['job','seq']))this.db.exec('CREATE INDEX approvals_job_seq ON approvals(job,seq);');
         this.db.exec('PRAGMA user_version=2;');
       }
+      if(version<3){
+        this.db.exec(`CREATE TABLE IF NOT EXISTS linear_quota_credentials(credential TEXT PRIMARY KEY,viewer TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS linear_quota_state(scope TEXT PRIMARY KEY,until_ms INTEGER NOT NULL DEFAULT 0,next_request INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,last_throttle INTEGER,throttle_kind TEXT,evidence TEXT,observed INTEGER);
+          CREATE TABLE IF NOT EXISTS linear_quota_projects(project TEXT PRIMARY KEY,credential TEXT NOT NULL,intake_state TEXT NOT NULL,observed INTEGER NOT NULL);`);
+        // Validate pre-existing unversioned quota tables before adopting them.
+        this.db.query('SELECT credential,viewer FROM linear_quota_credentials LIMIT 0').all();
+        this.db.query('SELECT scope,until_ms,next_request,failures,last_throttle,throttle_kind,evidence,observed FROM linear_quota_state LIMIT 0').all();
+        this.db.query('SELECT project,credential,intake_state,observed FROM linear_quota_projects LIMIT 0').all();
+        this.db.exec('PRAGMA user_version=3;');
+      }
     }).immediate();
     installRevisions(this);
-    this.db.exec(`CREATE TABLE IF NOT EXISTS linear_quota_credentials(credential TEXT PRIMARY KEY,viewer TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS linear_quota_state(scope TEXT PRIMARY KEY,until_ms INTEGER NOT NULL DEFAULT 0,next_request INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,last_throttle INTEGER,throttle_kind TEXT,evidence TEXT,observed INTEGER);
-      CREATE TABLE IF NOT EXISTS linear_quota_projects(project TEXT PRIMARY KEY,credential TEXT NOT NULL,intake_state TEXT NOT NULL,observed INTEGER NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS event_provenance (
       seq INTEGER PRIMARY KEY REFERENCES events(seq), event_ms INTEGER NOT NULL,
       runtime_version TEXT NOT NULL, attempt INTEGER NOT NULL, plan_hash TEXT,

@@ -133,7 +133,7 @@ export class LinearLifecycle{
    if(reservation)return reservation;
     this.assertSpecification(job,binding);
     this.assertRevision(job,revision);
-   const b=await withLinearReservation(()=>this.api('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success issue{id state{id}}}}',{id:j.issue,state:desired}),()=>{this.s.db.query("DELETE FROM linear_transitions WHERE job=? AND phase=? AND desired=? AND previous=? AND state='delivery_uncertain'").run(job,phase,desired,issue.state.id);});
+   const b=await withLinearReservation(()=>this.api('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success issue{id state{id}}}}',{id:j.issue,state:desired},{beforeSend:()=>{this.assertSpecification(job,binding);this.assertRevision(job,revision);}}),()=>{this.s.db.query("DELETE FROM linear_transitions WHERE job=? AND phase=? AND desired=? AND previous=? AND state='delivery_uncertain'").run(job,phase,desired,issue.state.id);});
   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||b.issueUpdate.issue.state?.id!==desired)throw Error('Linear status delivery requires reconciliation');
    return this.s.db.transaction(()=>{
     this.assertSpecification(job,binding);this.assertRevision(job,revision);
