@@ -40,3 +40,10 @@ test('network errors are sanitized without retrying and ordinary GraphQL errors 
     await expect(malformed('query{x}')).rejects.toThrow('Linear returned invalid JSON');
   }finally{s.close();}
 });
+
+test('quota persistence failures during viewer verification stop the request instead of falling back',async()=>{
+ const s=new Store(':memory:'),q=new LinearCooldowns(s,Date.now,async()=>{});let calls=0;
+ q.observe=()=>{throw Error('quota persistence unavailable');};
+ const api=createLinearAPI((async()=>{calls++;return Response.json({data:{viewer:{id:viewer}}});}) as typeof fetch,()=> 'private-key',q);
+ try{await expect(api('mutation{write{success}}')).rejects.toThrow('quota persistence unavailable');expect(calls).toBe(1);}finally{s.close();}
+});
