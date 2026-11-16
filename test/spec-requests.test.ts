@@ -18,6 +18,8 @@ import {featureGit} from '../src/approval-policy';
 import {ReviewLoop} from '../src/review-loop';
 import {Lifecycle} from '../src/lifecycle';
 import {activePlanning,PlanningCapacityReached} from '../src/planning-capacity';
+import {createLinearAPI} from '../src/linear-api';
+import {LinearCooldowns} from '../src/linear-cooldowns';
 
 const ready='<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const human='11111111-1111-4111-8111-111111111111';
@@ -179,6 +181,35 @@ test('lost Linear notice response reconciles its durable ID without reposting',a
   f.edit('edit');f.requests.api=async(q,v)=>{const result=await f.api(q,v);if(q.startsWith('mutation'))throw Error('lost notice response');return result;};
   expect((await f.requests.sync(f.c))[0].state).toBe('blocked');expect(f.creates()).toBe(1);
   f.requests.api=f.api;await f.requests.sync(f.c);expect(f.creates()).toBe(1);f.reply();await f.requests.sync(f.c);expect(f.sends).toHaveLength(1);
+ }finally{f.s.close();}
+});
+for(const failure of ['cooldown','persistence'])test(`final requirements read followed by ${failure} leaves an unsent replan notice retryable`,async()=>{
+ const f=fixture();let now=Date.now(),requirementsReads=0,mutations=0;
+ const quotas=new LinearCooldowns(f.s,()=>now,async ms=>{now+=ms;}),admit=quotas.admit.bind(quotas);quotas.verify('key',human);
+ f.requests.api=createLinearAPI((async(_url:any,init:any)=>{
+  const {query,variables}=JSON.parse(init.body);if(query.startsWith('mutation'))mutations++;
+  const data=await f.api(query,variables);const finalRead=query.includes('issue(id:')&&!query.includes('comments(')&&++requirementsReads===2;
+  if(finalRead&&failure==='persistence')quotas.admit=async()=>{throw Error('quota storage unavailable');};
+  return Response.json({data},{headers:finalRead&&failure==='cooldown'?{'x-ratelimit-requests-remaining':'0','x-ratelimit-requests-reset':String(now+60000)}:{}});
+ }) as typeof fetch,()=> 'key',quotas);
+ try{
+  f.edit('revised');expect((await f.requests.sync(f.c))[0].state).toBe('blocked');const before=f.row();
+  expect(before.notice_state).toBe('reserved');expect(before.source).toBeNull();expect(mutations).toBe(0);expect(f.creates()).toBe(0);expect(f.sends).toHaveLength(0);
+  now+=60000;quotas.admit=admit;expect((await f.requests.sync(f.c))[0].state).toBe('awaiting_replan_confirmation');
+  expect(f.row()).toMatchObject({notice_state:'posted',comment_id:before.comment_id,token:before.token,body:before.body,source:null});
+  await f.requests.sync(f.c);expect(mutations).toBe(1);expect(f.creates()).toBe(1);expect(f.sends).toHaveLength(0);
+  f.reply();await f.requests.sync(f.c);expect(f.sends).toHaveLength(1);expect(f.row().source).toBe('human');expect(mutations).toBe(1);
+ }finally{f.s.close();}
+});
+test('a throttle response after sending a replan notice retains uncertainty and never blindly republishes',async()=>{
+ const f=fixture();let now=Date.now(),mutations=0;const quotas=new LinearCooldowns(f.s,()=>now,async ms=>{now+=ms;});quotas.verify('key',human);
+ f.requests.api=createLinearAPI((async(_url:any,init:any)=>{
+  const {query,variables}=JSON.parse(init.body);if(query.startsWith('mutation')){mutations++;return new Response('throttled',{status:429,headers:{'retry-after':'60'}});}
+  return Response.json({data:await f.api(query,variables)});
+ }) as typeof fetch,()=> 'key',quotas);
+ try{
+  f.edit('revised');await f.requests.sync(f.c);expect(f.row().notice_state).toBe('delivery_uncertain');expect(mutations).toBe(1);
+  now+=60000;expect((await f.requests.sync(f.c))[0].reason).toContain('Notice delivery uncertain or missing');expect(f.row().notice_state).toBe('delivery_uncertain');expect(mutations).toBe(1);expect(f.sends).toHaveLength(0);
  }finally{f.s.close();}
 });
 test('consumed reply cannot repeat a retired replan attempt',async()=>{

@@ -1,7 +1,7 @@
 import {Store} from './core';
 import {FeaturePlanning} from './feature-planning';
 import {batchHash,ticketDescription,validateDraft} from './feature-schema';
-import {linearAPI,issueFields,type LinearAPI} from './linear-api';
+import {linearAPI,issueFields,LinearPreSendFailure,type LinearAPI} from './linear-api';
 import {LinearPreSendCooldown} from './linear-cooldowns';
 export class FeaturePublish{
  constructor(public s:Store,public plans:FeaturePlanning,public api:LinearAPI=linearAPI){s.db.exec(`CREATE TABLE IF NOT EXISTS feature_publications(plan TEXT NOT NULL REFERENCES feature_plans(id),key TEXT NOT NULL,id TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,receipt TEXT,PRIMARY KEY(plan,key));`);}
@@ -59,7 +59,7 @@ export class FeaturePublish{
       const r=b.issueRelationCreate?.issueRelation;if(!b.issueRelationCreate?.success||r?.id!==input.id||r.type!=='blocks'||r.issue?.id!==input.issueId||r.relatedIssue?.id!==input.relatedIssueId)throw Error('Dependency creation not confirmed');
      }
     }catch(error){
-     if(error instanceof LinearPreSendCooldown){
+     if(error instanceof LinearPreSendCooldown||error instanceof LinearPreSendFailure){
       this.s.db.query("UPDATE feature_publications SET state='reserved' WHERE plan=? AND key=? AND id=? AND state='delivery_uncertain'").run(id,op.key,op.id);
       throw error;
      }

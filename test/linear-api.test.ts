@@ -1,7 +1,8 @@
 import {test,expect,spyOn} from 'bun:test';
 import {Store} from '../src/core';
-import {createLinearAPI,coordinatedLinearFetch,withLinearReservation,LinearPreSendFailure} from '../src/linear-api';
+import {createLinearAPI,coordinatedLinearFetch,withLinearReservation,LinearPreSendFailure,linearAPI} from '../src/linear-api';
 import {LinearCooldowns,linearQuotaStatus,LinearCooldown,LinearPreSendCooldown} from '../src/linear-cooldowns';
+import {mkdtempSync,rmSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 const viewer='11111111-1111-1111-1111-111111111111';
 test('API verifies viewer once, shares across keys, and does not replay throttled mutations',async()=>{
   const s=new Store(':memory:');let now=1800000000000;const q=new LinearCooldowns(s,()=>now,async ms=>{now+=ms;});let identities=0,mutations=0;
@@ -108,4 +109,37 @@ test('an explicit null caller signal overrides a cancelled inherited Request sig
   const transport=coordinatedLinearFetch(q,'key',(async(_url:any,init:any)=>{sends++;expect(init.signal.aborted).toBe(false);return Response.json({data:{success:true}});}) as typeof fetch);
   await transport(new Request('https://api.linear.app/graphql',{signal:controller.signal}),{signal:null});expect(sends).toBe(1);
  }finally{s.close();}
+});
+
+for(const stage of ['verified','admit','observe','verify'] as const)test(`quota ${stage} failure before the requested mutation releases the reservation and preserves diagnostics`,async()=>{
+ const s=new Store(':memory:'),q=new LinearCooldowns(s,Date.now,async()=>{});let sends=0,mutations=0,releases=0;
+ const original=q[stage];(q as any)[stage]=()=>{throw Error('quota storage unavailable');};
+ const api=createLinearAPI((async(_url:any,init:any)=>{sends++;const {query}=JSON.parse(init.body);if(query.startsWith('mutation'))mutations++;return Response.json({data:query==='query{viewer{id}}'?{viewer:{id:viewer}}:{success:true}});}) as typeof fetch,()=> 'private-key',q);
+ try{
+  let error:unknown;try{await withLinearReservation(()=>api('mutation{write{success}}'),()=>{releases++;});}catch(e){error=e;}
+  expect(error).toBeInstanceOf(LinearPreSendFailure);expect((error as Error).message).toBe('quota storage unavailable');expect(releases).toBe(1);expect(mutations).toBe(0);expect(sends).toBe(stage==='observe'||stage==='verify'?1:0);
+  (q as any)[stage]=original;expect(await api('mutation{write{success}}')).toEqual({success:true});expect(mutations).toBe(1);
+ }finally{s.close();}
+});
+test('quota admission failure redacts credential material and supplies diagnostics for non-Error failures',async()=>{
+ const s=new Store(':memory:'),q=new LinearCooldowns(s,Date.now,async()=>{});q.verify('private-key',viewer);let sends=0;
+ const api=createLinearAPI((async()=>{sends++;return Response.json({data:{}});}) as typeof fetch,()=> 'private-key',q);
+ try{
+  q.admit=async()=>{throw Error('quota unavailable for private-key');};await expect(api('mutation{x}')).rejects.toThrow('quota unavailable for [redacted]');
+  q.admit=async()=>{throw 'unknown failure';};await expect(api('mutation{x}')).rejects.toThrow('Linear quota persistence failed');expect(sends).toBe(0);
+ }finally{s.close();}
+});
+test('quota persistence failure after a mutation fetch remains uncertain and never releases its reservation',async()=>{
+ const s=new Store(':memory:'),q=new LinearCooldowns(s,Date.now,async()=>{});q.verify('key',viewer);let sends=0,releases=0;
+ const failure=Error('post-send quota storage unavailable');q.observe=()=>{throw failure;};
+ const api=createLinearAPI((async()=>{sends++;return Response.json({data:{success:true}});}) as typeof fetch,()=> 'key',q);
+ try{
+  let error:unknown;try{await withLinearReservation(()=>api('mutation{x}'),()=>{releases++;});}catch(e){error=e;}
+  expect(error).toBe(failure);expect(error).not.toBeInstanceOf(LinearPreSendFailure);expect(sends).toBe(1);expect(releases).toBe(0);
+ }finally{s.close();}
+});
+test('default quota-store initialization failure is known-unsent without reading credentials',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'linear-store-unavailable-')),prior=process.env.ADLC_DB;process.env.ADLC_DB=directory;let releases=0;
+ try{await expect(withLinearReservation(()=>linearAPI('mutation{x}'),()=>{releases++;})).rejects.toBeInstanceOf(LinearPreSendFailure);expect(releases).toBe(1);}
+ finally{if(prior===undefined)delete process.env.ADLC_DB;else process.env.ADLC_DB=prior;rmSync(directory,{recursive:true,force:true});}
 });

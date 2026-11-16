@@ -58,6 +58,19 @@ for(const changed of ['specification','revision'])test(`status send rechecks ${c
   expect(changedDuringWait).toBe(true);expect(f.updates).toBe(0);expect(f.state).toBe('todo');expect(f.s.db.query('SELECT * FROM linear_transitions').all()).toEqual([]);
  }finally{f.s.close();}
 });
+for(const stage of ['admit','verified'] as const)test(`quota ${stage} storage failure releases an unsent status transition for a fresh retry`,async()=>{
+ const f=fixture(),base=f.sync.api;let now=Date.now();const quotas=new LinearCooldowns(f.s,()=>now,async ms=>{now+=ms;}),original=quotas[stage];quotas.verify('key','11111111-1111-1111-1111-111111111111');let fail=true;
+ f.sync.api=createLinearAPI((async(_url:any,init:any)=>{
+  const {query,variables}=JSON.parse(init.body),data=await base(query,variables);
+  if(fail&&query.includes('workflowState'))(quotas as any)[stage]=()=>{throw Error('quota storage unavailable');};
+  return Response.json({data});
+ }) as typeof fetch,()=> 'key',quotas);
+ const binding=(f.s.db.query('SELECT spec_hash FROM planning_runs WHERE job=?').get(f.id) as any).spec_hash;
+ try{
+  await expect(f.sync.move(f.id,'in-progress','progress',c,binding,null)).rejects.toBeInstanceOf(LinearPreSendFailure);expect(f.updates).toBe(0);expect(f.s.db.query('SELECT * FROM linear_transitions').all()).toEqual([]);
+  fail=false;(quotas as any)[stage]=original;expect(await f.sync.move(f.id,'in-progress','progress',c,binding,null)).toMatchObject({state:'confirmed'});expect(f.updates).toBe(1);
+ }finally{f.s.close();}
+});
 test('pre-send cooldown retains remediation notice ID and permits publication after the hold',async()=>{
  const f=budgetBlocked();let hold=true;f.intercept(q=>{if(hold&&q.startsWith('mutation'))throw new LinearPreSendCooldown(Date.now()+60000);});
  try{

@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';import {FeaturePublish} from '../src/feature-publish';import {plannedFeature} from './feature-fixture';
-import {createLinearAPI} from '../src/linear-api';
+import {createLinearAPI,LinearPreSendFailure} from '../src/linear-api';
 import {LinearCooldowns,LinearPreSendCooldown} from '../src/linear-cooldowns';
 function apiFixture(){const issues=new Map(),relations=new Map();let creates=0,lost=false;const api=async(query:string,v:any={})=>{
  if(query.includes('workflowState'))return {workflowState:{id:'00000000-0000-0000-0000-000000000005',type:'backlog',team:{id:'00000000-0000-0000-0000-000000000002'}},project:{id:'00000000-0000-0000-0000-000000000001',teams:{nodes:[{id:'00000000-0000-0000-0000-000000000002'}],pageInfo:{hasNextPage:false}}}};
@@ -52,5 +52,14 @@ test('a throttle response to a sent mutation keeps the uncertain reservation and
   planner.approve(id,planner.get(id).hash,'human');await expect(publisher.publish(id)).rejects.toThrow('uncertain');
   expect(s.db.query("SELECT count(*) AS n FROM feature_publications WHERE state='delivery_uncertain'").get()).toEqual({n:1});
   now+=60000;await expect(publisher.publish(id)).rejects.toThrow('No authoritative publication receipt');expect(mutations).toBe(1);expect(f.creates).toBe(0);
+ }finally{s.close();}
+});
+test('a known pre-send quota failure does not strand feature publication reservations',async()=>{
+ const {s,planner,id}=await plannedFeature(),f=apiFixture();let unavailable=true;
+ const publisher=new FeaturePublish(s,planner,async(query,v)=>{if(unavailable&&query.startsWith('mutation'))throw new LinearPreSendFailure('quota storage unavailable');return f.api(query,v);});
+ try{
+  planner.approve(id,planner.get(id).hash,'human');await expect(publisher.publish(id)).rejects.toBeInstanceOf(LinearPreSendFailure);
+  const before=s.db.query('SELECT id,state FROM feature_publications ORDER BY id').all() as any[];expect(before.every(op=>op.state==='reserved')).toBe(true);expect(f.creates).toBe(0);
+  unavailable=false;await publisher.publish(id);expect(f.creates).toBe(2);expect(f.relations.size).toBe(1);expect(s.db.query('SELECT id FROM feature_publications ORDER BY id').all()).toEqual(before.map(({id})=>({id})));
  }finally{s.close();}
 });

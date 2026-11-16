@@ -3,7 +3,7 @@ import {Store,digest} from './core';
 import type {Workflow,WorkflowConfig} from './workflow';
 import {SpecRecovery,assertCurrentPlanningRequirements} from './spec-recovery';
 import {latestRevision,revisionStatus} from './spec-revisions';
-import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {linearAPI,readLinearIssue,withLinearReservation,type LinearAPI} from './linear-api';
 import {LinearApprovals} from './linear-approvals';
 import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
 import {PlanningCapacityReached} from './planning-capacity';
@@ -89,7 +89,7 @@ export class SpecRequests{
     await this.guard(job,c,r.id,binding);
     const claim=this.s.db.query("UPDATE spec_requests SET notice_state='delivery_uncertain' WHERE revision=? AND notice_state='reserved'").run(r.id);
     if(!claim.changes)throw Error(`Notice delivery uncertain or missing. Inspect Linear comment ${n.comment_id}; normal polling reconciles it if present. If absence cannot be authoritatively established, use spec-reconcile ${job} CONFIG preview/confirmation to request planning without reposting the notice`);
-    const b=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}}),posted=b.commentCreate?.comment;
+     const b=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}}),()=>{this.s.db.query("UPDATE spec_requests SET notice_state='reserved' WHERE revision=? AND comment_id=? AND notice_state='delivery_uncertain'").run(r.id,n.comment_id);}),posted=b.commentCreate?.comment;
     if(b.commentCreate?.success===false&&!posted){
      // Only an explicit negative mutation acknowledgement is definite failure.
      // Transport/GraphQL errors can be partial successes and retain uncertainty.

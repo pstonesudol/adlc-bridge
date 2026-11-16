@@ -13,9 +13,10 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {LinearPreSendCooldown} from '../src/linear-cooldowns';
-test('pre-send cooldown keeps blocker comment ownership reserved and later posts exactly once',async()=>{
+import {LinearPreSendFailure} from '../src/linear-api';
+for(const failure of [new LinearPreSendCooldown(Date.now()+60000),new LinearPreSendFailure('quota storage unavailable')])test(`${failure.constructor.name} keeps blocker comment ownership reserved and later posts exactly once`,async()=>{
  const f=fixture(),blockers=f.blockers(),api=blockers.api;let hold=true;
- blockers.api=async(q,v)=>{if(hold&&q.startsWith('mutation'))throw new LinearPreSendCooldown(Date.now()+60000);return api(q,v);};
+ blockers.api=async(q,v)=>{if(hold&&q.startsWith('mutation'))throw failure;return api(q,v);};
  try{
   await blockers.sync(f.config);const before=f.s.db.query('SELECT * FROM blocker_notices').get() as any;
   expect(before.state).toBe('reserved');expect(f.creates).toBe(0);

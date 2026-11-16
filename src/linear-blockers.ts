@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import {RecoveryObservation,transient} from './recovery-observation';
 import {Store,digest} from './core';
-import {linearAPI,readLinearIssue,withLinearReservation,type LinearAPI} from './linear-api';
+import {linearAPI,readLinearIssue,withLinearReservation,LinearPreSendFailure,type LinearAPI} from './linear-api';
 import {recoveryRows} from './worktree-reservation';
 import {Lifecycle} from './lifecycle';
 import {settleDependencyWait,revisionBoundWait,currentOutcome,latestRevision} from './spec-revisions';
@@ -86,7 +86,7 @@ export class LinearBlockers{
     }
    const claim=this.s.db.query("UPDATE blocker_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
    if(!claim.changes)return {job,state:'delivery_uncertain',reason:'Blocker comment already claimed'};
-    const b=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:row.comment_id,issueId:j.issue,body:row.body,doNotSubscribeToIssue:false}}).catch(error=>{if(error instanceof LinearPreSendCooldown)throw error;throw Error('Blocker comment delivery uncertain; never repost blindly');}),()=>{this.s.db.query("UPDATE blocker_notices SET state='reserved' WHERE job=? AND binding=? AND comment_id=? AND state='delivery_uncertain'").run(job,binding,row.comment_id);});
+    const b=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:row.comment_id,issueId:j.issue,body:row.body,doNotSubscribeToIssue:false}}).catch(error=>{if(error instanceof LinearPreSendCooldown||error instanceof LinearPreSendFailure)throw error;throw Error('Blocker comment delivery uncertain; never repost blindly');}),()=>{this.s.db.query("UPDATE blocker_notices SET state='reserved' WHERE job=? AND binding=? AND comment_id=? AND state='delivery_uncertain'").run(job,binding,row.comment_id);});
    posted=b.commentCreate?.comment;
    if(!b.commentCreate?.success||posted?.id!==row.comment_id||posted.body!==row.body||!Number.isFinite(Date.parse(posted.createdAt)))throw Error('Blocker comment delivery requires reconciliation');
    this.s.db.query("UPDATE blocker_notices SET state='posted',created=? WHERE job=? AND binding=?").run(posted.createdAt,job,binding);

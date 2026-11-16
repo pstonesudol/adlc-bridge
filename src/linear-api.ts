@@ -6,6 +6,11 @@ export type LinearSendOptions={beforeSend?:()=>void};
 export type LinearAPI=(query:string,variables?:Record<string,unknown>,options?:LinearSendOptions)=>Promise<any>;
 class LinearTransportFailure extends Error{}
 export class LinearPreSendFailure extends Error{}
+function preSendQuotaFailure(error:unknown,token=''){
+ if(error instanceof LinearCooldown||error instanceof LinearPreSendFailure)return error;
+ const message=error instanceof Error?error.message:'Linear quota persistence failed';
+ return new LinearPreSendFailure(token?message.split(token).join('[redacted]'):message);
+}
 // Only the caller owning a fresh reservation may release it, and only when the
 // requested operation definitely never reached fetch. Sent failures stay fenced.
 export async function withLinearReservation<T>(send:()=>Promise<T>,release:()=>void):Promise<T>{
@@ -16,7 +21,7 @@ function validateLinearSend(beforeSend?:()=>void){
 }
 export function coordinatedLinearFetch(quotas:LinearCooldowns,token:string,send=fetch,project?:string,beforeSend?:()=>void):typeof fetch {
  return (async(url:any,init:any)=>{
-   await quotas.admit(token,project);
+   try{await quotas.admit(token,project);}catch(error){throw preSendQuotaFailure(error,token);}
    const prior=init?.signal!==undefined?init.signal:(url instanceof Request?url.signal:undefined);
    if(prior?.aborted)throw new LinearPreSendFailure('Linear request cancelled before send');
    validateLinearSend(beforeSend);
@@ -32,14 +37,19 @@ export function coordinatedLinearFetch(quotas:LinearCooldowns,token:string,send=
 export function createLinearAPI(send=fetch,token=linearToken,quotas?:LinearCooldowns):LinearAPI{return async(query,variables={},options={})=>{
   const credential=token();
   const transport=quotas?coordinatedLinearFetch(quotas,credential,send):send;
-  if(quotas&&!quotas.verified(credential)){
-    try{const identity=await transport('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query:'query{viewer{id}}'})});const b:any=await identity.json();if(identity.ok&&!b.errors)quotas.verify(credential,b.data?.viewer?.id);}catch(e){if(e instanceof LinearCooldown)throw new LinearPreSendCooldown(e.nextEligible);if(!(e instanceof LinearTransportFailure))throw e;}
+  let verified=false;
+  if(quotas)try{verified=quotas.verified(credential);}catch(error){throw preSendQuotaFailure(error,credential);}
+  if(quotas&&!verified){
+    try{const identity=await transport('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query:'query{viewer{id}}'})});const b:any=await identity.json();if(identity.ok&&!b.errors)quotas.verify(credential,b.data?.viewer?.id);}catch(e){if(e instanceof LinearCooldown)throw new LinearPreSendCooldown(e.nextEligible);if(!(e instanceof LinearTransportFailure))throw preSendQuotaFailure(e,credential);}
   }
   const operation=quotas?coordinatedLinearFetch(quotas,credential,send,undefined,options.beforeSend):send;
   if(!quotas)validateLinearSend(options.beforeSend);
   const r=await operation('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query,variables}),...(!quotas?{signal:AbortSignal.timeout(20000)}:{})});
  if(!r.ok)throw Error(`Linear HTTP ${r.status}`);const b=await r.json();if(b.errors||!b.data)throw Error('Linear returned errors or incomplete data');return b.data;
 };}
-export const linearAPI:LinearAPI=async(query,variables,options)=>{const s=new Store(process.env.ADLC_DB??registryPath());try{return await createLinearAPI(fetch,linearToken,new LinearCooldowns(s))(query,variables,options);}finally{s.close();}};
+export const linearAPI:LinearAPI=async(query,variables,options)=>{
+ let s:Store;try{s=new Store(process.env.ADLC_DB??registryPath());}catch(error){throw preSendQuotaFailure(error);}
+ try{return await createLinearAPI(fetch,linearToken,new LinearCooldowns(s))(query,variables,options);}finally{s.close();}
+};
 export const issueFields='id identifier title description url team{id} project{id} state{id type} labels(first:100){nodes{id name} pageInfo{hasNextPage}}';
 export async function readLinearIssue(id:string,api:LinearAPI=linearAPI){const b=await api(`query($id:String!){issue(id:$id){${issueFields}}}`,{id});return b.issue;}
