@@ -3,7 +3,9 @@ import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {Workflow,type WorkflowTransport} from '../src/workflow';
-import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,readFileSync,mkdirSync,writeFileSync,realpathSync} from 'node:fs';
+import {DependencySetup,outputDigest} from '../src/dependency-setup';
+import {ReceiptReconciliation} from '../src/receipt-reconciliation';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {turnBarrier} from '../src/turn-submission';import {createWorkflowTransport} from '../src/workflow-transport';
@@ -12,6 +14,35 @@ import {revisedHandoff,latestRevision} from '../src/spec-revisions';
 
 const config={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1}};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
+const dependencyPolicy={version:1 as const,runtime:'verification-container' as const,cwd:'.',lockfile:'package-lock.json' as const,manifests:['package.json','frontend/package.json'],cache:'/opt/npm-cache'};
+function scopedPlan(f:Fake,paths?:string[]){
+ f.completePlan();if(paths)f.sessions.get('session-1').transcript.entries[0].text+=`\n<!-- ADLC_PLAN_SCOPE ${JSON.stringify({version:1,paths})} -->`;
+}
+for(const cwd of ['.','app'])for(const path of ['package.json','frontend/package.json','package-lock.json',undefined])test(`dependency input plan requires operator review before dispatch (${cwd}/${path??'ambiguous scope'})`,async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),job=s.enqueue('p','setup-plan','Task');
+ try{
+  const c={...config,dependencySetup:{...dependencyPolicy,cwd}},covered=join(cwd,path??'package.json');
+  await w.startPlanning(job,c);scopedPlan(f,path?[covered]:undefined);await w.reconcilePlanning(job,c);
+  w.approve(job,s.get(job).plan_hash,'human',['**'],'supervised-host',ops);
+  let calls=0;w.dependencySetup.ensure=async()=>{calls++;throw Error('must not reach setup');};
+  for(let i=0;i<2;i++){
+   const result=await w.executeApproved(job,c);expect(result).toMatchObject({state:'dependency_setup_blocked'});expect(result.reason).toContain('Operator review required');expect(result.reason).toContain(covered);
+  }
+  expect(calls).toBe(0);expect(f.sends).toHaveLength(0);expect(f.starts).toHaveLength(1);expect(w.implementation(job).state).toBe('approved_pending');
+  expect(new ReceiptReconciliation(s).get(w.implementation(job).client_id)).toBeNull();
+ }finally{s.close();}
+});
+test('dependency setup blocks before initial dispatch and reuses the same worker after readiness',async()=>{
+ const s=new Store(':memory:'),f=new Fake(s),w=new Workflow(s,f),job=s.enqueue('p','setup','Task');
+ try{
+  await w.startPlanning(job,config);f.completePlan();await w.reconcilePlanning(job,config);
+  w.approve(job,s.get(job).plan_hash,'human',['src/**'],'supervised-host',ops);
+  let ready=false,calls=0;w.dependencySetup.ensure=async()=>{calls++;if(!ready)throw Error('Missing offline cache; operator review required');return {state:'ready',binding:'verified'};};
+  expect(await w.executeApproved(job,config)).toMatchObject({state:'dependency_setup_blocked'});expect(f.sends).toHaveLength(0);expect(w.implementation(job).state).toBe('approved_pending');
+  ready=true;await w.executeApproved(job,config);await w.executeApproved(job,config);
+  expect(f.starts).toHaveLength(1);expect(f.sends).toHaveLength(1);expect(f.sends[0].id).toBe('session-1');expect(calls).toBe(2);
+ }finally{s.close();}
+});
 class Fake implements WorkflowTransport{
  starts:any[]=[];sends:any[]=[];sessions=new Map<string,any>();loseSpawn=false;loseSend=false;
  constructor(public s:Store){}
@@ -131,6 +162,39 @@ async function planned(path=':memory:'){
  const s=new Store(path),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','issue',JSON.stringify({identifier:'DEMO-1',title:'Test',description:'Update src/a.ts'}));
  await w.tick(config);f.completePlan();await w.tick(config);return {s,f,w,id,hash:s.get(id).plan_hash};
 }
+for(const changed of [undefined,'package.json','frontend/package.json','package-lock.json'])test(`resume uses real setup binding and ${changed?'blocks changed '+changed:'continues unchanged inputs once'}`,async()=>{
+ const root=realpathSync(mkdtempSync(join(tmpdir(),'adlc-resume-setup-'))),repo=join(root,'repo'),tree=join(root,'tree');
+ const git=(cwd:string,...args:string[])=>{const p=Bun.spawnSync(['git',...args],{cwd,stdout:'pipe',stderr:'pipe'});if(p.exitCode)throw Error(p.stderr.toString());return p.stdout.toString();};
+ const s=new Store(join(root,'state.sqlite')),f=new Fake(s),w=new Workflow(s,f),id=s.enqueue('p','setup-resume','Task');
+ try{
+  mkdirSync(repo);git(repo,'init');git(repo,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','--allow-empty','-m','initial');git(repo,'worktree','add','-b','worker',tree);
+  mkdirSync(join(tree,'frontend'));writeFileSync(join(tree,'.gitignore'),'node_modules/\n');writeFileSync(join(tree,'package.json'),JSON.stringify({name:'root',workspaces:['frontend']}));writeFileSync(join(tree,'frontend/package.json'),'{"name":"frontend"}');
+  writeFileSync(join(tree,'package-lock.json'),JSON.stringify({lockfileVersion:3,packages:{'':{},frontend:{},'node_modules/frontend':{link:true,resolved:'frontend'}}}));git(tree,'add','.');git(tree,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','workspace');
+  const c={...config,repo,dependencySetup:dependencyPolicy,verification:{version:1 as const,mode:'container' as const,steps:[{cwd:'frontend',argv:['node','--version']}],container:{image:'sha256:'+'a'.repeat(64),inputs:['frontend']}}};
+  await w.startPlanning(id,c);scopedPlan(f,['frontend/story.txt']);await w.reconcilePlanning(id,c);
+  s.db.query('UPDATE planning_runs SET worktree=? WHERE job=?').run(tree,id);
+  const branch=(s.db.query('SELECT branch FROM planning_runs WHERE job=?').get(id) as any).branch;
+  f.worktree=async()=>({branch,head:'a'.repeat(40),tree});
+  w.approve(id,s.get(id).plan_hash,'human',['frontend/story.txt'],'supervised-host',ops);
+  let installs=0;const io={facts:async()=>({job:id,plan:s.get(id).plan_hash,spec:digest(s.get(id).spec),session:'session-1',branch,worktree:tree,dispatch:w.implementation(id).client_id,grant:JSON.stringify(s.db.query('SELECT * FROM git_grants WHERE job=?').get(id)),runtime:{docker:{path:'/trusted/docker',version:'1.2.3'}}}),install:async(input:any)=>{installs++;mkdirSync(join(input.destination,'0'));writeFileSync(join(input.destination,'0/package.json'),'{}');}};
+  w.dependencySetup=new DependencySetup(s,io);
+  await w.executeApproved(id,c);expect(installs).toBe(1);expect(f.sends).toHaveLength(1);
+  f.workerReceipt(workerBlock('needs-input','Missing stable product ID'));await w.tick(c);
+  (await import('../src/readiness')).recordResolution(s,id,'human-answer','Alice','Product ID SKU-42 confirmed');
+  const receipts=s.db.query('SELECT * FROM dependency_setups').all(),outputs=outputDigest(join(tree,'node_modules'));
+  if(changed){writeFileSync(join(tree,changed),readFileSync(join(tree,changed),'utf8')+'\n');git(tree,'add',changed);}
+  const index=git(tree,'diff','--cached','--binary'),fresh=new Workflow(s,f);fresh.dependencySetup=new DependencySetup(s,io);
+  if(changed){
+   for(let i=0;i<2;i++)await expect(fresh.resume(id,c)).rejects.toThrow(`Setup inputs changed after installation: ${changed};`);
+   expect(f.sends).toHaveLength(1);expect(s.db.query('SELECT * FROM continuations').all()).toHaveLength(0);
+   expect(s.db.query('SELECT * FROM dependency_setups').all()).toEqual(receipts);
+  }else{
+   expect(await fresh.resume(id,c)).toMatchObject({state:'continuation_delivery_accepted'});expect(f.sends).toHaveLength(2);
+   await expect(fresh.resume(id,c)).rejects.toThrow();expect(f.sends).toHaveLength(2);
+  }
+  expect(installs).toBe(1);expect(outputDigest(join(tree,'node_modules'))).toBe(outputs);expect(git(tree,'diff','--cached','--binary')).toBe(index);expect(f.starts).toHaveLength(1);
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
+});
 test('a remediation receipt cannot substitute for a missing original delivery receipt',async()=>{
  const {s,f,w,id,hash}=await planned();try{
   w.approve(id,hash,'human',['src/**'],'supervised-host',ops);await w.tick(config);f.finishImplementation();
@@ -629,6 +693,19 @@ test('guarded resume requires current resolution, resends no original request an
  f.sessions.get('session-1').transcript.controller='ready';
  await expect(w.resume(id,config)).rejects.toThrow('already in flight');
  expect(f.sends.length).toBe(before+1);s.close();
+});
+test('dependency setup blocker cannot reserve a continuation or replace its existing worker',async()=>{
+ const {recordResolution}=await import('../src/readiness');const {s,f,w,id,hash}=await planned();try{
+  w.approve(id,hash,'human',['src/a.ts'],'supervised-host',ops);await w.tick(config);
+  f.workerReceipt(workerBlock('blocked-dependency',undefined,'offline-cache'));await w.tick(config);
+  recordResolution(s,id,'dependency-satisfied','operator','Approved cache prerequisite provisioned separately');
+  w.dependencySetup.ensure=async()=>{throw Error('Cache entry still missing; operator review required');};
+  await expect(w.resume(id,config)).rejects.toThrow('Cache entry still missing');
+  expect(s.db.query('SELECT * FROM continuations').all()).toHaveLength(0);expect(f.sends).toHaveLength(1);expect(f.starts).toHaveLength(1);
+  w.dependencySetup.ensure=async()=>({state:'ready',binding:'verified'});
+  expect(await w.resume(id,config)).toMatchObject({state:'continuation_delivery_accepted',session:'session-1'});
+  await expect(w.resume(id,config)).rejects.toThrow();expect(f.sends).toHaveLength(2);expect(f.starts).toHaveLength(1);
+ }finally{s.close();}
 });
 
 test('failed continuation requires exact reviewed delivery recovery before another resume',async()=>{

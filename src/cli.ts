@@ -56,6 +56,7 @@ import {conflictRecoveryStatus,branchSyncRows} from './worktree-reservation';
 import {RecoveryObservation} from './recovery-observation';
 import {migrateController} from './controller-migration';
 import {DependencyRecovery} from './dependency-recovery';
+import {DependencySetup} from './dependency-setup';
 import {SpecRecovery} from './spec-recovery';
 import {RemediationReceipts} from './remediation-receipts';
 import {PlanReconciliation} from './plan-reconciliation';
@@ -262,7 +263,20 @@ async function main(){
       if(realpathSync(runtime.projectConfig)!==realpathSync(a[0]))throw Error('Runtime configuration belongs to a different project config');
       docker=runtime.tools.docker;
     }
-    const result=await runVerification(req(a[1],'Explicit worktree'),c.verification,Bun.spawn,{docker,projectRepo:c.repo});out(result);if(!result.passed)process.exitCode=1;return;
+     const worktree=req(a[1],'Explicit worktree');
+     const verify=async()=>{
+      if(c.dependencySetup&&!existsSync(db))throw Error('Existing state database required for dependency verification');
+      const store=c.dependencySetup?new Store(db):undefined;
+      try{
+       const guard=store?async()=>{
+        const owners=(store.db.query('SELECT job,worktree FROM planning_runs').all() as any[]).filter(r=>r.worktree&&existsSync(r.worktree)&&realpathSync(r.worktree)===realpathSync(worktree));
+        if(owners.length!==1)throw Error('Exact registered worker worktree required for dependency verification');
+        return new DependencySetup(store).ensure(owners[0].job,c,true);
+       }:undefined;
+       return await runVerification(worktree,c.verification,Bun.spawn,{docker,projectRepo:c.repo,dependencySetup:c.dependencySetup,dependencyGuard:guard});
+      }finally{store?.close();}
+     };
+     const result=c.dependencySetup?await withTurnSubmission(verify):await verify();out(result);if(!result.passed)process.exitCode=1;return;
   }
   if(['start','stop','service-status','service-config'].includes(command)){
     if(a.slice(1).some(x=>x!=='--apply')||(a.includes('--apply')&&command!=='service-config'))throw Error('Unsupported service option');

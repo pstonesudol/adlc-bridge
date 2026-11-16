@@ -6,6 +6,7 @@ import {remediationPolicy,type RemediationConfig} from './remediation';
 import {validateConflictPolicy,type ConflictPolicy} from './conflict-policy';
 import {validateClarifications} from './linear-clarifications';
 import {validateVerification,type Verification} from './verification';
+import {validateDependencySetup,type DependencySetupPolicy} from './dependency-setup-policy';
 import {effectiveSettings} from './project-settings';
 import {validateDependencies,type DependencyPolicy} from './dependency-policy';
 import {validateIntegrationPolicy,type IntegrationPolicy} from './integration-capabilities';
@@ -20,6 +21,7 @@ export type ProjectConfig = {
   approval?:ApprovalPolicy;
   reviewers?:ReviewerConfig[];
   verification?:Verification;
+  dependencySetup?:DependencySetupPolicy;
   replanning?:ReplanningPolicy;
   pollingIntervalSeconds?:number;
   automation?:{planningEnabled?:boolean;orchestratorProject?:string;maxPlanning?:number};
@@ -47,7 +49,9 @@ export function metadataCheckNames(value:unknown):string[]{
   return value;
 }
 export function validate(c: any): asserts c is ProjectConfig {
+  validateDependencySetup(c?.dependencySetup);
   if(c?.verification!==undefined)validateVerification(c.verification);
+  if(c?.dependencySetup&&c.verification?.mode!=='container')throw Error('dependencySetup requires container verification with an immutable image');
   effectiveSettings(c??{});
   validateReplanning(c??{});
   reviewerPolicy(c?.reviewers);
