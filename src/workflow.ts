@@ -15,7 +15,7 @@ import {PreSendFailure} from './pre-send';
 import {assertWorktreeAvailable,canonicalWorktree,worktreeReservation} from './worktree-reservation';
 import {ensureReadinessStore,activeReadinessResolution,applicableResolution,assertApprovalReadiness,readinessBinding,resolutionBinding,readinessFor,assessPlan,assessWorkerReceipt,clarificationDiscovery,WORKER_STATUS_INSTRUCTION} from './readiness';
 import {effectiveSettings} from './project-settings';
-import {latestRevision,revisionStatus,handoffPr,recordHandoff,currentOutcome,capturedRevision,revisedExecution,currentDispatchContinuation,implementationRecoveryContinuation,implementationCompletion,reconcileAuthorizedReviewScope,type HandoffProof} from './spec-revisions';
+import {latestRevision,revisionStatus,handoffPr,recordHandoff,resumeRevisedReview,currentOutcome,capturedRevision,revisedExecution,currentDispatchContinuation,implementationRecoveryContinuation,implementationCompletion,reconcileAuthorizedReviewScope,type HandoffProof} from './spec-revisions';
 import {SpecRecovery} from './spec-recovery';
 import {ensurePlanningRestores} from './planning-restore';
 import {PlanningDependencies} from './planning-dependencies';
@@ -26,6 +26,7 @@ import type {PlanningPRInventory} from './planning-prs';
 import {activePlanning,assertPlanningCapacity} from './planning-capacity';
 import {currentPlanningFailure} from './operator-evidence';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
+import {RevisionDelivery} from './revision-delivery';
 
 export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext};
 export {activePlanning} from './planning-capacity';
@@ -41,6 +42,7 @@ export interface WorkflowTransport{
   worktree?(job:string):Promise<{branch:string;head:string;tree?:string;worktree?:string}>;
   branchSnapshot?(repo:string,pr:number):Promise<any>;
   planningPRs?(repo:string,branch:string):Promise<PlanningPRInventory>;
+  readReviewEvidence?(repo:string,pr:number,checks:string[]):Promise<any>;
   restorePlan?(session:string,project:string):Promise<void>;
   planningFailureFacts?(session:string,turn:string):Promise<{turn:any;capabilities:unknown;authenticationState:unknown}>;
 }
@@ -450,6 +452,7 @@ export class Workflow{
      if(planning?.session_id!==d.session_id||planning?.project!==e.session.projectId||planning?.branch!==e.session.branch||!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured||target?.repo!==observedTarget?.repo||target?.pr!==observedTarget?.pr)return {state:'stale_execution',applied:false,session:d.session_id,reason:'Revised owner or review target changed during evidence collection'};
     }
     if(result.state==='pr_handoff')recordHandoff(this.s,job,d.plan_hash,handoffPr(result,prs),now,publishedProof);
+    if(result.state==='pr_handoff'&&revised)resumeRevisedReview(this.s,job,now);
    // A later remediation may be selected for the workflow outcome, but only
    // the continuation's own receipt can settle its durable delivery state.
    const contEntry=cont&&e.transcript?.entries?.find((x:any)=>x.clientMessageId===cont.client_id);
@@ -778,6 +781,11 @@ export class Workflow{
   const {maxPlanning}=effectiveSettings(c);
   const results:any[]=[];
   new ApprovalPolicyStore(this.s).revokeChanged(c.linear.projectId,c.approval);
+  const historical=new RevisionDelivery(this.s,this);
+  const retained=this.s.db.query("SELECT j.id FROM jobs j JOIN implementation_dispatch d ON d.job=j.id WHERE j.project=? AND j.state!='done'").all(c.linear.projectId) as any[];
+  for(const row of retained)try{
+   const result=await historical.observe(row.id,c);if(result)results.push({job:row.id,...result});
+  }catch(e){results.push({job:row.id,state:'revision_observation_deferred',reason:e instanceof Error?e.message:'Revision observation unavailable'});}
   this.s.db.query('INSERT INTO project_execution_policy VALUES (?,?) ON CONFLICT(project) DO UPDATE SET runtime=excluded.runtime').run(c.linear.projectId,'supervised-host');
   // Recover existing planning/delivery first. One uncertain session consumes a slot.
   const planning=this.s.db.query("SELECT d.job FROM planning_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? AND (j.state IN ('awaiting_plan','awaiting_approval') OR (j.state='blocked' AND d.state IN ('planning','dispatch_uncertain','needs_reconciliation')))").all(c.linear.projectId) as any[];
@@ -808,6 +816,7 @@ export class Workflow{
    outcomes:this.s.db.query(`SELECT w.job,j.issue,w.plan_hash,w.session_id,w.revision_id,w.dispatch_id,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.first_observed,w.grace_deadline,w.observed
      FROM worker_outcomes w JOIN jobs j ON j.id=w.job`).all().map((o:any)=>({...o,historical:!currentOutcome(this.s,o.job,o)})),
   continuations:this.s.db.query('SELECT job,plan_hash,binding,client_id,session_id,state,reason,at FROM continuations').all(),
+  revisionDeliveries:this.s.db.query("SELECT name FROM sqlite_master WHERE name='revision_delivery_observations'").get()?this.s.db.query('SELECT * FROM revision_delivery_observations').all().map((x:any)=>({...x,result:JSON.parse(x.result),persistedOnly:true})):[],
   blockers:this.s.db.query(`SELECT w.job,j.issue,w.outcome,w.reason,w.questions,w.dependencies,w.source,w.confidence,w.grace_deadline
       FROM worker_outcomes w JOIN jobs j ON j.id=w.job WHERE j.state!='done' AND w.plan_hash=j.plan_hash AND w.outcome IN ('needs_input','blocked_dependency','failed','uncertain','needs_reconciliation')`).all().filter((o:any)=>currentOutcome(this.s,o.job,this.outcomes(o.job))),requirementRevisions:this.s.list().map(j=>({job:j.id,...revisionStatus(this.s,j.id)})).filter(r=>r.revision)};}
 }
