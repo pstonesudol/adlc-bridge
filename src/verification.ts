@@ -1,8 +1,9 @@
-import {existsSync,lstatSync,realpathSync,mkdtempSync,mkdirSync,rmSync} from 'node:fs';
-import {resolve,relative,join,isAbsolute} from 'node:path';
+import {existsSync,lstatSync,realpathSync,mkdtempSync,mkdirSync,rmSync,cpSync} from 'node:fs';
+import {resolve,relative,join,isAbsolute,dirname} from 'node:path';
 import {tmpdir} from 'node:os';
 import {copyFrontend} from './container-check';
 import {validateDependencySetup,type DependencySetupPolicy} from './dependency-setup-policy';
+import {outputDigest} from './dependency-setup';
 
 export type Verification={version:1;mode:'host'|'container';steps:{cwd:string;argv:string[]}[];container?:{image:string;inputs:string[]}};
 export type VerificationContext={projectConfig:string;runtimeConfig:string;bun:string;cli:string};
@@ -12,6 +13,7 @@ export function validateVerificationContext(c:any):asserts c is VerificationCont
 }
 const safePath=(p:unknown):p is string=>typeof p==='string'&&p.length>0&&/^[\w. /-]+$/.test(p)&&!p.startsWith('/')&&!p.split('/').includes('..');
 function keys(v:any,allowed:string[]){if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).some(k=>!allowed.includes(k)))throw Error('Unknown verification field');}
+export function isImmutableImage(image:unknown):image is string{return typeof image==='string'&&/^([\w./:-]+@)?sha256:[a-f0-9]{64}$/.test(image);}
 export function validateVerification(v:any):asserts v is Verification{
  keys(v,['version','mode','steps','container']);
  if(v.version!==1||!['host','container'].includes(v.mode)||!Array.isArray(v.steps)||!v.steps.length)throw Error('Invalid verification version, mode or steps');
@@ -19,7 +21,7 @@ export function validateVerification(v:any):asserts v is Verification{
  if(v.mode==='host'&&v.container!==undefined)throw Error('Host verification cannot configure a container');
  if(v.mode==='container'){
   keys(v.container,['image','inputs']);
-  if(typeof v.container.image!=='string'||!/^([\w./:-]+@)?sha256:[a-f0-9]{64}$/.test(v.container.image)||!Array.isArray(v.container.inputs)||!v.container.inputs.length||v.container.inputs.some((p:any)=>!safePath(p)||p==='.'||p.split('/').some((x:string)=>x.startsWith('.')||['node_modules','AGENTS.md'].includes(x))))throw Error('Container requires immutable image and explicit non-private input paths');
+   if(!isImmutableImage(v.container.image)||!Array.isArray(v.container.inputs)||!v.container.inputs.length||v.container.inputs.some((p:any)=>!safePath(p)||p==='.'||p.split('/').some((x:string)=>x.startsWith('.')||['node_modules','AGENTS.md'].includes(x))))throw Error('Container requires immutable image and explicit non-private input paths');
  }
 }
 export function verificationInstructions(v?:Verification,context?:VerificationContext,worktree='CURRENT_ISOLATED_WORKTREE',dependencySetup=false){
@@ -27,7 +29,7 @@ export function verificationInstructions(v?:Verification,context?:VerificationCo
  validateVerification(v);
  if(context)validateVerificationContext(context);
   const runner=v.mode==='container'?(context?`Host-validated verification runner argv (use the current reserved worktree): ${JSON.stringify([context.bun,context.cli,'verification',context.projectConfig,worktree,'--run','--runtime',context.runtimeConfig])}`:'STOP before container verification: the host has not supplied a validated runtime configuration path. Request it; never guess a --runtime path or bypass the configured runner.'):'Host verification uses the commands below.';
-  if(dependencySetup)return verificationInstructions(v,context,worktree)+ '\nDependency setup is configured: use only the guarded verification runner above, which checks the same-worker setup receipt and mounts verified dependencies read-only. Never install dependencies yourself or bypass a cache/script/runtime blocker.';
+  if(dependencySetup)return verificationInstructions(v,context,worktree)+ '\nDependency setup is configured: use only the guarded verification runner above, which checks the same-worker setup receipt and mounts a hash-verified private dependency snapshot read-only. Never install dependencies yourself or bypass a cache/script/runtime blocker.';
  return `Project verification v1, execution mode: ${v.mode}. ${v.mode==='container'?`Use existing image ${v.container!.image}; no pulls, host credentials or Docker socket. Inputs: ${JSON.stringify(v.container!.inputs)}.`:'Commands run on the supervised host, not in a container.'}\n${runner}\n${v.steps.map(s=>`Working directory relative to the current isolated worktree: ${JSON.stringify(s.cwd)}; argv: ${JSON.stringify(s.argv)}`).join('\n')}\nNever put credentials in commands or evidence. Report exact commands, exit codes and limitations; mocked checks are not live verification.`;
 }
 function within(root:string,path:string){const p=realpathSync(resolve(root,path));if(relative(root,p).startsWith('..')||relative(root,p).startsWith('/'))throw Error('Verification path escapes worktree');return p;}
@@ -49,8 +51,15 @@ export async function runVerification(worktree:string,v:Verification,spawn:typeo
  validateVerification(v);const root=realpathSync(worktree);if(!existsSync(join(root,'.git')))throw Error('Git worktree required');
   assertVerificationRepository(root,execution.projectRepo);
   const setup=execution.dependencySetup;
-  if(setup){validateDependencySetup(setup);if(v.mode!=='container'||!execution.dependencyGuard)throw Error('Guarded container dependency setup required');await execution.dependencyGuard();}
-  const dependencyMounts=setup?[join(setup.cwd,'node_modules'),...setup.manifests.slice(1).map(p=>join(setup.cwd,p.slice(0,-'/package.json'.length),'node_modules'))].filter(p=>existsSync(resolve(root,p))).flatMap(p=>['--mount',`type=bind,src=${within(root,p)},dst=/workspace/${p},readonly`]):[];
+   let receipt:any;
+   const dependencyPaths=setup?[join(setup.cwd,'node_modules'),...setup.manifests.slice(1).map(p=>join(setup.cwd,p.slice(0,-'/package.json'.length),'node_modules'))]:[];
+   const guard=async()=>{
+    const current=await execution.dependencyGuard!() as any;
+    if(!current||current.state!=='ready'||typeof current.binding!=='string'||!Array.isArray(current.fingerprints)||current.fingerprints.length!==dependencyPaths.length||current.fingerprints.some((x:any)=>x!==null&&(typeof x!=='string'||!/^[a-f0-9]{64}$/.test(x))))throw Error('Verified dependency fingerprints required');
+    if(receipt&&JSON.stringify(current)!==JSON.stringify(receipt))throw Error('Dependency readiness changed during verification');
+    receipt=current;
+   };
+   if(setup){validateDependencySetup(setup);if(v.mode!=='container'||!execution.dependencyGuard)throw Error('Guarded container dependency setup required');await guard();}
  const docker=execution.docker;
  const uid=process.getuid?.(),gid=process.getgid?.();
  if(v.mode==='container'){
@@ -58,7 +67,16 @@ export async function runVerification(worktree:string,v:Verification,spawn:typeo
   if(!docker||typeof docker.path!=='string'||!isAbsolute(docker.path)||/[\x00-\x1f]/.test(docker.path)||typeof docker.version!=='string'||!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(docker.version))throw Error('Container verification requires an absolute Docker executable and exact version from runtime configuration');
   if(!(execution.probeDocker??probeDocker)(docker))throw Error('Configured Docker executable version check failed');
  }
- const snapshot=v.mode==='container'?realpathSync(mkdtempSync(join(tmpdir(),'adlc-verification-'))):undefined;
+  const snapshot=v.mode==='container'?realpathSync(mkdtempSync(join(tmpdir(),'adlc-verification-'))):undefined;
+  const dependencyMounts:string[]=[];
+  const checkSnapshot=()=>{
+   if(!setup||!snapshot)return;
+   for(let i=0;i<dependencyPaths.length;i++){
+    const path=dependencyPaths[i],dest=resolve(snapshot,path);
+    const actual=existsSync(dest)?outputDigest(dest,resolve(root,path),resolve(root,setup.cwd)):null;
+    if(actual!==receipt.fingerprints[i])throw Error('Dependency snapshot differs from verified setup receipt');
+   }
+  };
  try{
   if(snapshot){
    for(const input of v.container!.inputs){
@@ -67,15 +85,27 @@ export async function runVerification(worktree:string,v:Verification,spawn:typeo
     for(const part of input.split('/').filter(Boolean)){selected=join(selected,part);if(lstatSync(selected).isSymbolicLink())throw Error('Verification input cannot be symbolic link');}
     const source=within(root,input),dest=resolve(snapshot,input);mkdirSync(resolve(dest,'..'),{recursive:true});copyFrontend(source,dest);
    }
+   if(setup&&snapshot){
+    for(let i=0;i<dependencyPaths.length;i++)if(receipt.fingerprints[i]!==null){
+     const path=dependencyPaths[i],dest=resolve(snapshot,path);mkdirSync(dirname(dest),{recursive:true});
+     cpSync(within(root,path),dest,{recursive:true,dereference:false,verbatimSymlinks:true});
+     dependencyMounts.push('--mount',`type=bind,src=${dest},dst=/workspace/${path},readonly`);
+    }
+    // Containers never read the live worktree dependencies. Comparing the private
+    // copy to the recorded hashes also rejects transient writers during copying.
+    checkSnapshot();await guard();
+   }
   }
   const results=[];
   for(const step of v.steps){
    const cwd=within(snapshot??root,step.cwd);
-    if(setup)await execution.dependencyGuard!();
+     if(setup){await guard();checkSnapshot();}
     const argv=snapshot?[docker!.path,'run','--rm','--pull=never',...(process.env.AO_SESSION_ID?['--label',`ao.session=${process.env.AO_SESSION_ID}`]:[]),'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user',`${uid}:${gid}`,'--pids-limit','128','--memory','2g','--cpus','2','--tmpfs','/tmp:rw,nosuid,nodev,size=512m',...v.container!.inputs.flatMap(input=>['--mount',`type=bind,src=${resolve(snapshot,input)},dst=/workspace/${input},readonly`]),...dependencyMounts,'--workdir',`/workspace/${relative(snapshot,cwd)}`,'--entrypoint',step.argv[0],v.container!.image,...step.argv.slice(1)]:step.argv;
    // Output is inherited, not captured/exported as setup data. Commands must never contain secrets.
    const p=spawn(argv,{cwd,stdin:'ignore',stdout:'inherit',stderr:'inherit',env:snapshot?{PATH:process.env.PATH}:process.env});
-   const code=await p.exited;results.push({cwd:step.cwd,argv:step.argv,code});if(code!==0)break;
+    const code=await p.exited;
+    if(setup){await guard();checkSnapshot();}
+    results.push({cwd:step.cwd,argv:step.argv,code});if(code!==0)break;
   }
   return {mode:v.mode,passed:results.length===v.steps.length&&results.every(r=>r.code===0),results,agentContained:false};
  }finally{if(snapshot)rmSync(snapshot,{recursive:true,force:true});}

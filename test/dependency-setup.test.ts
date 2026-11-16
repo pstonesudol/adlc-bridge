@@ -1,11 +1,12 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
+import {runInNewContext} from 'node:vm';
 import {tmpdir} from 'node:os';
 import {Store} from '../src/core';
-import {DependencySetup,setupInputs,installOffline,offlineSetupProgram,type SetupBinding} from '../src/dependency-setup';
+import {DependencySetup,setupInputs,installOffline,offlineSetupProgram,setupWorkerOwners,type SetupBinding} from '../src/dependency-setup';
 import {validateDependencySetup} from '../src/dependency-setup-policy';
-import {runVerification} from '../src/verification';
+import {runVerification,validateVerification} from '../src/verification';
 
 const policy={version:1 as const,runtime:'verification-container' as const,cwd:'.',lockfile:'package-lock.json' as const,manifests:['package.json','frontend/package.json'],cache:'/opt/npm-cache'};
 function git(root:string,...args:string[]){const p=Bun.spawnSync(['git',...args],{cwd:root,stdout:'pipe',stderr:'pipe'});if(p.exitCode)throw Error(p.stderr.toString());return p.stdout.toString();}
@@ -45,6 +46,61 @@ test('blocked cache install retains staged edits and blocks duplicate setup afte
   await expect(new DependencySetup(f.s,io).ensure(f.job,f.c)).rejects.toThrow('Operator');
   expect(calls).toBe(1);expect(git(f.tree,'diff','--cached','--binary')).toBe(before);
  }finally{f.close();}
+});
+for(const change of ['manifest','cache','image','session'])test(`failed setup hold survives ${change} changes across service restart`,async()=>{
+ const f=fixture();try{
+  let calls=0;const io={...f.io,install:async()=>{calls++;throw Error('cache missing');}};
+  await expect(new DependencySetup(f.s,io).ensure(f.job,f.c)).rejects.toThrow('Setup failed');
+  if(change==='manifest'){const p=join(f.tree,'package.json'),m=JSON.parse(readFileSync(p,'utf8'));m.description='harmless edit';writeFileSync(p,JSON.stringify(m));}
+  if(change==='cache')f.c.dependencySetup={...policy,cache:'/opt/replacement-cache'};
+  if(change==='image')f.c.verification.container.image='registry.example/project@sha256:'+'b'.repeat(64);
+  if(change==='session')f.facts.session='replacement';
+  const reopened=new Store(join(f.root,'state.sqlite'));try{
+   await expect(new DependencySetup(reopened,io).ensure(f.job,f.c)).rejects.toThrow('operator reconciliation required');
+   expect(reopened.db.query('SELECT state FROM dependency_setups').all()).toEqual([{state:'blocked'}]);expect(calls).toBe(1);
+  }finally{reopened.close();}
+ }finally{f.close();}
+});
+test('a hold appearing during preflight is rechecked atomically before install reservation',async()=>{
+ const f=fixture();try{
+  let observations=0;f.setup.io.facts=async()=>{
+   if(++observations===2)f.s.db.query("INSERT INTO dependency_setups VALUES ('other',?,?,'blocked','{}','prior failure',NULL)").run(f.job,f.tree);
+   return structuredClone(f.facts);
+  };
+  await expect(f.setup.ensure(f.job,f.c)).rejects.toThrow('operator reconciliation required');expect(f.installs()).toBe(0);
+ }finally{f.close();}
+});
+test('setup accepts the same registry-qualified immutable image as verification',async()=>{
+ const f=fixture();try{
+  f.c.verification.container.image='registry.example/project@sha256:'+'a'.repeat(64);validateVerification(f.c.verification);
+  let installedImage='';const install=f.io.install;f.setup.io.install=async input=>{installedImage=input.image;await install(input);};
+  expect(await f.setup.ensure(f.job,f.c)).toMatchObject({state:'ready'});expect(installedImage).toBe(f.c.verification.container.image);
+  f.c.verification.container.image='registry.example/project:latest';await expect(f.setup.ensure(f.job,f.c)).rejects.toThrow('immutable');
+ }finally{f.close();}
+});
+test('missing branch metadata is resolved before exclusive ownership is decided',async()=>{
+ const rows={data:[{id:'owner',projectId:'project',isTerminated:false},{id:'other',projectId:'project',isTerminated:false}]};
+ const calls:string[]=[];const detail=async(id:string)=>{calls.push(id);return {session:{id,projectId:'project',branch:id==='owner'?'worker':'different',isTerminated:false}};};
+ expect((await setupWorkerOwners(rows,'project','worker',detail)).map(x=>x.id)).toEqual(['owner']);expect(calls).toEqual(['owner','other']);
+ expect(await setupWorkerOwners({data:rows.data.slice(1)},'project','worker',detail)).toEqual([]);
+ expect(await setupWorkerOwners(rows,'project','worker',async id=>({session:{id,projectId:'project',branch:'worker',isTerminated:false}}))).toHaveLength(2);
+ await expect(setupWorkerOwners(rows,'project','worker',async()=>({session:{}}))).rejects.toThrow('Incomplete detailed');
+ await expect(setupWorkerOwners(rows,'project','worker',async()=>{throw Error('unavailable');})).rejects.toThrow('unavailable');
+});
+test('offline npm uses separate empty user/global configuration without invoking npm',()=>{
+ const written=new Map<string,string>();let calls=0;
+ runInNewContext(offlineSetupProgram,{
+  require:(name:string)=>{
+   if(name==='fs')return {existsSync:(p:string)=>p==='/opt/cache',cpSync:()=>{},writeFileSync:(p:string,text:string)=>written.set(p,text)};
+   if(name==='path')return {join};
+   if(name==='child_process')return {spawnSync:(name:string,args:string[],options:any)=>{
+    calls++;expect(name).toBe('npm');expect(args).toContain('--offline');expect(args).toContain('--ignore-scripts');
+    const {npm_config_userconfig:user,npm_config_globalconfig:global}=options.env;expect(user).not.toBe(global);expect(written.get(user)).toBe('');expect(written.get(global)).toBe('');expect(user).toStartWith('/tmp/');expect(global).toStartWith('/tmp/');return {status:0};
+   }};
+   throw Error('unexpected module');
+  },process:{argv:['node',JSON.stringify({cache:'/opt/cache',outputs:[]})],env:{PATH:'/runtime/bin'},exit:()=>{throw Error('unexpected exit');}},console,
+ });
+ expect(calls).toBe(1);
 });
 test('install script and symlink inputs fail before any install',async()=>{
  const f=fixture();try{
@@ -88,8 +144,44 @@ test('verification refuses a failed setup guard before spawning a check',async()
 test('verification mounts prepared workspace dependencies read-only and rechecks the receipt',async()=>{
  const f=fixture();try{
   await f.setup.ensure(f.job,f.c);let argv:string[]=[],guards=0;
-  const result=await runVerification(f.tree,f.c.verification,((args:string[])=>{argv=args;return {exited:Promise.resolve(0)};}) as any,{projectRepo:f.repo,docker:{path:'/trusted/docker',version:'1.2.3'},probeDocker:()=>true,dependencySetup:policy,dependencyGuard:async()=>{guards++;await f.setup.ensure(f.job,f.c,true);}});
-  expect(result.passed).toBe(true);expect(guards).toBe(2);expect(argv).toContain(`type=bind,src=${f.tree}/node_modules,dst=/workspace/node_modules,readonly`);expect(argv[argv.indexOf('--network')+1]).toBe('none');
+  let dependencyMount='';
+  const result=await runVerification(f.tree,f.c.verification,((args:string[])=>{argv=args;dependencyMount=args.find(x=>x.endsWith('dst=/workspace/node_modules,readonly'))!;expect(dependencyMount).not.toContain(f.tree);const source=dependencyMount.split(',')[1].slice('src='.length);expect(readFileSync(join(source,'package.json'),'utf8')).toBe('{}');return {exited:Promise.resolve(0)};}) as any,{projectRepo:f.repo,docker:{path:'/trusted/docker',version:'1.2.3'},probeDocker:()=>true,dependencySetup:policy,dependencyGuard:async()=>{guards++;return f.setup.ensure(f.job,f.c,true);}});
+  expect(result.passed).toBe(true);expect(guards).toBe(4);expect(dependencyMount).toContain('adlc-verification-');expect(argv[argv.indexOf('--network')+1]).toBe('none');
+ }finally{f.close();}
+});
+for(const restore of [false,true])test(`verification excludes live worktree writers during a step (restored=${restore})`,async()=>{
+ const f=fixture();try{
+  await f.setup.ensure(f.job,f.c);let calls=0;
+  const verify=()=>runVerification(f.tree,f.c.verification,((args:string[])=>{
+   calls++;const mount=args.find(x=>x.endsWith('dst=/workspace/node_modules,readonly'))!,source=mount.split(',')[1].slice('src='.length);
+   writeFileSync(join(f.tree,'node_modules/package.json'),'changed while check runs');
+   expect(readFileSync(join(source,'package.json'),'utf8')).toBe('{}');
+   if(restore)writeFileSync(join(f.tree,'node_modules/package.json'),'{}');
+   return {exited:Promise.resolve(0)};
+  }) as any,{projectRepo:f.repo,docker:{path:'/trusted/docker',version:'1.2.3'},probeDocker:()=>true,dependencySetup:policy,dependencyGuard:()=>f.setup.ensure(f.job,f.c,true)});
+  if(restore)expect((await verify()).passed).toBe(true);else await expect(verify()).rejects.toThrow('changed dependencies');
+  expect(calls).toBe(1);
+ }finally{f.close();}
+});
+test('dependency mutation while copying cannot enter verification with an old receipt',async()=>{
+ const f=fixture();try{
+  await f.setup.ensure(f.job,f.c);let guards=0,calls=0;
+  await expect(runVerification(f.tree,f.c.verification,(()=>{calls++;return {exited:Promise.resolve(0)};}) as any,{projectRepo:f.repo,docker:{path:'/trusted/docker',version:'1.2.3'},probeDocker:()=>true,dependencySetup:policy,dependencyGuard:async()=>{
+   // Deliberately simulate a writer just after the initial source hash was read.
+   const proof=await f.setup.ensure(f.job,f.c,true);
+   if(++guards===1)writeFileSync(join(f.tree,'node_modules/package.json'),'transient mutation');
+   else writeFileSync(join(f.tree,'node_modules/package.json'),'{}');
+   return proof;
+  }})).rejects.toThrow('snapshot differs');expect(calls).toBe(0);
+ }finally{f.close();}
+});
+test('post-step snapshot fingerprint rejects private dependency changes even when live outputs match',async()=>{
+ const f=fixture();try{
+  await f.setup.ensure(f.job,f.c);
+  await expect(runVerification(f.tree,f.c.verification,((args:string[])=>{
+   const mount=args.find(x=>x.endsWith('dst=/workspace/node_modules,readonly'))!,source=mount.split(',')[1].slice('src='.length);
+   writeFileSync(join(source,'package.json'),'changed snapshot');return {exited:Promise.resolve(0)};
+  }) as any,{projectRepo:f.repo,docker:{path:'/trusted/docker',version:'1.2.3'},probeDocker:()=>true,dependencySetup:policy,dependencyGuard:()=>f.setup.ensure(f.job,f.c,true)})).rejects.toThrow('snapshot differs');
  }finally{f.close();}
 });
 test('offline container program and invocation prohibit scripts, network, pulls and host credentials',async()=>{

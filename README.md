@@ -185,9 +185,17 @@ reset/retry API. The normal approval/continuation receipt guards remain in force
 Never replace the worker or replay a send to recover setup.
 
 Configured verification uses the guarded runner, which requires an existing
-ready same-worker receipt and mounts its dependency outputs read-only. It never
-installs while an implementation turn is active. A changed input/image or
-modified/missing output stops verification for same-worker reconciliation.
+ready same-worker receipt. It copies dependencies into the owner-private
+verification snapshot, compares the copy against recorded fingerprints, and
+mounts only that copy read-only. Worktree writers therefore cannot affect the
+container's dependencies, even if they change and restore a file during a step.
+Readiness and snapshot fingerprints are checked before and after each step;
+changed live outputs still invalidate the result. This permits a worker to invoke
+verification without pausing its own turn, but never installs dependencies while
+that turn is active. A changed input/image or modified/missing output stops
+verification for same-worker reconciliation. Failed/interrupted setup holds are
+worktree-wide: changing manifests, policy, image or worker identity does not clear
+them or authorize another attempt.
 Unconfigured legacy projects keep their prior behavior.
 
 Project JSON keeps repository/Linear mappings, approval and routing policies, and

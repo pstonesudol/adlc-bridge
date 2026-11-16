@@ -4,13 +4,14 @@ import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {Store,digest} from './core';
 import {validateDependencySetup,type DependencySetupPolicy} from './dependency-setup-policy';
-import {assertWorktreeAvailable} from './worktree-reservation';
+import {assertWorktreeAvailable,canonicalWorktree} from './worktree-reservation';
 import {command,worktreeIdentity} from './delivery-evidence';
 import {sessionEvidence} from './session-evidence';
 import {AO} from './orchestrator';
 import {validateRuntime} from './setup';
 import {featureGit} from './approval-policy';
 import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
+import {isImmutableImage} from './verification';
 
 const action='Operator: inspect dependencySetup, the pinned image/cache and named prerequisite; prepare the approved cache/runtime separately, then recheck this same worker. Never enable scripts, go online, reset edits or resend delivery.';
 export class SetupBlocker extends Error{constructor(message:string){super(`${message}. ${action}`);}}
@@ -55,7 +56,9 @@ function fail(s){console.error(s);process.exit(2)}
 if(!fs.existsSync(cfg.cache))fail('Missing pre-populated npm cache');
 fs.cpSync(cfg.cache,'/tmp/cache',{recursive:true});
 fs.cpSync('/input','/tmp/project',{recursive:true});
-const r=cp.spawnSync('npm',['ci','--ignore-scripts','--offline','--no-audit','--no-fund','--cache','/tmp/cache'],{cwd:'/tmp/project',env:{PATH:process.env.PATH,HOME:'/tmp',npm_config_userconfig:'/dev/null',npm_config_globalconfig:'/dev/null'},stdio:'inherit'});
+fs.writeFileSync('/tmp/npm-user.npmrc','');
+fs.writeFileSync('/tmp/npm-global.npmrc','');
+const r=cp.spawnSync('npm',['ci','--ignore-scripts','--offline','--no-audit','--no-fund','--cache','/tmp/cache'],{cwd:'/tmp/project',env:{PATH:process.env.PATH,HOME:'/tmp',npm_config_userconfig:'/tmp/npm-user.npmrc',npm_config_globalconfig:'/tmp/npm-global.npmrc'},stdio:'inherit'});
 if(r.status!==0)fail('Offline npm ci failed; inspect missing cached package or runtime prerequisite');
 function inspect(dir){for(const ent of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,ent.name);if(ent.isSymbolicLink())continue;if(ent.isDirectory()){inspect(p);continue}if(ent.name==='binding.gyp')fail('Native lifecycle build prerequisite: '+p);if(ent.name==='package.json'){const m=JSON.parse(fs.readFileSync(p));if(['preinstall','install','postinstall','prepare','prepublish','preprepare','postprepare'].some(k=>m.scripts&&m.scripts[k]))fail('Lifecycle script prerequisite: '+p);}}}
 for(let i=0;i<cfg.outputs.length;i++){const src=path.join('/tmp/project',cfg.outputs[i]);if(!fs.existsSync(src))continue;inspect(src);fs.cpSync(src,path.join('/output',String(i)),{recursive:true,dereference:false,verbatimSymlinks:true});}
@@ -73,10 +76,25 @@ export async function installOffline(input:Parameters<SetupIO['install']>[0],spa
   if(await child.exited!==0)throw new SetupBlocker('Offline npm setup failed: inspect local output for missing cached package, lifecycle script or image prerequisite');
  }finally{rmSync(temp,{recursive:true,force:true});}
 }
-function outputDigest(root:string,logicalRoot=root,workspaceRoot=root):string{
+export function outputDigest(root:string,logicalRoot=root,workspaceRoot=root):string{
  const entries:any[]=[];let count=0;
  function visit(path:string){if(++count>200000)throw new SetupBlocker('Dependency output exceeds bounded inspection');const s=lstatSync(path),name=relative(root,path);if(s.isSymbolicLink()){const target=readlinkSync(path),resolved=relative(workspaceRoot,resolve(dirname(join(logicalRoot,name)),target));if(isAbsolute(target)||resolved.startsWith('..')||isAbsolute(resolved)||resolved.split('/').some(x=>x==='.git'||x.startsWith('.env')))throw new SetupBlocker(`Unsafe dependency symlink ${name}`);entries.push([name,'link',target]);}else if(s.isDirectory()){entries.push([name,'dir']);for(const n of readdirSync(path).sort())visit(join(path,n));}else if(s.isFile()){if(s.size>64_000_000)throw new SetupBlocker('Dependency file exceeds bounded inspection');entries.push([name,s.mode&0o777,createHash('sha256').update(readFileSync(path)).digest('hex')]);}else throw new SetupBlocker('Unsupported dependency output file');}
  visit(root);return digest(JSON.stringify(entries));
+}
+export async function setupWorkerOwners(inventory:any,project:string,branch:string,detail:(id:string)=>Promise<any>=async id=>JSON.parse(await command([AO,'session','get',id,'--json']))){
+ if(!Array.isArray(inventory.data))throw new SetupBlocker('Complete worker ownership inventory required');
+ const owners=[];
+ for(const row of inventory.data){
+  if(row.isTerminated===true||row.projectId&&row.projectId!==project||row.branch&&row.branch!==branch)continue;
+  let session=row;
+  if(!row.branch||!row.projectId||typeof row.isTerminated!=='boolean'){
+   if(typeof row.id!=='string'||!row.id||row.id.startsWith('-'))throw new SetupBlocker('Invalid worker inventory identity');
+   session=(await detail(row.id)).session;
+   if(session?.id!==row.id||typeof session.projectId!=='string'||typeof session.branch!=='string'||typeof session.isTerminated!=='boolean')throw new SetupBlocker('Incomplete detailed worker ownership evidence');
+  }
+  if(!session.isTerminated&&session.projectId===project&&session.branch===branch)owners.push(session);
+ }
+ return owners;
 }
 export class DependencySetup{
  io:SetupIO;
@@ -97,8 +115,7 @@ export class DependencySetup{
   const common=async(path:string)=>realpathSync(resolve(path,await command(['git','--no-optional-locks','rev-parse','--git-common-dir'],path)));
   if(await common(w.tree)!==await common(c.repo))throw new SetupBlocker('Worktree belongs to another repository');
   const inventory=JSON.parse(await command([AO,'session','ls','--all','--include-terminated','--json']));
-  if(!Array.isArray(inventory.data))throw new SetupBlocker('Complete worker ownership inventory required');
-  const owners=inventory.data.filter((x:any)=>!x.isTerminated&&x.projectId===p.project&&x.branch===p.branch);
+  const owners=await setupWorkerOwners(inventory,p.project,p.branch);
   if(owners.length!==1||owners[0].id!==p.session_id)throw new SetupBlocker('Exclusive same-worker ownership required');
   const runtime=JSON.parse(readFileSync(c.verificationContext?.runtimeConfig,'utf8'));validateRuntime(runtime);
   if(realpathSync(runtime.projectConfig)!==realpathSync(c.verificationContext.projectConfig)||!runtime.tools.docker)throw new SetupBlocker('Matching host-validated runtime with pinned Docker required');
@@ -111,14 +128,20 @@ export class DependencySetup{
  private async ensureWithin(job:string,c:any,checkOnly=false){
   if(!c?.dependencySetup)return;
   validateDependencySetup(c.dependencySetup);const policy=c.dependencySetup as DependencySetupPolicy;
-  if(c.verification?.mode!=='container'||!/^sha256:[a-f0-9]{64}$/.test(c.verification.container?.image??''))throw new SetupBlocker('Existing immutable container verification runtime required');
+  if(c.verification?.mode!=='container'||!isImmutableImage(c.verification.container?.image))throw new SetupBlocker('Existing immutable container verification runtime required');
   this.table();
   const facts=await this.io.facts(job,c,checkOnly),input=setupInputs(facts.worktree,policy),runtime=facts.runtime as any;
+  // Holds belong to the worktree, not just one hash of its mutable inputs.
+  const assertNoHolds=()=>{
+   const hold=(this.s.db.query("SELECT binding,worktree,state FROM dependency_setups WHERE state IN ('blocked','installing','publishing')").all() as any[]).find(row=>canonicalWorktree(row.worktree)===facts.worktree);
+   if(hold)throw new SetupBlocker(`Retained ${hold.state} setup ${hold.binding}; operator reconciliation required, never replay after input changes`);
+  };
+  assertNoHolds();
   const proof={facts,policy,image:c.verification.container.image,inputs:Object.fromEntries(Object.entries(input.files).map(([path,text])=>[path,digest(text)]))},binding=digest(JSON.stringify(proof));
   const row=this.s.db.query('SELECT * FROM dependency_setups WHERE binding=?').get(binding) as any;
   const outputs=input.outputs.map(path=>safe(input.root,path));
   const fingerprint=()=>outputs.map(path=>present(path)?outputDigest(path,path,input.root):null);
-  if(row){if(row.state==='ready'&&row.outputs===JSON.stringify(fingerprint()))return {binding,state:'ready'};throw new SetupBlocker(row.reason??`Retained ${row.state} setup or changed dependencies: inspect dependency_setups binding ${binding}; never replay an interrupted install`);}
+  if(row){const fingerprints=fingerprint();if(row.state==='ready'&&row.outputs===JSON.stringify(fingerprints))return {binding,state:'ready',fingerprints};throw new SetupBlocker(row.reason??`Retained ${row.state} setup or changed dependencies: inspect dependency_setups binding ${binding}; never replay an interrupted install`);}
   if(checkOnly)throw new SetupBlocker('No verified dependency setup receipt for current inputs; stop verification and request guarded setup in the idle same worker');
   for(let i=0;i<outputs.length;i++){
    if(present(outputs[i]))throw new SetupBlocker(`Unmanaged dependency output ${input.outputs[i]} exists; preserve it and reconcile separately`);
@@ -129,7 +152,7 @@ export class DependencySetup{
   const index=await command(['git','--no-optional-locks','diff','--cached','--binary'],facts.worktree);
   const unchanged=async()=>{if(JSON.stringify(await this.io.facts(job,c))!==JSON.stringify(facts)||JSON.stringify(setupInputs(facts.worktree,policy).files)!==JSON.stringify(input.files)||await command(['git','--no-optional-locks','diff','--cached','--binary'],facts.worktree)!==index)throw new SetupBlocker('Approval, worker, inputs or staged edits changed during setup; preserve work for reconciliation');};
   await unchanged();
-  this.s.db.query("INSERT INTO dependency_setups VALUES (?,?,?,'installing',?,NULL,NULL)").run(binding,job,facts.worktree,JSON.stringify(proof));
+  this.s.db.transaction(()=>{assertNoHolds();this.s.db.query("INSERT INTO dependency_setups VALUES (?,?,?,'installing',?,NULL,NULL)").run(binding,job,facts.worktree,JSON.stringify(proof));}).immediate();
   const temp=mkdtempSync(join(tmpdir(),'adlc-npm-output-'));
   try{
    await this.io.install({files:input.files,outputs:input.outputs,policy,image:proof.image,docker:runtime.docker,destination:temp});
@@ -146,8 +169,9 @@ export class DependencySetup{
    }
    if(!existsSync(outputs[0]))throw new SetupBlocker('Runtime did not produce root node_modules');
    await unchanged();
-   this.s.db.query("UPDATE dependency_setups SET state='ready',outputs=? WHERE binding=?").run(JSON.stringify(fingerprint()),binding);
-   return {binding,state:'ready'};
+   const fingerprints=fingerprint();
+   this.s.db.query("UPDATE dependency_setups SET state='ready',outputs=? WHERE binding=?").run(JSON.stringify(fingerprints),binding);
+   return {binding,state:'ready',fingerprints};
   }catch(e){const reason=e instanceof SetupBlocker?e.message:new SetupBlocker('Setup failed; inspect the local runtime and retained binding').message;this.s.db.query("UPDATE dependency_setups SET state='blocked',reason=? WHERE binding=?").run(reason,binding);throw new SetupBlocker(reason);}
   finally{rmSync(temp,{recursive:true,force:true});}
  }
