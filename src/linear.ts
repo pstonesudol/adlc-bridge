@@ -49,6 +49,7 @@ export function metadataCheckNames(value:unknown):string[]{
 export function validate(c: any): asserts c is ProjectConfig {
   validateDependencySetup(c?.dependencySetup);
   if(c?.verification!==undefined)validateVerification(c.verification);
+  if(c?.dependencySetup&&c.verification?.mode!=='container')throw Error('dependencySetup requires container verification with an immutable image');
   effectiveSettings(c??{});
   validateReplanning(c??{});
   reviewerPolicy(c?.reviewers);

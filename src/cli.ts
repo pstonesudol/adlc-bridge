@@ -265,6 +265,7 @@ async function main(){
     }
      const worktree=req(a[1],'Explicit worktree');
      const verify=async()=>{
+      if(c.dependencySetup&&!existsSync(db))throw Error('Existing state database required for dependency verification');
       const store=c.dependencySetup?new Store(db):undefined;
       try{
        const guard=store?async()=>{

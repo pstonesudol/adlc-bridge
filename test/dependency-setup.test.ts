@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,realpathSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,realpathSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {runInNewContext} from 'node:vm';
 import {tmpdir} from 'node:os';
@@ -7,6 +7,7 @@ import {Store} from '../src/core';
 import {DependencySetup,setupInputs,installOffline,offlineSetupProgram,setupWorkerOwners,type SetupBinding} from '../src/dependency-setup';
 import {validateDependencySetup} from '../src/dependency-setup-policy';
 import {runVerification,validateVerification} from '../src/verification';
+import {validate} from '../src/linear';
 
 const policy={version:1 as const,runtime:'verification-container' as const,cwd:'.',lockfile:'package-lock.json' as const,manifests:['package.json','frontend/package.json'],cache:'/opt/npm-cache'};
 function git(root:string,...args:string[]){const p=Bun.spawnSync(['git',...args],{cwd:root,stdout:'pipe',stderr:'pipe'});if(p.exitCode)throw Error(p.stderr.toString());return p.stdout.toString();}
@@ -26,6 +27,29 @@ function fixture(){
 test('policy rejects traversal, implicit inputs, host runtime and cache mount paths',()=>{
  validateDependencySetup(policy);
  for(const bad of [{cwd:'../escape'},{runtime:'host'},{manifests:['package.json','../package.json']},{cache:'/tmp/cache'},{cache:'/opt/../cache'},{extra:true}])expect(()=>validateDependencySetup({...policy,...bad})).toThrow();
+});
+function projectConfig(repo:string,verification:any){
+ const uuid='00000000-0000-0000-0000-000000000001';
+ return {version:1,name:'Fixture',repo,requiredChecks:['CI'],linear:{projectId:uuid,teamId:uuid,readyStateId:uuid,readyLabelId:uuid},dependencySetup:policy,verification};
+}
+test('configuration load rejects setup without container verification and accepts all immutable image forms',()=>{
+ const host={version:1,mode:'host',steps:[{cwd:'.',argv:['node','--version']}]};
+ expect(()=>validate(projectConfig('/fixture',undefined))).toThrow('dependencySetup requires container verification');
+ expect(()=>validate(projectConfig('/fixture',host))).toThrow('dependencySetup requires container verification');
+ for(const image of ['sha256:'+'a'.repeat(64),'registry.example/project@sha256:'+'b'.repeat(64)]){
+  expect(()=>validate(projectConfig('/fixture',{...host,mode:'container',container:{image,inputs:['frontend']}}))).not.toThrow();
+ }
+ expect(()=>validate({...projectConfig('/fixture',host),dependencySetup:undefined})).not.toThrow();
+ expect(()=>validate(projectConfig('/fixture',{...host,mode:'container',container:{image:'registry.example/project:latest',inputs:['frontend']}}))).toThrow('immutable');
+});
+test('dependency verification CLI names a missing state database and never creates it',()=>{
+ const f=fixture();try{
+  const project=join(f.root,'project.json'),runtime=join(f.root,'runtime.json'),db=join(f.root,'missing.sqlite');
+  writeFileSync(project,JSON.stringify(projectConfig(f.repo,f.c.verification)));
+  writeFileSync(runtime,JSON.stringify({version:1,platform:'launchd',projectConfig:project,controller:join(f.root,'installed/src/cli.ts'),workingDirectory:f.root,tools:Object.fromEntries(['bun','ao','git','gh','docker'].map(k=>[k,{path:`/trusted/bin/${k}`,version:'1.4.2'}])),service:{label:'local.adlc.fixture',path:join(f.root,'staged.plist'),interval:60,runAtLoad:false,stdout:join(f.root,'out.log'),stderr:join(f.root,'err.log')}}));
+  const cli=Bun.spawnSync([process.execPath,join(import.meta.dir,'../src/cli.ts'),'verification',project,f.tree,'--run','--runtime',runtime],{env:{PATH:process.env.PATH??'/usr/bin:/bin',HOME:f.root,ADLC_DB:db},stdout:'pipe',stderr:'pipe'});
+  expect(cli.exitCode).not.toBe(0);expect(cli.stderr.toString()).toContain('Existing state database required for dependency verification');expect(existsSync(db)).toBe(false);
+ }finally{f.close();}
 });
 for(const staged of [false,true])test(`Honey Summer fresh linked worktree installs offline and preserves staged edits (${staged})`,async()=>{
  const f=fixture();try{
