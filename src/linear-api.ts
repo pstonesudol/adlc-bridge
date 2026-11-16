@@ -1,9 +1,14 @@
 import {linearToken} from './credential';
 import {Store} from './core';
 import {registryPath} from './project-services';
-import {LinearCooldowns,isLinearThrottle,LinearCooldown} from './linear-cooldowns';
+import {LinearCooldowns,isLinearThrottle,LinearCooldown,LinearPreSendCooldown} from './linear-cooldowns';
 export type LinearAPI=(query:string,variables?:Record<string,unknown>)=>Promise<any>;
 class LinearTransportFailure extends Error{}
+// Only the caller owning a fresh reservation may release it, and only when the
+// requested operation definitely never reached fetch. Sent failures stay fenced.
+export async function withLinearReservation<T>(send:()=>Promise<T>,release:()=>void):Promise<T>{
+ try{return await send();}catch(error){if(error instanceof LinearPreSendCooldown)release();throw error;}
+}
 export function coordinatedLinearFetch(quotas:LinearCooldowns,token:string,send=fetch,project?:string):typeof fetch {
  return (async(url:any,init:any)=>{
    await quotas.admit(token,project);
@@ -19,7 +24,7 @@ export function createLinearAPI(send=fetch,token=linearToken,quotas?:LinearCoold
   const credential=token();
   const transport=quotas?coordinatedLinearFetch(quotas,credential,send):send;
   if(quotas&&!quotas.verified(credential)){
-    try{const identity=await transport('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query:'query{viewer{id}}'}),signal:AbortSignal.timeout(20000)});const b:any=await identity.json();if(identity.ok&&!b.errors)quotas.verify(credential,b.data?.viewer?.id);}catch(e){if(!(e instanceof LinearTransportFailure))throw e;}
+    try{const identity=await transport('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query:'query{viewer{id}}'}),signal:AbortSignal.timeout(20000)});const b:any=await identity.json();if(identity.ok&&!b.errors)quotas.verify(credential,b.data?.viewer?.id);}catch(e){if(e instanceof LinearCooldown)throw new LinearPreSendCooldown(e.nextEligible);if(!(e instanceof LinearTransportFailure))throw e;}
   }
   const r=await transport('https://api.linear.app/graphql',{method:'POST',headers:{Authorization:credential,'Content-Type':'application/json'},body:JSON.stringify({query,variables}),signal:AbortSignal.timeout(20000)});
  if(!r.ok)throw Error(`Linear HTTP ${r.status}`);const b=await r.json();if(b.errors||!b.data)throw Error('Linear returned errors or incomplete data');return b.data;

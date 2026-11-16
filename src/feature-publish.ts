@@ -2,6 +2,7 @@ import {Store} from './core';
 import {FeaturePlanning} from './feature-planning';
 import {batchHash,ticketDescription,validateDraft} from './feature-schema';
 import {linearAPI,issueFields,type LinearAPI} from './linear-api';
+import {LinearPreSendCooldown} from './linear-cooldowns';
 export class FeaturePublish{
  constructor(public s:Store,public plans:FeaturePlanning,public api:LinearAPI=linearAPI){s.db.exec(`CREATE TABLE IF NOT EXISTS feature_publications(plan TEXT NOT NULL REFERENCES feature_plans(id),key TEXT NOT NULL,id TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,receipt TEXT,PRIMARY KEY(plan,key));`);}
  approved(id:string){const p=this.plans.get(id);if(!['approved','publishing','published'].includes(p.state)||!p.actor||p.hash!==p.approved_hash||p.hash!==batchHash(JSON.parse(p.requirements),JSON.parse(p.target),JSON.parse(p.draft)))throw Error('Exact human-approved feature batch required');return p;}
@@ -57,7 +58,13 @@ export class FeaturePublish{
       const b=await this.api('mutation($input:IssueRelationCreateInput!){issueRelationCreate(input:$input){success issueRelation{id type issue{id}relatedIssue{id}}}}',{input});
       const r=b.issueRelationCreate?.issueRelation;if(!b.issueRelationCreate?.success||r?.id!==input.id||r.type!=='blocks'||r.issue?.id!==input.issueId||r.relatedIssue?.id!==input.relatedIssueId)throw Error('Dependency creation not confirmed');
      }
-    }catch{this.plans.event(id,'publication_uncertain',op.key);throw Error('Linear publication outcome uncertain; re-run publish to inspect receipts without duplicating tickets');}
+    }catch(error){
+     if(error instanceof LinearPreSendCooldown){
+      this.s.db.query("UPDATE feature_publications SET state='reserved' WHERE plan=? AND key=? AND id=? AND state='delivery_uncertain'").run(id,op.key,op.id);
+      throw error;
+     }
+     this.plans.event(id,'publication_uncertain',op.key);throw Error('Linear publication outcome uncertain; re-run publish to inspect receipts without duplicating tickets');
+    }
    }
    const receipt=await this.lookup(op,target);if(!receipt)throw Error('No authoritative publication receipt; automatic creation is not repeated');
    this.s.db.query("UPDATE feature_publications SET state='confirmed',receipt=? WHERE plan=? AND key=?").run(JSON.stringify(receipt),id,op.key);

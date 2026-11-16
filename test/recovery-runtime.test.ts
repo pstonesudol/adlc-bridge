@@ -5,6 +5,7 @@ import {Workflow} from '../src/workflow';
 import {ReviewLoop} from '../src/review-loop';
 import {createRecoveryIO,recoverProject} from '../src/recovery-runtime';
 import {PreSendFailure} from '../src/pre-send';
+import {LinearCooldowns,LinearPreSendCooldown,LinearCooldown} from '../src/linear-cooldowns';
 import {mkdtempSync,mkdirSync,rmSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';import {tmpdir} from 'node:os';
 const processResult=(out='',code=0)=>({stdout:new Blob([out]),stderr:new Blob([]),exited:Promise.resolve(code)}) as any;
@@ -71,4 +72,41 @@ test('an exhausted recovery pass does not admit ordinary workflow dispatch',asyn
   const result=await recoverProject(s,w,loop,{linear:{projectId:'project'}},{state:root,deadline:100,io,inventory:async()=>{now=100;return [];}});
   expect(result).toMatchObject({admit:false,complete:false});expect(result.reason).toContain('deadline');
  }finally{s.close();rmSync(root,{recursive:true,force:true});}
+});
+
+function linearFixture(s:Store){
+ const project='11111111-1111-1111-1111-111111111111',viewer='22222222-2222-2222-2222-222222222222';
+ const issue={id:'issue',identifier:'DEV-134',title:'Shared quotas',description:'requirements',project:{id:project},team:{id:project},state:{id:project},labels:{nodes:[{id:project}],pageInfo:{hasNextPage:false}}};
+ const job=s.enqueue(project,issue.id,JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description}));
+ return {viewer,issue,job,c:{linear:{projectId:project,teamId:project,readyStateId:project,readyLabelId:project}} as any};
+}
+
+test('recovery requirements honor another project/key hold in the same store and resume after expiry',async()=>{
+ const s=new Store(':memory:');let now=1800000000000,sends=0;const f=linearFixture(s),quotas=new LinearCooldowns(s,()=>now,async()=>{});
+ try{
+  quotas.verify('poller-key',f.viewer);quotas.verify('recovery-key',f.viewer);quotas.observe('poller-key',429,new Headers({'retry-after':'600'}),{});
+  const before=s.get(f.job),io=createRecoveryIO(s,now+900000,undefined,{now:()=>now,token:()=> 'recovery-key',send:(async()=>{sends++;return Response.json({data:{issue:f.issue}});}) as typeof fetch});
+  await expect(io.requirements(s,f.job,f.c)).rejects.toBeInstanceOf(LinearPreSendCooldown);expect(sends).toBe(0);expect(s.get(f.job)).toEqual(before);
+  now+=600000;await io.requirements(s,f.job,f.c);expect(sends).toBe(1);expect(s.get(f.job)).toEqual(before);
+ }finally{s.close();}
+});
+
+test('recovery requirements persist encountered throttles for other workers',async()=>{
+ const s=new Store(':memory:');const now=1800000000000,f=linearFixture(s),quotas=new LinearCooldowns(s,()=>now,async()=>{});let sends=0;
+ try{
+  quotas.verify('recovery-key',f.viewer);quotas.verify('poller-key',f.viewer);
+  const io=createRecoveryIO(s,now+900000,undefined,{now:()=>now,token:()=> 'recovery-key',send:(async()=>{sends++;return Response.json({errors:[{extensions:{code:'RATELIMITED'}}]},{headers:{'retry-after':'600'}});}) as typeof fetch});
+  await expect(io.requirements(s,f.job,f.c)).rejects.toBeInstanceOf(LinearCooldown);
+  await expect(quotas.admit('poller-key')).rejects.toBeInstanceOf(LinearPreSendCooldown);
+  await expect(io.requirements(s,f.job,f.c)).rejects.toBeInstanceOf(LinearPreSendCooldown);expect(sends).toBe(1);
+ }finally{s.close();}
+});
+
+test('recovery pacing cannot outlive the absolute recovery deadline',async()=>{
+ const s=new Store(':memory:');const now=1800000000000,f=linearFixture(s),quotas=new LinearCooldowns(s,()=>now,async()=>{});let sends=0;
+ try{
+  quotas.verify('key',f.viewer);await quotas.admit('key');
+  const io=createRecoveryIO(s,now+100,undefined,{now:()=>now,token:()=> 'key',send:(async()=>{sends++;return Response.json({data:{issue:f.issue}});}) as typeof fetch});
+  await expect(io.requirements(s,f.job,f.c)).rejects.toThrow('deadline');expect(sends).toBe(0);
+ }finally{s.close();}
 });

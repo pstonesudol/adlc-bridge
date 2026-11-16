@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {Store,digest} from './core';
-import {linearAPI,readLinearIssue,type LinearAPI} from './linear-api';
+import {linearAPI,readLinearIssue,withLinearReservation,type LinearAPI} from './linear-api';
 import {prLifecycle} from './github';
 import {latestRevision,revisedExecution,revisedHandoff} from './spec-revisions';
 import {LinearRouteNotices} from './linear-route-notices';
@@ -38,7 +38,7 @@ export class LinearLifecycle{
    const claimed=this.s.db.query('INSERT OR IGNORE INTO branch_drift_notices(job,signature,comment_id,state) VALUES (?,?,?,?)').run(job,signature,commentId,'delivery_uncertain');
    row=find();
    if(claimed.changes){
-    const result=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',{input:{id:commentId,issueId:j.issue,body}});
+     const result=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',{input:{id:commentId,issueId:j.issue,body}}),()=>{this.s.db.query("DELETE FROM branch_drift_notices WHERE job=? AND signature=? AND comment_id=? AND state='delivery_uncertain'").run(job,signature,commentId);});
     if(!result.commentCreate?.success)throw Error('Branch drift notice delivery uncertain; no blind replay');
     this.s.db.query("UPDATE branch_drift_notices SET state='confirmed' WHERE job=? AND signature=? AND state='delivery_uncertain'").run(job,signature);
     return;
@@ -90,7 +90,7 @@ export class LinearLifecycle{
   if(n.state!=='reserved')throw Error('Remediation notice delivery uncertain; never repost blindly');
   const claim=this.s.db.query("UPDATE remediation_notices SET state='delivery_uncertain' WHERE job=? AND binding=? AND state='reserved'").run(job,binding);
   if(!claim.changes)return {state:'delivery_uncertain'};
-  const response=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}});
+   const response=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body createdAt}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body,doNotSubscribeToIssue:false}}),()=>{this.s.db.query("UPDATE remediation_notices SET state='reserved' WHERE job=? AND binding=? AND comment_id=? AND state='delivery_uncertain'").run(job,binding,n.comment_id);});
   const comment=response.commentCreate?.comment;
   if(!response.commentCreate?.success||comment?.id!==n.comment_id||comment.body!==n.body||!Number.isFinite(Date.parse(comment.createdAt)))throw Error('Remediation notice delivery requires reconciliation');
   this.s.db.query("UPDATE remediation_notices SET state='posted',created=? WHERE job=? AND binding=?").run(comment.createdAt,job,binding);
@@ -133,7 +133,7 @@ export class LinearLifecycle{
    if(reservation)return reservation;
     this.assertSpecification(job,binding);
     this.assertRevision(job,revision);
-  const b=await this.api('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success issue{id state{id}}}}',{id:j.issue,state:desired});
+   const b=await withLinearReservation(()=>this.api('mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success issue{id state{id}}}}',{id:j.issue,state:desired}),()=>{this.s.db.query("DELETE FROM linear_transitions WHERE job=? AND phase=? AND desired=? AND previous=? AND state='delivery_uncertain'").run(job,phase,desired,issue.state.id);});
   if(!b.issueUpdate?.success||b.issueUpdate.issue?.id!==j.issue||b.issueUpdate.issue.state?.id!==desired)throw Error('Linear status delivery requires reconciliation');
    return this.s.db.transaction(()=>{
     this.assertSpecification(job,binding);this.assertRevision(job,revision);
@@ -179,7 +179,7 @@ export class LinearLifecycle{
     else{
      if(n.state!=='reserved')throw Error('Revision notice delivery uncertain; never replay');
      if(!this.s.db.query("UPDATE spec_notices SET state='delivery_uncertain' WHERE revision=? AND state='reserved'").run(r.id).changes)continue;
-     const response=await this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body}});
+      const response=await withLinearReservation(()=>this.api('mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{id body}}}',{input:{id:n.comment_id,issueId:j.issue,body:n.body}}),()=>{this.s.db.query("UPDATE spec_notices SET state='reserved' WHERE revision=? AND comment_id=? AND state='delivery_uncertain'").run(r.id,n.comment_id);});
      if(!response.commentCreate?.success||response.commentCreate.comment?.id!==n.comment_id||response.commentCreate.comment?.body!==n.body)throw Error('Revision notice delivery uncertain; reconcile exact ID/body');
     }
     this.s.db.query("UPDATE spec_notices SET state='posted' WHERE revision=?").run(r.id);

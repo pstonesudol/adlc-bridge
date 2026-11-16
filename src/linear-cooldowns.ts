@@ -5,6 +5,8 @@ const fingerprint=(token:string)=>createHash('sha256').update('adlc-linear-api-k
 export class LinearCooldown extends Error {
   constructor(public nextEligible:number){super(`Linear quota cooldown; next eligible ${new Date(nextEligible).toISOString()}`);}
 }
+// Unlike a throttle response, admission rejection proves this operation was not sent.
+export class LinearPreSendCooldown extends LinearCooldown {}
 type Budget={remaining:number|null;limit:number|null;reset:number|null};
 export type QuotaEvidence={requests:Budget;endpointRequests:Budget;complexity:Budget;endpointComplexity:Budget;retryAfter:number|null};
 const numeric=(s:string|null)=>s!==null&&s.trim()!==''&&Number.isFinite(Number(s))&&Number(s)>=0?Number(s):null;
@@ -52,10 +54,10 @@ export class LinearCooldowns {
       this.s.db.query('UPDATE linear_quota_state SET next_request=? WHERE scope=?').run(slot+250,scope);
       return {until:0,wait:slot-at};
     }).immediate();
-    if(slot.until)throw new LinearCooldown(slot.until);
+    if(slot.until)throw new LinearPreSendCooldown(slot.until);
     if(slot.wait>0)await this.pause(slot.wait);
     const row=this.s.db.query('SELECT until_ms FROM linear_quota_state WHERE scope=?').get(this.scope(credential)) as any;
-    if(row?.until_ms>this.now())throw new LinearCooldown(row.until_ms);
+    if(row?.until_ms>this.now())throw new LinearPreSendCooldown(row.until_ms);
   }
   observe(token:string,status:number,headers:Headers,body:any){
     if(status>=200&&status<300&&!body?.errors)this.verify(token,body?.data?.viewer?.id);

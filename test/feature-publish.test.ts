@@ -1,4 +1,6 @@
 import {test,expect} from 'bun:test';import {FeaturePublish} from '../src/feature-publish';import {plannedFeature} from './feature-fixture';
+import {createLinearAPI} from '../src/linear-api';
+import {LinearCooldowns,LinearPreSendCooldown} from '../src/linear-cooldowns';
 function apiFixture(){const issues=new Map(),relations=new Map();let creates=0,lost=false;const api=async(query:string,v:any={})=>{
  if(query.includes('workflowState'))return {workflowState:{id:'00000000-0000-0000-0000-000000000005',type:'backlog',team:{id:'00000000-0000-0000-0000-000000000002'}},project:{id:'00000000-0000-0000-0000-000000000001',teams:{nodes:[{id:'00000000-0000-0000-0000-000000000002'}],pageInfo:{hasNextPage:false}}}};
  if(query.includes('issueCreate(')){creates++;const p=v.input,issue={...p,identifier:'DEV-'+creates,url:'https://linear.app/issue/'+creates,team:{id:p.teamId},project:{id:p.projectId},state:{id:p.stateId,type:'backlog'},labels:{nodes:[],pageInfo:{hasNextPage:false}}};issues.set(p.id,issue);if(lost){lost=false;throw Error('Lost reply after creation');}return {issueCreate:{success:true,issue}};}
@@ -23,5 +25,32 @@ test('lost creation reply retains intake holds, then reconciles the existing UUI
 test('unexpected external workflow changes block batch release rather than queueing execution',async()=>{
  const {s,planner,id}=await plannedFeature(),f=apiFixture();const api=async(q:string,v:any)=>{const r=await f.api(q,v);if(r.issueCreate)r.issueCreate.issue.state.type='unstarted';return r;};try{
  planner.approve(id,planner.get(id).hash,'human');await expect(new FeaturePublish(s,planner,api).publish(id)).rejects.toThrow('uncertain');expect((s.db.query('SELECT count(*) AS n FROM feature_issue_holds').get() as any).n).toBe(2);
+ }finally{s.close();}
+});
+
+test('an exhausted target read defers unsent publication, then resumes with the same IDs without duplicates',async()=>{
+ const {s,planner,id}=await plannedFeature(),f=apiFixture();let now=1800000000000,exhaust=true;
+ const quotas=new LinearCooldowns(s,()=>now,async ms=>{now+=ms;});quotas.verify('key','11111111-1111-1111-1111-111111111111');
+ const send=(async(_url:any,init:any)=>{const {query,variables}=JSON.parse(init.body),data=await f.api(query,variables);const headers=exhaust&&query.includes('workflowState')?{'x-ratelimit-requests-remaining':'0','x-ratelimit-requests-reset':String(now+60000)}:{};exhaust=false;return Response.json({data},{headers});}) as typeof fetch;
+ const publisher=new FeaturePublish(s,planner,createLinearAPI(send,()=> 'key',quotas));
+ try{
+  planner.approve(id,planner.get(id).hash,'human');await expect(publisher.publish(id)).rejects.toBeInstanceOf(LinearPreSendCooldown);
+  const reserved=s.db.query('SELECT id,state FROM feature_publications WHERE plan=? ORDER BY id').all(id) as any[];
+  expect(reserved).toHaveLength(3);expect(reserved.every(op=>op.state==='reserved')).toBe(true);expect(f.creates).toBe(0);
+  now+=60000;await publisher.publish(id);expect(f.creates).toBe(2);expect(f.relations.size).toBe(1);expect(planner.get(id).state).toBe('published');
+  expect(s.db.query('SELECT id FROM feature_publications WHERE plan=? ORDER BY id').all(id)).toEqual(reserved.map(({id})=>({id})));
+  await publisher.publish(id);expect(f.creates).toBe(2);
+ }finally{s.close();}
+});
+
+test('a throttle response to a sent mutation keeps the uncertain reservation and is never replayed',async()=>{
+ const {s,planner,id}=await plannedFeature(),f=apiFixture();let now=1800000000000,mutations=0;
+ const quotas=new LinearCooldowns(s,()=>now,async ms=>{now+=ms;});quotas.verify('key','11111111-1111-1111-1111-111111111111');
+ const send=(async(_url:any,init:any)=>{const {query,variables}=JSON.parse(init.body);if(query.startsWith('mutation')){mutations++;return new Response('throttled',{status:429,headers:{'retry-after':'60'}});}return Response.json({data:await f.api(query,variables)});}) as typeof fetch;
+ const publisher=new FeaturePublish(s,planner,createLinearAPI(send,()=> 'key',quotas));
+ try{
+  planner.approve(id,planner.get(id).hash,'human');await expect(publisher.publish(id)).rejects.toThrow('uncertain');
+  expect(s.db.query("SELECT count(*) AS n FROM feature_publications WHERE state='delivery_uncertain'").get()).toEqual({n:1});
+  now+=60000;await expect(publisher.publish(id)).rejects.toThrow('No authoritative publication receipt');expect(mutations).toBe(1);expect(f.creates).toBe(0);
  }finally{s.close();}
 });

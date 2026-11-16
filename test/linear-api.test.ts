@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {createLinearAPI,coordinatedLinearFetch} from '../src/linear-api';
-import {LinearCooldowns,linearQuotaStatus} from '../src/linear-cooldowns';
+import {createLinearAPI,coordinatedLinearFetch,withLinearReservation} from '../src/linear-api';
+import {LinearCooldowns,linearQuotaStatus,LinearCooldown,LinearPreSendCooldown} from '../src/linear-cooldowns';
 const viewer='11111111-1111-1111-1111-111111111111';
 test('API verifies viewer once, shares across keys, and does not replay throttled mutations',async()=>{
   const s=new Store(':memory:');let now=1800000000000;const q=new LinearCooldowns(s,()=>now,async ms=>{now+=ms;});let identities=0,mutations=0;
@@ -46,4 +46,17 @@ test('quota persistence failures during viewer verification stop the request ins
  q.observe=()=>{throw Error('quota persistence unavailable');};
  const api=createLinearAPI((async()=>{calls++;return Response.json({data:{viewer:{id:viewer}}});}) as typeof fetch,()=> 'private-key',q);
  try{await expect(api('mutation{write{success}}')).rejects.toThrow('quota persistence unavailable');expect(calls).toBe(1);}finally{s.close();}
+});
+
+test('reservation release is limited to proven pre-send cooldowns, not sent throttles or transport failures',async()=>{
+ let releases=0;
+ for(const error of [new LinearCooldown(Date.now()+60000),Error('delivery uncertain')])await expect(withLinearReservation(async()=>{throw error;},()=>{releases++;})).rejects.toThrow();
+ expect(releases).toBe(0);
+ await expect(withLinearReservation(async()=>{throw new LinearPreSendCooldown(Date.now()+60000);},()=>{releases++;})).rejects.toBeInstanceOf(LinearPreSendCooldown);expect(releases).toBe(1);
+});
+
+test('viewer-verification throttling is pre-send for the requested mutation',async()=>{
+ const s=new Store(':memory:'),q=new LinearCooldowns(s,Date.now,async()=>{});let sends=0;
+ const api=createLinearAPI((async(_url:any,init:any)=>{sends++;expect(JSON.parse(init.body).query).toBe('query{viewer{id}}');return new Response('throttled',{status:429});}) as typeof fetch,()=> 'key',q);
+ try{await expect(api('mutation{write{success}}')).rejects.toBeInstanceOf(LinearPreSendCooldown);expect(sends).toBe(1);}finally{s.close();}
 });
