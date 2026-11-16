@@ -24,6 +24,8 @@ export function installRevisions(s:Store){s.db.exec(`CREATE TABLE IF NOT EXISTS 
   job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,pr INTEGER NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(job,plan_hash,revision));
   CREATE TABLE IF NOT EXISTS revision_handoff_proofs (
   job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,dispatch TEXT NOT NULL,session TEXT NOT NULL,spec TEXT NOT NULL,turn TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,PRIMARY KEY(job,plan_hash,revision));
+  CREATE TABLE IF NOT EXISTS revision_review_resumptions (
+  job TEXT NOT NULL,plan_hash TEXT NOT NULL,revision TEXT NOT NULL,dispatch TEXT NOT NULL,repo TEXT NOT NULL,pr INTEGER NOT NULL,head TEXT NOT NULL,PRIMARY KEY(job,plan_hash,revision));
 `);}
 export function recordRevision(s:Store,old:any,spec:string){
  const id=randomUUID(),detail={id,oldHash:digest(old.spec),newHash:digest(spec),summary:revisionSummary(old.spec,spec),staleApproval:old.approved_hash};
@@ -177,6 +179,24 @@ export function revisedHandoff(s:Store,job:string){
  // cannot release review or Done while that target still points elsewhere.
   const target=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
   return !target||target.pr===handoff.pr&&target.repo===proof.repo;
+}
+/** Project an exact authorized handoff once, not every poll. Superseded review
+ * decisions are audit history; provider requests and job budgets stay intact. */
+export function resumeRevisedReview(s:Store,job:string,now=Date.now()){
+ return s.db.transaction(()=>{
+  const j=s.get(job),r=latestRevision(s,job);
+  if(!r||r.state!=='authorized'||j.state!=='approved'||!j.actor||j.approved_hash!==j.plan_hash||j.plan_hash!==digest(JSON.stringify([j.spec,j.plan]))||!revisedHandoff(s,job))return false;
+  const d=s.db.query('SELECT * FROM implementation_dispatch WHERE job=?').get(job) as any;
+  const proof=s.db.query('SELECT * FROM revision_handoff_proofs WHERE job=? AND plan_hash=? AND revision=?').get(job,j.plan_hash,r.id) as any;
+  const t=s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?s.db.query('SELECT * FROM review_targets WHERE job=?').get(job) as any:null;
+  const run=s.db.query('SELECT * FROM runs WHERE job=?').get(job) as any;
+  if(!t||t.state==='completed'||t.repo!==proof.repo||t.pr!==proof.pr||t.allowed_paths!==d.paths||run?.owner!=='orchestrator'||run.session_id!==d.session_id||run.plan_hash!==j.plan_hash)return false;
+  const claimed=s.db.query('INSERT OR IGNORE INTO revision_review_resumptions VALUES (?,?,?,?,?,?,?)').run(job,j.plan_hash,r.id,d.client_id,proof.repo,proof.pr,proof.head);
+  if(!claimed.changes)return false;
+  s.db.query("UPDATE review_targets SET head=?,head_since=?,state='waiting_for_review',reason='Verified revised handoff; fresh current-head CI and review evaluation required',last_signature=NULL,updated=CURRENT_TIMESTAMP WHERE job=? AND pr=? AND state!='completed'").run(proof.head,now,job,proof.pr);
+  s.event(job,'revised_review_resumed',JSON.stringify({revision:r.id,plan:j.plan_hash,dispatch:d.client_id,session:d.session_id,repo:proof.repo,pr:proof.pr,head:proof.head,previous:{head:t.head,state:t.state,reason:t.reason},mergeEnabled:false}));
+  return true;
+ }).immediate();
 }
 export function observeLegacyRevision(s:Store,job:string){
  if(latestRevision(s,job)||!s.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get())return;

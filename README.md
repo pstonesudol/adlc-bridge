@@ -21,6 +21,31 @@ Test failures fail the job and remain visible in the Actions step output.
 CI has read-only repository permissions, does not persist checkout credentials,
 and performs no deployment, merge or auto-merge actions.
 
+## Requirements edits and operational notes
+
+The Linear issue identifier, title and description are requirements. Any edit
+invalidates the captured plan and its approval; adding a link or calling an edit
+“notes only” does not preserve authorization. Revised requirements go through
+the existing same-worker replanning and current-plan approval policy.
+
+For operational notes, incident context and follow-up links that do **not** change
+requirements, use a new Linear **comment**, not a description edit. Ordinary
+comments are not implementation instructions or permission grants. A requested
+scope/behavior change must be reflected in the requirements and replanned;
+approval and clarification commands still require their exact authenticated
+existing flows.
+
+While a revision is pending, workflow status exposes `revisionDeliveries`:
+historical receipt, worker, exact branch PR identity, head and CI/review snapshot.
+These observations never authorize a send, PR replacement or readiness clearance.
+Missing, stale or conflicting evidence reports the exact `spec-reconcile JOB
+CONFIG` preview action; preserve the original worker, worktree and PR. Normal
+polling continues read-only observations, respecting provider backoff. After a
+verified authorized same-worker revised handoff, the existing PR's review target
+advances to the verified head once and its superseded decision is retired. The
+normal current-head CI/review loop then applies unchanged authorization, scope,
+request grace/cooldown, delivery-receipt and human-only merge gates.
+
 ## CodeRabbit cooldown recovery
 
 The existing review loop keeps durable PR review cycles and per-head request

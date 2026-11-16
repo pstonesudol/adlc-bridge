@@ -37,7 +37,7 @@ function readStop(error:unknown,fallback:string){
  return {state:transient(readEvidence(error))?'waiting_for_worker':'blocked',send:false,reason:error instanceof Error?error.message:fallback};
 }
 import {validateVerification,validateVerificationContext,type Verification,type VerificationContext} from './verification';
-import {revisedExecution,revisedHandoff,latestRevision} from './spec-revisions';
+import {revisedExecution,revisedHandoff,latestRevision,currentOutcome} from './spec-revisions';
 import {ActionWatchdog,WATCHDOG_LIMITS} from './action-watchdog';
 import {observeLiveness,livenessStop} from './worker-liveness';
 import {bindReviewerPolicy,boundReviewerPolicy,ensureReviewerStore,reviewerInput,reviewFindingTrustFresh} from './reviewer-policy';
@@ -479,8 +479,9 @@ export class ReviewLoop{
    // polling. A stale failed outcome must not block a recovered continuation,
    // and any failure source must be blocked while one remains unrecovered.
    const failedContinuation=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT id FROM continuations WHERE job=? AND plan_hash=? AND state='failed' LIMIT 1").get(job,run.plan_hash) as any:null;
-   if(outcome?.plan_hash===run.plan_hash&&outcome.outcome==='failed'&&failedContinuation)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Previous guarded continuation failed without reviewed delivery recovery; no handoff or remediation'});
-   if(outcome?.plan_hash===run.plan_hash&&typeof outcome.source==='string'&&outcome.source.startsWith('remediation:')&&['needs_input','blocked_dependency','failed','uncertain'].includes(outcome.outcome)){
+    const outcomeCurrent=outcome?.plan_hash===run.plan_hash&&(!latestRevision(this.s,job)||currentOutcome(this.s,job,outcome));
+    if(outcomeCurrent&&outcome.outcome==='failed'&&failedContinuation)return record({state:'needs_reconciliation',send:false,head:e.head,reason:'Previous guarded continuation failed without reviewed delivery recovery; no handoff or remediation'});
+    if(outcomeCurrent&&typeof outcome.source==='string'&&outcome.source.startsWith('remediation:')&&['needs_input','blocked_dependency','failed','uncertain'].includes(outcome.outcome)){
     const handle=outcome.source.slice('remediation:'.length),entry=session.transcript.entries.find((x:any)=>x.clientMessageId===handle),turn=entry&&session.transcript.turns.find((x:any)=>x.id===entry.turnId);
     if(turn?.state==='completed')this.s.db.query("UPDATE remediation SET state='completed' WHERE job=? AND attempt=? AND state='delivery_uncertain'").run(job,Number(handle.split('-').at(-1)));
     return record({state:'blocked',send:false,head:e.head,reason:`Verification remediation ${outcome.outcome}: ${outcome.reason}; see the scoped Linear clarification/blocker flow`});
