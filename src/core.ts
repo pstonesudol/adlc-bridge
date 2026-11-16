@@ -78,6 +78,9 @@ export class Store {
       }
     }).immediate();
     installRevisions(this);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS linear_quota_credentials(credential TEXT PRIMARY KEY,viewer TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS linear_quota_state(scope TEXT PRIMARY KEY,until_ms INTEGER NOT NULL DEFAULT 0,next_request INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,last_throttle INTEGER,throttle_kind TEXT,evidence TEXT,observed INTEGER);
+      CREATE TABLE IF NOT EXISTS linear_quota_projects(project TEXT PRIMARY KEY,credential TEXT NOT NULL,intake_state TEXT NOT NULL,observed INTEGER NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS event_provenance (
       seq INTEGER PRIMARY KEY REFERENCES events(seq), event_ms INTEGER NOT NULL,
       runtime_version TEXT NOT NULL, attempt INTEGER NOT NULL, plan_hash TEXT,
