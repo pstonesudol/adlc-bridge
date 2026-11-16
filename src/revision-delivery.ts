@@ -30,12 +30,14 @@ export class RevisionDelivery{
   if(!r||!d||j.state==='done'||r.state==='preplanning'||r.state==='authorized'&&(!revisedExecution(this.s,job)||revisedHandoff(this.s,job)))return;
   const binding=this.binding(job),key=digest(binding),prior=this.s.db.query('SELECT * FROM revision_delivery_observations WHERE job=?').get(job) as any;
   const previous=prior?JSON.parse(prior.result):null;
-  let verified=verifiedRevisionDelivery(this.s,job);
   if(prior?.binding===key&&Date.now()>=prior.observed&&Date.now()-prior.observed<60000)return previous;
   const observations=new RecoveryObservation(this.s),release=observations.claim(`revision-delivery:${job}`);
   if(!release)return {state:'waiting_for_worker',send:false,reason:'Revision delivery observation already reserved; no duplicate reads'};
   try{return await withObservationFence(release.assert,async()=>{
    const wait=observations.readWait(job);if(wait)return wait;
+   // Other bridge processes may have persisted identity after our cadence read.
+   // Read the retained proof only while holding its writer lease.
+   let verified=verifiedRevisionDelivery(this.s,job);
    const current=()=>{assertObservationFence();if(this.binding(job)!==binding)throw Error('Revision delivery binding changed during observation; refresh without replay');};
    let result:any;
    try{
@@ -66,11 +68,13 @@ export class RevisionDelivery{
      const remote=await observations.read(job,'github',()=> (this.w.t.branchSnapshot??readBranchSnapshot)(c.githubRepo!,prs[0].number));current();
      if(canonicalWorktree(local.tree??local.worktree!)!==canonicalWorktree(p.worktree)||local.branch!==p.branch||remote.branch!==p.branch||remote.state!=='open'||remote.headRepo!==c.githubRepo||remote.baseRepo!==c.githubRepo||local.head!==remote.head||inventory.prs[0].head!==remote.head||!/^[a-f0-9]{40,64}$/.test(remote.head))throw Error('Original PR/worktree/head evidence conflicts');
      head=remote.head;
-     verified={state:'revision_delivery_observed',revision:r.id,client:b.client,session:b.session,receipt:receipt.state,turn:receipt.turn,repo:c.githubRepo,pr:prs[0].number,head,review:null,observed:Date.now(),authorization:'historical-only'};
+     const priorReview=verified?.review;
+     verified={state:'revision_delivery_observed',revision:r.id,client:b.client,session:b.session,receipt:receipt.state,turn:receipt.turn,repo:c.githubRepo,pr:prs[0].number,head,review:priorReview?.head===head?priorReview:null,observed:Date.now(),authorization:'historical-only'};
+     review=verified.review;
      if(this.w.t.readReviewEvidence){
       const e=await observations.read(job,'github',()=>this.w.t.readReviewEvidence!(c.githubRepo!,prs[0].number,c.requiredChecks));current();
       if(e.head!==head||e.reasons?.includes('Head changed')||e.prOpen===false)throw Error('PR head changed during CI/review observation');
-      review={head:e.head,failedChecks:e.failedChecks?.map((x:any)=>({id:x.id,name:x.name,sha:x.sha,conclusion:x.conclusion})),pendingChecks:e.pendingChecks,missingChecks:e.missingChecks,reviewerBlockers:e.reviewerEvidence?.blockers,reviewPending:e.coderabbitPending};
+      review={head:e.head,observed:Date.now(),failedChecks:e.failedChecks?.map((x:any)=>({id:x.id,name:x.name,sha:x.sha,conclusion:x.conclusion})),pendingChecks:e.pendingChecks,missingChecks:e.missingChecks,reviewerBlockers:e.reviewerEvidence?.blockers,reviewPending:e.coderabbitPending};
      }
     }
     result={state:'revision_delivery_observed',send:false,revision:r.id,client:b.client,session:b.session,receipt:receipt.state,turn:receipt.turn,repo:c.githubRepo,pr:prs[0]?.number??null,head,review,authorization:'historical-only',nextAction:`Await current revised-plan authorization and verified handoff; preview spec-reconcile ${job} CONFIG if reconciliation is required`};

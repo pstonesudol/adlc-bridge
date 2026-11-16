@@ -22,6 +22,7 @@ import {StartupRecovery} from '../src/startup-recovery';
 import {planningPRFixture} from './planning-pr-fixture';
 import {RevisionDelivery} from '../src/revision-delivery';
 import {sendPilotRemediation} from '../src/pilot';
+import {RecoveryObservation} from '../src/recovery-observation';
 
 const ready='<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -294,6 +295,50 @@ test('DEV-113 CI observation failure retains the completed original receipt and 
   f.e.session.prs=[{state:'open',number:18,url:'https://github.com/owner/repo/pull/18'}];
   await expect(f.recovery.preview(f.job,config)).rejects.toThrow('Retained original PR identity changed');
  }finally{reopened?.close();f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('DEV-113 retained PR identity is refreshed inside the lease after a competing process writes',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-observation-identity-race-')),path=join(dir,'state.db'),f=await fixture(path);
+ const other=new Store(path),claim=RecoveryObservation.prototype.claim;
+ try{
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];f.edit('v2');
+  const observer=new RevisionDelivery(f.s,f.w);let competed=false;
+  RecoveryObservation.prototype.claim=function(key:string,duration?:number){
+   if(key===`revision-delivery:${f.job}`&&!competed){
+    competed=true;
+    // Emulate B completing its verified PR-17 write after A's cadence read,
+    // but before A acquires the lease. Both connections use the actual lease.
+    const release=new RecoveryObservation(other).claim(key)!;
+    expect(release).not.toBeNull();
+    try{other.db.query('INSERT INTO revision_delivery_observations VALUES (?,?,?,?,?)').run(f.job,latestRevision(other,f.job).id,'competing-binding',Date.now(),JSON.stringify({state:'revision_delivery_observed',repo:'owner/repo',pr:17,head:'a'.repeat(40),review:null}));}finally{release();}
+    f.e.session.prs=[{state:'open',number:18,url:'https://github.com/owner/repo/pull/18'}];
+   }
+   return claim.call(this,key,duration);
+  };
+  const result=await observer.observe(f.job,config);
+  expect(competed).toBe(true);expect(result).toMatchObject({state:'blocked',reason:expect.stringContaining('Previously verified original PR identity changed'),lastVerified:{pr:17}});
+  expect(JSON.parse((other.db.query('SELECT result FROM revision_delivery_observations WHERE job=?').get(f.job) as any).result).lastVerified.pr).toBe(17);
+  expect(f.sends).toHaveLength(1);
+ }finally{RecoveryObservation.prototype.claim=claim;other.close();f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
+for(const changedHead of [false,true])test(`DEV-113 failed review refresh ${changedHead?'clears different-head':'retains same-head'} historical snapshot`,async()=>{
+ const f=await fixture();try{
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];f.edit('v2');
+  f.w.t.readReviewEvidence=async()=>({head:'a'.repeat(40),failedChecks:[],pendingChecks:['CI'],missingChecks:[],reviewerEvidence:{blockers:['Review pending']},coderabbitPending:true});
+  const observer=new RevisionDelivery(f.s,f.w),first=await observer.observe(f.job,config);
+  expect(first.review).toMatchObject({head:'a'.repeat(40),pendingChecks:['CI']});expect(typeof first.review.observed).toBe('number');
+  setSystemTime(new Date(Date.now()+60001));f.e.receiptObservation.observed=Date.now();
+  if(changedHead){
+   const inventory=f.w.t.planningPRs!,snapshot=f.w.t.branchSnapshot!;
+   f.w.t.worktree=async()=>({tree:'/worktree',branch:f.e.session.branch,head:'b'.repeat(40)});
+   f.w.t.planningPRs=async(...args)=>{const result=await inventory(...args);return {...result,prs:result.prs.map(p=>({...p,head:'b'.repeat(40)}))};};
+   f.w.t.branchSnapshot=async(...args)=>({...await snapshot(...args),head:'b'.repeat(40)});
+  }
+  f.w.t.readReviewEvidence=async()=>{throw Error('Review provider unavailable');};
+  const failed=await observer.observe(f.job,config);
+  expect(failed).toMatchObject({state:'blocked',lastVerified:{head:(changedHead?'b':'a').repeat(40),review:changedHead?null:first.review}});
+  if(!changedHead)expect(failed.lastVerified.review.observed).toBeLessThan(failed.lastVerified.observed);
+  expect(f.s.get(f.job).approved_hash).toBeNull();expect(f.sends).toHaveLength(1);
+ }finally{setSystemTime();f.s.close();}
 });
 for(const changed of ['revision','owner','lease'])test(`DEV-113 ${changed} changes during observation cannot persist stale evidence or replay`,async()=>{
  const f=await fixture();try{
