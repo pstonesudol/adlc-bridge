@@ -6,6 +6,7 @@ import {routingConfig,settings} from './routing-fixture';
 import {RoutePreflightFailure} from '../src/routing-session';
 import {LinearRouteNotices} from '../src/linear-route-notices';
 import {LinearLifecycle} from '../src/linear-lifecycle';
+import {LinearPreSendCooldown} from '../src/linear-cooldowns';
 const config={repo:'/repo',linear:{projectId:'p'},requiredChecks:['CI'],automation:{planningEnabled:true,orchestratorProject:'project',maxPlanning:1},routing:settings};
 const ops=['inspect','fetch','worktree','branch','commit','push-feature','open-pr'];
 class Fake implements WorkflowTransport{
@@ -86,6 +87,22 @@ test('Linear route requests are current-plan scoped, deduplicated and cannot app
   expect(w.implementation(id).state).toBe('approved_pending');expect(f.messages).toHaveLength(1);
   s.db.query("UPDATE jobs SET state='awaiting_approval',approved_hash=NULL WHERE id=?").run(id);
   expect(await notices.sync(c)).toEqual([]);expect(posts).toBe(1);
+ }finally{s.close();}
+});
+test('an unsent route notice retains its reserved ID/body and retries without uncertain-delivery reconciliation',async()=>{
+ const {s,f,w,id}=fixture();try{
+  const spec=JSON.stringify({identifier:'DEV-67',title:'Task',description:'Model unavailable'});s.db.query('UPDATE jobs SET spec=? WHERE id=?').run(spec,id);
+  await w.tick(config);await w.tick(config);w.approve(id,s.get(id).plan_hash,'human',['src/a.ts'],'supervised-host',ops);
+  f.preflightRoute=async()=>{throw new RoutePreflightFailure('unavailable');};await w.executeApproved(id,config);
+  let hold=true,posts=0,reads=0;
+  const notices=new LinearRouteNotices(s,async(query,vars:any)=>{
+   if(query.includes('commentCreate')){if(hold)throw new LinearPreSendCooldown(Date.now()+60000);posts++;return {commentCreate:{success:true,comment:{id:vars.input.id,body:vars.input.body}}};}
+   if(query.includes('comments(')){reads++;throw Error('No readback is needed for a known-unsent operation');}
+   return {issue:{id:'i',...JSON.parse(spec),project:{id:'p'},team:{id:'t'}}};
+  }),c={linear:{projectId:'p',teamId:'t'}};
+  await notices.sync(c);const before=s.db.query('SELECT * FROM dispatch_route_notices').get() as any;expect(before.state).toBe('reserved');expect(posts).toBe(0);
+  hold=false;await notices.sync(c);expect(s.db.query('SELECT comment_id,body,state FROM dispatch_route_notices').get()).toEqual({comment_id:before.comment_id,body:before.body,state:'posted'});
+  await notices.sync(c);expect(posts).toBe(1);expect(reads).toBe(0);expect(w.implementation(id).state).toBe('approved_pending');expect(f.messages).toHaveLength(1);
  }finally{s.close();}
 });
 test('a complete route-notice readback miss retries the persisted ID/body after a transient failure',async()=>{

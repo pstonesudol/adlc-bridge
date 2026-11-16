@@ -38,10 +38,12 @@ test('resume-job checks the configured project pause inside the fence before pol
   const after=Store.readonly(db);try{expect(after.get(job)).toEqual(before);expect(after.db.query('SELECT * FROM continuations').all()).toEqual([]);expect(after.list()).toHaveLength(1);}finally{after.close();}
   // An unrelated project pause must not prevent this project's polling path.
   setProjectIntakePaused('other-project',true,state);setProjectIntakePaused('paused-project',false,state);
-  const unpaused=run();expect(unpaused.exitCode).toBe(1);expect(unpaused.stderr.toString()).toContain('fixture provider read reached');expect(readFileSync(calls,'utf8')).toBe('fetch');
+   // Transport diagnostics are intentionally sanitized; the local call record
+   // still proves polling reached the stub without exposing provider text.
+   const unpaused=run();expect(unpaused.exitCode).toBe(1);expect(unpaused.stderr.toString()).toContain('Linear request failed; delivery may be uncertain');expect(unpaused.stderr.toString()).not.toContain('fixture provider read reached');expect(readFileSync(calls,'utf8')).toBe('fetch');
   // Legacy intake-only configurations for a genuinely unregistered Linear
   // project still reach polling; the provider remains stubbed and cannot send.
   writeFileSync(config,JSON.stringify({...original,automation:undefined,linear:{...original.linear,projectId:'00000000-0000-0000-0000-000000000002'}}));
-  const legacy=poll();expect(legacy.exitCode).toBe(1);expect(legacy.stderr.toString()).toContain('fixture provider read reached');expect(readFileSync(calls,'utf8')).toBe('fetchfetch');
+   const legacy=poll();expect(legacy.exitCode).toBe(1);expect(legacy.stderr.toString()).toContain('Linear request failed; delivery may be uncertain');expect(readFileSync(calls,'utf8')).toBe('fetchfetch');
  }finally{rmSync(home,{recursive:true,force:true});}
 });

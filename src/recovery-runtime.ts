@@ -20,6 +20,7 @@ import {trustedDaemon} from './daemon-runtime';
 import {disableNativeFeedback} from './ao-policy';
 import {assertCurrentPlanningRequirements} from './spec-recovery';
 import {createLinearAPI,readLinearIssue} from './linear-api';
+import {LinearCooldowns} from './linear-cooldowns';
 import {readPlanningPRs} from './planning-prs';
 
 type RecoveryIODependencies={spawn?:typeof Bun.spawn;send?:typeof fetch;now?:()=>number;trust?:typeof trustedDaemon;registry?:typeof restoreRegistry;token?:typeof linearToken};
@@ -44,7 +45,11 @@ export function createRecoveryIO(s:Store,deadline:number,submit=withTurnSubmissi
  transport.worktree=job=>worktreeIdentity(s,job,run);
   transport.branchSnapshot=(repo,pr)=>readBranchSnapshot(repo,pr,async args=>JSON.parse(await run(['gh',...args])));
   transport.planningPRs=(repo,branch)=>readPlanningPRs(repo,branch,async args=>JSON.parse(await run(['gh',...args])));
- const linear=createLinearAPI(send,deps.token??linearToken);
+  const quotas=new LinearCooldowns(s,deps.now??Date.now,async ms=>{
+   if(ms>=remaining())throw Error('Recovery pass deadline reached; retry after reconciling existing receipts');
+   await Bun.sleep(ms);remaining();
+  });
+  const linear=createLinearAPI(send,deps.token??linearToken,quotas);
  return {remaining,spawn,send,run,api,transport,
   inspect:(store:Store,job:string,c:any)=>restoreRepository(store,job,c,run,deps.registry??restoreRegistry),
   requirements:(store:Store,job:string,c:any)=>assertCurrentPlanningRequirements(store,job,c,id=>readLinearIssue(id,linear))};

@@ -7,6 +7,7 @@ import {effectiveSettings} from './project-settings';
 import {serviceSettings} from './service-settings';
 import {turnBarrier,type TurnBarrier} from './turn-submission';
 import {assertPollQuiescent,assertPollStarted} from './poll-process';
+import {linearQuotaStatus} from './linear-cooldowns';
 type StartupWait={attempts:number;pause:()=>Promise<unknown>};
 export async function waitForPollStartup<T extends {loaded:boolean;running?:boolean;pid?:number}>(status:()=>Promise<T>,verify:(current:T)=>void,kickstart:()=>Promise<void>,wait:StartupWait={attempts:100,pause:()=>Bun.sleep(100)}){
  await kickstart();let last:unknown;
@@ -69,7 +70,7 @@ async function controlProject(action:string,project:string|undefined,apply:boole
     const pid=r.stdout.match(/^\s*pid = (\d+)\s*$/m);
     return {loaded:r.code===0,running:r.code===0&&/state = running/.test(r.stdout),...(pid?{pid:Number(pid[1])}:{})};
   };
-  if(action==='service-status')return {project:entry.project,service:label,...await status(),definitionInstalled:existsSync(plist),intervalSeconds:settings?.pollingIntervalSeconds??null,...settings,settingsError,installedIntervalSeconds:existsSync(plist)?readDefinition(plist).StartInterval:null};
+   if(action==='service-status')return {project:entry.project,service:label,...await status(),definitionInstalled:existsSync(plist),intervalSeconds:settings?.pollingIntervalSeconds??null,...settings,settingsError,installedIntervalSeconds:existsSync(plist)?readDefinition(plist).StartInterval:null,linearQuota:linearQuotaStatus(s,entry.linear_project)};
   if(action==='service-config'){
    const current=await status(),def=readDefinition(plist);
    if(apply&&current.loaded&&options.requireEnabled){

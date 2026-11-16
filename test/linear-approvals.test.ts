@@ -11,6 +11,7 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {planningPRFixture} from './planning-pr-fixture';
+import {LinearPreSendCooldown} from '../src/linear-cooldowns';
 function fixture(path=':memory:'){
  const s=new Store(path),approver='00000000-0000-0000-0000-000000000001';let sends=0,creates=0,lost=false;
  const c:any={repo:'/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},requiredChecks:['CI'],automation:{planningEnabled:false,orchestratorProject:'ao'},approval:{mode:'ready-queue'},planApproval:{enabled:true,approverIds:[approver],scope:['src/**']}};
@@ -34,6 +35,16 @@ test('publishes one plan; exact human reply approves once, implementation starts
  const f=fixture();try{expect((await f.surface.sync(f.c))[0].state).toBe('awaiting_human_approval');await f.surface.sync(f.c);expect(f.counts()).toEqual({sends:0,creates:1});
  f.approve();expect((await f.surface.sync(f.c))[0].state).toBe('approved');expect(f.s.get(f.id).actor).toContain('Linear user');expect(f.counts().sends).toBe(0);
  await f.surface.sync(f.c);await f.w.tick(f.c);expect(f.counts().sends).toBe(1);
+ }finally{f.s.close();}
+});
+test('pre-send cooldown keeps an approval notice reserved for a later fresh publication',async()=>{
+ const f=fixture(),api=f.surface.api;let hold=true;
+ f.surface.api=async(q,v)=>{if(hold&&q.startsWith('mutation'))throw new LinearPreSendCooldown(Date.now()+60000);return api(q,v);};
+ try{
+  await f.surface.sync(f.c);const before=f.s.db.query('SELECT * FROM plan_approval_notices').get() as any;
+  expect(before.state).toBe('reserved');expect(f.counts()).toEqual({sends:0,creates:0});
+  hold=false;await f.surface.sync(f.c);const after=f.s.db.query('SELECT * FROM plan_approval_notices').get() as any;
+  expect(after.comment_id).toBe(before.comment_id);expect(after.token).toBe(before.token);expect(after.state).toBe('posted');expect(f.counts()).toEqual({sends:0,creates:1});
  }finally{f.s.close();}
 });
 test('invalid plan evidence cannot publish a misleading manual approval notice',async()=>{

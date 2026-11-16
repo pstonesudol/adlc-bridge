@@ -32,7 +32,7 @@ test('v1 upgrade preserves records, indexes and repeated opens',()=>fixture(path
     const s=new Store(path);
     try {
       expect(records(s.db)).toEqual(before);
-      expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:2});
+      expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:3});
       expect(s.db.query("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('events_job_seq','approvals_job_seq')").all()).toHaveLength(2);
       expect(s.db.query('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally {s.close();}
@@ -43,7 +43,7 @@ test('v1 upgrade accepts matching indexes and rejects conflicting definitions',(
   const db=new Database(path);db.exec(legacy);
   db.exec('CREATE INDEX events_job_seq ON events(job,seq); CREATE INDEX approvals_job_seq ON approvals(job,seq);');db.close();
   const s=new Store(path);
-  try {expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:2});} finally {s.close();}
+  try {expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:3});} finally {s.close();}
  });
  for(const ddl of [
   'CREATE UNIQUE INDEX events_job_seq ON events(job,seq)',
@@ -77,7 +77,7 @@ test('unsupported and failed upgrades preserve data and roll back DDL',()=>{
   });
 });
 test('read-only stores reject future versions without changing database bytes',()=>{
-  for(const version of [1,2,99]) fixture(path=>{
+  for(const version of [1,2,3,99]) fixture(path=>{
     const db=new Database(path);db.exec(legacy);db.exec(`PRAGMA user_version=${version}`);
     const before=records(db);db.close();const bytes=readFileSync(path);
     if(version===99) expect(()=>Store.readonly(path)).toThrow('Unsupported SQLite schema version: 99');
@@ -86,6 +86,7 @@ test('read-only stores reject future versions without changing database bytes',(
       try {
         expect(records(s.db)).toEqual(before);
         expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:version});
+        expect(s.db.query("SELECT name FROM sqlite_master WHERE name LIKE 'linear_quota_%'").all()).toEqual([]);
         expect(()=>s.db.exec("UPDATE jobs SET spec='changed'")).toThrow();
       } finally {s.close();}
     }
@@ -117,6 +118,30 @@ test('literal sqlite_ prefix rejects unversioned sqliteCache tables in both mode
   expect(()=>Store.readonly(path)).toThrow('Unversioned nonempty database; refusing read-only access');
   expect(()=>new Store(path)).toThrow('Unversioned nonempty database; refusing initialization');
   expect(inspect()).toEqual({rows:[{value:'preserved'}],version:{user_version:0},jobs:[]});
+}));
+
+const legacyV2=legacy+'\nCREATE INDEX events_job_seq ON events(job,seq); CREATE INDEX approvals_job_seq ON approvals(job,seq); PRAGMA user_version=2;';
+test('v2 quota migration is versioned, preserves records, and is idempotent on repeated writable opens',()=>fixture(path=>{
+ const db=new Database(path);db.exec(legacyV2);const before=records(db);db.close();
+ for(let i=0;i<2;i++){
+  const s=new Store(path);try{
+   expect(s.db.query('PRAGMA user_version').get()).toEqual({user_version:3});expect(records(s.db)).toEqual(before);
+   expect(s.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'linear_quota_%'").all()).toHaveLength(3);
+  }finally{s.close();}
+ }
+}));
+test('v2 quota adoption preserves already persisted cooldowns from the earlier initializer',()=>fixture(path=>{
+ const s=new Store(path);s.db.query('INSERT INTO linear_quota_state(scope,until_ms,last_throttle) VALUES (?,?,?)').run('viewer:fixture',1800000600000,1800000000000);s.db.exec('PRAGMA user_version=2;');s.close();
+ const next=new Store(path);try{
+  expect(next.db.query('PRAGMA user_version').get()).toEqual({user_version:3});
+  expect(next.db.query('SELECT scope,until_ms,last_throttle FROM linear_quota_state').all()).toEqual([{scope:'viewer:fixture',until_ms:1800000600000,last_throttle:1800000000000}]);
+ }finally{next.close();}
+}));
+test('failed v2 quota DDL/adoption rolls back new tables and user_version together',()=>fixture(path=>{
+ const db=new Database(path);db.exec(legacyV2+'\nCREATE VIEW linear_quota_projects AS SELECT 1 AS sentinel;');const before=records(db),schema=db.query('SELECT * FROM sqlite_master ORDER BY name').all();db.close();
+ expect(()=>new Store(path)).toThrow();const check=new Database(path,{readonly:true});try{
+  expect(check.query('PRAGMA user_version').get()).toEqual({user_version:2});expect(records(check)).toEqual(before);expect(check.query('SELECT * FROM sqlite_master ORDER BY name').all()).toEqual(schema);
+ }finally{check.close();}
 }));
 test('SQLite backup and restore preserves committed WAL records and integrity',()=>fixture((path,dir)=>{
   const s=new Store(path);

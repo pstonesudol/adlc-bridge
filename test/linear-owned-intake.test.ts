@@ -1,6 +1,8 @@
 import {test,expect} from 'bun:test';import {Store} from '../src/core';import {Planning} from '../src/planning';import {Workflow} from '../src/workflow';import {FeaturePlanning} from '../src/feature-planning';import {poll} from '../src/linear';import {featureConfig,Agents} from './feature-fixture';
 import {digest} from '../src/core';
 import {recordReadiness} from '../src/readiness';
+import {LinearCooldowns,linearQuotaStatus} from '../src/linear-cooldowns';
+import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
 const c={version:1 as const,...featureConfig,requiredChecks:['CI'],statusSync:{enabled:true,inProgress:'00000000-0000-0000-0000-000000000006',inReview:'00000000-0000-0000-0000-000000000007',done:'00000000-0000-0000-0000-000000000008'}};
 function issue(id:string,state:string){return {id,identifier:'DEV-1',title:'Task',description:'Requirements',project:{id:c.linear.projectId},team:{id:c.linear.teamId},state:{id:state},labels:{nodes:[{id:c.linear.readyLabelId}],pageInfo:{hasNextPage:false}}};}
 const response=(nodes:any[])=>new Response(JSON.stringify({data:{issues:{nodes,pageInfo:{hasNextPage:false}}}}));
@@ -93,4 +95,27 @@ test('intake reads the approval label without changing the ticket specification 
  required=true;await poll(c,s,'test');required=false;globalThis.fetch=(async()=>{throw Error('Unavailable snapshot');}) as any;
  await expect(poll(c,s,'test')).rejects.toThrow();expect(policy.requiresManual(j.id)).toBe(true);
  }finally{globalThis.fetch=old;s.close();}
+});
+
+test('shared-project throttling on page two survives restart and recovers without duplicate jobs or writes',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'adlc-intake-cooldown-')),path=join(root,'state.sqlite');let s=new Store(path),clock=1800000000000;
+ const viewer='11111111-1111-1111-1111-111111111111',config={...c,statusSync:undefined},second={...config,linear:{...config.linear,projectId:'33333333-3333-3333-3333-333333333333'}};
+ const coordinator=()=>new LinearCooldowns(s,()=>clock,async ms=>{clock+=ms;});let q=coordinator(),reads=0,writes=0;
+ q.verify('key-one',viewer);q.verify('key-two',viewer);
+ const source=issue('recovered',c.linear.readyStateId);
+ const page=(more=false)=>Response.json({data:{viewer:{id:viewer},issues:{nodes:[source],pageInfo:{hasNextPage:more,endCursor:more?'next':null}}}});
+ const partial=(async(_url:any,init:any)=>{const query=JSON.parse(init.body).query;if(query.includes('mutation'))writes++;reads++;return reads===1?page(true):Response.json({errors:[{extensions:{code:'RATELIMITED'}}]},{headers:{'retry-after':'120'}});}) as typeof fetch;
+ try{
+  await expect(poll(config,s,'key-one',partial,q)).rejects.toThrow('cooldown');expect(s.list()).toHaveLength(0);
+  const before=s.db.query('SELECT * FROM queue_observations').all();
+  await expect(poll(second,s,'key-two',partial,q)).rejects.toThrow('cooldown');expect(reads).toBe(2);expect(s.db.query('SELECT * FROM queue_observations').all()).toEqual(before);
+  expect(linearQuotaStatus(s,second.linear.projectId,clock).intakeState).toBe('cooldown');
+  s.close();s=new Store(path);q=coordinator();
+  await expect(poll(config,s,'key-one',partial,q)).rejects.toThrow('cooldown');expect(reads).toBe(2);
+  clock+=120000;
+  const recovered=(async(_url:any,init:any)=>{if(JSON.parse(init.body).query.includes('mutation'))writes++;reads++;return page();}) as typeof fetch;
+  await poll(config,s,'key-one',recovered,q);await poll(config,s,'key-one',recovered,q);
+  expect(s.list()).toHaveLength(1);expect(s.db.query("SELECT count(*) AS n FROM events WHERE kind='ingested'").get()).toEqual({n:1});expect(writes).toBe(0);
+  expect(linearQuotaStatus(s,c.linear.projectId,clock).intakeState).toBe('snapshot_complete');
+ }finally{s.close();rmSync(root,{recursive:true,force:true});}
 });
