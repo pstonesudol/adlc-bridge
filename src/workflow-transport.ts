@@ -9,6 +9,7 @@ import {withTurnSubmission} from './turn-submission';
 import {PreSendFailure} from './pre-send';
 import {nativeModeFailure} from './provider-mode';
 import {readPlanningPRs} from './planning-prs';
+import {readiness} from './github';
 import {readFileSync,realpathSync,writeFileSync,mkdirSync} from 'node:fs';
 import {homedir} from 'node:os';
 import {resolve,isAbsolute,basename,dirname} from 'node:path';
@@ -64,6 +65,7 @@ export function createWorkflowTransport(submit=withTurnSubmission,spawn=Bun.spaw
     return {turn:matches[0],capabilities:snapshot.capabilities,authenticationState:snapshot.account?.authenticationState};
    },
   planningPRs:readPlanningPRs,
+  readReviewEvidence:readiness,
   async restorePlan(session,project){
    let p:ReturnType<typeof spawn>;
    try{p=spawn([AO,'session','restore',session,'--project',project],{stdout:'pipe',stderr:'pipe',timeout:120000});}catch{throw new PreSendFailure('Native restore not launched');}

@@ -1,4 +1,4 @@
-import {test,expect} from 'bun:test';
+import {test,expect,setSystemTime} from 'bun:test';
 import {mkdtempSync,rmSync,writeFileSync,readFileSync,mkdirSync,symlinkSync,unlinkSync} from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Store,digest} from '../src/core';
 import {Planning} from '../src/planning';
@@ -20,6 +20,8 @@ import {routingConfig,settings} from './routing-fixture';
 import {RoutePreflightFailure} from '../src/routing-session';
 import {StartupRecovery} from '../src/startup-recovery';
 import {planningPRFixture} from './planning-pr-fixture';
+import {RevisionDelivery} from '../src/revision-delivery';
+import {sendPilotRemediation} from '../src/pilot';
 
 const ready='<!-- ADLC_PLAN_SCOPE {"version":1,"paths":["src/example.ts"]} -->\n<!-- ADLC_PLAN_STATUS {"version":1,"readiness":"ready","questions":[],"dependencies":[],"risks":[]} -->';
 const config:any={repo:'/repo',githubRepo:'owner/repo',linear:{projectId:'p',teamId:'t',readyStateId:'todo',readyLabelId:'ready'},automation:{planningEnabled:true,orchestratorProject:'project'},requiredChecks:['CI']};
@@ -192,6 +194,120 @@ async function publishRevised(f:Awaited<ReturnType<typeof fixture>>,pr=17){
  f.e.receiptObservation.observed=Date.now();
  return f.w.executeApproved(f.job,config);
 }
+test('DEV-113 edit at completion retains original receipt and PR, then revised handoff resumes current-head CI remediation once',async()=>{
+ const f=await fixture();try{
+  const original=f.w.implementation(f.job),ledger=new ReceiptReconciliation(f.s);
+  const loop=new ReviewLoop(f.s);loop.configureMetadataChecks('p',[]);loop.register(f.job,'owner/repo',17,['CI'],['src/**'],true);
+  f.s.db.query("UPDATE review_targets SET head=?,state='blocked',reason='Review findings exceed approved file scope' WHERE job=?").run('a'.repeat(40),f.job);
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];
+  f.e.transcript.turns.at(-1).state='running';f.edit('Edited while implementation was finishing');
+  expect(f.s.get(f.job).approved_hash).toBeNull();
+  let observations=0;f.w.t.readReviewEvidence=async()=>{observations++;return {head:'a'.repeat(40),failedChecks:[{id:1,name:'CI',sha:'a'.repeat(40),conclusion:'failure'}],pendingChecks:[],missingChecks:[],coderabbitPending:true};};
+  await f.w.tick(config);
+  expect(ledger.get(original.client_id).state).toBe('running');expect(observations).toBe(1);expect(f.sends).toHaveLength(1);
+  f.e.transcript.turns.at(-1).state='completed';f.e.receiptObservation.observed=Date.now()+60001;setSystemTime(new Date(Date.now()+60001));
+  await Promise.all([f.w.tick(config),f.w.tick(config)]);
+  expect(ledger.get(original.client_id)).toMatchObject({state:'completed',session:'owner',turn:original.client_id});
+  expect(f.w.status().revisionDeliveries[0].result).toMatchObject({pr:17,receipt:'completed',authorization:'historical-only'});
+  expect(f.s.get(f.job).state).toBe('awaiting_plan');expect(f.sends).toHaveLength(1);
+  await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  expect(f.s.get(f.job).approved_hash).toBeNull();
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);
+  await f.w.executeApproved(f.job,config);expect(f.sends).toHaveLength(3);
+  let head='b'.repeat(40);
+  f.w.t.worktree=async()=>({tree:'/worktree',branch:f.e.session.branch,head});
+  const snapshot=async()=>({head,base:'c'.repeat(40),branch:f.e.session.branch,state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',baseBranch:'main',defaultBranch:'main',mergeable:true,behind:0});
+  f.w.t.branchSnapshot=snapshot;
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  expect((await f.w.executeApproved(f.job,config)).state).toBe('pr_handoff');
+  expect(loop.get(f.job)).toMatchObject({head,state:'waiting_for_review'});expect(revisedHandoff(f.s,f.job)).toBe(true);
+  const e:any={head,clear:false,descriptionHash:'body',templateSignature:'template',reasons:['Required CI failed'],findings:[],failedChecks:[{id:120,sha:head,name:'CI',conclusion:'failure',url:'https://github.com/owner/repo/actions/runs/12/job/120'}],pendingChecks:[],missingChecks:[],coderabbitPending:false,prOpen:true};
+  let fixes=0;
+  const io:any={sessionEvidence:async()=>{f.e.receiptObservation.observed=Date.now();return f.e;},readBranchSnapshot:snapshot,worktreeIdentity:async()=>({tree:'/worktree',branch:f.e.session.branch,head}),readiness:async()=>e,readCIFailure:async()=> 'src/example.ts:12 AssertionError: expected true',submit:async(operation:any)=>operation(),spawn:(args:string[])=>{
+   fixes++;const client=args[args.indexOf('--client-message-id')+1];f.e.transcript.entries.push({clientMessageId:client,turnId:client,sequence:f.e.transcript.entries.length+1});f.e.transcript.turns.push({id:client,state:'running'});f.e.transcript.controller='busy';return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
+  }};
+  const overrides:any={...io,disableNativeFeedback:async()=>{},sendPilotRemediation:(...args:any[])=>sendPilotRemediation(...args as Parameters<typeof sendPilotRemediation>,io)};
+  const resumed=new ReviewLoop(f.s,async()=>{throw Error('CI failure must not request review');},overrides);
+  resumed.setVerification(f.job,{version:1,mode:'host',steps:[{cwd:'.',argv:['bun','test']}]});
+  expect(await resumed.tick(f.job)).toMatchObject({state:'remediation_pending',send:true});expect(fixes).toBe(1);
+  await Promise.all([new ReviewLoop(f.s,resumed.postReview,overrides).tick(f.job),resumed.tick(f.job)]);expect(fixes).toBe(1);
+  // Re-observing handoff never erases a new current-head decision or budget.
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';head='d'.repeat(40);e.head=head;e.failedChecks=[];e.clear=true;e.reasons=[];
+  await f.w.executeApproved(f.job,config);
+  expect(f.s.db.query("SELECT count(*) AS n FROM events WHERE kind='revised_review_resumed'").get()).toEqual({n:1});
+  expect((await resumed.tick(f.job)).state).toBe('ready_for_human');expect(fixes).toBe(1);expect(f.s.get(f.job).attempts).toBe(1);
+  expect(f.s.db.query('SELECT count(*) AS n FROM review_targets').get()).toEqual({n:1});expect(ledger.get(original.client_id).state).toBe('completed');
+ }finally{setSystemTime();f.s.close();}
+});
+for(const invalid of ['stale','ambiguous','head','target'])test(`DEV-113 pending revision ${invalid} PR evidence blocks without delivery replay`,async()=>{
+ const f=await fixture();try{
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];f.edit('v2');
+  if(invalid==='stale')f.e.receiptObservation.observed-=120001;
+  if(invalid==='ambiguous')f.e.session.prs.push({state:'open',number:18,url:'https://github.com/owner/repo/pull/18'});
+  if(invalid==='head')f.w.t.worktree=async()=>({tree:'/worktree',branch:f.e.session.branch,head:'b'.repeat(40)});
+  if(invalid==='target'){const loop=new ReviewLoop(f.s);f.s.db.query("INSERT INTO review_targets(job,repo,pr,required_checks,allowed_paths,head_since) VALUES (?,?,18,'[\"CI\"]','[\"src/**\"]',0)").run(f.job,'owner/repo');}
+  let reads=0;f.w.t.readReviewEvidence=async()=>{reads++;throw Error('No review reads for unverified identity');};
+  const result=await new RevisionDelivery(f.s,f.w).observe(f.job,config);
+  expect(result).toMatchObject({state:'blocked',send:false,nextAction:expect.stringContaining(`spec-reconcile ${f.job} CONFIG`)});expect(reads).toBe(0);expect(f.sends).toHaveLength(1);expect(f.s.get(f.job).approved_hash).toBeNull();
+ }finally{f.s.close();}
+});
+test('DEV-128 verified same-worker handoff retires old blocker and requests skipped new-head review once across restart',async()=>{
+ const f=await fixture(),dir=mkdtempSync(join(tmpdir(),'adlc-dev128-')),path=join(dir,'state.db');let reopened:Store|undefined;
+ try{
+  // Synthetic full fixture SHAs preserve the incident prefixes, not live facts.
+  const old='2bf8872'+'0'.repeat(33),head='5671cdd'+'0'.repeat(33);
+  const loop=new ReviewLoop(f.s);loop.configureMetadataChecks('p',[]);loop.register(f.job,'owner/repo',165,['CI'],['src/**'],true);
+  f.s.db.query("UPDATE review_targets SET head=?,state='blocked',reason='Review findings exceed approved file scope' WHERE job=?").run(old,f.job);
+  f.e.session.prs=[{state:'open',number:165,url:'https://github.com/owner/repo/pull/165'}];
+  f.edit('Approved accessibility revision');await f.recovery.reconcile(f.job,config,(await f.recovery.preview(f.job,config)).confirmation);f.complete();await f.recovery.capture(f.job,config);
+  f.w.approve(f.job,f.s.get(f.job).plan_hash,'human',['src/**'],'supervised-host',featureGit);await f.w.executeApproved(f.job,config);
+  f.w.t.worktree=async()=>({tree:'/worktree',branch:f.e.session.branch,head});
+  const snapshot=async()=>({head,base:'c'.repeat(40),branch:f.e.session.branch,state:'open',draft:false,headRepo:'owner/repo',baseRepo:'owner/repo',baseBranch:'main',defaultBranch:'main',mergeable:true,behind:0});f.w.t.branchSnapshot=snapshot;
+  f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
+  expect((await f.w.executeApproved(f.job,config)).state).toBe('pr_handoff');expect(loop.get(f.job)).toMatchObject({head,state:'waiting_for_review'});
+  const e:any={head,clear:false,descriptionHash:'body',reasons:['Explicit latest-SHA CodeRabbit approval missing'],findings:[],failedChecks:[],pendingChecks:[],missingChecks:[],coderabbitPending:false,prOpen:true,reviewSchedule:{head,signature:'skip-new-head',incremental:false,blocker:null,evidence:{classification:'stale-submitted-review',recoverable:true,review:{id:42,state:'CHANGES_REQUESTED',commit:old,stale:true},check:{id:43,conclusion:'skipped'}}}};
+  let requests=0;const post=async()=>{requests++;return {id:44};};
+  const io:any={sessionEvidence:async()=>{f.e.receiptObservation.observed=Date.now();return f.e;},readBranchSnapshot:snapshot,worktreeIdentity:f.w.t.worktree,readiness:async()=>e,sendPilotRemediation:async()=>{throw Error('No new code delivery');},disableNativeFeedback:async()=>{}};
+  const current=new ReviewLoop(f.s,post,io);
+  expect((await current.tick(f.job)).state).toBe('waiting_for_coderabbit');expect(requests).toBe(0);
+  setSystemTime(new Date(Date.now()+6*60000));
+  await Promise.all([current.tick(f.job),current.tick(f.job)]);expect(requests).toBe(1);
+  expect(current.get(f.job)).toMatchObject({head,state:'waiting_for_coderabbit'});
+  f.s.db.query('VACUUM INTO ?').run(path);reopened=new Store(path);
+  const restarted=new ReviewLoop(reopened,post,io),w=new Workflow(reopened,f.w.t);
+  await w.executeApproved(f.job,config);await Promise.all([restarted.tick(f.job),restarted.tick(f.job)]);
+  expect(requests).toBe(1);expect(f.sends).toHaveLength(3);expect(reopened.get(f.job).attempts).toBe(0);
+  expect(reopened.db.query("SELECT count(*) AS n FROM events WHERE kind='revised_review_resumed'").get()).toEqual({n:1});
+  expect(restarted.get(f.job).state).not.toBe('ready_for_human');
+ }finally{setSystemTime();reopened?.close();f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
+test('DEV-113 CI observation failure retains the completed original receipt and exact PR across restart',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'adlc-revision-observation-')),path=join(dir,'state.db'),f=await fixture(path);let reopened:Store|undefined;
+ try{
+  const original=f.w.implementation(f.job);f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];f.edit('v2');
+  let reads=0;f.w.t.readReviewEvidence=async()=>{reads++;throw Error('CI provider unavailable');};
+  const result=await new RevisionDelivery(f.s,f.w).observe(f.job,config);
+  expect(result).toMatchObject({state:'blocked',lastVerified:{pr:17,receipt:'completed',head:'a'.repeat(40)}});
+  expect(new ReceiptReconciliation(f.s).get(original.client_id).state).toBe('completed');
+  reopened=new Store(path);const w=new Workflow(reopened,f.w.t);
+  expect(await new RevisionDelivery(reopened,w).observe(f.job,config)).toEqual(result);expect(reads).toBe(1);expect(f.sends).toHaveLength(1);
+  f.e.session.prs=[{state:'open',number:18,url:'https://github.com/owner/repo/pull/18'}];
+  await expect(f.recovery.preview(f.job,config)).rejects.toThrow('Retained original PR identity changed');
+ }finally{reopened?.close();f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
+for(const changed of ['revision','owner','lease'])test(`DEV-113 ${changed} changes during observation cannot persist stale evidence or replay`,async()=>{
+ const f=await fixture();try{
+  f.e.session.prs=[{state:'open',number:17,url:'https://github.com/owner/repo/pull/17'}];f.edit('v2');
+  f.w.t.readReviewEvidence=async()=>{
+   if(changed==='revision')f.edit('v3');
+   if(changed==='owner')f.s.db.query("UPDATE planning_runs SET session_id='other' WHERE job=?").run(f.job);
+   if(changed==='lease')f.s.db.query("UPDATE observation_leases SET token='other' WHERE key=?").run(`revision-delivery:${f.job}`);
+   return {head:'a'.repeat(40),failedChecks:[],pendingChecks:[],missingChecks:[]};
+  };
+  await expect(new RevisionDelivery(f.s,f.w).observe(f.job,config)).rejects.toThrow();
+  expect(f.s.db.query('SELECT * FROM revision_delivery_observations').all()).toHaveLength(0);expect(f.sends).toHaveLength(1);expect(f.s.get(f.job).approved_hash).toBeNull();
+ }finally{f.s.close();}
+});
 for(const outcome of ['needs_input','blocked_dependency','uncertain'])test(`DEV-104 revised approval retains but does not enforce a historical ${outcome} worker blocker`,async()=>{
  const f=await fixture();try{
   const old=f.w.implementation(f.job);
@@ -297,7 +413,7 @@ test('DEV-64 recovered proof survives reopening but cannot authorize a replaceme
   expect(revisedHandoff(f.s,f.job)).toBe(false);
  }finally{f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
-for(const race of ['dispatch','revision','target','owner'])test(`DEV-64 ${race} change while awaiting published head discards handoff proof`,async()=>{
+for(const race of ['dispatch','revision','target','owner','approval'])test(`DEV-64 ${race} change while awaiting published head discards handoff proof`,async()=>{
  const f=await revisedFixture();try{
   await f.w.executeApproved(f.job,config);
   f.e.transcript.turns.at(-1).state='completed';f.e.transcript.controller='ready';f.e.receiptObservation.observed=Date.now();
@@ -309,7 +425,8 @@ for(const race of ['dispatch','revision','target','owner'])test(`DEV-64 ${race} 
    if(race==='dispatch')f.s.db.query("UPDATE implementation_dispatch SET client_id='replacement' WHERE job=?").run(f.job);
    if(race==='revision')f.edit('Changed while reading published head');
    if(race==='target')f.s.db.query('UPDATE review_targets SET pr=18 WHERE job=?').run(f.job);
-   if(race==='owner')f.s.db.query("UPDATE planning_runs SET session_id='replacement' WHERE job=?").run(f.job);
+    if(race==='owner')f.s.db.query("UPDATE planning_runs SET session_id='replacement' WHERE job=?").run(f.job);
+    if(race==='approval')f.s.db.query('UPDATE jobs SET approved_hash=NULL WHERE id=?').run(f.job);
    return result;
   };
   expect((await f.w.executionStatus(f.job,f.e,config)).state).not.toBe('pr_handoff');

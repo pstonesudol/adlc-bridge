@@ -11,6 +11,7 @@ import {RECEIPT_FRESHNESS_MS} from './receipt-reconciliation';
 import {assertProjectReferenceIntakeEnabled,assertConfiguredProjectIntakeEnabled} from './project-services';
 import {readPlanningPRs} from './planning-prs';
 import {assertPlanningCapacity} from './planning-capacity';
+import {verifiedRevisionDelivery} from './revision-delivery';
 
 export async function assertCurrentPlanningRequirements(s:Store,job:string,c:WorkflowConfig,read=readLinearIssue){
  const j=s.get(job),issue=await read(j.issue),lc=c as any;
@@ -100,7 +101,9 @@ export class SpecRecovery{
    const prs=session.prs.filter((x:any)=>x.state==='open');
   if(prs.length>1||prs.some((x:any)=>x.url!==`https://github.com/${c.githubRepo}/pull/${x.number}`))throw Error('Attached PR identity ambiguous');
   const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
-   if(target&&(!prs.length||target.repo!==c.githubRepo||target.pr!==prs[0].number))throw Error('Existing PR target missing or changed');
+    if(target&&(!prs.length||target.repo!==c.githubRepo||target.pr!==prs[0].number))throw Error('Existing PR target missing or changed');
+    const retained=verifiedRevisionDelivery(this.s,job);
+    if(retained?.pr&&(retained.repo!==c.githubRepo||retained.pr!==prs[0]?.number))throw Error(`Retained original PR identity changed; preview spec-reconcile ${job} CONFIG and reconcile the original attachment without replacing the worker or PR`);
    const inventory=await(this.w.t.planningPRs??readPlanningPRs)(c.githubRepo!,p.branch);
    if(inventory?.complete!==true||inventory.repo!==c.githubRepo||inventory.branch!==p.branch||!Array.isArray(inventory.prs)||inventory.prs.length>1)throw Error('Complete unambiguous branch PR lookup required; preserve existing worker and PR');
    if(inventory.prs.some(x=>!Number.isSafeInteger(x.number)||x.number<1||x.url!==`https://github.com/${c.githubRepo}/pull/${x.number}`||x.repo!==c.githubRepo||x.base!==c.githubRepo||x.branch!==p.branch||x.head!==local.head||x.state!=='open')||JSON.stringify(inventory.prs.map(x=>x.url).sort())!==JSON.stringify(prs.map((x:any)=>x.url).sort()))throw Error('Branch PR lookup conflicts with owner/worktree evidence; reconcile attachment without replacing worker or PR');
