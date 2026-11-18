@@ -2,6 +2,16 @@ import {test,expect} from 'bun:test';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,statSync,readdirSync} from 'node:fs';
 import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {editConfig,configView,configValue,configPolling} from '../src/operator-config';
+import {validate} from '../src/linear';
+test('draft promotion requires explicit repository-bound trusted configuration, not draft-review settings',()=>{
+ const base={...configuration('/repo'),githubRepo:'owner/repo'};
+ validate(base);
+ const policy={enabled:true,repository:'owner/repo',operators:['operator'],integrations:[],checks:[{id:'visual',kind:'responsive',definition:'all widths',viewports:['390','1440']}]};
+ validate({...base,draftPromotion:policy});
+ for(const bad of [{...policy,repository:'fork/repo'},{...policy,enabled:'true'},{...policy,checks:[]},{...policy,maxAgeMs:-1}]){
+  expect(()=>validate({...base,draftPromotion:bad})).toThrow();
+ }
+});
 export function configuration(repo:string){return {version:1,name:'fixture',repo,requiredChecks:['CI'],automation:{orchestratorProject:'p'},linear:{projectId:'00000000-0000-0000-0000-000000000001',teamId:'00000000-0000-0000-0000-000000000002',readyStateId:'00000000-0000-0000-0000-000000000003',readyLabelId:'00000000-0000-0000-0000-000000000004'},privateCredential:'DO_NOT_PRINT',routing:{harness:'opencode-v2',credentialPath:'/secret/reference'}};}
 test('config preview, apply, defaults, permissions, redaction, reset and retained fields',()=>{
  const root=mkdtempSync(join(tmpdir(),'op-config-'));try{

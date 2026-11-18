@@ -46,7 +46,11 @@ export function jobBlockers(s:Store,job:string){
  const inspection=Object.create(s) as Store;inspection.readonly=true;
  const resolved=hasTable(s,'plan_resolutions')?applicableResolution(inspection,job):null;
  for(const r of evidenceRows(s,'plan_readiness',job))if(r.plan_hash===j.plan_hash&&(!r.valid||r.state!=='ready')&&!resolved)add('plan_readiness',r.reason??`Plan readiness: ${r.state}`,`adlc jobs show-plan ${job}`,r.updated??null);
- for(const r of bound('remediation_budget'))if(r.stop_reason)add('budget_exhausted',`Remediation stopped: ${r.stop_reason}; ${r.consumed} consumed; ${r.extensions} extended`,`adlc jobs budget ${job} --project ${j.project}`,r.updated);
+  for(const r of bound('remediation_budget'))if(r.stop_reason)add('budget_exhausted',`Remediation stopped: ${r.stop_reason}; ${r.consumed} consumed; ${r.extensions} extended`,`adlc jobs budget ${job} --project ${j.project}`,r.updated);
+  for(const r of bound('draft_deliveries')){
+   let b:any;try{b=JSON.parse(r.detail);}catch{continue;}
+   if(r.reason&&b.spec===digest(j.spec)&&b.revision===(revision?.id??null))add('draft_delivery',`Draft PR ${b.repo}#${b.pr}: ${r.reason}`,`adlc acceptance-status ${job} CONFIG`,r.observed);
+  }
  for(const table of ['planning_dispatch','implementation_dispatch','worker_outcomes','startup_recovery_results','delivery_adoptions'])for(const r of bound(table)){
   const state=r.state??r.outcome;
   if(/uncertain|reconciliation|blocked|needs_input|failed/.test(state??''))add(`${table}:${state}`,`${table}: ${state}${r.reason?`; ${r.reason}`:''}`,inspect,r.updated??r.first_observed??r.observed??null);

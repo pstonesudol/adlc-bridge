@@ -565,7 +565,7 @@ test('publication proof rejects detached/dirty/unpublished work, lifecycle and i
    if(kind==='owner')f.setOwners(['worker','another']);
    const io={...f.io,snapshot:async()=>({...await f.io.snapshot(),...kind==='closed'?{state:'closed'}:kind==='retargeted'?{baseBranch:'other'}:kind==='fork'?{headRepo:'fork/repo'}:{}})};
    const before=f.recovery.row(f.job),review=f.s.db.query('SELECT * FROM review_targets').get();
-   const expected={dirty:'Dirty, unpublished or divergent local work',unpublished:'Dirty, unpublished or divergent local work',closed:'Target is not the owned open feature PR',retargeted:'Owned isolated delivery repository/base/worktree evidence mismatch',fork:'Target is not the owned open feature PR',owner:'Owned isolated delivery repository/base/worktree evidence mismatch'};
+   const expected={dirty:'Dirty, unpublished or divergent local work',unpublished:'Dirty, unpublished or divergent local work',closed:'Existing PR is not open',retargeted:'Owned isolated delivery repository/base/worktree evidence mismatch',fork:'Existing PR repository or fork mismatch',owner:'Owned isolated delivery repository/base/worktree evidence mismatch'};
    await expect(new ConflictRecovery(f.s,io as any).publishedPreview(f.job,f.config,'merge','human')).rejects.toThrow(expected[kind]);
    expect(f.recovery.row(f.job)).toEqual(before);expect(f.s.db.query('SELECT * FROM review_targets').get()).toEqual(review);
   }finally{f.close();}

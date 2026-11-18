@@ -16,7 +16,16 @@ export function deliveryBranch(s:Store,job:string,session:any,repo?:string,pr?:n
  return p.branch as string;
 }
 export function assertDeliveryTarget(s:Store,job:string,session:any,repo:string,pr:number,b:any){
+ assertDeliveryArtifact(s,job,session,repo,pr,b);
+ if(b.draft!==false)throw Error('Draft PR delivery exists; record current acceptance evidence and explicit project draft-promotion authorization before review');
+}
+/** Identity does not imply review readiness. Only delivery-stage callers may
+ * accept drafts; review, maintenance and remediation keep the strict gate. */
+export function assertDeliveryArtifact(s:Store,job:string,session:any,repo:string,pr:number,b:any){
  const expected=deliveryBranch(s,job,session,repo,pr);
- if(b.state!=='open'||b.draft!==false||b.headRepo!==repo||b.baseRepo!==repo||!b.defaultBranch||!b.baseBranch||b.branch===b.defaultBranch||b.branch===b.baseBranch)throw Error('Target is not the owned open feature PR');
+ if(b.baseRepo!==repo||b.headRepo!==repo)throw Error('Existing PR repository or fork mismatch');
+ if(b.state!=='open')throw Error('Existing PR is not open');
+ if(typeof b.draft!=='boolean')throw Error('Existing PR draft evidence is incomplete');
+ if(!b.defaultBranch||!b.baseBranch||b.branch===b.defaultBranch||b.branch===b.baseBranch)throw Error('Existing PR is not an owned feature branch');
  if(b.branch!==expected)throw Error(`Blocked — branch mismatch: reserved ${session.branch}; actual ${b.branch}; candidate https://github.com/${repo}/pull/${pr}; run recover-handoff JOB CONFIG (preview), then --confirm HASH`);
 }

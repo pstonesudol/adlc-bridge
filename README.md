@@ -2219,6 +2219,105 @@ are conservative escalation boundaries, not universal automatic recovery claims.
 
 ### Existing worker handoff recovery
 
+Drafts are delivery artifacts, not identity errors or review clearance.
+`recover-handoff` preview identifies drafts separately; confirmation adopts only
+the exact delivery identity and does **not** clear questions, failed verification,
+uncertain continuations, or authorize review. Normal polling reports each
+acceptance blocker in CLI and the existing deduplicated Linear blocker surface.
+After a current answer is recorded through the existing clarification/operator
+workflow, `resume-job` can continue the same idle worker and PR. It reconciles
+delivery first and sends one idle-only continuation per decision; uncertainty
+never authorizes replay. DEV-74's planning/standing-approval gates are unchanged.
+
+#### Opt-in draft promotion and acceptance evidence
+
+The trusted project configuration may declare `draftPromotion`, independently
+of `.coderabbit.yaml` draft-review settings:
+
+```json
+{
+  "enabled": false,
+  "repository": "OWNER/REPOSITORY",
+  "operators": ["EXPLICIT_AUTHORIZED_OPERATOR_ID"],
+  "integrations": [],
+  "maxAgeMs": 120000,
+  "checks": [
+    {"id":"visual","kind":"responsive","definition":"Approved responsive criteria v1","viewports":["390x844","1440x900"]},
+    {"id":"saved","kind":"live-content","definition":"Approved saved-content criteria v1","environment":"APPROVED_ENVIRONMENT"}
+  ]
+}
+```
+
+This example is disabled; editing source/example configuration does not authorize
+or activate live configuration. Each project must explicitly supply its required
+checks/viewports, authorized issuers and environment. An enabled policy must
+match `githubRepo`. Omitted policy means no automatic promotion. `maxAgeMs` is
+optional; if supplied it is a positive evidence age limit, checked again after
+awaited verification. Head, check-definition, requirement instance, approval/scope,
+dispatch or owner changes invalidate bound evidence regardless of age.
+
+Trusted local operators (the same local administrative trust boundary as named
+plan resolutions) can inspect and append evidence:
+
+```sh
+bun src/cli.ts acceptance-status JOB CONFIG
+bun src/cli.ts record-acceptance JOB CONFIG RECORD_JSON --human OPERATOR_ID
+```
+
+`acceptance-status` reports the current binding, check definition hashes and
+blockers without writing state, sending workers or promoting. It may invoke an
+explicitly configured read-only live verifier. `record-acceptance` requires
+current job approval, exact existing worker/PR/head and an operator ID explicitly
+allowlisted in this project policy. It does not resolve worker questions, grant
+scope, run verification, or promote immediately. Do not expose this local admin
+command as an unauthenticated API. Worker text and PR comments are not issuers.
+Integration adapters must authenticate their issuer independently before calling
+the acceptance store with a configured integration principal; no worker-facing
+CLI accepts an integration identity asserted in a JSON file.
+
+The record file contains:
+
+```json
+{
+  "repository":"OWNER/REPOSITORY",
+  "pr":175,
+  "head":"EXACT_FULL_CURRENT_HEAD_SHA",
+  "check":"visual",
+  "definitionHash":"HASH_FROM_ACCEPTANCE_STATUS",
+  "passed":true,
+  "issuer":"EXPLICIT_AUTHORIZED_OPERATOR_ID",
+  "observed":1794972000000,
+  "reference":"OPAQUE_EVIDENCE_REFERENCE",
+  "viewports":["390x844","1440x900"]
+}
+```
+
+Live-content records additionally require `environment` and `revision` (observed
+revision or digest). The live check definition can explicitly configure
+`verifier: ["/absolute/trusted/read-only-executable", "fixed-argument"]`.
+The trusted executable receives only `ADLC_EVIDENCE_ENVIRONMENT` plus a minimal
+PATH, and must return bounded JSON `{"environment":"…","revision":"…"}` for the
+current saved content. No shell or reference URL is executed/fetched. The operator
+must separately authorize that read-only integration; do not put credentials in
+argv, records, references or configuration examples. Missing verifier, provider
+failure or changed current revision keeps the draft blocked. This feature neither
+installs a verifier nor grants access to a live environment.
+
+Evidence is append-only and durable in ADLC state, outside Git. The latest record
+for a check/definition is authoritative, including a failure. CI can attest only
+its expressly named check; it cannot substitute for responsive or live-content
+acceptance. All required checks must pass, the worker must report the exact PR URL
+and head in a completed handoff, and complete clean isolated worktree/remote/owner
+evidence must still match. Immediately before promotion the bridge rechecks
+approval, policy, head and live evidence. Promotion reserves one durable attempt
+for the same PR; lost replies/restarts reconcile observed ready state and never
+blindly repeat the mutation, including after policy or head changes. An unresolved
+attempt requires operator investigation, not direct database repair.
+
+Only an observed ready PR with current evidence enters normal review. Existing
+review-provider policy remains intact; promotion is not reviewer approval and
+never merges, enables auto-merge, deploys or activates branch protection.
+
 Workers must retain the reserved planning branch. At completed delivery, the
 bridge verifies the registered worktree branch/HEAD and PR identity. Drift is
 reported as **Blocked — branch mismatch**, with a deduplicated Linear comment
@@ -2246,7 +2345,8 @@ durable claim intent before using AO's supported `claim-pr --no-takeover`.
 Lost receipts reconcile authoritative attachment; an uncertain unattached claim
 is never replayed automatically. Adoption stores a distinct delivery identity,
 preserving reservation rows, audit history, and remediation/update budgets.
-Normal polling registers the existing PR after successful adoption; no worker
+Normal polling registers the existing ready PR after successful adoption and
+any required draft promotion; no worker
 is restarted and implementation is never resent. Manual review now requires
 CONFIG and uses the same branch policy and identity checks as periodic review.
 

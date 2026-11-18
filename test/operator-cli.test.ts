@@ -8,6 +8,13 @@ import {Planning} from '../src/planning';
 import {RecoveryObservation} from '../src/recovery-observation';
 import {readFailure} from '../src/provider-read';
 import {resolveJob,jobViews} from '../src/operator-cli';
+import {deliveryEngineFailure} from '../src/operator-dispatch';
+test('grouped delivery CLI preserves fixed identity diagnostics, not arbitrary provider stderr',()=>{
+ expect(deliveryEngineFailure('Existing PR exact remote head mismatch\n')).toContain('exact remote head mismatch. Next:');
+ expect(deliveryEngineFailure('Existing PR feature branch mismatch')).toContain('never replace the worker or PR');
+ expect(deliveryEngineFailure('Bearer PRIVATE_PROVIDER_ERROR')).toBeNull();
+ expect(deliveryEngineFailure('Existing PR exact remote head mismatch\nBearer PRIVATE')).toBeNull();
+});
 const cli=join(import.meta.dir,'../src/cli.ts');
 test('CLI presents persisted first planning failure and local sign-in action without approving or sending',async()=>{
  const root=mkdtempSync(join(tmpdir(),'operator-planning-')),path=join(root,'state.sqlite'),s=new Store(path);try{

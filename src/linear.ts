@@ -14,6 +14,7 @@ import {reviewerPolicy,type ReviewerConfig} from './reviewer-policy';
 import {validateReplanning,type ReplanningPolicy} from './spec-requests';
 import {coordinatedLinearFetch} from './linear-api';
 import {LinearCooldowns,LinearCooldown} from './linear-cooldowns';
+import {validateDraftPolicy,type DraftPolicy} from './acceptance-evidence';
 
 export type ProjectConfig = {
   version: 1; name: string; repo: string;
@@ -21,6 +22,7 @@ export type ProjectConfig = {
   approval?:ApprovalPolicy;
   reviewers?:ReviewerConfig[];
   verification?:Verification;
+  draftPromotion?:DraftPolicy;
   dependencySetup?:DependencySetupPolicy;
   replanning?:ReplanningPolicy;
   pollingIntervalSeconds?:number;
@@ -49,6 +51,7 @@ export function metadataCheckNames(value:unknown):string[]{
   return value;
 }
 export function validate(c: any): asserts c is ProjectConfig {
+  validateDraftPolicy(c?.draftPromotion,c?.githubRepo);
   validateDependencySetup(c?.dependencySetup);
   if(c?.verification!==undefined)validateVerification(c.verification);
   if(c?.dependencySetup&&c.verification?.mode!=='container')throw Error('dependencySetup requires container verification with an immutable image');
@@ -133,7 +136,7 @@ export async function poll(c: ProjectConfig, store: Store, token: string,send=fe
        // Existing approved sessions retain eligibility while the dependency
        // coordinator waits for verified source capabilities. Initial intake is
        // unchanged; Linear Done alone never authorizes an existing continuation.
-       if(c.dependencyRecovery?.enabled&&store.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()&&store.db.query("SELECT 1 FROM implementation_dispatch d JOIN jobs j ON j.id=d.job WHERE j.issue=? AND j.project=? AND d.state IN ('delivery_uncertain','delivery_accepted','implementation_running','blocked_dependency','needs_input','awaiting_pr','pr_handoff','failed','uncertain','needs_reconciliation','blocked')").get(issue.id,c.linear.projectId))continue;
+        if(c.dependencyRecovery?.enabled&&store.db.query("SELECT name FROM sqlite_master WHERE name='implementation_dispatch'").get()&&store.db.query("SELECT 1 FROM implementation_dispatch d JOIN jobs j ON j.id=d.job WHERE j.issue=? AND j.project=? AND d.state IN ('delivery_uncertain','delivery_accepted','implementation_running','blocked_dependency','needs_input','awaiting_pr','draft_handoff','pr_handoff','failed','uncertain','needs_reconciliation','blocked')").get(issue.id,c.linear.projectId))continue;
        // Keep an existing captured planning wait eligible for observation, not
        // authorization. Its receipt still gates approval until verified proof.
        if(c.dependencyRecovery?.enabled&&c.dependencyRecovery.jobs?.some(d=>d.issue===issue.id&&d.stage==='planning')&&store.db.query("SELECT name FROM sqlite_master WHERE name='planning_runs'").get()&&store.db.query("SELECT name FROM sqlite_master WHERE name='plan_readiness'").get()&&store.db.query("SELECT 1 FROM planning_runs p JOIN jobs j ON j.id=p.job JOIN plan_readiness r ON r.job=j.id AND r.plan_hash=j.plan_hash WHERE j.issue=? AND j.project=? AND j.state='awaiting_approval' AND p.state='plan_captured' AND r.valid=1 AND r.source='receipt' AND r.state='blocked-by-dependency' AND r.spec_hash=? AND p.spec_hash=r.spec_hash AND j.spec=?").get(issue.id,c.linear.projectId,digest(JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''})),JSON.stringify({identifier:issue.identifier,title:issue.title,description:issue.description??''})))continue;

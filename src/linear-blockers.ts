@@ -111,7 +111,7 @@ export class LinearBlockers{
    if(c.blockerSync?.enabled!==true)return {state:'disabled'};
    // Requirement revisions supersede old clarification/dependency labels. Their
    // revision blocker remains visible, but must not preserve an obsolete label.
-   const independent=jobBlockers(this.s,job).blockers.filter(b=>['approval_required','stale_plan','budget_exhausted','ownership'].includes(b.code));
+   const independent=jobBlockers(this.s,job).blockers.filter(b=>['approval_required','stale_plan','budget_exhausted','ownership','draft_delivery'].includes(b.code));
    if(independent.length)return {state:'retained',reason:'Independent approval, budget or ownership blockers remain',blockers:independent.map(b=>b.code)};
    if(this.s.db.query("SELECT name FROM sqlite_master WHERE name='planning_dependency_waits'").get()&&this.s.db.query("SELECT 1 FROM planning_dependency_waits d JOIN jobs j ON j.id=d.job WHERE d.job=? AND d.plan=j.plan_hash AND d.state!='resolved' AND j.state='awaiting_approval'").get(job))return {state:'retained',reason:'Planning dependency evidence remains unresolved'};
    settleDependencyWait(this.s,job);

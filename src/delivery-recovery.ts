@@ -3,6 +3,7 @@ import {resolve} from 'node:path';
 import {Store,digest} from './core';
 import {assertWorktreeAvailable} from './worktree-reservation';
 import {latestRevision} from './spec-revisions';
+import {assertDeliveryUnreserved} from './acceptance-evidence';
 
 // Evidence reports the resolved worktree root, while authorization keeps the
 // active run value. Compare canonical forms, but persist the run representation
@@ -38,12 +39,17 @@ export class DeliveryRecovery{
   if(f.owners.some(x=>x!==f.session))throw Error('Another active session owns the PR');
   if(f.candidates.length!==1)throw Error('Exactly one unambiguous existing PR required');
   const p=f.candidates[0];
-  if(p.repo!==c.githubRepo||p.url!==`https://github.com/${c.githubRepo}/pull/${p.pr}`||!Number.isSafeInteger(p.pr)||p.pr<1||p.fork!==false||p.state!=='open'||p.draft!==false||!p.defaultBranch||!p.baseBranch||p.branch===p.defaultBranch||p.branch===p.baseBranch||p.branch!==f.branch||p.head!==f.head||!/^[a-f0-9]{40,64}$/.test(f.head))throw Error('Existing PR repository, feature branch or exact remote head mismatch');
+   if(p.repo!==c.githubRepo||p.url!==`https://github.com/${c.githubRepo}/pull/${p.pr}`||!Number.isSafeInteger(p.pr)||p.pr<1)throw Error('Existing PR repository or URL mismatch');
+   if(p.fork!==false)throw Error('Existing PR repository fork mismatch');
+   if(p.state!=='open')throw Error('Existing PR is not open');
+   if(typeof p.draft!=='boolean')throw Error('Existing PR draft evidence incomplete');
+   if(!p.defaultBranch||!p.baseBranch||p.branch===p.defaultBranch||p.branch===p.baseBranch||p.branch!==f.branch)throw Error('Existing PR feature branch mismatch');
+   if(p.head!==f.head||!/^[a-f0-9]{40,64}$/.test(f.head))throw Error('Existing PR exact remote head mismatch');
   const proposal={job,auth,...f,owners:[...f.owners].sort(),candidate:p};
   // Owner attachment may be completed after a lost claim receipt; it is checked
   // independently, not part of the immutable proposal fingerprint.
   const hash=digest(JSON.stringify({...proposal,owners:[]}));
-  return {state:'preview',hash,proposal,mergeEnabled:false};
+   return {state:'preview',hash,proposal,delivery:p.draft?'draft':'ready',nextAction:p.draft?'Confirm identity only; keep draft, resolve worker/acceptance blockers, then use authorized promotion workflow':'Confirm exact handoff',mergeEnabled:false};
  }
   async confirm(job:string,c:any,hash:string){
    assertWorktreeAvailable(this.s,job);
@@ -55,8 +61,9 @@ export class DeliveryRecovery{
   // unattempted state, so a crash before the claim remains retryable.
   const pre=await this.preview(job,c);
   if(pre.hash!==hash)throw Error('Proposal changed before claim; explicit reconciliation required');
-   const reservation=this.s.db.transaction(()=>{
-    assertWorktreeAvailable(this.s,job);
+    const reservation=this.s.db.transaction(()=>{
+     assertWorktreeAvailable(this.s,job);
+     assertDeliveryUnreserved(this.s,job,'adoption');
    this.authorization(job,c);
    const old=this.s.db.query('SELECT * FROM delivery_adoptions WHERE job=?').get(job) as any;
    if(old){if(old.proposal!==hash)throw Error('Existing adoption requires reconciliation; never overwrite');return old.state==='reserved'?'retry':false;}
@@ -74,8 +81,11 @@ export class DeliveryRecovery{
     this.authorization(job,c);
    const changed=this.s.db.query("UPDATE delivery_adoptions SET state='adopted' WHERE job=? AND proposal=? AND state='claim_uncertain'").run(job,hash);
    const adopted=this.s.db.query("SELECT * FROM delivery_adoptions WHERE job=? AND proposal=? AND state='adopted'").get(job,hash) as any;
-   if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
-   if(changed.changes)this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
+    if(!adopted)throw Error('Adoption not confirmed; reconciliation required');
+    if(changed.changes)this.s.event(job,'delivery_identity_adopted',JSON.stringify({hash,reserved:p.reserved,branch:p.branch,pr:p.candidate.url}));
+    // Draft adoption settles identity only. Never erase a question, verification
+    // failure or uncertain continuation by declaring review handoff.
+    if(p.candidate.draft)return {job,state:'draft_handoff',session:p.session,pr:{number:p.candidate.pr,url:p.candidate.url},hash,reviewReady:false,nextAction:'Reconcile current worker outcome and acceptance evidence; draft discovery authorizes no continuation or review'};
    // A confirmation can settle only the failed continuation it observed. An
    // adoption that predates that failure has no row here and stays blocked.
    const failed=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()
