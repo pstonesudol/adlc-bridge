@@ -81,6 +81,75 @@ test('resolved clarification continues the exact existing draft worker once, nev
   expect(f.s.db.query('SELECT session_id FROM continuations').all()).toEqual([{session_id:'worker'}]);expect(f.b.draft).toBe(true);
  }finally{f.s.close();}
 });
+function laterDelivery(f:ReturnType<typeof fixture>,client='operator-later',turn='later',outcome='uncertain'){
+ f.e.transcript.entries.push(
+  {clientMessageId:client,turnId:turn,sequence:3,kind:'message',role:'user'},
+  {turnId:turn,sequence:4,kind:'message',role:'assistant',origin:'provider',streaming:false,text:`${f.e.session.prs[0].url} ${f.b.head}\n<!-- ADLC_WORKER_STATUS ${JSON.stringify({version:1,outcome,reason:'later delivery outcome',questions:[],dependencies:[]})} -->`},
+ );
+ f.e.transcript.turns.push({id:turn,state:'completed'});
+}
+test('same-head continuation dispatch invalidates original acceptance records before promotion',async()=>{
+ const f=fixture();try{
+  f.receipt('needs-input');await f.status();await f.record('visual');await f.record('saved');
+  const original=(await f.w.draftFacts(f.job,f.c)).binding;
+  recordResolution(f.s,f.job,'human-answer','human','Continue unchanged requirements');
+  const sent=await f.w.resume(f.job,f.c);
+  laterDelivery(f,sent.clientId,'continued','pr-handoff');
+  const current=(await f.w.draftFacts(f.job,f.c)).binding;
+  expect(current.dispatch).toBe(sent.clientId);expect(original.dispatch).toBe(f.d.client_id);
+  expect(current.head).toBe(original.head);
+  const blocked=await f.status();
+  expect(blocked.state).toBe('draft_handoff');expect(blocked.reason).toContain('missing current-head/current-definition evidence');
+  expect(f.counts().promotions).toBe(0);
+  await f.record('visual');await f.record('saved');
+  expect((await f.status()).state).toBe('pr_handoff');expect(f.counts().promotions).toBe(1);
+ }finally{f.s.close();}
+});
+test('promotion includes a later-delivery blocker found only in its final observation',async()=>{
+ const f=fixture();try{
+  await f.record('visual');await f.record('saved');
+  const before=await f.w.draftFacts(f.job,f.c);
+  let added=false;
+  f.w.t.verifyDraftIdentity=async()=>{if(!added){added=true;laterDelivery(f);}};
+  const result=await f.status(),after=await f.w.draftFacts(f.job,f.c);
+  expect([after.binding,after.receipt,after.draft,after.idle]).toEqual([before.binding,before.receipt,before.draft,before.idle]);
+  expect(result.state).toBe('draft_handoff');expect(result.reason).toContain('later worker delivery must be reconciled');
+  expect(f.counts().promotions).toBe(0);expect(f.b.draft).toBe(true);
+ }finally{f.s.close();}
+});
+for(const timing of ['before-answer','before-reservation'])test(`continuation rejects a later completed delivery ${timing} without sending`,async()=>{
+ const f=fixture();try{
+  f.receipt('needs-input');
+  if(timing==='before-answer')laterDelivery(f);
+  await f.status();
+  recordResolution(f.s,f.job,'human-answer','human','Answer original question only');
+  if(timing==='before-reservation'){
+   let added=false;f.w.t.verifyDraftIdentity=async()=>{if(!added){added=true;laterDelivery(f);}};
+  }
+  await expect(f.w.resume(f.job,f.c)).rejects.toThrow('later worker delivery must be reconciled');
+  expect(f.counts().sends).toBe(0);expect(f.s.db.query('SELECT * FROM continuations').all()).toHaveLength(0);
+ }finally{f.s.close();}
+});
+test('ready promotion with no prior persisted draft observation reconciles after restart',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'draft-unobserved-')),path=join(dir,'state.sqlite'),f=fixture(150,path);
+ let restarted:Store|undefined;
+ try{
+  await f.record('visual');await f.record('saved');let mutations=0,failRead=false;
+  f.w.t.promoteDraft=async()=>{mutations++;f.b.draft=false;failRead=true;};
+  const read=f.w.t.branchSnapshot!;
+  f.w.t.branchSnapshot=async(...args)=>{if(failRead){failRead=false;throw Error('post-mutation provider read unavailable');}return read(...args);};
+  expect((await f.status()).state).toBe('blocked');
+  expect(f.s.db.query('SELECT * FROM draft_deliveries').all()).toHaveLength(0);
+  expect(f.s.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'uncertain'});
+  f.s.close();restarted=new Store(path);
+  const workflow=new Workflow(restarted,f.w.t);
+  expect((await workflow.executionStatus(f.job,structuredClone(f.e),f.c)).state).toBe('pr_handoff');
+  expect(restarted.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'promoted'});
+  expect(()=>assertDeliveryUnreserved(restarted!,f.job,'continuation')).not.toThrow();
+  expect(()=>assertDeliveryUnreserved(restarted!,f.job,'adoption')).not.toThrow();
+  expect(mutations).toBe(1);
+ }finally{if(restarted)restarted.close();else f.s.close();rmSync(dir,{recursive:true,force:true});}
+});
 test('draft-only needs-reconciliation dispatch can continue after a current operator decision',async()=>{
  const f=fixture();try{
   await f.status();

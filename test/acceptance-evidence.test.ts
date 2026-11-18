@@ -1,6 +1,6 @@
 import {test,expect} from 'bun:test';
 import {Store} from '../src/core';
-import {AcceptanceEvidence,checkHash,validateDraftPolicy,bindDraftConfig,CURRENT_DRAFT_POLICY,type DraftPolicy,type DraftBinding,type AcceptanceRecord} from '../src/acceptance-evidence';
+import {AcceptanceEvidence,checkHash,validateDraftPolicy,bindDraftConfig,CURRENT_DRAFT_POLICY,verifyLiveContent,type DraftPolicy,type DraftBinding,type AcceptanceRecord} from '../src/acceptance-evidence';
 
 function fixture(){
  const s=new Store(':memory:'),job=s.enqueue('project','issue','spec');
@@ -86,5 +86,54 @@ test('host-only configuration guard notices policy revocation without exposing c
   expect(JSON.stringify(snapshot)).not.toContain('current trusted');
   config={...config,draftPromotion:{...f.p,enabled:false},credential:'NEVER_PRINT'};
   expect(()=>snapshot[CURRENT_DRAFT_POLICY]()).toThrow('Trusted draft project policy changed; reload before any effect');
+ }finally{f.s.close();}
+});
+function verifierProcess(stdout:string[],stderr:string[],code=0){
+ let kills=0,produced=0,cancelled=0;
+ const stream=(chunks:string[])=>{
+  let index=0;
+  return new ReadableStream<Uint8Array>({
+   pull(controller){if(index===chunks.length){controller.close();return;}produced++;controller.enqueue(new TextEncoder().encode(chunks[index++]));},
+   cancel(){cancelled++;},
+  });
+ };
+ const spawn=(()=>({stdout:stream(stdout),stderr:stream(stderr),exited:Promise.resolve(code),kill:(signal:string)=>{expect(signal).toBe('SIGKILL');kills++;}})) as typeof Bun.spawn;
+ return {spawn,kills:()=>kills,produced:()=>produced,cancelled:()=>cancelled};
+}
+for(const kind of ['stdout','stderr','utf8'])test(`live verifier bounds ${kind} bytes while reading, kills and cancels on overflow`,async()=>{
+ const f=fixture();try{
+  const valid=JSON.stringify({environment:'test',revision:'v1'});
+  const large=kind==='utf8'?JSON.stringify({environment:'test',revision:'v1',noise:'😀'.repeat(5000)}):'x'.repeat(9000);
+  const stdout=kind==='stderr'?[valid]:kind==='utf8'?[large]:Array(100).fill(large);
+  const stderr=kind==='stderr'?Array(100).fill(large):[];
+  const child=verifierProcess(stdout,stderr);
+  const record={environment:'test',revision:'v1'} as AcceptanceRecord;
+  expect(await verifyLiveContent(f.p.checks[1],record,child.spawn)).toBe(false);
+  expect(child.kills()).toBe(1);expect(child.produced()).toBeLessThan(10);
+  if(kind!=='utf8')expect(child.cancelled()).toBeGreaterThan(0);
+ }finally{f.s.close();}
+});
+test('small valid verifier responses and exact per-stream byte limits remain accepted',async()=>{
+ const f=fixture();try{
+  const valid=JSON.stringify({environment:'test',revision:'v1'}),record={environment:'test',revision:'v1'} as AcceptanceRecord;
+  for(const [out,err] of [[[valid.slice(0,10),valid.slice(10)],['diagnostic']],[[valid.padEnd(16000,' ')],['e'.repeat(16000)]]]){
+   const child=verifierProcess(out,err);
+   expect(await verifyLiveContent(f.p.checks[1],record,child.spawn)).toBe(true);expect(child.kills()).toBe(0);
+  }
+  for(const [out,code] of [[valid,1],['not-json',0]] as const){
+   expect(await verifyLiveContent(f.p.checks[1],record,verifierProcess([out],[],code).spawn)).toBe(false);
+  }
+ }finally{f.s.close();}
+});
+test('a verifier output read error terminates the process and fails closed',async()=>{
+ const f=fixture();try{
+  let kills=0;
+  const spawn=(()=>({
+   stdout:new ReadableStream({pull(controller){controller.error(Error('unreadable output'));}}),
+   stderr:new ReadableStream({pull(controller){controller.enqueue(new Uint8Array(100));}}),
+   exited:Promise.resolve(0),kill:()=>kills++,
+  })) as typeof Bun.spawn;
+  expect(await verifyLiveContent(f.p.checks[1],{environment:'test',revision:'v1'} as AcceptanceRecord,spawn)).toBe(false);
+  expect(kills).toBe(1);
  }finally{f.s.close();}
 });

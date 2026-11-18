@@ -8,7 +8,7 @@ import {Lifecycle} from './lifecycle';
 import {TaskRouting,type Route,type RoutingSettings} from './task-routing';
 import {capturePlan} from './session-evidence';
 import {deliveryBranch,assertDeliveryTarget,assertDeliveryArtifact} from './delivery-identity';
-import {AcceptanceEvidence,promoteDraft,verifyLiveContent,CURRENT_DRAFT_POLICY,assertDeliveryUnreserved,type DraftPolicy,type DraftBinding,type AcceptanceCheck,type AcceptanceRecord} from './acceptance-evidence';
+import {AcceptanceEvidence,promoteDraft,verifyLiveContent,CURRENT_DRAFT_POLICY,assertDeliveryUnreserved,hasPendingPromotion,type DraftPolicy,type DraftBinding,type AcceptanceCheck,type AcceptanceRecord} from './acceptance-evidence';
 import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
@@ -530,7 +530,7 @@ export class Workflow{
      if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
       if(!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Exact published HEAD required');
       const knownDraft=this.s.db.query("SELECT name FROM sqlite_master WHERE name='draft_deliveries'").get()?this.s.db.query('SELECT plan_hash,reason FROM draft_deliveries WHERE job=?').get(job) as any:null;
-      if(b.draft||knownDraft?.plan_hash===d.plan_hash&&knownDraft.reason){
+      if(b.draft||knownDraft?.plan_hash===d.plan_hash&&knownDraft.reason||hasPendingPromotion(this.s,job,c.githubRepo,prs[0].number)){
        const draft=await this.draftStatus(job,c,persist);
        if(draft.state!=='pr_handoff')return finish(draft);
       }
@@ -704,15 +704,17 @@ export class Workflow{
    // Revalidate authority after awaited provider reads.
    if(JSON.stringify(new DeliveryRecovery(this.s,{} as any).authorization(job,c))!==JSON.stringify(auth))throw Error('Draft authorization changed during observation');
    c[CURRENT_DRAFT_POLICY]?.();
-   const binding:DraftBinding={job,plan:auth.plan,spec:auth.spec,revision:auth.revision??null,dispatch:d.client_id,session:auth.session,worktree:auth.worktree,branch:b.branch,repo:c.githubRepo!,pr:pr.number,head:b.head,authorization:digest(JSON.stringify(auth))};
+   const binding:DraftBinding={job,plan:auth.plan,spec:auth.spec,revision:auth.revision??null,dispatch:client,session:auth.session,worktree:auth.worktree,branch:b.branch,repo:c.githubRepo!,pr:pr.number,head:b.head,authorization:digest(JSON.stringify(auth))};
    const blockers:string[]=[];
-   if(!idle)blockers.push('Draft worker busy or activity unknown; await authoritative idle evidence');
+   const deliveryBlockers:string[]=[];
+   const deliveryBlocker=(reason:string)=>{deliveryBlockers.push(reason);blockers.push(reason);};
+   if(!idle)deliveryBlocker('Draft worker busy or activity unknown; await authoritative idle evidence');
    if(receipt?.outcome!=='pr-handoff'||receipt.questions.length||receipt.dependencies.some((x:any)=>x.blocking!==false))blockers.push(receipt?.reason||'Draft requires a completed current worker handoff with no unresolved requirements');
    if(receipt?.outcome==='pr-handoff'&&(!receiptText.includes(b.head)||!receiptText.includes(pr.url)))blockers.push('Draft worker handoff must report the exact current PR URL and head SHA');
    const failed=this.s.db.query("SELECT 1 FROM continuations WHERE job=? AND plan_hash=? AND state IN ('failed','reserved','delivery_uncertain')").get(job,auth.plan);
-   if(failed)blockers.push('Draft has failed or uncertain continuation delivery; explicit reconciliation required');
-   if(e.transcript.entries.some((x:any)=>x.clientMessageId&&x.turnId!==turn.id&&Number(x.sequence)>Number(entry.sequence)))blockers.push('A later worker delivery must be reconciled before draft continuation or promotion');
-   return {binding,draft:b.draft===true,blockers,idle,receipt,pr,discovery:clarificationDiscovery(receiptText)};
+   if(failed)deliveryBlocker('Draft has failed or uncertain continuation delivery; explicit reconciliation required');
+   if(e.transcript.entries.some((x:any)=>x.clientMessageId&&x.turnId!==turn.id&&Number(x.sequence)>Number(entry.sequence)))deliveryBlocker('A later worker delivery must be reconciled before draft continuation or promotion');
+   return {binding,draft:b.draft===true,blockers,deliveryBlockers,idle,receipt,pr,discovery:clarificationDiscovery(receiptText)};
   }
   private async verifyDraftIdentity(b:DraftBinding,c:WorkflowConfig){
    if(this.t.verifyDraftIdentity)return this.t.verifyDraftIdentity(b,c);
@@ -728,8 +730,9 @@ export class Workflow{
     const blockers=[...f.blockers,...await evidence.blockers(f.binding,c.draftPromotion,this.t.verifyAcceptance??verifyLiveContent)];
     if(!blockers.length)await this.verifyDraftIdentity(f.binding,c);
     const after=await this.draftFacts(job,c);
+    blockers.push(...after.blockers);
     if(JSON.stringify([after.binding,after.receipt,after.draft,after.idle])!==JSON.stringify([f.binding,f.receipt,f.draft,f.idle]))blockers.push('Draft head, worker handoff or authorization changed during acceptance verification');
-    return {...f,blockers};
+    return {...f,blockers:[...new Set(blockers)]};
    };
    let blockers=[...facts.blockers,...await evidence.blockers(facts.binding,c.draftPromotion,this.t.verifyAcceptance??verifyLiveContent)];
    if(persist&&blockers.length===0){
@@ -828,7 +831,7 @@ export class Workflow{
     const draft=outcome.source==='draft-delivery'?await this.draftFacts(job,c):null;
     if(draft?.draft){
      if(!['human-answer','dependency-satisfied'].includes(resolution.source))throw Error('Draft continuation requires a current answer or verified dependency decision, not acknowledgement');
-     if(!draft.idle||draft.blockers.some(x=>/uncertain continuation|failed.*continuation/.test(x)))throw Error('Draft worker busy, unknown or delivery uncertain; reconcile without resending');
+     if(!draft.idle||draft.deliveryBlockers.length)throw Error(`Draft worker busy, unknown or delivery uncertain; reconcile without resending${draft.deliveryBlockers.length?`: ${draft.deliveryBlockers.join('; ')}`:''}`);
      if(!['needs-input','blocked-dependency','pr-handoff'].includes(draft.receipt?.outcome))throw Error('Draft worker did not report a supported resumable outcome');
      const observed=this.s.db.query("SELECT detail FROM draft_deliveries WHERE job=?").get(job) as any;
      if(!observed||observed.detail!==JSON.stringify(draft.binding))throw Error('Current draft delivery must be reconciled before continuing');
@@ -882,7 +885,7 @@ export class Workflow{
     if(draftTarget){
      await this.verifyDraftIdentity(draftTarget.binding,c);
      const latest=await this.draftFacts(job,c);
-    if(!latest.draft||!latest.idle||JSON.stringify([latest.binding,latest.receipt])!==JSON.stringify([draftTarget.binding,draftTarget.receipt]))throw Error('Draft delivery changed before continuation reservation');
+    if(!latest.draft||!latest.idle||latest.deliveryBlockers.length||JSON.stringify([latest.binding,latest.receipt])!==JSON.stringify([draftTarget.binding,draftTarget.receipt]))throw Error(`Draft delivery changed before continuation reservation${latest.deliveryBlockers.length?`: ${latest.deliveryBlockers.join('; ')}`:''}`);
    }
   if(remediationTarget){
    const b=await (this.t.branchSnapshot?this.t.branchSnapshot(remediationTarget.repo,remediationTarget.pr):readBranchSnapshot(remediationTarget.repo,remediationTarget.pr));

@@ -102,6 +102,15 @@ export class AcceptanceEvidence{
  }
 }
 export type PromotionFacts={binding:DraftBinding;draft:boolean;blockers:string[]};
+/** Read-only routing evidence, independent of whether a draft observation was
+ * persisted before the promotion process stopped. */
+export function hasPendingPromotion(s:Store,job:string,repo:string,pr:number){
+ if(!exists(s,'draft_promotions'))return false;
+ return (s.db.query("SELECT detail FROM draft_promotions WHERE job=? AND state='uncertain'").all(job) as {detail:string}[]).some(row=>{
+  let b:DraftBinding;try{b=JSON.parse(row.detail);}catch{throw Error('Draft promotion reservation identity is incomplete; reconcile before handoff');}
+  return b.repo===repo&&b.pr===pr;
+ });
+}
 /** Ready-state reconciliation settles the original attempt, whose policy/head
  * fingerprint may differ from today's verified evidence. Never rebind its detail
  * or settle another repository/PR merely because it shares the job. */
@@ -157,10 +166,40 @@ export async function promoteDraft(s:Store,p:DraftPolicy|undefined,inspect:()=>P
 
 /** Only explicitly trusted project configuration supplies the executable/argv.
  * No shell, evidence-reference fetching, credentials or user-supplied commands. */
-export async function verifyLiveContent(c:AcceptanceCheck,r:AcceptanceRecord){
+export async function verifyLiveContent(c:AcceptanceCheck,r:AcceptanceRecord,spawn:typeof Bun.spawn=Bun.spawn){
  if(!c.verifier)return false;
- const child=Bun.spawn(c.verifier,{stdin:'ignore',stdout:'pipe',stderr:'pipe',timeout:30000,env:{PATH:'/usr/bin:/bin',ADLC_EVIDENCE_ENVIRONMENT:c.environment!}});
- const [out,,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
- if(code!==0||out.length>16000)return false;
+ let child:ReturnType<typeof spawn>;
+ try{child=spawn(c.verifier,{stdin:'ignore',stdout:'pipe',stderr:'pipe',timeout:30000,env:{PATH:'/usr/bin:/bin',ADLC_EVIDENCE_ENVIRONMENT:c.environment!}});}catch{return false;}
+ const readers=new Set<ReadableStreamDefaultReader<Uint8Array>>();
+ let stopped=false;
+ const stop=()=>{
+  if(stopped)return;stopped=true;
+  try{child.kill('SIGKILL');}catch{/* Already exited is still failed evidence. */}
+  for(const reader of readers)void reader.cancel().catch(()=>{});
+ };
+ const bounded=async(stream:ReadableStream<Uint8Array>,capture:boolean)=>{
+  const reader=stream.getReader();readers.add(reader);
+  let bytes=0;const chunks:Uint8Array[]=[];
+  try{
+   while(!stopped){
+    const {value,done}=await reader.read();
+    if(done)break;
+    bytes+=value.byteLength;
+    if(bytes>16000){stop();return null;}
+    if(capture)chunks.push(value.slice());
+   }
+   if(stopped)return null;
+   const data=new Uint8Array(capture?bytes:0);let offset=0;
+   for(const chunk of chunks){data.set(chunk,offset);offset+=chunk.byteLength;}
+   return new TextDecoder().decode(data);
+  }catch{stop();return null;}
+  finally{readers.delete(reader);reader.releaseLock();}
+ };
+ const [out,err,code]=await Promise.all([
+  bounded(child.stdout as ReadableStream<Uint8Array>,true),
+  bounded(child.stderr as ReadableStream<Uint8Array>,false),
+  child.exited.catch(()=>{stop();return null;}),
+ ]);
+ if(stopped||code!==0||out===null||err===null)return false;
  try{const live=JSON.parse(out);return live.environment===c.environment&&live.revision===r.revision;}catch{return false;}
 }
