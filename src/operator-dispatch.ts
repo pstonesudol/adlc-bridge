@@ -20,6 +20,21 @@ import {assertConfiguredProjectIntakeEnabled} from './project-services';
 import {Database} from 'bun:sqlite';
 import {remediationPolicy} from './remediation';
 
+/** Only fixed, engine-authored delivery diagnostics may cross the subprocess
+ * boundary. Never echo arbitrary provider stderr or worker-authored strings. */
+export function deliveryEngineFailure(stderr:string){
+ const known=[
+  'Existing PR repository or URL mismatch','Existing PR repository fork mismatch',
+  'Existing PR feature branch mismatch','Existing PR exact remote head mismatch',
+  'Existing PR is not open','Existing PR draft evidence incomplete',
+  'Originating session/worktree identity mismatch','Another active session owns the PR',
+  'Exactly one unambiguous existing PR required','Idle controller with no queued or running turns required',
+  'Completed original implementation delivery receipt required','Clean registered isolated worktree required',
+  'Reserved branch lineage mismatch or missing anchor','Local HEAD differs from exact remote feature ref',
+ ];
+ const reason=known.find(value=>stderr.trim()===value);
+ return reason?`${reason}. Next: inspect existing session/worktree and provider identity, correct only the stated evidence, then preview recover-delivery again; never replace the worker or PR.`:null;
+}
 export function modernCommand(command:string,args:string[]){
  return ['config','queue','auth','version','completion'].includes(command)||command==='diagnostics'&&args[0]==='export'||command==='projects'&&args[0]==='show'||['status','doctor'].includes(command)&&args.includes('--project')||command==='jobs'&&['metrics','show','list','status','lookup','explain','watch','logs','reconcile','budget','extend-budget','resume','recover-delivery'].includes(args[0]);
 }
@@ -82,7 +97,7 @@ export async function dispatchOperator(command:string,args:string[],db:string){
    const entry=entries.length?selectProject(entries,requested):undefined,configPath=position[2]??entry?.config;
    if(!configPath)throw new OperatorError('A registered project or explicit CONFIG is required');
    const config=JSON.parse(readFileSync(configPath,'utf8'));validate(config);if(config.linear.projectId!==view.project)throw new OperatorError('Job/config project mismatch',1);
-   const invoke=async(argv:string[])=>{const p=Bun.spawn([process.execPath,join(import.meta.dir,'cli.ts'),...argv],{stdout:'pipe',stderr:'pipe',env:{...process.env,ADLC_DB:db},timeout:120000});const [text,_error,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw new OperatorError('Guarded engine refused or evidence unavailable; inspect jobs explain and the corresponding legacy engine preview. No replacement worker is authorized.',1);return JSON.parse(text);};
+    const invoke=async(argv:string[])=>{const p=Bun.spawn([process.execPath,join(import.meta.dir,'cli.ts'),...argv],{stdout:'pipe',stderr:'pipe',env:{...process.env,ADLC_DB:db},timeout:120000});const [text,_error,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);if(code!==0)throw new OperatorError((operation==='recover-delivery'?deliveryEngineFailure(_error):null)??'Guarded engine refused or evidence unavailable; inspect jobs explain and the corresponding legacy engine preview. No replacement worker is authorized.',1);return JSON.parse(text);};
    if(operation==='resume'){
     const inspection=Store.readonly(db);try{assertConfiguredProjectIntakeEnabled(config,inspection);}catch(error){const message=error instanceof Error?error.message:'';throw new OperatorError(message.startsWith('Registered project identity')?'Registered project identity missing or changed; reconcile the configuration before intake':'Project intake is intentionally paused; use services start PROJECT after inspection',1);}finally{inspection.close();}
     const proposal={job,project:view.project,effect:'Resume eligible existing session through lifecycle engine',binding:view.version,configuration:digest(JSON.stringify(config))},confirmation=digest(JSON.stringify(proposal));

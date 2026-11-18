@@ -1,13 +1,14 @@
 import {ApprovalPolicyStore,featureGit,type ApprovalPolicy} from './approval-policy';
 import {validScopes,planPaths,scopeAllows} from './file-scope';
 import {Store,digest} from './core';
-import {ReceiptReconciliation} from './receipt-reconciliation';
+import {ReceiptReconciliation,evaluateReceipt} from './receipt-reconciliation';
 import {verificationInstructions,type Verification,type VerificationContext} from './verification';
 import {Planning} from './planning';
 import {Lifecycle} from './lifecycle';
 import {TaskRouting,type Route,type RoutingSettings} from './task-routing';
 import {capturePlan} from './session-evidence';
-import {deliveryBranch,assertDeliveryTarget} from './delivery-identity';
+import {deliveryBranch,assertDeliveryTarget,assertDeliveryArtifact} from './delivery-identity';
+import {AcceptanceEvidence,promoteDraft,verifyLiveContent,CURRENT_DRAFT_POLICY,assertDeliveryUnreserved,type DraftPolicy,type DraftBinding,type AcceptanceCheck,type AcceptanceRecord} from './acceptance-evidence';
 import {worktreeIdentity,recoveryTransport} from './delivery-evidence';
 import {DeliveryRecovery} from './delivery-recovery';
 import {readBranchSnapshot} from './branch-updates';
@@ -30,7 +31,7 @@ import {RevisionDelivery} from './revision-delivery';
 import {DependencySetup,setupInputPaths} from './dependency-setup';
 import type {DependencySetupPolicy} from './dependency-setup-policy';
 
-export type WorkflowConfig={repo:string;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext;dependencySetup?:DependencySetupPolicy};
+export type WorkflowConfig={repo:string;[CURRENT_DRAFT_POLICY]?:()=>void;draftPromotion?:DraftPolicy;replanning?:{automatic:boolean};linear:{projectId:string};automation?:{planningEnabled:boolean;orchestratorProject:string;maxPlanning?:number};requiredChecks:string[];githubRepo?:string;routing?:RoutingSettings;approval?:ApprovalPolicy;workflow?:{prGraceMs?:number};verification?:Verification;verificationContext?:VerificationContext;dependencySetup?:DependencySetupPolicy};
 export {activePlanning} from './planning-capacity';
 export interface WorkflowTransport{
  submit?<T>(operation:()=>Promise<T>):Promise<T>;
@@ -46,7 +47,10 @@ export interface WorkflowTransport{
   planningPRs?(repo:string,branch:string):Promise<PlanningPRInventory>;
   readReviewEvidence?(repo:string,pr:number,checks:string[]):Promise<any>;
   restorePlan?(session:string,project:string):Promise<void>;
-  planningFailureFacts?(session:string,turn:string):Promise<{turn:any;capabilities:unknown;authenticationState:unknown}>;
+   planningFailureFacts?(session:string,turn:string):Promise<{turn:any;capabilities:unknown;authenticationState:unknown}>;
+   verifyAcceptance?(check:AcceptanceCheck,record:AcceptanceRecord):Promise<boolean>;
+   promoteDraft?(repo:string,pr:number):Promise<void>;
+   verifyDraftIdentity?(binding:DraftBinding,c:WorkflowConfig):Promise<void>;
 }
 export class Workflow{
   dependencySetup:DependencySetup;
@@ -522,9 +526,14 @@ export class Workflow{
    if(prs.length===1){
     if(!c?.githubRepo||prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)throw Error('Exact configured PR repository required');
     const b=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo,prs[0].number):readBranchSnapshot(c.githubRepo,prs[0].number));
-    assertDeliveryTarget(this.s,job,e.session,c.githubRepo,prs[0].number,b);
+     assertDeliveryArtifact(this.s,job,e.session,c.githubRepo,prs[0].number,b);
      if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before handoff');
-     if(!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Exact published HEAD required');
+      if(!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Exact published HEAD required');
+      const knownDraft=this.s.db.query("SELECT name FROM sqlite_master WHERE name='draft_deliveries'").get()?this.s.db.query('SELECT plan_hash,reason FROM draft_deliveries WHERE job=?').get(job) as any:null;
+      if(b.draft||knownDraft?.plan_hash===d.plan_hash&&knownDraft.reason){
+       const draft=await this.draftStatus(job,c,persist);
+       if(draft.state!=='pr_handoff')return finish(draft);
+      }
       publishedProof={dispatch:d.client_id,session:d.session_id,spec:digest(observedJob.spec),turn:implementationReceipt?.turn??originalLedger.get(d.client_id)?.turn??turn.id,repo:c.githubRepo,head:b.head};
    }
   }catch(err){
@@ -601,8 +610,9 @@ export class Workflow{
   if(!this.s.db.query("SELECT name FROM sqlite_master WHERE name='worker_outcomes'").get())return null;
   return this.s.db.query('SELECT * FROM worker_outcomes WHERE job=?').get(job);
  }
- private saveOutcome(job:string,d:any,result:any,graceMs:number,now:number,previous?:any){
-  const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&previous.outcome==='awaiting_pr';
+  private saveOutcome(job:string,d:any,result:any,graceMs:number,now:number,previous?:any){
+   const sameDraft=previous?.source==='draft-delivery'&&result.source==='draft-delivery'&&previous.outcome===result.outcome&&previous.reason===(result.reason??null)&&previous.questions===JSON.stringify(result.questions??[])&&previous.dependencies===JSON.stringify(result.dependencies??[]);
+   const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&(previous.outcome==='awaiting_pr'||sameDraft);
   const first=same&&Number.isFinite(Number(previous.first_observed))?Number(previous.first_observed):now;
   const deadline=result.state==='awaiting_pr'?first+graceMs:null;
   this.s.db.query(`INSERT INTO worker_outcomes(job,plan_hash,session_id,outcome,reason,questions,dependencies,source,confidence,first_observed,grace_deadline,observed)
@@ -632,37 +642,125 @@ export class Workflow{
    const assessed=assessWorkerReceipt(item.text??'');
    if(assessed.valid){receipt=assessed.receipt;discovery=clarificationDiscovery(item.text??'');source='receipt';confidence='high';break;}
   }
-  if(remediation)source=`remediation:${remediationHandle}`;
-  if(receipt){
-   if(receipt.outcome==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:receipt.reason||'Worker requested input',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
-   if(receipt.outcome==='blocked-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:receipt.reason||'Worker is blocked by a dependency',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
-   if(receipt.outcome==='failed')return {state:'failed',outcome:'failed',reason:receipt.reason||'Worker reported failure',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
-   if(receipt.outcome==='uncertain')return {state:'uncertain',outcome:'uncertain',reason:receipt.reason||'Worker reported an uncertain outcome',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
+   if(remediation)source=`remediation:${remediationHandle}`;
+   if(receipt){
+    if(receipt.outcome==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:receipt.reason||'Worker requested input',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
+    if(receipt.outcome==='blocked-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:receipt.reason||'Worker is blocked by a dependency',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence,discovery};
+    if(receipt.outcome==='failed')return {state:'failed',outcome:'failed',reason:receipt.reason||'Worker reported failure',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
+    if(receipt.outcome==='uncertain')return {state:'uncertain',outcome:'uncertain',reason:receipt.reason||'Worker reported an uncertain outcome',questions:receipt.questions,dependencies:receipt.dependencies,source,confidence};
+   }
+   if(prs.length===1)return {state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'session',confidence:'high',pr:prs[0]};
+   let readiness=readinessFor(this.s,job);
+   if(!readiness){
+    const current=this.s.get(job);
+    if(current.plan){const legacy=assessPlan(current.plan);readiness={plan_hash:current.plan_hash,spec_hash:digest(current.spec),...legacy};}
+   }
+   const legacyConcrete=readiness?.source==='plan-text'&&readiness.questions.length>0;
+   const readinessResolution=readiness&&readiness.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer','dependency-satisfied']):null;
+   const legacyResolution=legacyConcrete&&readiness?.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer']):null;
+   const readinessResolved=legacyConcrete?!!legacyResolution:!!readinessResolution;
+   if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved){
+    if(readiness.valid&&readiness.state==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:'Plan requires input that the completed worker did not resolve',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
+    if(readiness.valid&&readiness.state==='blocked-by-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:'Plan is blocked by a referenced dependency',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
+   }
+   const previous=this.outcomes(job);
+   const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&previous.outcome==='awaiting_pr';
+   const first=same?Number(previous.first_observed):now;
+   const deadline=first+graceMs;
+   if(now<deadline)return {state:'awaiting_pr',outcome:'awaiting_pr',reason:`Waiting for PR metadata until ${new Date(deadline).toISOString()}; implementation will not be resent`,questions:[],dependencies:[],source,confidence,graceDeadline:deadline};
+   if(receipt?.outcome==='pr-handoff')return {state:'needs_reconciliation',outcome:'uncertain',reason:'Worker reported PR handoff but no open PR metadata appeared within the grace period; verify the worker PR manually and never resend',questions:[],dependencies:[],source:'receipt',confidence:'high'};
+   if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved&&readiness.source==='plan-text'&&readiness.questions.length)return {state:'needs_input',outcome:'needs_input',reason:`PR metadata grace expired; legacy plan text records unresolved questions: ${readiness.reason}`,questions:readiness.questions,dependencies:readiness.dependencies,source:'legacy-plan',confidence:'low'};
+   return {state:'needs_reconciliation',outcome:'uncertain',reason:'Completed implementation turn has no open PR and no structured outcome after the PR metadata grace period; interpretation is uncertain and no work will be resent',questions:[],dependencies:[],source,confidence};
   }
-  if(prs.length===1)return {state:'pr_handoff',outcome:'pr_handoff',reason:null,questions:[],dependencies:[],source:'session',confidence:'high',pr:prs[0]};
-  let readiness=readinessFor(this.s,job);
-  if(!readiness){
-   const current=this.s.get(job);
-   if(current.plan){const legacy=assessPlan(current.plan);readiness={plan_hash:current.plan_hash,spec_hash:digest(current.spec),...legacy};}
+  /** Fresh delivery-stage facts. Never used to relax the review-stage gate. */
+  async draftFacts(job:string,c:WorkflowConfig){
+   c[CURRENT_DRAFT_POLICY]?.();
+   const auth=new DeliveryRecovery(this.s,{} as any).authorization(job,c),d=this.implementation(job);
+   const e=await this.t.evidence(auth.session),local=await (this.t.worktree?this.t.worktree(job):worktreeIdentity(this.s,job));
+   if(e.session?.id!==auth.session||e.session?.projectId!==auth.project||e.session?.branch!==auth.reserved||e.session?.isTerminated!==false)throw Error('Draft originating session identity mismatch');
+   if(canonicalWorktree((local as any).tree??(local as any).worktree??'')!==canonicalWorktree(auth.worktree))throw Error('Draft worktree identity mismatch');
+   const prs=e.session.prs?.filter((p:any)=>p.state==='open');
+   if(!Array.isArray(prs)||prs.length!==1||prs[0].url!==`https://github.com/${c.githubRepo}/pull/${prs[0].number}`)throw Error('Exactly one exact attached draft delivery PR required');
+   const pr=prs[0],b=await (this.t.branchSnapshot?this.t.branchSnapshot(c.githubRepo!,pr.number):readBranchSnapshot(c.githubRepo!,pr.number));
+   assertDeliveryArtifact(this.s,job,e.session,c.githubRepo!,pr.number,b);
+   if(local.branch!==b.branch||local.head!==b.head||!/^[a-f0-9]{40,64}$/.test(b.head))throw Error('Draft exact local/remote head or branch mismatch');
+   const cont=currentDispatchContinuation(this.s,job,d),client=cont?.client_id??d.client_id;
+   if(revisedExecution(this.s,job)&&!capturedRevision(this.s,job,d.plan_hash,d.session_id).captured)throw Error('Current revised captured plan required for draft delivery');
+   const evaluated=evaluateReceipt({job,plan:auth.plan,spec:auth.spec,session:auth.session,client,attempt:cont?`continuation:${cont.id}`:'implementation:1'},e);
+   if(evaluated.state!=='completed')throw Error(`Draft delivery evidence incomplete: ${evaluated.reason}`);
+   const entry=e.transcript?.entries?.find((x:any)=>x.clientMessageId===client),turn=entry&&e.transcript?.turns?.find((x:any)=>x.id===entry.turnId);
+   if(turn?.state!=='completed')throw Error('Completed current draft worker delivery receipt required; reconcile before continuation');
+   const ledger=new ReceiptReconciliation(this.s),receiptBinding=ledger.get(client);
+   if(receiptBinding){
+    const delivery=ledger.inspect({job,plan:auth.plan,spec:auth.spec,session:auth.session,client,attempt:cont?`continuation:${cont.id}`:'implementation:1'},e,false);
+    if(delivery.state!=='completed')throw Error('Current draft delivery receipt incomplete or uncertain; never resend');
+   }
+   const idle=e.session.activity?.state==='idle'&&e.transcript?.controller==='ready'&&Array.isArray(e.transcript.turns)&&e.transcript.turns.every((t:any)=>['completed','failed','cancelled','interrupted'].includes(t.state));
+   let receipt:any=null,receiptText='';
+   for(const item of [...(e.transcript?.entries??[])].reverse()){
+    if(item.turnId!==turn.id||item.kind!=='message'||item.role!=='assistant'||item.origin!=='provider'||item.streaming)continue;
+    const assessed=assessWorkerReceipt(item.text??'');if(assessed.valid){receipt=assessed.receipt;receiptText=item.text??'';break;}
+   }
+   // Revalidate authority after awaited provider reads.
+   if(JSON.stringify(new DeliveryRecovery(this.s,{} as any).authorization(job,c))!==JSON.stringify(auth))throw Error('Draft authorization changed during observation');
+   c[CURRENT_DRAFT_POLICY]?.();
+   const binding:DraftBinding={job,plan:auth.plan,spec:auth.spec,revision:auth.revision??null,dispatch:d.client_id,session:auth.session,worktree:auth.worktree,branch:b.branch,repo:c.githubRepo!,pr:pr.number,head:b.head,authorization:digest(JSON.stringify(auth))};
+   const blockers:string[]=[];
+   if(!idle)blockers.push('Draft worker busy or activity unknown; await authoritative idle evidence');
+   if(receipt?.outcome!=='pr-handoff'||receipt.questions.length||receipt.dependencies.some((x:any)=>x.blocking!==false))blockers.push(receipt?.reason||'Draft requires a completed current worker handoff with no unresolved requirements');
+   if(receipt?.outcome==='pr-handoff'&&(!receiptText.includes(b.head)||!receiptText.includes(pr.url)))blockers.push('Draft worker handoff must report the exact current PR URL and head SHA');
+   const failed=this.s.db.query("SELECT 1 FROM continuations WHERE job=? AND plan_hash=? AND state IN ('failed','reserved','delivery_uncertain')").get(job,auth.plan);
+   if(failed)blockers.push('Draft has failed or uncertain continuation delivery; explicit reconciliation required');
+   if(e.transcript.entries.some((x:any)=>x.clientMessageId&&x.turnId!==turn.id&&Number(x.sequence)>Number(entry.sequence)))blockers.push('A later worker delivery must be reconciled before draft continuation or promotion');
+   return {binding,draft:b.draft===true,blockers,idle,receipt,pr,discovery:clarificationDiscovery(receiptText)};
   }
-  const legacyConcrete=readiness?.source==='plan-text'&&readiness.questions.length>0;
-  const readinessResolution=readiness&&readiness.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer','dependency-satisfied']):null;
-  const legacyResolution=legacyConcrete&&readiness?.plan_hash===d.plan_hash?activeReadinessResolution(this.s,job,['human-answer']):null;
-  const readinessResolved=legacyConcrete?!!legacyResolution:!!readinessResolution;
-  if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved){
-   if(readiness.valid&&readiness.state==='needs-input')return {state:'needs_input',outcome:'needs_input',reason:'Plan requires input that the completed worker did not resolve',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
-   if(readiness.valid&&readiness.state==='blocked-by-dependency')return {state:'blocked_dependency',outcome:'blocked_dependency',reason:'Plan is blocked by a referenced dependency',questions:readiness.questions,dependencies:readiness.dependencies,source:'plan-readiness',confidence:'medium'};
+  private async verifyDraftIdentity(b:DraftBinding,c:WorkflowConfig){
+   if(this.t.verifyDraftIdentity)return this.t.verifyDraftIdentity(b,c);
+   // Use the same complete, read-only collector as recover-handoff: cleanliness,
+   // registered isolation, lineage, exact remote ref and complete owner inventory.
+   const {proposal:p}=await new DeliveryRecovery(this.s,recoveryTransport(this.s)).preview(b.job,c);
+   if(digest(JSON.stringify(p.auth))!==b.authorization||p.session!==b.session||p.branch!==b.branch||p.head!==b.head||p.candidate.repo!==b.repo||p.candidate.pr!==b.pr)throw Error('Draft complete ownership/remote evidence changed');
   }
-  const previous=this.outcomes(job);
-  const same=previous&&previous.plan_hash===d.plan_hash&&previous.session_id===d.session_id&&previous.outcome==='awaiting_pr';
-  const first=same?Number(previous.first_observed):now;
-  const deadline=first+graceMs;
-  if(now<deadline)return {state:'awaiting_pr',outcome:'awaiting_pr',reason:`Waiting for PR metadata until ${new Date(deadline).toISOString()}; implementation will not be resent`,questions:[],dependencies:[],source,confidence,graceDeadline:deadline};
-  if(receipt?.outcome==='pr-handoff')return {state:'needs_reconciliation',outcome:'uncertain',reason:'Worker reported PR handoff but no open PR metadata appeared within the grace period; verify the worker PR manually and never resend',questions:[],dependencies:[],source:'receipt',confidence:'high'};
-  if(readiness&&readiness.plan_hash===d.plan_hash&&!readinessResolved&&readiness.source==='plan-text'&&readiness.questions.length)return {state:'needs_input',outcome:'needs_input',reason:`PR metadata grace expired; legacy plan text records unresolved questions: ${readiness.reason}`,questions:readiness.questions,dependencies:readiness.dependencies,source:'legacy-plan',confidence:'low'};
-  return {state:'needs_reconciliation',outcome:'uncertain',reason:'Completed implementation turn has no open PR and no structured outcome after the PR metadata grace period; interpretation is uncertain and no work will be resent',questions:[],dependencies:[],source,confidence};
- }
- async previewReconcile(c:WorkflowConfig){
+  private async draftStatus(job:string,c:WorkflowConfig,persist:boolean){
+   const evidence=new AcceptanceEvidence(this.s),facts=await this.draftFacts(job,c);
+   const inspect=async()=>{
+    const f=await this.draftFacts(job,c);
+    const blockers=[...f.blockers,...await evidence.blockers(f.binding,c.draftPromotion,this.t.verifyAcceptance??verifyLiveContent)];
+    if(!blockers.length)await this.verifyDraftIdentity(f.binding,c);
+    const after=await this.draftFacts(job,c);
+    if(JSON.stringify([after.binding,after.receipt,after.draft,after.idle])!==JSON.stringify([f.binding,f.receipt,f.draft,f.idle]))blockers.push('Draft head, worker handoff or authorization changed during acceptance verification');
+    return {...f,blockers};
+   };
+   let blockers=[...facts.blockers,...await evidence.blockers(facts.binding,c.draftPromotion,this.t.verifyAcceptance??verifyLiveContent)];
+   if(persist&&blockers.length===0){
+    const promoted=await promoteDraft(this.s,c.draftPromotion,inspect,async b=>{
+     if(this.t.promoteDraft)await this.t.promoteDraft(b.repo,b.pr);
+     else await this.promoteExistingDraft(b,async()=>{
+      const last=await inspect();
+      if(JSON.stringify(last.binding)!==JSON.stringify(b)||!last.draft||last.blockers.length)throw Error('Draft promotion authority or evidence changed before mutation');
+     });
+    });
+    if(promoted.ready){
+     evidence.observe(facts.binding,[]);
+     return {state:'pr_handoff',outcome:'pr_handoff',source:'draft-promoted',confidence:'high',pr:facts.pr,questions:[],dependencies:[]};
+    }
+    blockers=promoted.blockers;
+   }
+   if(persist)evidence.observe(facts.binding,blockers);
+   const receipt=facts.receipt,stopped=receipt&&['needs-input','blocked-dependency','failed','uncertain'].includes(receipt.outcome);
+   const state=stopped?({'needs-input':'needs_input','blocked-dependency':'blocked_dependency',failed:'failed',uncertain:'uncertain'} as any)[receipt.outcome]:'draft_handoff';
+   return {state,outcome:stopped?state:'needs_reconciliation',source:'draft-delivery',confidence:'high',pr:facts.pr,reason:`Draft PR delivery exists; ${blockers.join('; ')||'await authorized promotion'}`,questions:receipt?.questions??[],dependencies:receipt?.dependencies??[],discovery:facts.discovery};
+  }
+  private async promoteExistingDraft(b:DraftBinding,revalidate:()=>Promise<void>){
+   const child=Bun.spawn(['gh','api','graphql','-f','query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid isDraft}}}','-f',`owner=${b.repo.split('/')[0]}`,'-f',`name=${b.repo.split('/')[1]}`,'-F',`number=${b.pr}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+   const [out,,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+   let id;try{const p=JSON.parse(out).data.repository.pullRequest;if(p.headRefOid===b.head&&p.isDraft===true)id=p.id;}catch{}
+   if(code!==0||typeof id!=='string'||!/^[A-Za-z0-9_=-]+$/.test(id))throw Error('Draft promotion node evidence unavailable');
+   await revalidate();
+   const mutation=Bun.spawn(['gh','api','graphql','-f','query=mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}','-f',`id=${id}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+   await Promise.all([new Response(mutation.stdout).text(),new Response(mutation.stderr).text(),mutation.exited]);
+  }
+  async previewReconcile(c:WorkflowConfig){
   const rows=this.s.db.query('SELECT d.job FROM implementation_dispatch d JOIN jobs j ON j.id=d.job WHERE j.project=? ORDER BY j.updated,j.id').all(c.linear.projectId) as any[];
   const graceMs=c.workflow?.prGraceMs??120000,now=Date.now(),results:any[]=[];
   for(const row of rows){
@@ -689,7 +787,8 @@ export class Workflow{
   if(d.plan_hash!==j.plan_hash||r.spec_hash!==digest(j.spec))throw Error('Material plan or requirement change invalidates the previous authorization');
    const outcome=this.outcomes(job);
    if(!currentOutcome(this.s,job,outcome))throw Error('Worker outcome belongs to a superseded revision or dispatch; await current implementation evidence');
-   if(!outcome||!['needs_input','blocked_dependency'].includes(outcome.outcome))throw Error('Only a worker stopped on needs-input or a blocked dependency can resume');
+    const draftStop=outcome?.source==='draft-delivery'&&outcome.outcome==='needs_reconciliation';
+    if(!outcome||!['needs_input','blocked_dependency'].includes(outcome.outcome)&&!draftStop)throw Error('Only a worker stopped on needs-input, a blocked dependency or a verified draft delivery can resume');
    if(outcome.outcome==='blocked_dependency'&&(c as any).dependencyRecovery?.enabled&&!dependencyEvidence)throw Error('Dependency verification enabled; use dependency-preview/dependency-resume, not a prose resolution');
   if(outcome.plan_hash!==d.plan_hash)throw Error('Worker outcome belongs to a different plan');
   const readinessBindingValue=readinessBinding(this.s,job);
@@ -711,15 +810,27 @@ export class Workflow{
   const e=await this.t.evidence(d.session_id);
   if(e.session?.id!==d.session_id||r.session_id!==d.session_id||run.session_id!==d.session_id||e.session?.projectId!==r.project||e.session?.branch!==r.branch||e.session?.isTerminated)throw Error('Existing execution session identity changed');
   if(e.transcript?.controller!=='ready')throw Error('Worker is not idle; wait before resuming');
-  if(run.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(run.state))throw Error('Existing orchestrator-owned run required');
+   const runAllowed=(x:any)=>['running','needs_input','blocked_dependency'].includes(x.state)||outcome.source==='draft-delivery'&&x.state==='needs_reconciliation'&&/draft/i.test(x.reason??'');
+   if(run.owner!=='orchestrator'||!runAllowed(run))throw Error('Existing orchestrator-owned run required');
   const prs=(e.session.prs??[]).filter((p:any)=>p.state==='open');
-  let remediationTarget:any=null;
-  if(prs.length){
+   let remediationTarget:any=null;
+   let draftTarget:Awaited<ReturnType<Workflow['draftFacts']>>|null=null;
+   if(prs.length){
+    const draft=outcome.source==='draft-delivery'?await this.draftFacts(job,c):null;
+    if(draft?.draft){
+     if(!['human-answer','dependency-satisfied'].includes(resolution.source))throw Error('Draft continuation requires a current answer or verified dependency decision, not acknowledgement');
+     if(!draft.idle||draft.blockers.some(x=>/uncertain continuation|failed.*continuation/.test(x)))throw Error('Draft worker busy, unknown or delivery uncertain; reconcile without resending');
+     if(!['needs-input','blocked-dependency','pr-handoff'].includes(draft.receipt?.outcome))throw Error('Draft worker did not report a supported resumable outcome');
+     const observed=this.s.db.query("SELECT detail FROM draft_deliveries WHERE job=?").get(job) as any;
+     if(!observed||observed.detail!==JSON.stringify(draft.binding))throw Error('Current draft delivery must be reconciled before continuing');
+     draftTarget=draft;
+    }else{
    const target=this.s.db.query("SELECT name FROM sqlite_master WHERE name='review_targets'").get()?this.s.db.query('SELECT repo,pr FROM review_targets WHERE job=?').get(job) as any:null;
    const fix=typeof outcome.source==='string'&&outcome.source.startsWith('remediation:adlc-fix-')?outcome.source.slice('remediation:'.length):null;
    const attempt=fix&&this.s.db.query("SELECT r.state,c.kind FROM remediation r JOIN remediation_context c ON c.job=r.job AND c.attempt=r.attempt WHERE r.job=? AND r.attempt=?").get(job,Number(fix.split('-').at(-1))) as any;
    if(prs.length!==1||!target||target.repo!==c.githubRepo||prs[0].number!==target.pr||prs[0].url!==`https://github.com/${target.repo}/pull/${target.pr}`||!attempt||attempt.state!=='completed')throw Error('A PR already exists; only its reconciled owned remediation blocker can resume');
-   remediationTarget={...target,kind:attempt.kind};
+    remediationTarget={...target,kind:attempt.kind};
+    }
   }
   const failedContinuation=this.s.db.query("SELECT name FROM sqlite_master WHERE name='continuations'").get()?this.s.db.query("SELECT * FROM continuations WHERE job=? AND plan_hash=? AND state='failed' ORDER BY id DESC LIMIT 1").get(job,j.plan_hash) as any:null;
   if(failedContinuation&&!(await this.recoveredDelivery(job,c,e,prs,d,failedContinuation.id)))throw Error('Previous guarded continuation failed; exact reviewed delivery recovery required before resuming');
@@ -741,7 +852,8 @@ export class Workflow{
      `Blocker resolution provenance (${resolution.actor}), via ${resolution.source}: ${resolution.detail}. This evidence is not a new human approval.`,
     `Previously outstanding questions: ${JSON.stringify(JSON.parse(outcome.questions))}`,
     `Previously referenced dependencies: ${JSON.stringify(JSON.parse(outcome.dependencies))}`,
-    remediationTarget?`This continues remediation on https://github.com/${remediationTarget.repo}/pull/${remediationTarget.pr}, not a fresh implementation. Inspect its current head and prior remediation artifacts first. Attempt scope: ${remediationTarget.kind}. ${remediationTarget.kind==='pr_description'?'Description and verification only: do not edit application files, commit or push.':''} Do not replay completed checks or edits. Stop if the answer does not resolve the exact blocker within existing authorization. ${verificationInstructions(c.verification,c.verificationContext,r.worktree)}`:'',
+     remediationTarget?`This continues remediation on https://github.com/${remediationTarget.repo}/pull/${remediationTarget.pr}, not a fresh implementation. Inspect its current head and prior remediation artifacts first. Attempt scope: ${remediationTarget.kind}. ${remediationTarget.kind==='pr_description'?'Description and verification only: do not edit application files, commit or push.':''} Do not replay completed checks or edits. Stop if the answer does not resolve the exact blocker within existing authorization. ${verificationInstructions(c.verification,c.verificationContext,r.worktree)}`:'',
+     draftTarget?`Preserve draft PR ${draftTarget.pr.url}, branch ${draftTarget.binding.branch}, and head history. Inspect existing work and acceptance blockers first. Continue only the resolved blocker within current scope; do not create another worker, branch or PR, mark ready, request review, or repeat completed implementation. ${verificationInstructions(c.verification,c.verificationContext,r.worktree)}`:'',
     'The existing plan, approved repository scope and feature-branch Git permissions remain in force and are not expanded. If requirements or scope changed, stop and request replanning. Never merge a PR, enable auto-merge, deploy, weaken protection, or invoke ADLC/ALDC skills.',
     WORKER_STATUS_INSTRUCTION
   ].join('\n\n');
@@ -755,16 +867,23 @@ export class Workflow{
   if(local.branch!==deliveryBranch(this.s,job,e.session))throw Error('Worktree branch changed; reconcile before continuation');
   const fresh=await this.t.evidence(d.session_id);
   const freshPRs=(fresh.session.prs??[]).filter((p:any)=>p.state==='open');
-  const expectedPR=remediationTarget&&freshPRs.length===1&&freshPRs[0].number===remediationTarget.pr&&freshPRs[0].url===`https://github.com/${remediationTarget.repo}/pull/${remediationTarget.pr}`;
-  if(fresh.session?.id!==d.session_id||fresh.session?.projectId!==r.project||fresh.session?.branch!==r.branch||fresh.session?.isTerminated||fresh.transcript?.controller!=='ready'||!Array.isArray(fresh.transcript?.turns)||fresh.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))||(remediationTarget?!expectedPR:freshPRs.length>0))throw Error('Worker changed or has active/queued work before resume reservation');
+   const target=remediationTarget??(draftTarget?draftTarget.binding:null);
+   const expectedPR=target&&freshPRs.length===1&&freshPRs[0].number===target.pr&&freshPRs[0].url===`https://github.com/${target.repo}/pull/${target.pr}`;
+   if(fresh.session?.id!==d.session_id||fresh.session?.projectId!==r.project||fresh.session?.branch!==r.branch||fresh.session?.isTerminated||fresh.transcript?.controller!=='ready'||!Array.isArray(fresh.transcript?.turns)||fresh.transcript.turns.some((t:any)=>['running','queued'].includes(t.state))||(target?!expectedPR:freshPRs.length>0))throw Error('Worker changed or has active/queued work before resume reservation');
+    if(draftTarget){
+     await this.verifyDraftIdentity(draftTarget.binding,c);
+     const latest=await this.draftFacts(job,c);
+    if(!latest.draft||!latest.idle||JSON.stringify([latest.binding,latest.receipt])!==JSON.stringify([draftTarget.binding,draftTarget.receipt]))throw Error('Draft delivery changed before continuation reservation');
+   }
   if(remediationTarget){
    const b=await (this.t.branchSnapshot?this.t.branchSnapshot(remediationTarget.repo,remediationTarget.pr):readBranchSnapshot(remediationTarget.repo,remediationTarget.pr));
    assertDeliveryTarget(this.s,job,fresh.session,remediationTarget.repo,remediationTarget.pr,b);
    if(local.head!==b.head)throw Error('Worktree and remote PR HEAD differ; reconcile before remediation continuation');
   }
   try{
-    claim=this.s.db.transaction(()=>{
-     assertWorktreeAvailable(this.s,job);
+     claim=this.s.db.transaction(()=>{
+      assertWorktreeAvailable(this.s,job);
+      assertDeliveryUnreserved(this.s,job,'continuation');
     const current=this.s.get(job);
     if(current.plan_hash!==j.plan_hash||current.spec!==j.spec)throw Error('Plan changed during resume reservation');
     if(current.state!=='approved'||current.approved_hash!==j.plan_hash||current.actor!==j.actor)throw Error('Plan approval revoked or changed during resume reservation');
@@ -774,7 +893,7 @@ export class Workflow{
      if(!currentOutcome(this.s,job,this.outcomes(job)))throw Error('Worker outcome revision or dispatch changed during resume');
     if(proof)policy.verify(job,c.linear.projectId,c.approval);
     const currentRun=new Lifecycle(this.s).run(job);
-    if(currentRun?.owner!=='orchestrator'||!['running','needs_input','blocked_dependency'].includes(currentRun.state)||currentRun.session_id!==run.session_id||currentRun.worktree!==run.worktree||currentRun.plan_hash!==j.plan_hash)throw Error('Worker ownership changed during resume');
+     if(currentRun?.owner!=='orchestrator'||!runAllowed(currentRun)||currentRun.session_id!==run.session_id||currentRun.worktree!==run.worktree||currentRun.plan_hash!==j.plan_hash)throw Error('Worker ownership changed during resume');
     if(resolutionBinding(this.s,job)!==resolution.binding||applicableResolution(this.s,job)?.detail!==resolution.detail)throw Error('Resolution changed before continuation');
     if(this.unresolvedContinuation(job,j.plan_hash))throw Error('A continuation is already reserved or in flight; never duplicate a resume delivery');
     const inserted=this.s.db.query("INSERT INTO continuations(job,plan_hash,spec_hash,binding,client_id,session_id,state) VALUES (?,?,?,?,?,?,'reserved')").run(job,j.plan_hash,digest(j.spec),binding,clientId,d.session_id);
@@ -791,7 +910,7 @@ export class Workflow{
   const receipts=new ReceiptReconciliation(this.s);
   receipts.reserve({job,plan:j.plan_hash,spec:digest(j.spec),session:d.session_id,client:clientId,attempt:`continuation:${claim.lastInsertRowid}`});
   try{
-   await this.t.sendImplementation(d.session_id,prompt,clientId);
+    await this.t.sendImplementation(d.session_id,prompt,clientId,'idle-only');
    receipts.accepted(clientId);
    this.s.db.query("UPDATE continuations SET state='delivery_accepted',reason=NULL WHERE client_id=?").run(clientId);
    this.s.db.query("UPDATE worker_outcomes SET outcome='running',reason='Continuation accepted; awaiting worker outcome',grace_deadline=NULL,observed=? WHERE job=?").run(Date.now(),job);

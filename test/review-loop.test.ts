@@ -99,6 +99,18 @@ function templateFixture(){
  loop.requests.wait('owner/repo',1,e.reviewSchedule);s.db.query('UPDATE coderabbit_waits SET started=?').run(Date.now()-6*60*1000);
   return {s,id,head,e,session,loop,io,sends:()=>sends,reviews:()=>reviews};
 }
+test('draft discovery never enters reviewer requests or remediation even when CI/review evidence is green',async()=>{
+ const f=templateFixture();try{
+  const read=f.loop.io.readBranchSnapshot;
+  f.loop.io.readBranchSnapshot=async(...args)=>({...await read(...args),draft:true});
+  f.e.clear=true;
+  for(let n=0;n<2;n++){
+   const result=await f.loop.tick(f.id);
+   expect(result.state).toBe('blocked');expect(result.reason).toContain('Draft PR delivery exists');
+  }
+  expect(f.sends()).toBe(0);expect(f.reviews()).toBe(0);
+ }finally{f.s.close();}
+});
 function cooldownChronologyFixture(){
  const f=templateFixture(),at=Date.now(),stamp=(ms:number)=>new Date(at+ms).toISOString();
  f.loop.configureMetadataChecks('project',[]);
@@ -973,7 +985,7 @@ test('identity failures retain specific hints and do not consume provider read r
    if(kind==='session')f.session.session.prs=[];
    if(kind==='local')f.loop.io.worktreeIdentity=async()=>({tree:'/worktree',branch:'wrong',head:f.head});
    if(kind==='repository')f.loop.io.readBranchSnapshot=async(...args)=>({...await original(...args),headRepo:'fork/repo'});
-   const expected={session:'Target/session mismatch',local:'Blocked — branch mismatch',repository:'Target is not the owned open feature PR'};
+   const expected={session:'Target/session mismatch',local:'Blocked — branch mismatch',repository:'Existing PR repository or fork mismatch'};
    for(let n=0;n<7;n++){
     if(kind==='authorization')await expect(f.loop.tick(f.id,{enabled:true,authorizedBy:'human',maxUpdates:3},undefined,undefined,{conflictRecovery:{enabled:true}})).rejects.toThrow('approved feature branch execution');
     else expect((await f.loop.tick(f.id,undefined,undefined,undefined,{conflictRecovery:{enabled:true}})).reason).toContain(expected[kind]);

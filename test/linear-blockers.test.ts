@@ -14,6 +14,17 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {LinearPreSendCooldown} from '../src/linear-cooldowns';
 import {LinearPreSendFailure} from '../src/linear-api';
+import {AcceptanceEvidence} from '../src/acceptance-evidence';
+test('draft handoff publishes independent acceptance blockers once and continuation does not clear them',async()=>{
+ const f=fixture();try{
+  const reason='Draft PR delivery exists; Acceptance visual: missing required viewports; Acceptance saved: current live content revision cannot be verified';
+  f.s.db.query("UPDATE worker_outcomes SET outcome='needs_reconciliation',source='draft-delivery',reason=?,questions='[]',dependencies='[]' WHERE job=?").run(reason,f.id);
+  new AcceptanceEvidence(f.s).observe({job:f.id,plan:f.s.get(f.id).plan_hash!,spec:digest(spec),revision:null,dispatch:'dispatch',session:'session',worktree:'/worktree',branch:'feature',repo:'owner/repo',pr:175,head:'a'.repeat(40),authorization:'current'},[reason]);
+  const publisher=f.blockers();await publisher.sync(f.config);await publisher.sync(f.config);
+  expect(f.creates).toBe(1);expect(f.comments[0].body).toContain('Acceptance visual');expect(f.comments[0].body).toContain('Acceptance saved');expect(f.comments[0].body).toContain('acceptance-status');expect(f.comments[0].body).not.toContain('identity mismatch');
+  f.running();await publisher.sync(f.config);expect(f.labels).toContain(labelId);
+ }finally{f.s.close();}
+});
 for(const failure of [new LinearPreSendCooldown(Date.now()+60000),new LinearPreSendFailure('quota storage unavailable')])test(`${failure.constructor.name} keeps blocker comment ownership reserved and later posts exactly once`,async()=>{
  const f=fixture(),blockers=f.blockers(),api=blockers.api;let hold=true;
  blockers.api=async(q,v)=>{if(hold&&q.startsWith('mutation'))throw failure;return api(q,v);};

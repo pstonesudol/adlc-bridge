@@ -9,6 +9,7 @@ import {readFileSync,existsSync,realpathSync} from 'node:fs';
 import {join,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {Store} from './core';
+import {AcceptanceEvidence,checkHash,verifyLiveContent,bindDraftConfig} from './acceptance-evidence';
 import {PlanningRestore} from './planning-restore';
 import {recoverProject,assertRecoveryAvailable} from './recovery-runtime';
 import {ApprovalPolicyStore} from './approval-policy';
@@ -90,7 +91,8 @@ const db=process.env.ADLC_DB??join(homedir(),'Library','Application Support','AD
 function projectConfiguration(path:string){
  const i=a.indexOf('--runtime'),runtime=i>=0?req(a[i+1],'Runtime config'):process.env.ADLC_VERIFICATION_RUNTIME_CONFIG;
  if(runtime?.startsWith('--'))throw Error('--runtime requires a runtime configuration path');
- return withVerificationContext(JSON.parse(readFileSync(path,'utf8')),path,runtime);
+ const read=()=>JSON.parse(readFileSync(path,'utf8'));
+ return bindDraftConfig(withVerificationContext(read(),path,runtime),read);
 }
 export async function runCLIReviewTick<T>(operation:()=>Promise<T>):Promise<T>{
  let interrupted:'SIGINT'|'SIGTERM'|undefined;
@@ -477,8 +479,26 @@ Registered approved review targets can request bounded in-scope fixes from their
      }):await dependencies.preview(a[0],config));
     }finally{store.close();}
    }
-    if(!['approvals','review-status','extend-review-cycle','reconcile-review-query','reconcile-review-provider','reconcile-review-checks','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
-  const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?JSON.parse(readFileSync(req(a[command==='reconcile-preview'?0:1],'Config'),'utf8')):null;if(c)validate(c);
+    if(command==='record-acceptance'||command==='acceptance-status'){
+     const applying=command==='record-acceptance';
+     if(applying?(a.length!==5||a[3]!=='--human'):a.length!==2)throw Error('Use acceptance-status JOB CONFIG or record-acceptance JOB CONFIG RECORD_JSON --human OPERATOR_ID');
+     if(!existsSync(db))throw Error('Existing database required');
+     const config=projectConfiguration(a[1]);validate(config);
+     const store=new Store(db,!applying);
+     try{
+      const workflow=new Workflow(store,liveTransport,undefined,true),evidence=new AcceptanceEvidence(store);
+      const operation=async()=>{
+       if(applying){assertRecoveryAvailable();assertConfiguredProjectIntakeEnabled(config,store);}
+       const facts=await workflow.draftFacts(a[0],config);
+       if(!applying)return {job:a[0],binding:facts.binding,checks:config.draftPromotion?.checks.map(c=>({id:c.id,definitionHash:checkHash(c)}))??[],blockers:[...facts.blockers,...await evidence.blockers(facts.binding,config.draftPromotion,verifyLiveContent)],readOnly:true};
+       if(!config.draftPromotion)throw Error('Explicit project acceptance policy required');
+       return evidence.record(facts.binding,config.draftPromotion,JSON.parse(readFileSync(a[2],'utf8')),{kind:'operator',id:a[4]});
+      };
+      return out(applying?await withTurnSubmission(operation):await operation());
+     }finally{store.close();}
+    }
+     if(!['approvals','review-status','extend-review-cycle','reconcile-review-query','reconcile-review-provider','reconcile-review-checks','recover-handoff','recovery-status','recovery-preview','retry-observation','reconcile-publication','reconcile-conflict','authorize-base-merge','status','show-plan','approve-job','ingest','plan','capture-plan','adopt-pilot','observe-pilot','register-review','rebind-review-target','tick-review','extend-budget','approve-plan','prepare','poll','serve','reconcile-preview','resolve-plan','resume-job'].includes(command))throw Error('Unknown command');
+  const c=['poll','serve'].includes(command)?projectConfiguration(req(a[0],'Config')):['reconcile-preview','resume-job'].includes(command)?projectConfiguration(req(a[command==='reconcile-preview'?0:1],'Config')):null;if(c)validate(c);
     if(command==='reconcile-publication'){
      if(a.length!==4&&!(a.length===6&&a[4]==='--confirm'))throw Error('Use reconcile-publication JOB CONFIG SOURCE HUMAN [--confirm HASH]');
      const config=JSON.parse(readFileSync(a[1],'utf8'));validate(config);

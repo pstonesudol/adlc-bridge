@@ -16,6 +16,14 @@
   "name": "Your project",
   "repo": "/absolute/path/to/your/repository",
   "githubRepo": "OWNER/REPOSITORY",
+  "draftPromotion": {
+    "enabled": false,
+    "repository": "OWNER/REPOSITORY",
+    "operators": [],
+    "integrations": [],
+    "maxAgeMs": 120000,
+    "checks": [{"id": "acceptance", "kind": "check", "definition": "REPLACE_WITH_REQUIRED_ACCEPTANCE_DEFINITION"}]
+  },
   "verification": {
     "version": 1,
     "mode": "host",
