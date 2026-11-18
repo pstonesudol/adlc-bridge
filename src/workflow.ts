@@ -751,13 +751,22 @@ export class Workflow{
    const state=stopped?({'needs-input':'needs_input','blocked-dependency':'blocked_dependency',failed:'failed',uncertain:'uncertain'} as any)[receipt.outcome]:'draft_handoff';
    return {state,outcome:stopped?state:'needs_reconciliation',source:'draft-delivery',confidence:'high',pr:facts.pr,reason:`Draft PR delivery exists; ${blockers.join('; ')||'await authorized promotion'}`,questions:receipt?.questions??[],dependencies:receipt?.dependencies??[],discovery:facts.discovery};
   }
-  private async promoteExistingDraft(b:DraftBinding,revalidate:()=>Promise<void>){
-   const child=Bun.spawn(['gh','api','graphql','-f','query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid isDraft}}}','-f',`owner=${b.repo.split('/')[0]}`,'-f',`name=${b.repo.split('/')[1]}`,'-F',`number=${b.pr}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
-   const [out,,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
-   let id;try{const p=JSON.parse(out).data.repository.pullRequest;if(p.headRefOid===b.head&&p.isDraft===true)id=p.id;}catch{}
-   if(code!==0||typeof id!=='string'||!/^[A-Za-z0-9_=-]+$/.test(id))throw Error('Draft promotion node evidence unavailable');
-   await revalidate();
-   const mutation=Bun.spawn(['gh','api','graphql','-f','query=mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}','-f',`id=${id}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+  private async promoteExistingDraft(b:DraftBinding,revalidate:()=>Promise<void>,spawn:typeof Bun.spawn=Bun.spawn){
+   let id:string;
+   try{
+    const child=spawn(['gh','api','graphql','-f','query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid isDraft}}}','-f',`owner=${b.repo.split('/')[0]}`,'-f',`name=${b.repo.split('/')[1]}`,'-F',`number=${b.pr}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
+    const [out,,code]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
+    const p=JSON.parse(out).data.repository.pullRequest;
+    if(code!==0||p.headRefOid!==b.head||p.isDraft!==true||typeof p.id!=='string'||!/^[A-Za-z0-9_=-]+$/.test(p.id))throw Error('Draft promotion node evidence unavailable');
+    id=p.id;
+    await revalidate();
+   }catch{
+    // This region performs reads and revalidation only. No mutation process has
+    // been launched, so the reservation may safely be released by the caller.
+    throw new PreSendFailure('Draft promotion not sent: node lookup or pre-mutation evidence unavailable');
+   }
+   // Never classify any error at/after this send boundary as PreSendFailure.
+   const mutation=spawn(['gh','api','graphql','-f','query=mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}','-f',`id=${id}`],{stdout:'pipe',stderr:'pipe',timeout:30000});
    await Promise.all([new Response(mutation.stdout).text(),new Response(mutation.stderr).text(),mutation.exited]);
   }
   async previewReconcile(c:WorkflowConfig){

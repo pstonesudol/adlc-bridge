@@ -4,7 +4,8 @@ import {Workflow} from '../src/workflow';
 import {Planning} from '../src/planning';
 import {Lifecycle} from '../src/lifecycle';
 import {recordReadiness,recordResolution} from '../src/readiness';
-import {AcceptanceEvidence,checkHash,promoteDraft,bindDraftConfig,type DraftPolicy} from '../src/acceptance-evidence';
+import {AcceptanceEvidence,checkHash,promoteDraft,bindDraftConfig,assertDeliveryUnreserved,type DraftPolicy} from '../src/acceptance-evidence';
+import {PreSendFailure} from '../src/pre-send';
 import {DeliveryRecovery} from '../src/delivery-recovery';
 import {jobBlockers} from '../src/operator-evidence';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -127,7 +128,10 @@ test('durable promotion reservation survives a closed/reopened database with no 
   f.s.close();restarted=new Store(path);
   const result=await promoteDraft(restarted,f.policy,async()=>({...facts,blockers:[]}),async()=>{mutations++;});
   expect(result.ready).toBe(false);expect(mutations).toBe(1);
-  expect((await promoteDraft(restarted,f.policy,async()=>({...facts,draft:false,blockers:[]}),async()=>{mutations++;})).ready).toBe(true);
+  const current={...facts,binding:{...facts.binding,head:'a'.repeat(40)},draft:false,blockers:[]};
+  expect((await promoteDraft(restarted,{...f.policy,maxAgeMs:10000},async()=>current,async()=>{mutations++;})).ready).toBe(true);
+  expect(restarted.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'promoted'});
+  expect(JSON.parse((restarted.db.query('SELECT detail FROM draft_promotions').get() as any).detail).head).toBe(facts.binding.head);
   expect(mutations).toBe(1);
  }finally{if(restarted)restarted.close();else f.s.close();rmSync(dir,{recursive:true,force:true});}
 });
@@ -161,6 +165,104 @@ test('restarted promotion evaluator settles the durable reservation after author
   await promoteDraft(f.s,f.policy,async()=>({...facts,blockers:[]}),send);
   expect((await promoteDraft(f.s,f.policy,async()=>({...facts,draft:false,blockers:[]}),send)).ready).toBe(true);
   expect(f.s.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'promoted'});expect(calls).toBe(1);
+ }finally{f.s.close();}
+});
+for(const change of ['policy','head'])test(`ready reconciliation settles the original reservation after ${change} changes`,async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c);let mutations=0;
+  const send=async()=>{mutations++;throw Error('unknown after send');};
+  await promoteDraft(f.s,f.policy,async()=>({...facts,blockers:[]}),send);
+  const original=f.s.db.query('SELECT binding,detail FROM draft_promotions').get();
+  const policy=change==='policy'?{...f.policy,maxAgeMs:10000}:f.policy;
+  const current=change==='head'?{...facts,binding:{...facts.binding,head:'a'.repeat(40)}}:facts;
+  expect((await promoteDraft(f.s,policy,async()=>({...current,draft:false,blockers:[]}),send)).ready).toBe(true);
+  expect(f.s.db.query('SELECT binding,detail,state FROM draft_promotions').get()).toEqual({...original as any,state:'promoted'});
+  expect(()=>assertDeliveryUnreserved(f.s,f.job,'continuation')).not.toThrow();
+  expect(()=>assertDeliveryUnreserved(f.s,f.job,'adoption')).not.toThrow();
+  await promoteDraft(f.s,policy,async()=>({...current,draft:false,blockers:[]}),send);
+  expect(f.s.db.query("SELECT * FROM events WHERE kind='draft_promoted'").all()).toHaveLength(1);
+  await promoteDraft(f.s,policy,async()=>({...current,draft:true,blockers:[]}),send);
+  expect(mutations).toBe(1); // Re-drafting does not authorize another mutation.
+ }finally{f.s.close();}
+});
+test('ready reconciliation cannot settle an uncertain reservation for another repository, PR or job',async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c),otherJob=f.s.enqueue('project','other-issue','spec');
+  const attempts=[
+   facts,
+   {...facts,binding:{...facts.binding,pr:151}},
+   {...facts,binding:{...facts.binding,repo:'other/repo'}},
+   {...facts,binding:{...facts.binding,job:otherJob}},
+  ];
+  for(const attempt of attempts)await promoteDraft(f.s,f.policy,async()=>({...attempt,blockers:[]}),async()=>{throw Error('unknown');});
+  await promoteDraft(f.s,{...f.policy,maxAgeMs:10000},async()=>({...facts,draft:false,blockers:[]}),async()=>{throw Error('must not resend');});
+  const rows=f.s.db.query('SELECT job,state,detail FROM draft_promotions').all() as any[];
+  expect(rows).toHaveLength(4);
+  for(const row of rows){
+   const b=JSON.parse(row.detail),match=row.job===f.job&&b.repo===facts.binding.repo&&b.pr===facts.binding.pr;
+   expect(row.state).toBe(match?'promoted':'uncertain');
+  }
+ }finally{f.s.close();}
+});
+for(const failure of ['spawn','exit','json','node','head','revalidation'])test(`default promotion ${failure} failure before mutation releases only its own reservation and permits retry`,async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c);let fail=true,mutations=0;
+  const spawn=((args:string[])=>{
+   if(args.some(a=>a.includes('markPullRequestReadyForReview'))){
+    mutations++;f.b.draft=false;
+    return {stdout:new Response('{}').body,stderr:new Response('').body,exited:Promise.resolve(0)};
+   }
+   if(fail&&failure==='spawn')throw Error('lookup launch failed');
+   const body=fail&&failure==='json'?'not json':JSON.stringify({data:{repository:{pullRequest:{id:fail&&failure==='node'?null:'PR_node',headRefOid:fail&&failure==='head'?'a'.repeat(40):facts.binding.head,isDraft:true}}}});
+   return {stdout:new Response(body).body,stderr:new Response('').body,exited:Promise.resolve(fail&&failure==='exit'?1:0)};
+  }) as typeof Bun.spawn;
+  const inspect=async()=>({...facts,draft:f.b.draft,blockers:[]});
+  const promote=(b:any)=>(f.w as any).promoteExistingDraft(b,async()=>{if(fail&&failure==='revalidation')throw Error('head/policy changed');},spawn);
+  const blocked=await promoteDraft(f.s,f.policy,inspect,promote);
+  expect(blocked.ready).toBe(false);expect(blocked.blockers[0]).toContain('was not sent; reservation released');
+  expect(mutations).toBe(0);expect(f.s.db.query('SELECT * FROM draft_promotions').all()).toHaveLength(0);
+  expect(()=>assertDeliveryUnreserved(f.s,f.job,'continuation')).not.toThrow();
+  expect(()=>assertDeliveryUnreserved(f.s,f.job,'adoption')).not.toThrow();
+  expect(f.s.db.query("SELECT * FROM events WHERE kind='draft_promotion_not_sent'").all()).toHaveLength(1);
+  fail=false;
+  expect((await promoteDraft(f.s,f.policy,inspect,promote)).ready).toBe(true);
+  expect(mutations).toBe(1);expect(f.s.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'promoted'});
+ }finally{f.s.close();}
+});
+test('default promotion error after mutation launch remains uncertain and never permits replay',async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c);let mutations=0;
+  const spawn=((args:string[])=>{
+   if(args.some(a=>a.includes('markPullRequestReadyForReview'))){
+    mutations++;
+    return {stdout:new Response('').body,stderr:new Response('').body,exited:Promise.reject(Error('lost mutation process outcome'))};
+   }
+   return {stdout:new Response(JSON.stringify({data:{repository:{pullRequest:{id:'PR_node',headRefOid:facts.binding.head,isDraft:true}}}})).body,stderr:new Response('').body,exited:Promise.resolve(0)};
+  }) as typeof Bun.spawn;
+  const inspect=async()=>({...facts,blockers:[]});
+  const send=(b:any)=>(f.w as any).promoteExistingDraft(b,async()=>{},spawn);
+  expect((await promoteDraft(f.s,f.policy,inspect,send)).ready).toBe(false);
+  expect((await promoteDraft(f.s,f.policy,inspect,send)).ready).toBe(false);
+  expect(mutations).toBe(1);expect(f.s.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'uncertain'});
+  expect(()=>assertDeliveryUnreserved(f.s,f.job,'continuation')).toThrow('promotion reserved or uncertain');
+ }finally{f.s.close();}
+});
+test('an untyped error claiming to be pre-mutation cannot release uncertainty',async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c);
+  await promoteDraft(f.s,f.policy,async()=>({...facts,blockers:[]}),async()=>{throw Object.assign(Error('untrusted marker'),{preMutation:true});});
+  expect(f.s.db.query('SELECT state FROM draft_promotions').get()).toEqual({state:'uncertain'});
+ }finally{f.s.close();}
+});
+test('a typed pre-send failure releases only the reservation created by its invocation',async()=>{
+ const f=fixture();try{
+  const facts=await f.w.draftFacts(f.job,f.c),other={...facts,binding:{...facts.binding,pr:151}};
+  await promoteDraft(f.s,f.policy,async()=>({...other,blockers:[]}),async()=>{throw Error('unknown other PR outcome');});
+  await promoteDraft(f.s,f.policy,async()=>({...facts,blockers:[]}),async()=>{throw new PreSendFailure('not sent');});
+  const rows=f.s.db.query('SELECT state,detail FROM draft_promotions').all() as any[];
+  expect(rows).toHaveLength(1);expect(rows[0].state).toBe('uncertain');expect(JSON.parse(rows[0].detail).pr).toBe(151);
+  const event=f.s.db.query("SELECT detail FROM events WHERE kind='draft_promotion_not_sent'").get() as any;
+  expect(JSON.parse(event.detail).attempt.pr).toBe(150);
  }finally{f.s.close();}
 });
 for(const scenario of ['owner','head','provider','receipt','approval'])test(`draft effects fail closed on changed ${scenario}`,async()=>{

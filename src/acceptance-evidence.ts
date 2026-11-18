@@ -1,5 +1,6 @@
 import {Store,digest} from './core';
 import {assertObservationFence} from './observation-fence';
+import {PreSendFailure} from './pre-send';
 
 export type AcceptanceCheck={id:string;kind:'check'|'responsive'|'live-content';definition:string;viewports?:string[];environment?:string;verifier?:string[]};
 export type DraftPolicy={enabled:boolean;repository:string;operators:string[];integrations:string[];checks:AcceptanceCheck[];maxAgeMs?:number};
@@ -101,6 +102,20 @@ export class AcceptanceEvidence{
  }
 }
 export type PromotionFacts={binding:DraftBinding;draft:boolean;blockers:string[]};
+/** Ready-state reconciliation settles the original attempt, whose policy/head
+ * fingerprint may differ from today's verified evidence. Never rebind its detail
+ * or settle another repository/PR merely because it shares the job. */
+function settlePromotions(s:Store,observed:DraftBinding){
+ s.db.transaction(()=>{
+  const rows=s.db.query("SELECT binding,detail FROM draft_promotions WHERE job=? AND state='uncertain'").all(observed.job) as {binding:string;detail:string}[];
+  for(const row of rows){
+   let attempt:DraftBinding;try{attempt=JSON.parse(row.detail);}catch{continue;}
+   if(!attempt||attempt.repo!==observed.repo||attempt.pr!==observed.pr)continue;
+   const changed=s.db.query("UPDATE draft_promotions SET state='promoted' WHERE job=? AND binding=? AND state='uncertain'").run(observed.job,row.binding);
+   if(changed.changes)s.event(observed.job,'draft_promoted',JSON.stringify({reservation:row.binding,attempt,observed}));
+  }
+ }).immediate();
+}
 /** At most one mutation attempt for the same job/PR. An uncertain attempt
  * survives restart and is settled only by authoritative ready-state evidence. */
 export async function promoteDraft(s:Store,p:DraftPolicy|undefined,inspect:()=>Promise<PromotionFacts>,promote:(b:DraftBinding)=>Promise<void>){
@@ -110,7 +125,7 @@ export async function promoteDraft(s:Store,p:DraftPolicy|undefined,inspect:()=>P
  const fingerprint=digest(JSON.stringify([first.binding,p])),same=(f:PromotionFacts)=>digest(JSON.stringify([f.binding,p]))===fingerprint;
  evidence.install();
  if(!first.draft){
-  s.db.query("UPDATE draft_promotions SET state='promoted' WHERE job=? AND binding=? AND state='uncertain'").run(first.binding.job,fingerprint);
+  settlePromotions(s,first.binding);
   return {ready:true,blockers:[]};
  }
  const prior=(s.db.query('SELECT state,detail FROM draft_promotions WHERE job=?').all(first.binding.job) as any[]).find(r=>{const b=JSON.parse(r.detail);return b.repo===first.binding.repo&&b.pr===first.binding.pr;});
@@ -124,11 +139,19 @@ export async function promoteDraft(s:Store,p:DraftPolicy|undefined,inspect:()=>P
   if(pending)return {changes:0};
   return s.db.query("INSERT OR IGNORE INTO draft_promotions VALUES (?,?,'uncertain',?)").run(first.binding.job,fingerprint,JSON.stringify(first.binding));
  }).immediate();
- if(reserved.changes)try{await promote(first.binding);}catch{/* Do not retry an uncertain mutation. */}
+ if(reserved.changes)try{await promote(first.binding);}catch(error){
+  // Only the trusted transport's typed proof of non-delivery may release this
+  // invocation's reservation. Unknown errors, including unreadable replies from
+  // a launched mutation, must remain durable uncertainty across restarts.
+  if(error instanceof PreSendFailure){
+   const released=s.db.query("DELETE FROM draft_promotions WHERE job=? AND binding=? AND state='uncertain'").run(first.binding.job,fingerprint);
+   if(released.changes)s.event(first.binding.job,'draft_promotion_not_sent',JSON.stringify({reservation:fingerprint,attempt:first.binding}));
+   return {ready:false,blockers:['Draft promotion was not sent; reservation released. Refresh current evidence before retrying the authorized workflow']};
+  }
+ }
  const after=await inspect();
  if(!same(after)||after.blockers.length||after.draft)return {ready:false,blockers:after.blockers.length?after.blockers:['Draft promotion uncertain or head changed; reconcile without replay']};
- const settled=s.db.query("UPDATE draft_promotions SET state='promoted' WHERE job=? AND binding=? AND state='uncertain'").run(first.binding.job,fingerprint);
- if(settled.changes)s.event(first.binding.job,'draft_promoted',JSON.stringify(first.binding));
+ settlePromotions(s,after.binding);
  return {ready:true,blockers:[]};
 }
 
